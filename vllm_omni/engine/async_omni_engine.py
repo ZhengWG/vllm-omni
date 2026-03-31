@@ -435,10 +435,19 @@ class AsyncOmniEngine:
         return stage_client, output_processor, started.vllm_config, input_processor
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
-        """Initialize stage clients/processors in orchestrator thread and assign to self."""
+        """Initialize stage clients/processors in orchestrator thread and assign to self.
+
+        Multi-replica support: when a stage config contains
+        ``runtime.num_replicas > 1``, multiple clients are created for the same
+        logical stage and the flat ``stage_clients`` list grows accordingly.
+        ``logical_stage_to_clients`` maps each logical stage id to the list of
+        client indices that belong to it.
+        """
         device_control_env = current_omni_platform.device_control_env_var
 
         num_stages = self.num_stages
+        # These are indexed by *logical* stage_id during initialization, then
+        # expanded to flat client-indexed lists at the end.
         stage_clients: list[Any | None] = [None] * num_stages
         output_processors: list[Any | None] = [None] * num_stages
         stage_vllm_configs: list[Any | None] = [None] * num_stages
@@ -447,6 +456,15 @@ class AsyncOmniEngine:
         llm_launch_futures: dict[int, concurrent.futures.Future[StartedLlmStage]] = {}
         started_llm_stages: dict[int, StartedLlmStage] = {}
         llm_stage_launch_lock = threading.Lock()
+
+        # Track per-logical-stage replica count from config
+        replicas_per_stage: list[int] = []
+        for stage_cfg in self.stage_configs:
+            runtime_cfg = getattr(stage_cfg, "runtime", {})
+            num_replicas = int(
+                runtime_cfg.get("num_replicas", 1) if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "num_replicas", 1)
+            )
+            replicas_per_stage.append(max(1, num_replicas))
 
         async_chunk = self.async_chunk
         prompt_expand_func = None
@@ -549,21 +567,61 @@ class AsyncOmniEngine:
             )
             raise
 
-        self.stage_clients = initialized_stage_clients
-        self.output_processors = output_processors
-        self.stage_vllm_configs = stage_vllm_configs
+        # ---- Multi-replica expansion ----
+        # Expand the logical-indexed lists into flat client-indexed lists.
+        # For replica_index > 0 the same client/processor/config is shared
+        # (they point to the same underlying EngineCore) — full per-replica
+        # process isolation is out-of-scope for this first iteration.
+        flat_clients: list[Any] = []
+        flat_output_processors: list[Any] = []
+        flat_vllm_configs: list[Any] = []
+        logical_stage_to_clients: list[list[int]] = []
+        # sampling_params and stage_metadata are per-logical-stage
+        logical_default_sampling_params: list[Any] = []
+        logical_stage_metadata: list[dict[str, Any]] = []
+
+        for logical_id, client in enumerate(initialized_stage_clients):
+            num_replicas = replicas_per_stage[logical_id]
+            client_indices: list[int] = []
+            for replica_idx in range(num_replicas):
+                ci = len(flat_clients)
+                client_indices.append(ci)
+                if replica_idx == 0:
+                    # First replica uses the already-created objects
+                    flat_clients.append(client)
+                    flat_output_processors.append(output_processors[logical_id])
+                    flat_vllm_configs.append(stage_vllm_configs[logical_id])
+                else:
+                    # Additional replicas: for now, share the same client.
+                    # True per-replica process isolation will be added later.
+                    # TODO: launch separate EngineCore processes for replica_idx > 0
+                    flat_clients.append(client)
+                    flat_output_processors.append(output_processors[logical_id])
+                    flat_vllm_configs.append(stage_vllm_configs[logical_id])
+                    logger.info(
+                        "[AsyncOmniEngine] Logical stage %s replica %s → client %s (shared)",
+                        logical_id, replica_idx, ci,
+                    )
+            logical_stage_to_clients.append(client_indices)
+            logical_default_sampling_params.append(default_sampling_params_list[logical_id])
+            logical_stage_metadata.append(stage_metadata[logical_id])
+
+        self.stage_clients = flat_clients
+        self.output_processors = flat_output_processors
+        self.stage_vllm_configs = flat_vllm_configs
+        self.logical_stage_to_clients = logical_stage_to_clients
         self.input_processor = input_processor
         self.prompt_expand_func = prompt_expand_func
         # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()
-        if any(getattr(stage_client, "is_comprehension", False) for stage_client in initialized_stage_clients):
+        if any(getattr(stage_client, "is_comprehension", False) for stage_client in flat_clients):
             supported_tasks.add("generate")
-        if any(metadata.get("final_output_type") == "audio" for metadata in stage_metadata):
+        if any(metadata.get("final_output_type") == "audio" for metadata in logical_stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
 
-        self.default_sampling_params_list = default_sampling_params_list
-        self.stage_metadata = stage_metadata
+        self.default_sampling_params_list = logical_default_sampling_params
+        self.stage_metadata = logical_stage_metadata
 
     def _initialize_janus_queues(self) -> None:
         """Initialize janus queues inside orchestrator thread loop context."""
@@ -594,6 +652,7 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
+                logical_stage_to_clients=getattr(self, "logical_stage_to_clients", None),
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

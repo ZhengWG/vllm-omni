@@ -111,6 +111,11 @@ class StageMetadata:
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
+    # Multi-replica fields: logical_stage_id is the original stage_id from
+    # the YAML config; replica_index distinguishes replicas of the same
+    # logical stage.  For single-replica stages these default to stage_id / 0.
+    logical_stage_id: int = -1
+    replica_index: int = 0
 
 
 @dataclass
@@ -172,6 +177,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             model_stage=None,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
+            logical_stage_id=stage_id,
         )
 
     model_stage = getattr(engine_args, "model_stage", None)
@@ -193,6 +199,7 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
+        logical_stage_id=stage_id,
     )
 
 

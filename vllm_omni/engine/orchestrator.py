@@ -104,6 +104,11 @@ class OrchestratorRequestState:
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
 
+    # Multi-replica: maps logical_stage_id -> client_index chosen for this
+    # request.  Ensures the same request always hits the same replica within
+    # a given logical stage (KV / intermediate-state affinity).
+    chosen_client_index: dict[int, int] = field(default_factory=dict)
+
 
 class Orchestrator:
     """Runs inside a background thread's asyncio event loop.
@@ -122,17 +127,38 @@ class Orchestrator:
         stage_vllm_configs: list[Any],
         *,
         async_chunk: bool = False,
+        logical_stage_to_clients: list[list[int]] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
 
-        self.num_stages = len(stage_clients)
+        self.num_clients = len(stage_clients)
         self.async_chunk = bool(async_chunk)
 
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
         self.stage_vllm_configs: list[Any] = stage_vllm_configs
+
+        # Multi-replica mapping: logical_stage_id -> list of client indices.
+        # When not provided (single-replica), default to identity mapping.
+        if logical_stage_to_clients is not None:
+            self.logical_stage_to_clients = logical_stage_to_clients
+        else:
+            self.logical_stage_to_clients = [[i] for i in range(self.num_clients)]
+        self.num_logical_stages = len(self.logical_stage_to_clients)
+
+        # Reverse mapping: client_index -> logical_stage_id
+        self._client_to_logical: list[int] = [0] * self.num_clients
+        for logical_id, client_indices in enumerate(self.logical_stage_to_clients):
+            for ci in client_indices:
+                self._client_to_logical[ci] = logical_id
+
+        # Round-robin counters for replica selection per logical stage
+        self._replica_rr: list[int] = [0] * self.num_logical_stages
+
+        # Backward compat: num_stages now means num_logical_stages
+        self.num_stages = self.num_logical_stages
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
@@ -144,14 +170,40 @@ class Orchestrator:
         self._companion_done: dict[str, set[str]] = {}
         self._deferred_parents: dict[str, dict[str, Any]] = {}
 
-        # Per-stage metrics accumulators.
-        self._batch_seq: list[int] = [0] * self.num_stages
-        self._agg_total_tokens: list[int] = [0] * self.num_stages
-        self._agg_total_gen_time_ms: list[float] = [0.0] * self.num_stages
+        # Per-client metrics accumulators.
+        self._batch_seq: list[int] = [0] * self.num_clients
+        self._agg_total_tokens: list[int] = [0] * self.num_clients
+        self._agg_total_gen_time_ms: list[float] = [0.0] * self.num_clients
 
         # Shutdown coordination
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
+
+    def _choose_client_index(
+        self,
+        logical_stage_id: int,
+        req_state: OrchestratorRequestState,
+    ) -> int:
+        """Pick a client for *logical_stage_id* and record the choice.
+
+        If this request already has a chosen client for the logical stage,
+        return the existing one (affinity).  Otherwise round-robin among the
+        available replicas.
+        """
+        existing = req_state.chosen_client_index.get(logical_stage_id)
+        if existing is not None:
+            return existing
+
+        candidates = self.logical_stage_to_clients[logical_stage_id]
+        if len(candidates) == 1:
+            chosen = candidates[0]
+        else:
+            rr = self._replica_rr[logical_stage_id]
+            chosen = candidates[rr % len(candidates)]
+            self._replica_rr[logical_stage_id] = rr + 1
+
+        req_state.chosen_client_index[logical_stage_id] = chosen
+        return chosen
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -226,31 +278,38 @@ class Orchestrator:
         """Inner loop for _orchestration_output_handler (clean cancellation).
 
         Control flow: poll raw → process through output processor → route.
+
+        Multi-replica: iterates over every *client_index* (not logical stage),
+        and resolves the logical_stage_id from client metadata for routing.
         """
         while not self._shutdown_event.is_set():
             idle = True
-            for stage_id in range(self.num_stages):
+            for client_index in range(self.num_clients):
                 if self._shutdown_event.is_set():
                     return
 
+                logical_stage_id = self._client_to_logical[client_index]
+
                 # 1) Diffusion stage: poll non-blocking queue
-                # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
-                # which is different from EngineCoreOutputs (LLM stages). We may want to unify
-                # the output format in the future to simplify the processing logic in Orchestrator.
-                stage_client = self.stage_clients[stage_id]
+                stage_client = self.stage_clients[client_index]
                 if stage_client.stage_type == "diffusion":
                     output = stage_client.get_diffusion_output_async()
                     if output is not None:
                         idle = False
                         req_state = self.request_states.get(output.request_id)
                         if req_state is not None:
-                            stage_metrics = self._build_stage_metrics(stage_id, output.request_id, [output], req_state)
-                            await self._route_output(stage_id, output, req_state, stage_metrics)
+                            stage_metrics = self._build_stage_metrics(
+                                client_index, output.request_id, [output], req_state
+                            )
+                            await self._route_output(
+                                logical_stage_id, output, req_state, stage_metrics,
+                                client_index=client_index,
+                            )
                     continue
 
-                # 1) Poll raw outputs from the stage
+                # 1) Poll raw outputs from the client
                 try:
-                    raw_outputs = await asyncio.wait_for(self._poll_stage_raw(stage_id), timeout=0.001)
+                    raw_outputs = await asyncio.wait_for(self._poll_stage_raw(client_index), timeout=0.001)
                 except asyncio.TimeoutError:
                     continue
                 except asyncio.CancelledError:
@@ -259,8 +318,9 @@ class Orchestrator:
                     if self._shutdown_event.is_set():
                         return
                     logger.exception(
-                        "[Orchestrator] _poll_stage_raw failed for stage-%s",
-                        stage_id,
+                        "[Orchestrator] _poll_stage_raw failed for client-%s (logical stage-%s)",
+                        client_index,
+                        logical_stage_id,
                     )
                     raise
 
@@ -269,28 +329,33 @@ class Orchestrator:
                 idle = False
 
                 # 2) Process raw outputs through the output processor
-                request_outputs = await self._process_stage_outputs(stage_id, raw_outputs)
+                request_outputs = await self._process_stage_outputs(client_index, raw_outputs)
 
                 # 3) Route each processed output
                 for output in request_outputs:
                     req_state = self.request_states.get(output.request_id)
                     if req_state is None:
                         logger.warning(
-                            "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
+                            "[Orchestrator] Dropping output for unknown req %s at client-%s "
+                            "(logical stage-%s, known reqs: %s)",
                             output.request_id,
-                            stage_id,
+                            client_index,
+                            logical_stage_id,
                             list(self.request_states.keys()),
                         )
                         continue
                     stage_metrics = None
                     if output.finished:
                         stage_metrics = self._build_stage_metrics(
-                            stage_id,
+                            client_index,
                             output.request_id,
                             [output],
                             req_state,
                         )
-                    await self._route_output(stage_id, output, req_state, stage_metrics)
+                    await self._route_output(
+                        logical_stage_id, output, req_state, stage_metrics,
+                        client_index=client_index,
+                    )
 
             if idle:
                 await asyncio.sleep(0.001)
@@ -303,12 +368,22 @@ class Orchestrator:
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
+        *,
+        client_index: int | None = None,
     ) -> None:
-        """Route a processed output: send to main thread and/or forward to next stage."""
+        """Route a processed output: send to main thread and/or forward to next stage.
+
+        Args:
+            stage_id: Logical stage id.
+            client_index: Physical client index that produced this output.
+                          Defaults to stage_id for backward compat.
+        """
+        if client_index is None:
+            client_index = stage_id
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
-        stage_client = self.stage_clients[stage_id]
+        stage_client = self.stage_clients[client_index]
 
         # CFG companion handling: companions don't produce user-visible output
         # and don't forward to the next stage directly.
@@ -331,6 +406,7 @@ class Orchestrator:
                             deferred["stage_id"],
                             deferred["output"],
                             parent_state,
+                            client_index=deferred.get("client_index", deferred["stage_id"]),
                         )
             self.request_states.pop(req_id, None)
             return
@@ -364,13 +440,16 @@ class Orchestrator:
                 self._deferred_parents[req_id] = {
                     "stage_id": stage_id,
                     "output": output,
+                    "client_index": client_index,
                 }
                 logger.debug(
                     "[Orchestrator] Parent %s deferred, waiting for CFG companions",
                     req_id,
                 )
             else:
-                await self._forward_to_next_stage(req_id, stage_id, output, req_state)
+                await self._forward_to_next_stage(
+                    req_id, stage_id, output, req_state, client_index=client_index,
+                )
 
         if finished and stage_id == req_state.final_stage_id:
             self._cleanup_companion_state(req_id)
@@ -395,35 +474,36 @@ class Orchestrator:
 
     def _build_stage_metrics(
         self,
-        stage_id: int,
+        client_index: int,
         req_id: str,
         request_outputs: list[RequestOutput],
         req_state: OrchestratorRequestState,
     ) -> StageRequestMetrics:
-        """Build StageRequestMetrics for a finished request at a stage.
+        """Build StageRequestMetrics for a finished request at a client.
 
         Reuses StageRequestMetrics so OrchestratorMetrics and downstream
         metric handlers can consume a stable schema.
         """
+        logical_stage_id = self._client_to_logical[client_index]
         now = _time.time()
-        submit_ts = req_state.stage_submit_ts.get(stage_id, now)
+        submit_ts = req_state.stage_submit_ts.get(logical_stage_id, now)
         stage_gen_time_ms = (now - submit_ts) * 1000.0
 
         num_tokens_out = count_tokens_from_outputs(request_outputs)
         num_tokens_in = 0
-        if stage_id == 0:
+        if logical_stage_id == 0:
             for ro in request_outputs:
                 ptids = getattr(ro, "prompt_token_ids", None)
                 if ptids is not None:
                     num_tokens_in += len(ptids)
 
-        # Monotonic batch counter per stage.
-        self._batch_seq[stage_id] += 1
-        batch_id = self._batch_seq[stage_id]
+        # Monotonic batch counter per client.
+        self._batch_seq[client_index] += 1
+        batch_id = self._batch_seq[client_index]
 
         # Accumulate for running-average stage_stats
-        self._agg_total_tokens[stage_id] += num_tokens_out
-        self._agg_total_gen_time_ms[stage_id] += stage_gen_time_ms
+        self._agg_total_tokens[client_index] += num_tokens_out
+        self._agg_total_gen_time_ms[client_index] += stage_gen_time_ms
 
         return StageRequestMetrics(
             num_tokens_in=num_tokens_in,
@@ -435,8 +515,8 @@ class Orchestrator:
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
             stage_stats=StageStats(
-                total_token=self._agg_total_tokens[stage_id],
-                total_gen_time_ms=self._agg_total_gen_time_ms[stage_id],
+                total_token=self._agg_total_tokens[client_index],
+                total_gen_time_ms=self._agg_total_gen_time_ms[client_index],
             ),
         )
 
@@ -446,18 +526,28 @@ class Orchestrator:
         stage_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
+        *,
+        client_index: int | None = None,
     ) -> None:
         """Forward output from current stage to the next stage.
 
         Handles the full pipeline: set outputs on current stage, compute
         next-stage inputs, build lightweight requests, and submit them.
+
+        Args:
+            stage_id: Logical stage id that produced the output.
+            client_index: Physical client index that produced the output.
         """
-        next_stage_id = stage_id + 1
-        next_client = self.stage_clients[next_stage_id]
-        params = req_state.sampling_params_list[next_stage_id]
+        if client_index is None:
+            client_index = stage_id
+
+        next_logical = stage_id + 1
+        next_ci = self._choose_client_index(next_logical, req_state)
+        next_client = self.stage_clients[next_ci]
+        params = req_state.sampling_params_list[next_logical]
 
         if next_client.stage_type == "diffusion":
-            self.stage_clients[stage_id].set_engine_outputs([output])
+            self.stage_clients[client_index].set_engine_outputs([output])
             if next_client.custom_process_input_func is not None:
                 diffusion_prompt = next_client.custom_process_input_func(
                     self.stage_clients,
@@ -493,22 +583,25 @@ class Orchestrator:
                 )
             else:
                 await next_client.add_request_async(req_id, diffusion_prompt, params)
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            req_state.stage_submit_ts[next_logical] = _time.time()
             return
 
-        self.stage_clients[stage_id].set_engine_outputs([output])
+        # Set outputs on the client that actually produced them
+        self.stage_clients[client_index].set_engine_outputs([output])
 
         # Process inputs for next stage
         try:
             next_inputs = next_client.process_engine_inputs(
                 stage_list=self.stage_clients,
                 prompt=req_state.prompt,
+                source_client_index=client_index,
             )
         except Exception:
             logger.exception(
-                "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
+                "[Orchestrator] req=%s process_engine_inputs FAILED for logical stage-%s (client-%s)",
                 req_id,
-                next_stage_id,
+                next_logical,
+                next_ci,
             )
             raise
 
@@ -518,13 +611,13 @@ class Orchestrator:
                 request_id=req_id,
                 prompt=next_input,
                 params=params,
-                model_config=self.stage_vllm_configs[next_stage_id].model_config,
+                model_config=self.stage_vllm_configs[next_ci].model_config,
             )
 
             # TODO: Here we directly use the req id to assign.
             request.external_req_id = request.request_id
 
-            self.output_processors[next_stage_id].add_request(
+            self.output_processors[next_ci].add_request(
                 request=request,
                 prompt=None,
                 parent_req=None,
@@ -534,26 +627,26 @@ class Orchestrator:
 
             await next_client.add_request_async(request)
 
-        # Record submit timestamp for the next stage
-        req_state.stage_submit_ts[next_stage_id] = _time.time()
+        # Record submit timestamp for the next logical stage
+        req_state.stage_submit_ts[next_logical] = _time.time()
 
-    async def _poll_stage_raw(self, stage_id: int) -> EngineCoreOutputs | None:
+    async def _poll_stage_raw(self, client_index: int) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage client without processing.
 
         Returns the raw outputs object, or None when there is nothing
         to consume.
         """
-        outputs = await self.stage_clients[stage_id].get_output_async()
+        outputs = await self.stage_clients[client_index].get_output_async()
         if not outputs.outputs:
             return None
         return outputs
 
-    async def _process_stage_outputs(self, stage_id: int, raw_outputs: EngineCoreOutputs) -> list[RequestOutput]:
+    async def _process_stage_outputs(self, client_index: int, raw_outputs: EngineCoreOutputs) -> list[RequestOutput]:
         """Run the output processor on raw outputs, returning RequestOutputs.
 
         Also handles abort forwarding and scheduler stats updates.
         """
-        processor = self.output_processors[stage_id]
+        processor = self.output_processors[client_index]
 
         processed = processor.process_outputs(
             raw_outputs.outputs,
@@ -562,7 +655,7 @@ class Orchestrator:
         )
 
         if processed.reqs_to_abort:
-            await self.stage_clients[stage_id].abort_requests_async(processed.reqs_to_abort)
+            await self.stage_clients[client_index].abort_requests_async(processed.reqs_to_abort)
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
@@ -571,7 +664,7 @@ class Orchestrator:
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
-        stage_id = 0
+        logical_stage_id = 0
         request_id = msg["request_id"]
         prompt = msg["prompt"]
         original_prompt = msg.get("original_prompt", prompt)
@@ -585,7 +678,7 @@ class Orchestrator:
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
             "prompt_type=%s original_prompt_type=%s final_stage=%s "
             "num_sampling_params=%d",
-            stage_id,
+            logical_stage_id,
             request_id,
             type(prompt).__name__,
             type(original_prompt).__name__,
@@ -601,14 +694,17 @@ class Orchestrator:
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
         )
-        req_state.stage_submit_ts[stage_id] = _time.time()
         self.request_states[request_id] = req_state
+
+        # Choose a replica for logical stage 0
+        client_index = self._choose_client_index(logical_stage_id, req_state)
+        req_state.stage_submit_ts[logical_stage_id] = _time.time()
 
         # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
         # (pre-processed by AsyncOmniEngine.add_request, output processor
         # already registered there) - submit directly.
         request = prompt
-        stage_client = self.stage_clients[stage_id]
+        stage_client = self.stage_clients[client_index]
         if stage_client.stage_type == "diffusion":
             if isinstance(prompt, list):
                 await stage_client.add_batch_request_async(
@@ -621,7 +717,7 @@ class Orchestrator:
         else:
             await stage_client.add_request_async(request)
 
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and logical_stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _prewarm_async_chunk_stages(
@@ -635,6 +731,9 @@ class Orchestrator:
         In async-chunk mode, stages exchange data through connectors/chunk adapters,
         so downstream stages should be armed once at request start instead of waiting
         for stage-finished forwarding.
+
+        Multi-replica: uses _choose_client_index so the prewarm targets align
+        with the orchestration-face chosen replicas.
         """
         if req_state.final_stage_id <= 0:
             return
@@ -661,24 +760,25 @@ class Orchestrator:
         base_input["multi_modal_data"] = None
         base_input["mm_processor_kwargs"] = None
 
-        for next_stage_id in range(1, req_state.final_stage_id + 1):
-            next_client = self.stage_clients[next_stage_id]
-            params = req_state.sampling_params_list[next_stage_id]
+        for next_logical in range(1, req_state.final_stage_id + 1):
+            next_ci = self._choose_client_index(next_logical, req_state)
+            next_client = self.stage_clients[next_ci]
+            params = req_state.sampling_params_list[next_logical]
 
             if next_client.stage_type == "diffusion":
                 await next_client.add_request_async(request_id, req_state.prompt, params)
-                req_state.stage_submit_ts[next_stage_id] = _time.time()
+                req_state.stage_submit_ts[next_logical] = _time.time()
                 continue
 
             request = build_engine_core_request_from_tokens(
                 request_id=request_id,
                 prompt=base_input,
                 params=params,
-                model_config=self.stage_vllm_configs[next_stage_id].model_config,
+                model_config=self.stage_vllm_configs[next_ci].model_config,
             )
             request.external_req_id = request.request_id
 
-            self.output_processors[next_stage_id].add_request(
+            self.output_processors[next_ci].add_request(
                 request=request,
                 prompt=None,
                 parent_req=None,
@@ -686,7 +786,7 @@ class Orchestrator:
                 queue=None,
             )
             await next_client.add_request_async(request)
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
+            req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -710,18 +810,28 @@ class Orchestrator:
             sampling_params_list=sampling_params_list,
             final_stage_id=0,
         )
-        companion_state.stage_submit_ts[0] = _time.time()
         self.request_states[companion_id] = companion_state
 
+        # Use same replica as the parent for affinity, or choose one
+        parent_state = self.request_states.get(parent_id)
+        if parent_state is not None and 0 in parent_state.chosen_client_index:
+            client_index = parent_state.chosen_client_index[0]
+            companion_state.chosen_client_index[0] = client_index
+        else:
+            client_index = self._choose_client_index(0, companion_state)
+
+        companion_state.stage_submit_ts[0] = _time.time()
+
         request = companion_prompt  # Already a processed OmniEngineCoreRequest
-        stage_client = self.stage_clients[0]
+        stage_client = self.stage_clients[client_index]
         await stage_client.add_request_async(request)
 
         logger.info(
-            "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s)",
+            "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, client=%s)",
             companion_id,
             role,
             parent_id,
+            client_index,
         )
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
@@ -740,8 +850,8 @@ class Orchestrator:
             self._deferred_parents.pop(req_id, None)
 
         all_ids_to_abort = list(request_ids) + companion_ids_to_abort
-        for stage_id in range(self.num_stages):
-            await self.stage_clients[stage_id].abort_requests_async(all_ids_to_abort)
+        for ci in range(self.num_clients):
+            await self.stage_clients[ci].abort_requests_async(all_ids_to_abort)
         for req_id in request_ids:
             self.request_states.pop(req_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
@@ -759,16 +869,26 @@ class Orchestrator:
         args = tuple(msg.get("args", ()))
         kwargs = dict(msg.get("kwargs") or {})
         requested_stage_ids = msg.get("stage_ids")
-        stage_ids = list(range(self.num_stages)) if requested_stage_ids is None else list(requested_stage_ids)
+        # When stage_ids are provided they refer to logical stages; expand
+        # to all client indices belonging to those logical stages.
+        if requested_stage_ids is None:
+            stage_ids = list(range(self.num_clients))
+        else:
+            stage_ids = []
+            for lid in requested_stage_ids:
+                if 0 <= lid < self.num_logical_stages:
+                    stage_ids.extend(self.logical_stage_to_clients[lid])
+                else:
+                    stage_ids.append(lid)  # keep invalid id for error reporting
 
         results: list[Any] = []
         for stage_id in stage_ids:
-            if stage_id < 0 or stage_id >= self.num_stages:
+            if stage_id < 0 or stage_id >= self.num_clients:
                 results.append(
                     {
                         "supported": False,
                         "todo": True,
-                        "error": f"Invalid stage id {stage_id}",
+                        "error": f"Invalid client index {stage_id}",
                     }
                 )
                 continue
@@ -817,10 +937,10 @@ class Orchestrator:
             return
 
         self._stages_shutdown = True
-        logger.info("[Orchestrator] Shutting down all stages")
-        for stage_id, stage_client in enumerate(self.stage_clients):
+        logger.info("[Orchestrator] Shutting down all %d client(s)", self.num_clients)
+        for ci, stage_client in enumerate(self.stage_clients):
             try:
                 stage_client.shutdown()
-                logger.info(f"[Orchestrator] Stage {stage_id} shut down")
+                logger.info("[Orchestrator] Client %d shut down", ci)
             except Exception as e:
-                logger.warning(f"[Orchestrator] Failed to shutdown stage {stage_id}: {e}")
+                logger.warning("[Orchestrator] Failed to shutdown client %d: %s", ci, e)
