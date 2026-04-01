@@ -302,7 +302,10 @@ class Orchestrator:
                                 client_index, output.request_id, [output], req_state
                             )
                             await self._route_output(
-                                logical_stage_id, output, req_state, stage_metrics,
+                                logical_stage_id,
+                                output,
+                                req_state,
+                                stage_metrics,
                                 client_index=client_index,
                             )
                     continue
@@ -353,7 +356,10 @@ class Orchestrator:
                             req_state,
                         )
                     await self._route_output(
-                        logical_stage_id, output, req_state, stage_metrics,
+                        logical_stage_id,
+                        output,
+                        req_state,
+                        stage_metrics,
                         client_index=client_index,
                     )
 
@@ -448,7 +454,11 @@ class Orchestrator:
                 )
             else:
                 await self._forward_to_next_stage(
-                    req_id, stage_id, output, req_state, client_index=client_index,
+                    req_id,
+                    stage_id,
+                    output,
+                    req_state,
+                    client_index=client_index,
                 )
 
         if finished and stage_id == req_state.final_stage_id:

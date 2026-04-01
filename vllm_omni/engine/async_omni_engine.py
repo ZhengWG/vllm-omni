@@ -463,7 +463,9 @@ class AsyncOmniEngine:
         for stage_cfg in self.stage_configs:
             runtime_cfg = getattr(stage_cfg, "runtime", {})
             num_replicas = int(
-                runtime_cfg.get("num_replicas", 1) if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "num_replicas", 1)
+                runtime_cfg.get("num_replicas", 1)
+                if hasattr(runtime_cfg, "get")
+                else getattr(runtime_cfg, "num_replicas", 1)
             )
             replicas_per_stage.append(max(1, num_replicas))
 
@@ -475,8 +477,7 @@ class AsyncOmniEngine:
                 continue
             runtime_cfg = getattr(stage_cfg, "runtime", {})
             devices_str = (
-                runtime_cfg.get("devices") if hasattr(runtime_cfg, "get")
-                else getattr(runtime_cfg, "devices", None)
+                runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
             )
             tp_size = get_stage_tp_size(stage_cfg)
             per_replica = split_devices_for_replicas(devices_str, num_replicas, tp_size, logical_id)
@@ -484,7 +485,10 @@ class AsyncOmniEngine:
                 replica_devices_map[(logical_id, r)] = dev_str
             logger.info(
                 "[AsyncOmniEngine] Stage %s: %d replicas, tp=%d, devices split: %s",
-                logical_id, num_replicas, tp_size, per_replica,
+                logical_id,
+                num_replicas,
+                tp_size,
+                per_replica,
             )
 
         async_chunk = self.async_chunk
@@ -569,7 +573,8 @@ class AsyncOmniEngine:
 
                         logger.info(
                             "[AsyncOmniEngine] Launching stage %s replica %s (devices=%s)",
-                            stage_id, replica_idx,
+                            stage_id,
+                            replica_idx,
                             getattr(getattr(replica_cfg, "runtime", None), "devices", "default"),
                         )
 
@@ -647,7 +652,9 @@ class AsyncOmniEngine:
                         if num_replicas > 1:
                             logger.info(
                                 "[AsyncOmniEngine] Logical stage %s replica %s → client %s (isolated)",
-                                logical_id, replica_idx, ci,
+                                logical_id,
+                                replica_idx,
+                                ci,
                             )
 
                 logical_stage_to_clients.append(client_indices)
