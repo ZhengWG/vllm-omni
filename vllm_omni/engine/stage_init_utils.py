@@ -218,6 +218,51 @@ def prepare_engine_environment() -> None:
         pass
 
 
+def split_devices_for_replicas(
+    devices_str: str | None,
+    num_replicas: int,
+    tp_size: int,
+    stage_id: int,
+) -> list[str]:
+    """Split a devices string into per-replica subsets.
+
+    When ``num_replicas`` is 1, returns ``[devices_str]`` unchanged.
+    Otherwise, the total number of device IDs must equal
+    ``num_replicas * tp_size``; each replica gets ``tp_size`` consecutive
+    device IDs.
+
+    Example::
+
+        split_devices_for_replicas("1,2,3,4", num_replicas=2, tp_size=2, stage_id=1)
+        # → ["1,2", "3,4"]
+    """
+    if num_replicas <= 1 or devices_str is None:
+        return [devices_str] if devices_str is not None else [devices_str]
+
+    device_list = [d.strip() for d in devices_str.split(",") if d.strip()]
+    required = num_replicas * tp_size
+    if len(device_list) != required:
+        raise ValueError(
+            f"Stage {stage_id}: num_replicas={num_replicas}, "
+            f"tensor_parallel_size={tp_size} requires "
+            f"{required} devices, got {len(device_list)}: {devices_str}"
+        )
+
+    result: list[str] = []
+    for r in range(num_replicas):
+        chunk = device_list[r * tp_size : (r + 1) * tp_size]
+        result.append(",".join(chunk))
+    return result
+
+
+def get_stage_tp_size(stage_cfg: Any) -> int:
+    """Extract tensor_parallel_size from a stage config object."""
+    engine_args = getattr(stage_cfg, "engine_args", {})
+    if hasattr(engine_args, "get"):
+        return int(engine_args.get("tensor_parallel_size", 1) or 1)
+    return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
+
+
 def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
     """Device mapping via set_stage_devices for a single stage."""
     physical_devices = set_stage_devices(
