@@ -342,6 +342,11 @@ class Orchestrator:
                         continue
                     idle = False
 
+                    # Handle prefill-finished KV-ready signals before finished outputs.
+                    await self._handle_kv_ready_raw_outputs(
+                        stage_id, raw_outputs, replica_index=replica_index,
+                    )
+
                     # 2) Process raw outputs through the output processor
                     request_outputs = await self._process_stage_outputs(
                         stage_id, raw_outputs, replica_index=replica_index,
@@ -400,26 +405,7 @@ class Orchestrator:
         # CFG companion handling: companions don't produce user-visible output
         # and don't forward to the next stage directly.
         if finished and req_id in self._companion_ids:
-            parent_id = self._companion_to_parent.get(req_id)
-            if parent_id is not None:
-                self._companion_done.setdefault(parent_id, set()).add(req_id)
-                logger.debug(
-                    "[Orchestrator] CFG companion %s done (parent=%s)",
-                    req_id,
-                    parent_id,
-                )
-                # Check if parent is waiting and all companions are done
-                if parent_id in self._deferred_parents and self._all_companions_done(parent_id):
-                    deferred = self._deferred_parents.pop(parent_id)
-                    parent_state = self.request_states.get(parent_id)
-                    if parent_state is not None:
-                        await self._forward_to_next_stage(
-                            parent_id,
-                            deferred["stage_id"],
-                            deferred["output"],
-                            parent_state,
-                            replica_index=deferred.get("replica_index", 0),
-                        )
+            await self._handle_cfg_companion_ready(req_id)
             self.request_states.pop(req_id, None)
             return
 
@@ -446,18 +432,18 @@ class Orchestrator:
                 }
             )
 
-        if finished and stage_id < req_state.final_stage_id and not self.async_chunk:
-            # If this parent has CFG companions, defer forwarding until all done
+        if (
+            finished
+            and stage_id < req_state.final_stage_id
+            and not self.async_chunk
+            and not self._next_stage_already_submitted(stage_id, req_state)
+        ):
             if req_id in self._companion_map and not self._all_companions_done(req_id):
                 self._deferred_parents[req_id] = {
                     "stage_id": stage_id,
                     "output": output,
                     "replica_index": replica_index,
                 }
-                logger.debug(
-                    "[Orchestrator] Parent %s deferred, waiting for CFG companions",
-                    req_id,
-                )
             else:
                 await self._forward_to_next_stage(
                     req_id,
@@ -487,6 +473,70 @@ class Orchestrator:
             return True
         done_set = self._companion_done.get(parent_id, set())
         return all(cid in done_set for cid in role_map.values())
+
+    def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
+        return (stage_id + 1) in req_state.stage_submit_ts
+
+    async def _handle_cfg_companion_ready(self, req_id: str) -> None:
+        """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
+        parent_id = self._companion_to_parent.get(req_id)
+        if parent_id is None:
+            return
+        done_set = self._companion_done.setdefault(parent_id, set())
+        if req_id in done_set:
+            return
+        done_set.add(req_id)
+        if parent_id in self._deferred_parents and self._all_companions_done(parent_id):
+            deferred = self._deferred_parents.pop(parent_id)
+            parent_state = self.request_states.get(parent_id)
+            if parent_state is not None and not self._next_stage_already_submitted(deferred["stage_id"], parent_state):
+                await self._forward_to_next_stage(
+                    parent_id,
+                    deferred["stage_id"],
+                    deferred["output"],
+                    parent_state,
+                    replica_index=deferred.get("replica_index", 0),
+                )
+
+    async def _handle_kv_ready_raw_outputs(
+        self,
+        stage_id: int,
+        raw_outputs: EngineCoreOutputs,
+        *,
+        replica_index: int = 0,
+    ) -> None:
+        """Forward split requests once stage-0 KV is ready, not only when decode fully finishes."""
+        if self.async_chunk:
+            return
+        for raw_output in raw_outputs.outputs:
+            kv_params = getattr(raw_output, "kv_transfer_params", None)
+            if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
+                continue
+            req_id = raw_output.request_id
+            req_state = self.request_states.get(req_id)
+            if req_state is None:
+                continue
+            if req_id in self._companion_ids:
+                await self._handle_cfg_companion_ready(req_id)
+                continue
+            if stage_id >= req_state.final_stage_id:
+                continue
+            if self._next_stage_already_submitted(stage_id, req_state):
+                continue
+            if req_id in self._companion_map and not self._all_companions_done(req_id):
+                self._deferred_parents[req_id] = {
+                    "stage_id": stage_id,
+                    "output": raw_output,
+                    "replica_index": replica_index,
+                }
+            else:
+                await self._forward_to_next_stage(
+                    req_id,
+                    stage_id,
+                    raw_output,
+                    req_state,
+                    replica_index=replica_index,
+                )
 
     def _build_stage_metrics(
         self,
