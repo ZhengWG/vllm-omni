@@ -450,10 +450,10 @@ class AsyncOmniEngine:
 
         num_stages = self.num_stages
         input_processor: InputProcessor | None = None
-        # Keyed by (logical_stage_id, replica_idx)
-        llm_launch_keys: list[tuple[int, int]] = []
-        llm_launch_futures: dict[tuple[int, int], concurrent.futures.Future[StartedLlmStage]] = {}
-        started_llm_stages: dict[tuple[int, int], StartedLlmStage] = {}
+        # Per-stage launch futures and results: stage_id → [replicas]
+        llm_stage_ids: list[int] = []
+        llm_launch_futures: dict[int, list[concurrent.futures.Future[StartedLlmStage]]] = {}
+        started_llm_stages: dict[int, list[StartedLlmStage]] = {}
         llm_stage_launch_lock = threading.Lock()
         # Diffusion stages (no multi-replica support yet)
         diffusion_clients: dict[int, Any] = {}
@@ -470,7 +470,8 @@ class AsyncOmniEngine:
             replicas_per_stage.append(max(1, num_replicas))
 
         # Pre-compute per-replica device assignments for multi-replica stages
-        replica_devices_map: dict[tuple[int, int], str] = {}
+        # stage_id → [devices_str_per_replica]
+        replica_devices_map: dict[int, list[str]] = {}
         for logical_id, stage_cfg in enumerate(self.stage_configs):
             num_replicas = replicas_per_stage[logical_id]
             if num_replicas <= 1:
@@ -480,15 +481,15 @@ class AsyncOmniEngine:
                 runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
             )
             tp_size = get_stage_tp_size(stage_cfg)
-            per_replica = split_devices_for_replicas(devices_str, num_replicas, tp_size, logical_id)
-            for r, dev_str in enumerate(per_replica):
-                replica_devices_map[(logical_id, r)] = dev_str
+            replica_devices_map[logical_id] = split_devices_for_replicas(
+                devices_str, num_replicas, tp_size, logical_id,
+            )
             logger.info(
                 "[AsyncOmniEngine] Stage %s: %d replicas, tp=%d, devices split: %s",
                 logical_id,
                 num_replicas,
                 tp_size,
-                per_replica,
+                replica_devices_map[logical_id],
             )
 
         async_chunk = self.async_chunk
@@ -504,7 +505,8 @@ class AsyncOmniEngine:
 
         # Initialized outside try so error handler can always access them
         flat_clients: list[Any] = []
-        all_clients: dict[tuple[int, int], Any] = {}
+        # stage_id → [client_per_replica]
+        all_clients: dict[int, list[Any]] = {}
 
         try:
             with concurrent.futures.ThreadPoolExecutor(
@@ -554,19 +556,19 @@ class AsyncOmniEngine:
                         continue
 
                     # Submit one launch future per replica
+                    llm_stage_ids.append(stage_id)
                     num_replicas = replicas_per_stage[stage_id]
-                    for replica_idx in range(num_replicas):
-                        key = (stage_id, replica_idx)
-                        llm_launch_keys.append(key)
+                    stage_futures: list[concurrent.futures.Future[StartedLlmStage]] = []
 
+                    for replica_idx in range(num_replicas):
                         # For replica > 0, deep-copy stage_cfg and override devices
                         if replica_idx > 0:
                             replica_cfg = copy.deepcopy(stage_cfg)
                         else:
                             replica_cfg = stage_cfg
 
-                        if key in replica_devices_map:
-                            replica_cfg.runtime.devices = replica_devices_map[key]
+                        if stage_id in replica_devices_map:
+                            replica_cfg.runtime.devices = replica_devices_map[stage_id][replica_idx]
 
                         replica_metadata = extract_stage_metadata(replica_cfg)
                         replica_metadata.replica_index = replica_idx
@@ -578,7 +580,7 @@ class AsyncOmniEngine:
                             getattr(getattr(replica_cfg, "runtime", None), "devices", "default"),
                         )
 
-                        llm_launch_futures[key] = launch_executor.submit(
+                        stage_futures.append(launch_executor.submit(
                             self._launch_llm_stage,
                             replica_cfg,
                             replica_metadata,
@@ -586,12 +588,18 @@ class AsyncOmniEngine:
                             stage_init_timeout,
                             llm_stage_launch_lock,
                             omni_kv_connector,
-                        )
+                        ))
 
-                concurrent.futures.wait(list(llm_launch_futures.values()))
+                    llm_launch_futures[stage_id] = stage_futures
 
-                for key in llm_launch_keys:
-                    started_llm_stages[key] = llm_launch_futures[key].result()
+                # Wait for all futures across all stages
+                all_futures = [f for futures in llm_launch_futures.values() for f in futures]
+                concurrent.futures.wait(all_futures)
+
+                for stage_id in llm_stage_ids:
+                    started_llm_stages[stage_id] = [
+                        f.result() for f in llm_launch_futures[stage_id]
+                    ]
 
             # ---- Build flat client lists directly ----
             # Attach each launched replica and build the flat index structures.
@@ -601,21 +609,27 @@ class AsyncOmniEngine:
 
             # Per-logical-stage lists (not per-client)
             logical_stage_clients_for_finalize: list[Any | None] = [None] * num_stages
-            all_output_processors: dict[tuple[int, int], Any] = {}
-            all_vllm_configs: dict[tuple[int, int], Any] = {}
+            all_output_processors: dict[int, list[Any]] = {}
+            all_vllm_configs: dict[int, list[Any]] = {}
 
-            for key in llm_launch_keys:
-                stage_id, replica_idx = key
-                started = started_llm_stages[key]
-                client, output_proc, vllm_cfg, stage0_inp = self._attach_llm_stage(started)
-                all_clients[key] = client
-                all_output_processors[key] = output_proc
-                all_vllm_configs[key] = vllm_cfg
-                if stage0_inp is not None:
-                    input_processor = stage0_inp
+            for stage_id in llm_stage_ids:
+                stage_clients_list: list[Any] = []
+                stage_output_procs: list[Any] = []
+                stage_vllm_cfgs: list[Any] = []
+
+                for replica_idx, started in enumerate(started_llm_stages[stage_id]):
+                    client, output_proc, vllm_cfg, stage0_inp = self._attach_llm_stage(started)
+                    stage_clients_list.append(client)
+                    stage_output_procs.append(output_proc)
+                    stage_vllm_cfgs.append(vllm_cfg)
+                    if stage0_inp is not None:
+                        input_processor = stage0_inp
+
+                all_clients[stage_id] = stage_clients_list
+                all_output_processors[stage_id] = stage_output_procs
+                all_vllm_configs[stage_id] = stage_vllm_cfgs
                 # Use first replica for finalize_initialized_stages
-                if replica_idx == 0:
-                    logical_stage_clients_for_finalize[stage_id] = client
+                logical_stage_clients_for_finalize[stage_id] = stage_clients_list[0]
 
             # Place diffusion clients into the logical list
             for stage_id, diff_client in diffusion_clients.items():
@@ -643,15 +657,14 @@ class AsyncOmniEngine:
                     flat_vllm_configs.append(None)
                 else:
                     for replica_idx in range(num_replicas):
-                        key = (logical_id, replica_idx)
                         ci = len(flat_clients)
                         client_indices.append(ci)
-                        flat_clients.append(all_clients[key])
-                        flat_output_processors.append(all_output_processors[key])
-                        flat_vllm_configs.append(all_vllm_configs[key])
+                        flat_clients.append(all_clients[logical_id][replica_idx])
+                        flat_output_processors.append(all_output_processors[logical_id][replica_idx])
+                        flat_vllm_configs.append(all_vllm_configs[logical_id][replica_idx])
                         if num_replicas > 1:
                             logger.info(
-                                "[AsyncOmniEngine] Logical stage %s replica %s → client %s (isolated)",
+                                "[AsyncOmniEngine] Stage %s replica %s → client %s (isolated)",
                                 logical_id,
                                 replica_idx,
                                 ci,
@@ -662,21 +675,22 @@ class AsyncOmniEngine:
                 logical_stage_metadata.append(stage_metadata[logical_id])
 
         except Exception:
-            for key, future in llm_launch_futures.items():
-                if not future.done() or future.cancelled() or future.exception() is not None:
-                    continue
-                started_llm_stages.setdefault(key, future.result())
+            for stage_id, futures in llm_launch_futures.items():
+                for f in futures:
+                    if not f.done() or f.cancelled() or f.exception() is not None:
+                        continue
+                    started_llm_stages.setdefault(stage_id, []).append(f.result())
             # Collect all initialized clients for cleanup
-            cleanup_clients: list[Any] = list(diffusion_clients.values()) + list(all_clients.values())
+            cleanup_clients: list[Any] = list(diffusion_clients.values())
+            for clients in all_clients.values():
+                cleanup_clients.extend(clients)
             cleanup_clients = [c for c in cleanup_clients if c is not None]
+            all_started = [s for stages in started_llm_stages.values() for s in stages]
             logger.exception(
                 "[AsyncOmniEngine] Stage initialization failed; shutting down %s initialized client(s)",
                 len(cleanup_clients),
             )
-            cleanup_failed_stage_initialization(
-                cleanup_clients,
-                list(started_llm_stages.values()),
-            )
+            cleanup_failed_stage_initialization(cleanup_clients, all_started)
             raise
 
         self.stage_clients = flat_clients
@@ -725,7 +739,7 @@ class AsyncOmniEngine:
                 stage_clients=self.stage_clients,
                 output_processors=self.output_processors,
                 stage_vllm_configs=self.stage_vllm_configs,
-                logical_stage_to_clients=getattr(self, "logical_stage_to_clients", None),
+                logical_stage_to_clients=self.logical_stage_to_clients,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

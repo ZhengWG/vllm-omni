@@ -123,15 +123,14 @@ class StageEngineCoreClient(AsyncMPClient):
         self,
         stage_list: list[Any],
         prompt: OmniTokensPrompt | list[OmniTokensPrompt] | None = None,
-        source_client_index: int | None = None,
+        source_client: Any | None = None,
     ) -> list[OmniTokensPrompt]:
         """Process inputs from upstream stages.
 
         Args:
-            source_client_index: When multi-replica is enabled, specifies the
-                exact client index in *stage_list* that produced the upstream
-                output.  Falls back to ``engine_input_source[0]`` for backward
-                compat.
+            source_client: When multi-replica is enabled, the upstream client
+                object that produced the output.  Falls back to
+                ``stage_list[engine_input_source[0]]`` for backward compat.
         """
         from vllm_omni.inputs.data import OmniTokensPrompt
 
@@ -146,8 +145,9 @@ class StageEngineCoreClient(AsyncMPClient):
         if not self.engine_input_source:
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
 
-        source_id = source_client_index if source_client_index is not None else self.engine_input_source[0]
-        source_outputs = stage_list[source_id].engine_outputs
+        if source_client is None:
+            source_client = stage_list[self.engine_input_source[0]]
+        source_outputs = source_client.engine_outputs
 
         if not isinstance(prompt, list):
             prompt = [prompt]
