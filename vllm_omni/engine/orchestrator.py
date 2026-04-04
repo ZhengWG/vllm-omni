@@ -309,11 +309,17 @@ class Orchestrator:
                             req_state = self.request_states.get(output.request_id)
                             if req_state is not None:
                                 stage_metrics = self._build_stage_metrics(
-                                    stage_id, output.request_id, [output], req_state,
+                                    stage_id,
+                                    output.request_id,
+                                    [output],
+                                    req_state,
                                     replica_index=replica_index,
                                 )
                                 await self._route_output(
-                                    stage_id, output, req_state, stage_metrics,
+                                    stage_id,
+                                    output,
+                                    req_state,
+                                    stage_metrics,
                                     replica_index=replica_index,
                                 )
                         continue
@@ -344,12 +350,16 @@ class Orchestrator:
 
                     # Handle prefill-finished KV-ready signals before finished outputs.
                     await self._handle_kv_ready_raw_outputs(
-                        stage_id, raw_outputs, replica_index=replica_index,
+                        stage_id,
+                        raw_outputs,
+                        replica_index=replica_index,
                     )
 
                     # 2) Process raw outputs through the output processor
                     request_outputs = await self._process_stage_outputs(
-                        stage_id, raw_outputs, replica_index=replica_index,
+                        stage_id,
+                        raw_outputs,
+                        replica_index=replica_index,
                     )
 
                     # 3) Route each processed output
@@ -368,11 +378,17 @@ class Orchestrator:
                         stage_metrics = None
                         if output.finished:
                             stage_metrics = self._build_stage_metrics(
-                                stage_id, output.request_id, [output], req_state,
+                                stage_id,
+                                output.request_id,
+                                [output],
+                                req_state,
                                 replica_index=replica_index,
                             )
                         await self._route_output(
-                            stage_id, output, req_state, stage_metrics,
+                            stage_id,
+                            output,
+                            req_state,
+                            stage_metrics,
                             replica_index=replica_index,
                         )
 
@@ -698,7 +714,10 @@ class Orchestrator:
         req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _poll_stage_raw(
-        self, stage_id: int, *, replica_index: int = 0,
+        self,
+        stage_id: int,
+        *,
+        replica_index: int = 0,
     ) -> EngineCoreOutputs | None:
         """Pull raw EngineCoreOutputs from a stage replica without processing.
 
@@ -712,7 +731,11 @@ class Orchestrator:
         return outputs
 
     async def _process_stage_outputs(
-        self, stage_id: int, raw_outputs: EngineCoreOutputs, *, replica_index: int = 0,
+        self,
+        stage_id: int,
+        raw_outputs: EngineCoreOutputs,
+        *,
+        replica_index: int = 0,
     ) -> list[RequestOutput]:
         """Run the output processor on raw outputs, returning RequestOutputs.
 
@@ -900,8 +923,7 @@ class Orchestrator:
         await stage_client.add_request_async(request)
 
         logger.info(
-            "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, "
-            "stage-0 replica-%s)",
+            "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, stage-0 replica-%s)",
             companion_id,
             role,
             parent_id,

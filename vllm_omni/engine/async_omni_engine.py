@@ -482,7 +482,10 @@ class AsyncOmniEngine:
             )
             tp_size = get_stage_tp_size(stage_cfg)
             replica_devices_map[logical_id] = split_devices_for_replicas(
-                devices_str, num_replicas, tp_size, logical_id,
+                devices_str,
+                num_replicas,
+                tp_size,
+                logical_id,
             )
             logger.info(
                 "[AsyncOmniEngine] Stage %s: %d replicas, tp=%d, devices split: %s",
@@ -580,15 +583,17 @@ class AsyncOmniEngine:
                             getattr(getattr(replica_cfg, "runtime", None), "devices", "default"),
                         )
 
-                        stage_futures.append(launch_executor.submit(
-                            self._launch_llm_stage,
-                            replica_cfg,
-                            replica_metadata,
-                            stage_connector_spec,
-                            stage_init_timeout,
-                            llm_stage_launch_lock,
-                            omni_kv_connector,
-                        ))
+                        stage_futures.append(
+                            launch_executor.submit(
+                                self._launch_llm_stage,
+                                replica_cfg,
+                                replica_metadata,
+                                stage_connector_spec,
+                                stage_init_timeout,
+                                llm_stage_launch_lock,
+                                omni_kv_connector,
+                            )
+                        )
 
                     llm_launch_futures[stage_id] = stage_futures
 
@@ -597,9 +602,7 @@ class AsyncOmniEngine:
                 concurrent.futures.wait(all_futures)
 
                 for stage_id in llm_stage_ids:
-                    started_llm_stages[stage_id] = [
-                        f.result() for f in llm_launch_futures[stage_id]
-                    ]
+                    started_llm_stages[stage_id] = [f.result() for f in llm_launch_futures[stage_id]]
 
             # ---- Build flat client lists directly ----
             # Attach each launched replica and build the flat index structures.
