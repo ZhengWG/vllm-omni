@@ -112,6 +112,7 @@ nav:
       - design/module/dit_module.md
       - design/module/entrypoint_module.md
       - design/module/async_omni_architecture.md
+      - design/module/qwen3-omni-ming-architecture.md
   - Docs Guide: contributing/DOCS_GUIDE.md
 - API Reference:
   - api/README.md
