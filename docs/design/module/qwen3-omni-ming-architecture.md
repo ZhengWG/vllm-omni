@@ -1,9 +1,8 @@
-# Qwen3-Omni 与 Ming-flash-omni 在 vLLM-Omni 的架构与推理流程梳理
+# Qwen3-Omni 与 Ming-flash-omni 在 vLLM-Omni 的架构与推理流程梳理（细化版）
 
-> 本文面向 **vllm-omni 框架实现**，重点回答两件事：
+> 这版按你给的文章脉络重写：先讲 **Omni 通用概念框架**（Codec / RVQ / 四阶段 / 合成设计自由度），再下钻 **Qwen3-Omni 的执行细节**，最后对照 **Ming PR #1822** 的落地边界。
 >
-> 1. 当前仓库中 `Qwen3-Omni` 的模型结构、阶段拆分、推理计算流程是如何落地的？
-> 2. 基于上游 PR [#1822](https://github.com/vllm-project/vllm-omni/pull/1822) 的 `Ming-flash-omni-2.0` 支持，当前落地了什么、缺了什么、与完整模型结构的差距是什么？
+> 目标不是只给“代码目录说明”，而是给“模型原理 -> 推理执行 -> 框架抽象”的连续视角。
 
 ---
 
@@ -21,7 +20,7 @@
   `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_moe_code_predictor_mtp.py`
 - Code2Wav（codec -> waveform）  
   `vllm_omni/model_executor/models/qwen3_omni/qwen3_omni_code2wav.py`
-- Stage 输入拼接（thinker->talker / talker->code2wav）  
+- Stage 输入桥接（thinker->talker / talker->code2wav）  
   `vllm_omni/model_executor/stage_input_processors/qwen3_omni.py`
 - Stage 配置  
   `vllm_omni/model_executor/stage_configs/qwen3_omni_moe*.yaml`
@@ -46,227 +45,359 @@
 
 ---
 
-## 1. Qwen3-Omni：当前 vLLM-Omni 的实现结构
+## 1. Omni 通用概念框架（对齐你文章的第一部分）
 
-## 1.1 三阶段拓扑（Thinker -> Talker -> Code2Wav）
+## 1.1 四阶段 Pipeline：从波形到波形
 
-当前实现是 **统一 model class + stage 化实例化**：
-
-- `model_stage=thinker`：只初始化 thinker 子模型
-- `model_stage=talker`：只初始化 talker 子模型，并启用 custom pre/post process
-- `model_stage=code2wav`：只初始化 code2wav 子模型
-
-其核心由 `Qwen3OmniMoeForConditionalGeneration` 完成 stage 分发。
+一个典型 omni 语音对话/语音输出路径可以统一成四段：
 
 ```mermaid
 flowchart LR
-    A[Stage-0 Thinker\nMultimodal Prefill + Text Decode] -->|text hidden + captured layers + tts embeds| B[Stage-1 Talker\nCodec Layer-0 AR]
-    B -->|code_predictor_codes| C[Stage-2 Code2Wav\nCausal ConvNet]
-    C --> D[Audio Stream]
+    A[Audio Encoding\nwaveform -> codec tokens or hidden states] --> B[Understanding / Thinker\nmultimodal prefill + decode]
+    B --> C[Speech Synthesis / Talker\ntext/hidden -> codec tokens]
+    C --> D[Audio Decoding / Vocoder\ncodec tokens -> waveform]
 ```
 
----
+从框架层看：
 
-## 1.2 Thinker：多模态输入对齐 + 文本解码
-
-### (a) 输入处理与占位符扩展
-
-`qwen3_omni_moe_thinker.py` 里，`Qwen3OmniMoeThinkerMultiModalProcessor` 负责：
-
-- 把 audio/image/video 映射为 tokenizer 占位符 token 序列
-- 计算每个模态 token 数（音频由 feature length 推导）
-- 支持 `use_audio_in_video` 的 interleaved 情况
-- 为 MRoPE 提供可复原的 `mm_features`
-
-### (b) Embedding 融合
-
-`embed_input_ids()` 逻辑：
-
-- 先 text embedding
-- 再把多模态 embedding 合并进 `is_multimodal` 位置
-- 若视觉 deepstack 生效，额外写入 deepstack buffer
-
-### (c) 输出给 Talker 的信息
-
-Thinker forward 可开启 `capture_layer_indices=[0, accept_hidden_layer]`，并返回：
-
-- layer0 embedding（作为 Talker 的 text 通道输入来源）
-- 指定中间层 hidden（作为 Talker 的 mm 通道输入来源）
-- 另外在 `make_omni_output()` 中，额外产出 `tts_bos/eos/pad` 的 thinker-side embedding
+- **A 与 D** 通常计算模式较稳定（编码器/卷积解码器）
+- **B 与 C** 是架构差异核心（信息流耦合方式、时序、缓存策略）
 
 ---
 
-## 1.3 Thinker -> Talker 的桥接：stage input processor + talker preprocess
+## 1.2 Codec 与 RVQ：为什么音频最终要进离散 token 空间
 
-桥接分两层：
+原始波形（16kHz/24kHz/48kHz）时间分辨率太高，Transformer 直接吃波形序列不可行。  
+因此需要先做：
 
-1. **Stage 间拼包**（`stage_input_processors/qwen3_omni.py`）
-2. **Talker 侧解包与重构输入**（`qwen3_omni.py` 中 `talker_preprocess_*`）
+1. 连续特征压缩（帧级表示）
+2. 连续向量量化为离散 token（VQ / RVQ）
 
-核心点：
+### 单层 VQ（直观）
 
-- prefill 阶段：构建 talker prompt（包含用户段、assistant bootstrap 段、speaker token）
-- decode 阶段：把 thinker decode 产生的新 token embedding 按步喂给 talker
-- 同时维护 `last_talker_hidden`、`trailing_text_hidden`、`cached_thinker_decode_embeddings` 等跨步缓存
+- 一帧连续向量 `x` 在 codebook 中做近邻查找
+- 选中条目索引 `id` 作为 token
 
-这对应一个典型 **异步双循环**（尤其 async_chunk 模式）：
+### 多层 RVQ（实用）
+
+- 第 0 层量化原向量，得到 `id_0`
+- 第 1 层量化残差，得到 `id_1`
+- ...
+- 第 N-1 层量化更细残差，得到 `id_(N-1)`
+
+于是一个时间步不是 1 个 token，而是 `N` 个 codebook token（同一帧的多层量化）。
+
+这直接导致后续 Talker 的两种主流策略：
+
+- 一次生成所有层（并行/块式）
+- 先生成关键层（如 layer0），再补全其余层（分层）
+
+---
+
+## 1.3 信息层级不对称：为什么会出现 Dual-AR / MTP 这类补全器
+
+从工程实践看，多数 codec 层承载信息并不对称：
+
+- 前层（尤其 layer0）更偏语义/韵律骨架
+- 后层更偏音色、细节、颗粒度
+
+这意味着“主干模型 + 轻量补全器”的分工是自然的：
+
+- 主干模型保证“说什么 + 粗粒度怎么说”
+- 补全器完善“声学细节”
+
+Qwen3-Omni 的 `Talker + MTP` 与 S2 Pro 的 `Slow AR + Fast AR` 都是这个思想在不同任务定义下的体现。
+
+---
+
+## 1.4 Speech Synthesis 的四个自由度（框架抽象关键）
+
+| 维度 | 选项 A | 选项 B |
+|---|---|---|
+| 生成范式 | AR（逐 token） | NAR（Diffusion/Flow） |
+| Codebook 策略 | 逐层/分组补全 | 同步并行输出 |
+| Thinker->Talker 信息流 | text token + hidden state | hidden only |
+| 时序关系 | 串行嵌套 | 异步流水线 |
+
+Qwen3-Omni 在当前实现属于：
+
+- AR
+- layer0 + 残余补全
+- text token + 选层 hidden state
+- Thinker/Talker 异步（尤其 async_chunk）
+
+---
+
+## 1.5 Serving 视角的瓶颈分解
+
+一个常见、且很实用的分解是：
+
+- LLM decode（Thinker/Talker）偏 **memory-bandwidth bound**（KV cache 读写）
+- Vocoder（Code2Wav/ConvNet）偏 **compute bound**
+
+所以 stage 分离并行通常能提升资源利用率（而不只是模型逻辑清晰）。
+
+---
+
+## 2. Qwen3-Omni：原理到执行流程（细化）
+
+## 2.1 当前 vLLM-Omni 的三阶段拓扑
+
+当前实现是 **统一 model class + stage 化实例化**：
+
+- `model_stage=thinker`：仅 thinker 子模型
+- `model_stage=talker`：仅 talker 子模型，启用 custom pre/post process
+- `model_stage=code2wav`：仅 code2wav 子模型
 
 ```mermaid
-sequenceDiagram
-    participant T as Thinker Loop
-    participant R as Relay Buffer
-    participant K as Talker Loop
-    T->>R: prefill embeds + hidden(layer k)
-    T->>R: decode token embeds (step t)
-    K->>R: read prefill/bootstrap data
-    K->>K: layer-0 codec decode
-    K->>K: MTP补全 residual codebooks
-    K->>R: write code_predictor_codes
+flowchart LR
+    A[Stage-0 Thinker\nMultimodal Prefill + Text Decode] -->|text hidden + captured layers + tts embeds| B[Stage-1 Talker\nLayer-0 codec AR + MTP]
+    B -->|code_predictor_codes| C[Stage-2 Code2Wav\nCausal ConvNet]
+    C --> D[Streaming Audio]
 ```
 
 ---
 
-## 1.4 Talker + MTP 的计算流程（代码级）
+## 2.2 输入侧与输出侧的表征不对称（Qwen3 的一个关键特征）
 
-`qwen3_omni_moe_talker.py` 中：
+Qwen3-Omni 在实现上非常明确地做了：
 
-- Talker 主干是 MoE Transformer（codec embedding 替换文本 embedding）
-- `codec_head` 只负责预测 layer-0 codec
-- `code_predictor_forward()` 调用 `Qwen3OmniMoeTalkerCodePredictor`
+- **输入侧**：音/图/视频以连续 hidden 进入 Thinker（不是 RVQ 离散 token）
+- **输出侧**：Talker 生成离散 codec token，再交给 Code2Wav
 
-`qwen3_omni_moe_code_predictor_mtp.py` 里的 MTP 关键实现：
+这在代码上对应：
 
-- 采用 **re-prefill（短序列重算）**，不跨帧持久 KV cache
-- 每步 sequence 很短（`num_code_groups + 1`），用 SDPA + inline top-k/top-p sampling
-- 通过本地 `proj_buf` 聚合每层 codec embedding，避免跨请求 alias
+- `qwen3_omni_moe_thinker.py`：多模态 processor + continuous embeddings 合并
+- `qwen3_omni_moe_talker.py`：codec embedding / codec_head / code predictor
 
-Talker 单步可抽象为：
+---
+
+## 2.3 Thinker 的执行流程（prefill + decode）
+
+### Step A: 多模态 placeholder 展开
+
+`Qwen3OmniMoeThinkerMultiModalProcessor` 会把 `<|audio_pad|>/<|image_pad|>/<|video_pad|>` 扩展成与特征长度一致的 token 片段。
+
+### Step B: embedding 融合
+
+`embed_input_ids()` 先得到 text embedding，再按 `is_multimodal` 把 mm embedding merge 进去；如果 deepstack 视觉特征开启，会额外准备 deepstack buffer。
+
+### Step C: forward 时捕获 Talker 需要的中间表示
+
+Thinker 可按 `capture_layer_indices` 返回：
+
+- layer 0 embedding（text 通道）
+- `accept_hidden_layer` 的 hidden（mm 通道）
+
+并在 `make_omni_output()` 额外附上 thinker-side `tts_bos/eos/pad` embedding，供 Talker 侧投影后使用。
+
+---
+
+## 2.4 Thinker -> Talker 信息流（为什么既要 text token 又要 hidden）
+
+对齐你文章的论点：  
+Talker 需要“说什么”与“怎么说”两个通道：
+
+- text token / text embedding：语义锚点（内容一致性）
+- mm hidden：语气、音色、韵律等连续属性
+
+在当前代码里，这体现为：
+
+- `text_projection`：thinker text space -> talker hidden
+- `hidden_projection`：thinker mm hidden -> talker hidden
+- 二者在 talker 输入侧做加和/拼接式融合（具体位置相关）
+
+---
+
+## 2.5 Talker 单步 decode 的计算图
+
+在 `talker_preprocess_decode()` + `talker_mtp()` 路径下，可抽象成：
 
 ```mermaid
 flowchart TD
-    A[layer-0 codec token] --> B[Code Predictor step 1..G-1]
-    H[last talker hidden] --> B
-    B --> C[all codec groups]
-    C --> D[summed embeddings]
-    D --> E[next talker input embed]
+    A[上一步 layer0 token] --> B[talker codec embedding]
+    T[当前 text_step 投影向量] --> C[输入融合]
+    H[last_talker_hidden] --> D[Talker forward]
+    C --> D
+    D --> E[layer0 codec logits]
+    E --> F[sample layer0 id]
+    F --> G[MTP补全 layer1..layerN]
+    G --> I[code_predictor_codes]
+    G --> J[summed codec embeds]
+    J --> K[下一步输入]
+```
+
+注意：MTP 在当前实现采取 re-prefill 短序列重算，而不是跨帧增长 KV cache。
+
+---
+
+## 2.6 MTP（Code Predictor）为什么是“短序列重算”而不是 paged KV
+
+`qwen3_omni_moe_code_predictor_mtp.py` 的实现特点：
+
+- 每步序列长度很小（`num_code_groups + 1`）
+- 重算代价可接受，且实现更稳定
+- 避免管理跨帧 KV 生命周期复杂性
+- 内联 top-k/top-p 采样，减少额外 op 调度
+
+这与“paged KV 适合长上下文、动态增长、多请求共享”的适用场景不同。
+
+---
+
+## 2.7 Code2Wav：流式输出与上下文裁剪
+
+`qwen3_omni_code2wav.py` 中：
+
+- `chunked_decode`：固定 chunk_size + left_context_size
+- `chunked_decode_streaming`：由上游传入每请求 left context
+
+语音流式输出本质是：  
+每次拿到足够 codec 帧就可调用 causal ConvNet 产生增量波形。
+
+> 实现细节：当前 `qwen3_omni.py` code2wav 输入重排按 **16 quantizers** 分组（并非所有注释里写的 8 层）。
+
+---
+
+## 2.8 sync 与 async_chunk 执行时序差异
+
+### 同步模式
+
+- Thinker 完成阶段结果后，才触发 Talker
+- Talker 完成后，才触发 Code2Wav
+
+### async_chunk 模式
+
+- Thinker chunk 级输出到达即转发 Talker
+- Talker chunk 级 codec 立刻转发 Code2Wav
+- 三个 loop 可以流水并行
+
+```mermaid
+sequenceDiagram
+    participant Th as Thinker
+    participant Ta as Talker
+    participant V as Code2Wav
+    Th->>Ta: chunk0 hidden/text
+    Ta->>V: chunk0 codec
+    Th->>Ta: chunk1 hidden/text
+    Ta->>V: chunk1 codec
+    V-->>V: incremental waveform emit
 ```
 
 ---
 
-## 1.5 Code2Wav：按 chunk 的流式解码
+## 2.9 KV Cache 需求分层（Thinker / Talker / MTP）
 
-`qwen3_omni_code2wav.py` 里实现了两条路径：
-
-- `chunked_decode()`：同步 chunk 解码（带 left context）
-- `chunked_decode_streaming()`：async-chunk 场景，按每次输入带 `left_context_size`
-
-一个实现细节：当前 `qwen3_omni.py` 的 code2wav 输入重排按 **16** 个 quantizer 分组（`input_ids.shape[0] % 16`），因此注释里“8-layer RVQ”的表述在部分文件中是历史残留，实际代码路径是 16 组处理。
-
----
-
-## 1.6 运行时拓扑配置（sync / async_chunk / multiconnector）
-
-- 同步三阶段：`qwen3_omni_moe.yaml`
-- 异步 chunk：`qwen3_omni_moe_async_chunk.yaml`
-- 多连接器版本：`qwen3_omni_moe_multiconnector.yaml`
-
-差异集中在：
-
-- `async_chunk: true/false`
-- `custom_process_next_stage_input_func` 与 connector 配置
-- stage 间传输是否共享内存/外部 connector
+| 模块 | 上下文增长 | 典型 cache 策略 | 备注 |
+|---|---|---|---|
+| Thinker | 长程增长 | paged KV + 连续批处理 | 标准 LLM serving |
+| Talker | 按时间步增长 | paged KV | 独立 decode loop |
+| MTP | 每步短序列 | 重算或短暂临时 cache | 当前实现偏 re-prefill |
+| Code2Wav | 非 Transformer | 无 KV 概念 | ConvNet 逐块解码 |
 
 ---
 
-## 2. Ming-flash-omni（PR #1822）代码结构梳理
+## 3. Ming-flash-omni（PR #1822）细化分析
 
-## 2.1 PR 落地范围：只支持 Thinker
+## 3.1 落地范围：Thinker-only（这是核心边界）
 
-PR 标题与代码一致：`[Model] Add Ming-flash-omni-2.0 Thinker Stage`。
+PR 标题和代码一致：`[Model] Add Ming-flash-omni-2.0 Thinker Stage`。
 
 `ming_flash_omni.py` 中：
 
 - `model_stage=thinker` 已实现
-- `imagegen` / `talker` 均 `NotImplementedError`
+- `imagegen` / `talker` 为 `NotImplementedError`
 
-也就是说，在 vLLM-Omni 中此 PR 的可用能力是：
-
-- 输入：text / image / video / audio
-- 输出：text
+即当前可服务能力是：  
+**text/image/video/audio 输入 -> text 输出**
 
 ---
 
-## 2.2 Ming Thinker 组件拆解
-
-`ming_flash_omni_thinker.py` 的结构：
-
-- `language_model`: `BailingMoeV2ForCausalLM`
-- `vision`: `MingVisionEncoder`（封装 Qwen3 vision transformer）
-- `audio`: `WhisperAudioEncoder`
-- `linear_proj` / `linear_proj_audio`: 投影到 LLM hidden size
+## 3.2 Ming Thinker 组件图与数据流
 
 ```mermaid
 flowchart LR
-    I[Image/Video] --> V[MingVisionEncoder]
-    A[Audio] --> W[WhisperAudioEncoder]
-    V --> PV[VisionProjector]
-    W --> PA[AudioProjector]
+    I[Image / Video] --> VE[MingVisionEncoder]
+    A[Audio Mel Features] --> AE[WhisperAudioEncoder]
+    VE --> VP[VisionProjector]
+    AE --> AP[AudioProjector]
     T[Text Tokens] --> LLM[BailingMoeV2 LLM]
-    PV --> LLM
-    PA --> LLM
-    LLM --> O[Text Output]
+    VP --> LLM
+    AP --> LLM
+    LLM --> TXT[Text Logits / Tokens]
 ```
 
+组件对应：
+
+- `MingVisionEncoder`：封装 Qwen3 vision transformer
+- `WhisperAudioEncoder`：packed varlen 注意力音频编码
+- `VisionProjector` / `AudioProjector`：统一映射到 LLM hidden size
+- `BailingMoeV2ForCausalLM`：多模态统一解码主干
+
 ---
 
-## 2.3 MoE 路由：MultiRouter（文本/图像/音频分路）
+## 3.3 Ming 的 Processor：高层占位符到 patch token 的映射
 
-`modeling_bailing_moe_v2.py` 的关键点：
+`processors/ming.py` 核心做法：
+
+- 用户 prompt 用 `<IMAGE>/<VIDEO>/<AUDIO>` 作为高层占位
+- 在 processor 中扩展为 `<image><imagePatch>*N</image>` 等具体 token 片段
+- 音频分支走 Whisper log-mel 特征，输出 `audio_feats` 与 `encoder_feats_lengths`
+
+这与 Qwen3 的 placeholder 机制目标一致，但 token 命名与展开规则不同。
+
+---
+
+## 3.4 音频编码执行细节（PR 里值得注意的工程点）
+
+`audio_encoder.py` 使用 packed varlen 处理多段音频：
+
+1. 每段 mel 经 conv1/conv2 下采样
+2. 拼成 packed 序列
+3. 用 `cu_seqlens` 在 attention 中做 varlen 计算
+4. 输出再经 `AudioProjector` 映射到 LLM hidden
+
+这种 packed 流程的好处是：
+
+- 减少 padding 浪费
+- 让多段不同长度音频共享批处理通路
+
+---
+
+## 3.5 BailingMoeV2 的 MultiRouter：模态感知专家路由
+
+`modeling_bailing_moe_v2.py` 的核心差异化点：
 
 - 稀疏层使用 `SharedFusedMoE`
-- Router 支持 `router_type=MultiRouter`
-- 存在三套路由门：`gate` / `image_gate` / `audio_gate`
-- forward 时根据 `image_mask`、`audio_mask` 选择对应路由结果
+- 有三套路由 gate：`gate`、`image_gate`、`audio_gate`
+- 根据 token 级 `image_mask` / `audio_mask` 选择最终路由结果
 
-这和“统一 backbone + 模态特异路由”的设计一致：主干层一致，专家选择分模态。
+可理解为：
 
----
+- 文本 token 走通用路由
+- 图像 patch token 与音频 patch token 可走专用路由分布
 
-## 2.4 MRoPE 变体：Ming video_rope
-
-同文件里有 `MingVideoRopeMRotaryEmbedding`：
-
-- 不是标准 contiguous 的 T/H/W 分段
-- 对 spatial 频率做 H/W 交错映射
-- temporal 频率放在末段
-
-这也是 Ming 与 Qwen3 在位置编码实现上的一个显著差异点。
+这类“模态特异路由”对统一 omni backbone 很关键。
 
 ---
 
-## 2.5 自定义 Processor / Config 适配
+## 3.6 Ming 的 MRoPE 变体：video_rope（非标准分段）
 
-PR 中新增：
+`MingVideoRopeMRotaryEmbedding` 不是普通 mrope 的 T/H/W 连续切片，而是：
 
-- `transformers_utils/configs/ming_flash_omni.py`
-  - 注册 `BailingMoeV2Config` / `BailingMM2Config`
-  - 适配 `AutoConfig` 与 tokenizer 映射
-- `transformers_utils/processors/ming.py`
-  - 统一 `<IMAGE>/<VIDEO>/<AUDIO>` 高层占位符
-  - 扩展为 patch token 序列
-  - 音频预处理使用 Whisper log-mel 路径
+- spatial 维按 H/W 交错
+- temporal 维放后段
 
-此部分是“模型可被 vLLM-Omni 正确 parse 与 token 化”的关键。
+这意味着框架层如果抽象“3D RoPE”，要允许模型自定义 remap，而不是假设单一分段实现。
 
 ---
 
-## 3. PR 实现 vs HF 完整模型能力对照
+## 3.7 PR 实现 vs HF 完整能力对照
 
-基于 `Jonathan1909/Ming-flash-omni-2.0`（复制于官方仓）：
+基于 `Jonathan1909/Ming-flash-omni-2.0` 的 `config.json` / `README.md`：
 
-- `config.json` 显示架构名为 `BailingMM2NativeForConditionalGeneration`
-- README 声明完整能力是 **输入 image/text/video/audio，输出 image/text/audio**
-- 示例代码中 `from_pretrained(..., load_image_gen=True, load_talker=True)`，说明原生模型含 imagegen 和 talker 路径
+- 架构名：`BailingMM2NativeForConditionalGeneration`
+- 完整能力：image/text/video/audio 输入，image/text/audio 输出
+- 示例中显式 `load_image_gen=True, load_talker=True`
 
 对照 PR #1822：
 
@@ -275,50 +406,53 @@ PR 中新增：
 | Thinker（多模态理解->文本） | 有 | 有 |
 | Image Generation | 有 | 无（占位） |
 | Talker / Audio Generation | 有 | 无（占位） |
-| vLLM-Omni stage config | 理论可三阶段 | 当前单阶段 thinker |
+| stage config 形态 | 可多阶段 | 当前单阶段 thinker |
 
 ---
 
-## 4. 与 Qwen3-Omni 对比后的框架抽象边界
+## 4. 与你文章里的 S2 Pro / Qwen3 对比视角对齐（框架抽象边界）
 
-## 4.1 可统一的抽象
+虽然本文实现侧重 Qwen3 与 Ming，但从框架抽象角度，确实可借你文章的结论：
 
-1. **Stage 编排抽象**：都可映射到 encode/understand/synthesize/decode 的 stage 概念  
-2. **多模态 processor + placeholder 扩展**：都需要 placeholder->patch token 展开  
-3. **LLM serving 基础设施**：Thinker 都可复用 paged KV、continuous batching、PP/TP、torch.compile
+## 4.1 可以统一的能力
 
-## 4.2 必须差异化的抽象
+1. **LLM decode serving 基建**：continuous batching / paged KV / PP / TP / compile  
+2. **Stage orchestration**：stage 间输入输出、connector、流式分发  
+3. **后处理插件化**：code predictor / vocoder 作为 per-step callback
 
-1. **Talker 形态差异**  
-   - Qwen3: 已有独立 Talker + MTP + Code2Wav
-   - Ming PR: 无 talker/imagegen 落地
-2. **位置编码语义差异**  
-   - Qwen3: 标准 mrope + interleaved audio/video 处理
-   - Ming: video_rope（H/W 交错 + T 后置）
-3. **MoE 路由策略差异**  
-   - Ming: MultiRouter（image/audio/text 分路）是主干行为的一部分
-   - Qwen3: Thinker/Talker 分体后在不同模块完成语义与语音分工
+## 4.2 必须模型特异化的能力
 
----
-
-## 5. 工程建议（面向后续实现）
-
-### 对 Ming（若继续落地 imagegen/talker）
-
-1. 先补齐 stage2/3 的统一入口类（`ming_flash_omni.py`）  
-2. 明确 talker 与 imagegen 的调度模型是“嵌套”还是“独立 loop”  
-3. 在 stage_input_processor 中引入 thinker->talker / thinker->imagegen 的 relay 协议
-
-### 对 Qwen3（持续优化方向）
-
-1. 清理“8-layer vs 16-layer”注释歧义，统一文档与代码口径  
-2. 把 Talker prefix cache 从 token-key 扩展到 voice/style-key（当前天然不适配 Radix token 前缀）
+1. **Talker 执行模式**
+   - S2 Pro 风格：嵌套在同一步内（Dual-AR）
+   - Qwen3 风格：独立 loop + relay
+2. **信息流语义**
+   - 是否必须 text token 作为语义锚点
+   - hidden state 选层策略与模态筛选策略
+3. **位置编码与路由语义**
+   - Qwen3 mrope / Ming video_rope
+   - 通用路由 vs 模态专路由（MultiRouter）
 
 ---
 
-## 6. 总结
+## 5. 工程建议（下一步可执行）
 
-- **Qwen3-Omni 在当前 vLLM-Omni 已是完整三阶段可跑通实现**：Thinker、Talker+MTP、Code2Wav 均已落地，且支持 async_chunk。
-- **Ming PR #1822 的核心贡献是 Thinker 侧接入**：完成了配置、处理器、多模态 encoder、BailingMoE 主干与 MRoPE 适配，但尚未把 imagegen/talker 接到可服务的 stage。
-- 从框架抽象角度看：**“LLM serving 基础设施可统一，跨 stage 语义/声学信息流与路由机制必须模型特异化”。**
+### 对文档
+
+- 将“8-layer vs 16-layer”在 Qwen3 相关文档统一口径，避免读者混淆
+- 在 Qwen3 文档中显式加入“输入连续、输出离散”的一行总述
+
+### 对 Ming 后续实现
+
+1. 先实现 `model_stage=talker` 与 `model_stage=imagegen` 的最小可跑通骨架  
+2. 在 stage_input_processor 中定义 thinker->talker / thinker->imagegen relay schema  
+3. 明确 talker 采用嵌套式还是异步流水线式调度（决定缓存与调度抽象）
+
+---
+
+## 6. 总结（细化版）
+
+- Qwen3-Omni 在当前 vLLM-Omni 已形成完整三阶段链路：Thinker、Talker+MTP、Code2Wav，并支持 async_chunk。
+- Ming PR #1822 的价值在于把 Thinker 路径完整接入（含多模态 processor、音/视 encoder、BailingMoE 主干、video_rope 适配）；但 imagegen 与 talker 仍未落地为可服务 stage。
+- 从“模型原理 -> 执行流程 -> 框架抽象”看，核心结论是：  
+  **可统一的是 serving 基建与 stage 编排；必须差异化的是跨阶段信息流语义、路由策略、以及位置编码/生成时序的模型特异实现。**
 
