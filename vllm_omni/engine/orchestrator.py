@@ -28,6 +28,7 @@ from vllm_omni.engine import (
     OmniEngineCoreRequest,
 )
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.stage_pool import StagePool, StageReplica, build_stage_pools
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -136,6 +137,12 @@ class Orchestrator:
         self.num_clients = len(stage_clients)
         self.async_chunk = bool(async_chunk)
 
+        # Flat-list view: retained as a compatibility layer so existing call
+        # sites that index by flat client_index (metrics, shutdown, collective
+        # RPC fan-out, etc.) keep working.  StagePool below is the canonical
+        # path for replica selection and should be preferred in new code.
+        # TODO(stage-pool): migrate remaining flat-list readers onto
+        # self.stage_pools and drop these attributes.
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
         self.stage_vllm_configs: list[Any] = stage_vllm_configs
@@ -148,16 +155,22 @@ class Orchestrator:
             self.logical_stage_to_clients = [[i] for i in range(self.num_clients)]
         self.num_logical_stages = len(self.logical_stage_to_clients)
 
-        # Reverse mappings: client_index -> (logical_stage_id, replica_index)
+        # Canonical per-logical-stage replica container.
+        self.stage_pools: list[StagePool] = build_stage_pools(
+            stage_clients,
+            output_processors,
+            stage_vllm_configs,
+            self.logical_stage_to_clients,
+        )
+
+        # Reverse mappings: client_index -> (logical_stage_id, replica_index).
+        # Kept for metrics/shutdown log lines that index by flat client_index.
         self._client_to_logical: list[int] = [0] * self.num_clients
         self._client_to_replica: list[int] = [0] * self.num_clients
         for logical_id, client_indices in enumerate(self.logical_stage_to_clients):
             for ri, ci in enumerate(client_indices):
                 self._client_to_logical[ci] = logical_id
                 self._client_to_replica[ci] = ri
-
-        # Round-robin counters for replica selection per logical stage
-        self._replica_rr: list[int] = [0] * self.num_logical_stages
 
         # Backward compat: num_stages now means num_logical_stages
         self.num_stages = self.num_logical_stages
@@ -186,26 +199,14 @@ class Orchestrator:
         logical_stage_id: int,
         req_state: OrchestratorRequestState,
     ) -> int:
-        """Pick a client for *logical_stage_id* and record the choice.
+        """Pick a flat client_index for *logical_stage_id* via the stage pool.
 
-        If this request already has a chosen client for the logical stage,
-        return the existing one (affinity).  Otherwise round-robin among the
-        available replicas.
+        Thin wrapper that delegates to ``StagePool.select_replica`` so the
+        flat-index-based call sites keep working.  New code should call the
+        pool directly when the StageReplica object itself is useful.
         """
-        existing = req_state.chosen_client_index.get(logical_stage_id)
-        if existing is not None:
-            return existing
-
-        candidates = self.logical_stage_to_clients[logical_stage_id]
-        if len(candidates) == 1:
-            chosen = candidates[0]
-        else:
-            rr = self._replica_rr[logical_stage_id]
-            chosen = candidates[rr % len(candidates)]
-            self._replica_rr[logical_stage_id] = rr + 1
-
-        req_state.chosen_client_index[logical_stage_id] = chosen
-        return chosen
+        replica = self.stage_pools[logical_stage_id].select_replica(req_state)
+        return replica.flat_index
 
     def _resolve_client_index(self, stage_id: int, replica_index: int = 0) -> int:
         """Resolve (stage_id, replica_index) to a flat client index."""
@@ -251,7 +252,14 @@ class Orchestrator:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     async def _request_handler(self) -> None:
-        """Read messages from the main thread via request_async_queue."""
+        """Read messages from the main thread via request_async_queue.
+
+        TODO(stage-pool): the while loop below has no top-level try/except, so
+        any unhandled exception inside a _handle_* coroutine kills this task
+        and leaves the orchestrator unable to consume further messages.  Wrap
+        each dispatch in a per-message try/except so one bad request can't
+        wedge the whole engine.
+        """
         while True:
             msg = await self.request_async_queue.get()
             msg_type = msg.get("type")
@@ -908,26 +916,35 @@ class Orchestrator:
         )
         self.request_states[companion_id] = companion_state
 
-        # Use same replica as the parent for affinity, or choose one
+        # CFG companions must land on the same stage-0 replica as their
+        # parent so the diffusion stage can fetch both KV caches from a
+        # single device.  Pass affinity_from explicitly; if the parent is
+        # already gone (aborted between add_request and add_companion) fall
+        # back to round-robin rather than failing the companion.
+        stage0_pool = self.stage_pools[0]
         parent_state = self.request_states.get(parent_id)
-        if parent_state is not None and 0 in parent_state.chosen_client_index:
-            client_index = parent_state.chosen_client_index[0]
-            companion_state.chosen_client_index[0] = client_index
-        else:
-            client_index = self._choose_client_index(0, companion_state)
+        parent_replica: StageReplica | None = None
+        if parent_state is not None:
+            parent_flat = parent_state.chosen_client_index.get(0)
+            if parent_flat is not None:
+                parent_replica = stage0_pool.get_replica_by_flat_index(parent_flat)
+
+        companion_replica = stage0_pool.select_replica(
+            companion_state,
+            affinity_from=parent_replica,
+        )
 
         companion_state.stage_submit_ts[0] = _time.time()
 
         request = companion_prompt  # Already a processed OmniEngineCoreRequest
-        stage_client = self.stage_clients[client_index]
-        await stage_client.add_request_async(request)
+        await companion_replica.client.add_request_async(request)
 
         logger.info(
             "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, stage-0 replica-%s)",
             companion_id,
             role,
             parent_id,
-            self._client_to_replica[client_index],
+            companion_replica.replica_index,
         )
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
