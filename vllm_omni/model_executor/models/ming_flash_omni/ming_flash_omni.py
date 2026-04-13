@@ -101,10 +101,19 @@ class MingFlashOmniForConditionalGeneration(
             self.talker = None
 
         elif self.model_stage == "imagegen":
-            # TODO: Implement image generator stage
-            raise NotImplementedError(
-                "Image generation stage is not yet implemented. Please use model_stage='thinker' for now."
+            from .ming_flash_omni_imagegen import MingFlashOmniImageGenModel
+
+            logger.info(
+                "[MingFlashOmni] building imagegen stage (dit_type=%s)",
+                getattr(config.image_gen_config, "dit_type", "?"),
             )
+            self.thinker = None
+            self.imagegen = MingFlashOmniImageGenModel(
+                vllm_config=vllm_config,
+                prefix=maybe_prefix(prefix, "imagegen"),
+            )
+            self.model = self.imagegen
+            self.talker = None
 
         elif self.model_stage == "talker":
             # TODO: Implement talker (TTS) stage
@@ -188,7 +197,17 @@ class MingFlashOmniForConditionalGeneration(
             thinker_loaded = add_prefix_to_loaded_weights(thinker_loaded, "thinker")
             loaded_weights.update(thinker_loaded)
 
-        # TODO: Load imagegen weights when implemented
+        if self.model_stage == "imagegen":
+            # The imagegen stage loads transformer/vae/connector/mlp weights
+            # lazily from their own subfolders inside MingFlashOmniImageGenModel
+            # (see ming_flash_omni_imagegen.py). Top-level thinker tensors are
+            # not consumed on this stage; we pass whatever we got through so
+            # load_weights() can log and drop them.
+            all_incoming = thinker_weights + imagegen_weights
+            if all_incoming:
+                imagegen_loaded = self.imagegen.load_weights(all_incoming)
+                loaded_weights.update(imagegen_loaded)
+
         # TODO: Load talker weights when implemented
 
         return loaded_weights
