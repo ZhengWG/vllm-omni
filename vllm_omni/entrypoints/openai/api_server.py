@@ -52,6 +52,8 @@ from vllm.entrypoints.openai.engine.protocol import (
 from vllm.entrypoints.openai.models.protocol import BaseModelPath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 from vllm.entrypoints.openai.orca_metrics import metrics_header
+from vllm.entrypoints.openai.realtime.connection import RealtimeConnection
+from vllm.entrypoints.openai.realtime.serving import OpenAIServingRealtime
 from vllm.entrypoints.openai.responses.serving import OpenAIServingResponses
 from vllm.entrypoints.openai.server_utils import get_uvicorn_log_config
 from vllm.entrypoints.openai.speech_to_text.serving import (
@@ -351,6 +353,10 @@ async def omni_run_server_worker(listen_address, sock, args, client_config=None,
     try:
         await shutdown_task
     finally:
+        state = getattr(app, "state", None)
+        serving_speech = getattr(state, "openai_serving_speech", None) if state is not None else None
+        if serving_speech is not None:
+            serving_speech.shutdown()
         sock.close()
 
 
@@ -508,6 +514,13 @@ async def omni_init_app_state(
             stage_configs=diffusion_stage_configs,
         )
 
+        state.openai_serving_speech = OmniOpenAIServingSpeech.for_diffusion(
+            diffusion_engine=engine_client,
+            model_name=model_name,
+            stage_configs=diffusion_stage_configs,
+        )
+        state.openai_streaming_speech = None
+
         state.enable_server_load_tracking = getattr(args, "enable_server_load_tracking", False)
         state.server_load_metrics = 0
         logger.info("Pure diffusion API server initialized for model: %s", model_name)
@@ -630,6 +643,7 @@ async def omni_init_app_state(
         OpenAIServingResponses(
             engine_client,
             state.openai_serving_models,
+            openai_serving_render=state.openai_serving_render,
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -690,7 +704,8 @@ async def omni_init_app_state(
         OpenAIServingPooling(
             engine_client,
             state.openai_serving_models,
-            supported_tasks=supported_tasks,
+            state.openai_serving_render,
+            supported_tasks=tuple(supported_tasks),
             request_logger=request_logger,
             chat_template=resolved_chat_template,
             chat_template_content_format=args.chat_template_content_format,
@@ -737,6 +752,7 @@ async def omni_init_app_state(
     state.openai_serving_tokenization = OpenAIServingTokenization(
         engine_client,
         state.openai_serving_models,
+        state.openai_serving_render,
         request_logger=request_logger,
         chat_template=resolved_chat_template,
         chat_template_content_format=args.chat_template_content_format,
@@ -778,6 +794,7 @@ async def omni_init_app_state(
             reasoning_parser=args.structured_outputs_config.reasoning_parser,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
             enable_force_include_usage=args.enable_force_include_usage,
+            default_chat_template_kwargs=args.default_chat_template_kwargs,
         )
         if "generate" in supported_tasks
         else None
@@ -786,6 +803,7 @@ async def omni_init_app_state(
         ServingTokens(
             engine_client,
             state.openai_serving_models,
+            state.openai_serving_render,
             request_logger=request_logger,
             return_tokens_as_token_ids=args.return_tokens_as_token_ids,
             enable_prompt_tokens_details=args.enable_prompt_tokens_details,
@@ -802,6 +820,11 @@ async def omni_init_app_state(
 
     state.openai_streaming_speech = OmniStreamingSpeechHandler(
         speech_service=state.openai_serving_speech,
+    )
+    state.openai_serving_realtime = OpenAIServingRealtime(
+        engine_client=engine_client,
+        models=state.openai_serving_models,
+        request_logger=request_logger,
     )
 
     state.openai_serving_video = OmniOpenAIServingVideo(
@@ -1017,17 +1040,20 @@ async def list_voices(raw_request: Request):
     uploaded_speakers = []
     if hasattr(handler, "uploaded_speakers"):
         for voice_name, info in handler.uploaded_speakers.items():
-            uploaded_speakers.append(
-                {
-                    "name": info.get("name", voice_name),
-                    "consent": info.get("consent", ""),
-                    "created_at": info.get("created_at", 0),
-                    "file_size": info.get("file_size", 0),
-                    "mime_type": info.get("mime_type", ""),
-                    "embedding_source": info.get("embedding_source", "audio"),
-                    "embedding_dim": info.get("embedding_dim"),
-                }
-            )
+            voice_entry = {
+                "name": info.get("name", voice_name),
+                "consent": info.get("consent", ""),
+                "created_at": info.get("created_at", 0),
+                "file_size": info.get("file_size", 0),
+                "mime_type": info.get("mime_type", ""),
+                "embedding_source": info.get("embedding_source", "audio"),
+                "embedding_dim": info.get("embedding_dim"),
+            }
+            if info.get("ref_text"):
+                voice_entry["ref_text"] = info["ref_text"]
+            if info.get("speaker_description"):
+                voice_entry["speaker_description"] = info["speaker_description"]
+            uploaded_speakers.append(voice_entry)
 
     return JSONResponse(content={"voices": speakers, "uploaded_voices": uploaded_speakers})
 
@@ -1046,7 +1072,8 @@ async def upload_voice(
     speaker_embedding: str | None = Form(None),
     consent: str = Form(...),
     name: str = Form(...),
-    ref_text: str = Form(None),
+    ref_text: str | None = Form(None),
+    speaker_description: str | None = Form(None),
 ):
     """Upload a new voice for voice cloning.
 
@@ -1065,6 +1092,11 @@ async def upload_voice(
         speaker_embedding: JSON-encoded float list. Mutually exclusive with audio_sample.
         consent: Consent recording ID
         name: Name for the new voice
+        ref_text: Optional transcript of the audio for ICL (in-context
+            learning) mode. When provided, voice clone requests using this
+            voice will produce higher quality results.
+        speaker_description: Optional free-form description of the voice
+            (e.g. "warm speaker", "energetic narrator").
         raw_request: Raw FastAPI request
 
     Returns:
@@ -1082,7 +1114,13 @@ async def upload_voice(
         if speaker_embedding is not None:
             result = await handler.upload_voice_embedding(speaker_embedding, consent, name)
         elif audio_sample is not None:
-            result = await handler.upload_voice(audio_sample, consent, name, ref_text=ref_text)
+            result = await handler.upload_voice(
+                audio_sample,
+                consent,
+                name,
+                ref_text=ref_text,
+                speaker_description=speaker_description,
+            )
         else:
             return base(raw_request).create_error_response(
                 message="Either 'audio_sample' or 'speaker_embedding' must be provided"
@@ -1161,6 +1199,19 @@ async def streaming_speech(websocket: WebSocket):
     await handler.handle_session(websocket)
 
 
+@router.websocket("/v1/realtime")
+async def realtime_websocket(websocket: WebSocket):
+    """WebSocket endpoint for OpenAI-style realtime interactions."""
+    serving = getattr(websocket.app.state, "openai_serving_realtime", None)
+    if serving is None:
+        await websocket.accept()
+        await websocket.send_json({"type": "error", "error": "Realtime API is not available", "code": "unsupported"})
+        await websocket.close()
+        return
+    connection = RealtimeConnection(websocket, serving)
+    await connection.handle_connection()
+
+
 # Health and Model endpoints for diffusion mode
 
 
@@ -1232,7 +1283,8 @@ async def show_available_models(raw_request: Request) -> JSONResponse:
         HTTPStatus.INTERNAL_SERVER_ERROR.value: {"model": ErrorResponse},
     },
 )
-async def generate_images(request: ImageGenerationRequest, raw_request: Request) -> ImageGenerationResponse:
+@with_cancellation
+async def generate_images(request: ImageGenerationRequest, raw_request: Request):
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
@@ -1264,7 +1316,13 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
         if request.negative_prompt is not None:
             prompt["negative_prompt"] = request.negative_prompt
         gen_params = OmniDiffusionSamplingParams(num_outputs_per_prompt=request.n)
-
+        extra_args = {}
+        if request.use_system_prompt is not None:
+            extra_args["use_system_prompt"] = request.use_system_prompt
+        if request.system_prompt is not None:
+            extra_args["system_prompt"] = request.system_prompt
+        if extra_args:
+            gen_params.extra_args = extra_args
         # Parse per-request LoRA (compatible with chat's extra_body.lora shape).
         lora_request, lora_scale = _parse_lora_request(request.lora)
         _update_if_not_none(gen_params, "lora_request", lora_request)
@@ -1277,6 +1335,10 @@ async def generate_images(request: ImageGenerationRequest, raw_request: Request)
             size_str = f"{width}x{height}"
         else:
             size_str = "model default"
+
+        app_state_args = getattr(raw_request.app.state, "args", None)
+        _check_max_generated_image_size(app_state_args, width, height)
+
         _update_if_not_none(gen_params, "width", width)
         _update_if_not_none(gen_params, "height", height)
 
@@ -1367,6 +1429,7 @@ async def edit_images(
     negative_prompt: str | None = Form(None),
     num_inference_steps: int | None = Form(None),
     guidance_scale: float | None = Form(None),
+    strength: float | None = Form(None),
     true_cfg_scale: float | None = Form(None),
     seed: int | None = Form(None),
     generator_device: str | None = Form(None),
@@ -1462,7 +1525,6 @@ async def edit_images(
             )
 
         # 3.3 Parse and add size if provided
-        max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
         width, height = None, None
         if size.lower() == "auto":
             if resolution is None:
@@ -1472,23 +1534,7 @@ async def edit_images(
         else:
             width, height = parse_size(size)
 
-        # Check max_generated_image_size
-        if max_generated_image_size is not None:
-            if width is not None and height is not None:
-                if width * height > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
-                        f"size of {max_generated_image_size} pixels.",
-                    )
-            elif resolution is not None:
-                # When resolution is set, the output size is resolution * resolution
-                if resolution * resolution > max_generated_image_size:
-                    raise HTTPException(
-                        status_code=HTTPStatus.BAD_REQUEST.value,
-                        detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
-                        f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
-                    )
+        _check_max_generated_image_size(app_state_args, width, height, resolution)
 
         size_str = f"{width}x{height}" if width is not None and height is not None else "auto"
         _update_if_not_none(gen_params, "width", width)
@@ -1497,6 +1543,7 @@ async def edit_images(
         # 3.4 Add optional parameters ONLY if provided
         _update_if_not_none(gen_params, "num_inference_steps", num_inference_steps)
         _update_if_not_none(gen_params, "guidance_scale", guidance_scale)
+        _update_if_not_none(gen_params, "strength", strength)
         _update_if_not_none(gen_params, "true_cfg_scale", true_cfg_scale)
         # If seed is not provided, generate a random one to ensure
         # a proper generator is initialized in the backend.
@@ -1685,6 +1732,34 @@ async def _generate_with_async_omni(
             detail="No output generated from multi-stage pipeline.",
         )
     return result
+
+
+def _check_max_generated_image_size(
+    app_state_args: Any,
+    width: int | None,
+    height: int | None,
+    resolution: int | None = None,
+) -> None:
+    """Raise 400 if the requested image size exceeds --max-generated-image-size."""
+    max_generated_image_size = getattr(app_state_args, "max_generated_image_size", None)
+    # Check max_generated_image_size
+    if max_generated_image_size is None:
+        return
+    if width is not None and height is not None:
+        if width * height > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested image size {width}x{height} exceeds the maximum allowed "
+                f"size of {max_generated_image_size} pixels.",
+            )
+    elif resolution is not None:
+        # When resolution is set, the output size is resolution * resolution
+        if resolution * resolution > max_generated_image_size:
+            raise HTTPException(
+                status_code=HTTPStatus.BAD_REQUEST.value,
+                detail=f"Requested resolution {resolution} (max {resolution}x{resolution} pixels) "
+                f"exceeds the maximum allowed size of {max_generated_image_size} pixels.",
+            )
 
 
 def _update_if_not_none(object: Any, key: str, val: Any) -> None:
@@ -1934,6 +2009,8 @@ async def _run_video_generation_job(
                 "file_name": file_name,
                 "completed_at": int(time.time()),
                 "inference_time_s": time.perf_counter() - started_at,
+                "stage_durations": response.stage_durations,
+                "peak_memory_mb": response.peak_memory_mb,
             },
         )
     except Exception as exc:
@@ -2107,7 +2184,7 @@ async def create_video_sync(
     request_id = f"video_sync-{random_uuid()}"
     started_at = time.perf_counter()
     try:
-        video_bytes = await asyncio.wait_for(
+        video_bytes, stage_durations, peak_memory_mb = await asyncio.wait_for(
             handler.generate_video_bytes(request, request_id, reference_image=reference_image),
             timeout=VIDEO_SYNC_TIMEOUT_S,
         )
@@ -2133,6 +2210,8 @@ async def create_video_sync(
             "X-Request-Id": request_id,
             "X-Model": effective_model_name,
             "X-Inference-Time-S": f"{inference_time_s:.3f}",
+            "X-Stage-Durations": json.dumps(stage_durations, separators=(",", ":")),
+            "X-Peak-Memory-MB": f"{peak_memory_mb:.3f}",
         },
     )
 

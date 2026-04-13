@@ -22,6 +22,8 @@ from vllm.outputs import RequestOutput
 from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
+from vllm.v1.metrics.loggers import StatLoggerManager
+from vllm.v1.metrics.stats import IterationStats
 
 from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 from vllm_omni.engine import (
@@ -80,7 +82,7 @@ def build_engine_core_request_from_tokens(
         sampling_params=sampling_params,
         pooling_params=pooling_params,
         arrival_time=arrival_time,
-        lora_request=None,
+        lora_request=getattr(params, "lora_request", None),
         cache_salt=None,
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
@@ -129,6 +131,7 @@ class Orchestrator:
         *,
         async_chunk: bool = False,
         logical_stage_to_clients: list[list[int]] | None = None,
+        logger_manager: StatLoggerManager | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -146,6 +149,8 @@ class Orchestrator:
         self.stage_clients: list[Any] = stage_clients
         self.output_processors: list[Any] = output_processors
         self.stage_vllm_configs: list[Any] = stage_vllm_configs
+        self.logger_manager: StatLoggerManager | None = logger_manager
+        self.log_stats = self.logger_manager is not None
 
         # Multi-replica mapping: logical_stage_id -> list of client indices.
         # When not provided (single-replica), default to identity mapping.
@@ -266,6 +271,8 @@ class Orchestrator:
 
             if msg_type == "add_request":
                 await self._handle_add_request(msg)
+            elif msg_type == "streaming_update":
+                await self._handle_streaming_update(msg)
             elif msg_type == "add_companion_request":
                 await self._handle_add_companion(msg)
             elif msg_type == "abort":
@@ -311,7 +318,7 @@ class Orchestrator:
                     # the output format in the future to simplify the processing logic in Orchestrator.
                     stage_client = self.stage_clients[client_index]
                     if stage_client.stage_type == "diffusion":
-                        output = stage_client.get_diffusion_output_async()
+                        output = stage_client.get_diffusion_output_nowait()
                         if output is not None:
                             idle = False
                             req_state = self.request_states.get(output.request_id)
@@ -612,6 +619,30 @@ class Orchestrator:
             ),
         )
 
+    def _build_kv_sender_info(self, sender_stage_ids: list[int]) -> dict[int, dict[str, Any]] | None:
+        """Build per-request sender info for diffusion KV-transfer receivers."""
+        sender_infos: dict[int, dict[str, Any]] = {}
+        for sender_stage_id in dict.fromkeys(sender_stage_ids):
+            if sender_stage_id < 0 or sender_stage_id >= self.num_stages:
+                continue
+
+            sender_stage = self.stage_clients[sender_stage_id]
+            get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
+            if not callable(get_sender_info):
+                continue
+
+            sender_info = get_sender_info()
+            if not sender_info:
+                logger.warning(
+                    "[Orchestrator] Stage-%s has no KV sender info available",
+                    sender_stage_id,
+                )
+                continue
+
+            sender_infos[sender_stage_id] = sender_info
+
+        return sender_infos or None
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -666,14 +697,22 @@ class Orchestrator:
                         req_id,
                     )
 
+            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
+            kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
             if isinstance(diffusion_prompt, list):
                 await next_client.add_batch_request_async(
                     req_id,
                     diffusion_prompt,
                     params,
+                    kv_sender_info=kv_sender_info,
                 )
             else:
-                await next_client.add_request_async(req_id, diffusion_prompt, params)
+                await next_client.add_request_async(
+                    req_id,
+                    diffusion_prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
             req_state.stage_submit_ts[next_logical] = _time.time()
             return
 
@@ -752,10 +791,13 @@ class Orchestrator:
         client_index = self._resolve_client_index(stage_id, replica_index)
         processor = self.output_processors[client_index]
 
+        num_outputs = len(raw_outputs.outputs)
+        iteration_stats = IterationStats() if (self.log_stats and num_outputs) else None
+
         processed = processor.process_outputs(
             raw_outputs.outputs,
             raw_outputs.timestamp,
-            None,
+            iteration_stats,
         )
 
         if processed.reqs_to_abort:
@@ -763,6 +805,22 @@ class Orchestrator:
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
+
+        # Mirror vLLM AsyncLLM output_handler: feed stats to the logger
+        # manager so LoggingStatLogger can periodically print KV cache /
+        # prefix cache hit rate, and PrometheusStatLogger can publish.
+        if self.logger_manager is not None:
+            try:
+                self.logger_manager.record(
+                    engine_idx=stage_id,
+                    scheduler_stats=raw_outputs.scheduler_stats,
+                    iteration_stats=iteration_stats,
+                )
+            except Exception:
+                logger.exception(
+                    "[Orchestrator] stat logger record failed for stage-%s",
+                    stage_id,
+                )
 
         return processed.request_outputs
 
@@ -824,6 +882,34 @@ class Orchestrator:
         if self.async_chunk and logical_stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
+    async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
+        """Handle a streaming_update message for an existing request."""
+        stage_id = 0
+        request_id = msg["request_id"]
+        request = msg["prompt"]
+
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            logger.warning(
+                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                request_id,
+            )
+            fallback_msg = dict(msg)
+            fallback_msg["type"] = "add_request"
+            await self._handle_add_request(fallback_msg)
+            return
+
+        if "sampling_params_list" in msg and msg["sampling_params_list"]:
+            req_state.sampling_params_list = msg["sampling_params_list"]
+
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        stage_client = self.stage_clients[stage_id]
+        if stage_client.stage_type == "diffusion":
+            params = req_state.sampling_params_list[stage_id]
+            await stage_client.add_request_async(request_id, request, params)
+        else:
+            await stage_client.add_request_async(request)
+
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -870,7 +956,14 @@ class Orchestrator:
             params = req_state.sampling_params_list[next_logical]
 
             if next_client.stage_type == "diffusion":
-                await next_client.add_request_async(request_id, req_state.prompt, params)
+                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_logical - 1])
+                kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
+                await next_client.add_request_async(
+                    request_id,
+                    req_state.prompt,
+                    params,
+                    kv_sender_info=kv_sender_info,
+                )
                 req_state.stage_submit_ts[next_logical] = _time.time()
                 continue
 
