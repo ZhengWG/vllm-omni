@@ -77,6 +77,73 @@ def _ensure_vllm_platform():
             )
 
 
+# TODO(ming-followup): Temporary workaround for a known upstream issue in
+# inclusionAI/Ming — the checkpoint's .py files (configuration_bailingmm2.py,
+# modeling_bailingmm2.py, ...) use bare-name sibling imports like
+# ``from configuration_bailing_moe_v2 import BailingMoeV2Config`` instead of
+# explicit relative imports. This forces the whole checkpoint directory to
+# be on sys.path at transformers ``check_imports`` time. The function below
+# papers over it by injecting the path into sys.path/PYTHONPATH.
+#
+# The correct long-term fix is one of:
+#   (1) rewrite the imports in the Ming .py files during
+#       ``scripts/prepare_ming_checkpoint.sh`` to use relative imports
+#       (``from .configuration_bailing_moe_v2 import ...``), which makes
+#       them work as a proper package without sys.path manipulation, OR
+#   (2) file an upstream PR to inclusionAI/Ming so the checkpoint works
+#       out-of-the-box without any sys.path hack.
+# Until one of those lands, keep this helper but delete it once Ming's
+# upstream imports are clean.
+def _maybe_inject_local_trust_remote_code_path(model: str | None) -> None:
+    """Add a local checkpoint directory to ``sys.path`` / ``PYTHONPATH`` when
+    it contains sibling-imported remote-code ``.py`` files.
+
+    transformers' ``trust_remote_code`` auto-downloads ``.py`` modules into
+    the HF cache and adds that cache to ``sys.path`` — but **only** when
+    loading from a HuggingFace hub id. For a local checkpoint path,
+    transformers looks for the files on disk and will fail at ``check_imports``
+    time if those files use bare-name sibling imports (e.g. Ming's
+    ``from configuration_bailing_moe_v2 import ...``) and the directory is
+    not already on ``sys.path``.
+
+    This helper detects that case and injects the model directory into both
+    ``sys.path`` (for the current process) and ``PYTHONPATH`` (so spawned
+    worker subprocesses inherit it). It is intentionally scoped: it only
+    triggers when the model directory contains at least one ``.py`` file
+    whose name matches the known Ming pattern — so it is a no-op for other
+    models that do not need this workaround.
+    """
+    if not model or not os.path.isdir(model):
+        return
+    # Heuristic: trigger when Ming's configuration source files are present.
+    # This covers both inclusionAI/Ming-flash-omni-2.0 and related Bailing
+    # family checkpoints that rely on bare-name sibling imports.
+    triggers = (
+        "configuration_bailingmm2.py",
+        "configuration_bailing_moe_v2.py",
+    )
+    if not any(os.path.exists(os.path.join(model, t)) for t in triggers):
+        return
+
+    model_abs = os.path.abspath(model)
+    import sys as _sys
+
+    if model_abs not in _sys.path:
+        _sys.path.insert(0, model_abs)
+    existing_pp = os.environ.get("PYTHONPATH", "")
+    pp_parts = [p for p in existing_pp.split(os.pathsep) if p]
+    if model_abs not in pp_parts:
+        pp_parts.insert(0, model_abs)
+        os.environ["PYTHONPATH"] = os.pathsep.join(pp_parts)
+    logger.info(
+        "Injected local checkpoint %s into sys.path and PYTHONPATH so that "
+        "transformers remote-code sibling imports (e.g. Ming's "
+        "configuration_bailing_moe_v2) resolve for this process and spawned "
+        "workers.",
+        model_abs,
+    )
+
+
 class OmniServeCommand(CLISubcommand):
     """The `serve` subcommand for the vLLM CLI."""
 
@@ -98,6 +165,12 @@ class OmniServeCommand(CLISubcommand):
         # Stash the set of long-option keys the user actually typed so the
         # stage-config factory can give YAML precedence over argparse defaults.
         args._cli_explicit_keys = detect_explicit_cli_keys(sys.argv[1:], OmniServeCommand._parser)
+
+        # Ming-style checkpoints need their directory on sys.path so that
+        # sibling imports inside ``.py`` files resolve at ``check_imports``
+        # time. Inject it here before any transformers loading happens, so
+        # end users don't need to set PYTHONPATH or drop a .pth file.
+        _maybe_inject_local_trust_remote_code_path(getattr(args, "model", None))
 
         if args.headless:
             run_headless(args)
