@@ -40,6 +40,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
+from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
 logger = init_logger(__name__)
 
@@ -60,7 +61,7 @@ class ExecuteModelState(NamedTuple):
     slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None = None
 
 
-class GPUARModelRunner(OmniGPUModelRunner):
+class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     """Autoregressive GPU model runner that returns hidden states per request.
 
     Follows the v0.12 two-phase execute/sample flow from GPUModelRunner, and
@@ -260,6 +261,10 @@ class GPUARModelRunner(OmniGPUModelRunner):
         ):
             # Update persistent batch states.
             deferred_state_corrections_fn = self._update_states(scheduler_output)
+
+            # Notify model of finished requests for state cleanup
+            if scheduler_output.finished_req_ids and hasattr(self.model, "on_requests_finished"):
+                self.model.on_requests_finished(scheduler_output.finished_req_ids)
 
             if has_ec_transfer() and not get_ec_transfer().is_consumer:
                 with self.maybe_get_ec_connector_output(
@@ -792,11 +797,14 @@ class GPUARModelRunner(OmniGPUModelRunner):
                     elif isinstance(v, dict):
                         mm_payload[k] = {sk: sv[start:end].contiguous() for sk, sv in v.items()}
                     elif isinstance(v, list):
-                        element = v[idx] if idx < len(v) else v[0]
-                        # Clone tensors to avoid cross-request aliasing
-                        if isinstance(element, torch.Tensor):
-                            element = element.clone()
-                        mm_payload[k] = element
+                        if idx < len(v):
+                            element = v[idx]
+                            if element is not None:
+                                if isinstance(element, torch.Tensor):
+                                    element = element.clone()
+                                mm_payload[k] = element
+                        # Skip None elements: msgspec cannot serialize None
+                        # in dict[str, torch.Tensor] typed fields.
                     elif isinstance(v, torch.Tensor):
                         # List-derived tensor payloads are request-invariant; clone to
                         # avoid accidental cross-request aliasing on downstream mutation.
