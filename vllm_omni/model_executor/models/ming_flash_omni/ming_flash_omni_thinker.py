@@ -483,21 +483,12 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         through `MingFlashOmniProcessor.__call__`) so that the high-level
         placeholder tokens remain **unexpanded** in the tokenized output.
         """
-        # Defense in depth: if somehow a request with ``image_gen_mode=True``
-        # but no pre-expansion reaches this path, append the image-gen
-        # suffix here. The real expansion happens in
-        # ``serving_chat.py`` because text-only requests skip this method
-        # entirely (vllm short-circuits to the tokenizer when mm_data is
-        # empty).
-        if mm_kwargs.get("image_gen_mode") and "<imagePatch>" not in prompt:
-            image_gen_config = getattr(self.info.ctx.model_config.hf_config, "image_gen_config", None)
-            num_query_tokens = int(image_gen_config.num_query_tokens) if image_gen_config is not None else 256
-            prompt = f"{prompt}<image>{'<imagePatch>' * num_query_tokens}</image>"
-            logger.info(
-                "[MingFlashOmniThinker] (fallback) auto-expanded image-gen prompt: "
-                "appended <image>%d*<imagePatch></image>",
-                num_query_tokens,
-            )
+        # Auto prompt expansion for text-to-image happens in
+        # ``vllm_omni/entrypoints/openai/serving_chat.py`` (the Ming-arch
+        # gated branch appends ``<image><imagePatch>*N</image>`` to the
+        # prompt text). That runs in the API server before vllm sees the
+        # request, so by the time _call_hf_processor is invoked the prompt
+        # already contains the <imagePatch> tokens.
 
         hf_processor = self.info.get_hf_processor()
         tokenizer = self.info.get_tokenizer()

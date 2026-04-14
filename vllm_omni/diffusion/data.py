@@ -706,6 +706,17 @@ class OmniDiffusionConfig:
                 self.model_class_name = "BagelPipeline"
                 self.tf_model_config = TransformerConfig()
                 self.update_multimodal_support()
+            elif "BailingMM2NativeForConditionalGeneration" in architectures or model_type in (
+                "bailingmm_moe_v2_lite",
+                "ming_flash_omni",
+                "ming_flash_omni_thinker",
+            ):
+                # Ming-flash-omni-2.0 — imagegen stage uses the custom
+                # ``MingImagePipeline`` (ZImage DiT + Qwen2 connector). See
+                # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming.py.
+                self.model_class_name = "MingImagePipeline"
+                self.tf_model_config = TransformerConfig()
+                self.update_multimodal_support()
             elif model_type == "nextstep":
                 if self.model_class_name is None:
                     self.model_class_name = "NextStep11Pipeline"
