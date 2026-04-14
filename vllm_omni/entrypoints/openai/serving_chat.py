@@ -376,6 +376,44 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     mm_processor_kwargs["target_w"] = width
                 if mm_processor_kwargs:
                     tprompt["mm_processor_kwargs"] = mm_processor_kwargs
+
+                # Ming-flash-omni auto prompt expansion: for text-to-image
+                # requests, Ming's thinker expects its prompt to end with
+                # ``<image><imagePatch>*N</image>`` where N is the total
+                # number of learnable image-gen query tokens (e.g. 256 for
+                # 16x16). These ``<imagePatch>`` positions are where the
+                # thinker substitutes its ``query_tokens_dict`` embeddings
+                # during forward. Other vllm-omni image models (bagel,
+                # glm_image, etc.) must NOT get this suffix, so gate on
+                # the loaded model's architecture list.
+                if not is_img2img:
+                    try:
+                        _archs = (
+                            getattr(
+                                getattr(self.engine_client.model_config, "hf_config", None),
+                                "architectures",
+                                None,
+                            )
+                            or []
+                        )
+                    except Exception:
+                        _archs = []
+                    if any("MingFlashOmni" in a or "BailingMM2" in a for a in _archs):
+                        num_query_tokens = 256
+                        try:
+                            _ig = getattr(
+                                self.engine_client.model_config.hf_config,
+                                "image_gen_config",
+                                None,
+                            )
+                            if _ig is not None and hasattr(_ig, "num_query_tokens"):
+                                num_query_tokens = int(_ig.num_query_tokens)
+                        except Exception:
+                            pass
+                        if "<imagePatch>" not in tprompt["prompt"]:
+                            tprompt["prompt"] = (
+                                tprompt["prompt"] + "<image>" + ("<imagePatch>" * num_query_tokens) + "</image>"
+                            )
                 if engine_prompt_image is not None:
                     tprompt["multi_modal_data"] = engine_prompt_image
 

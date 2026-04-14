@@ -50,6 +50,21 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenCon
 logger = logging.getLogger(__name__)
 
 
+def _tstats(name: str, t: torch.Tensor) -> str:
+    """Compact one-line tensor statistics for debug logging."""
+    try:
+        f = t.detach().float()
+        norm_per_feat = f.norm(dim=-1).mean().item() if f.dim() >= 1 else float("nan")
+        return (
+            f"{name}: shape={tuple(t.shape)} dtype={t.dtype} "
+            f"mean={f.mean().item():+.4f} std={f.std().item():.4f} "
+            f"min={f.min().item():+.3f} max={f.max().item():+.3f} "
+            f"|x|/feat={norm_per_feat:.3f}"
+        )
+    except Exception as e:  # noqa: BLE001
+        return f"{name}: <stats failed: {e}>"
+
+
 class MingConditionEncoder(nn.Module):
     """Wraps a Qwen2 connector + norm/projection, producing DiT condition embeds.
 
@@ -142,40 +157,38 @@ class MingConditionEncoder(nn.Module):
         self.connector = base
 
         # proj_in: align thinker_hidden_size -> connector_hidden_size.
-        if self.thinker_hidden_size != self.connector_hidden_size:
-            logger.info(
-                "[MingConditionEncoder] adding proj_in: %d -> %d",
-                self.thinker_hidden_size,
-                self.connector_hidden_size,
-            )
-            self.proj_in = nn.Linear(self.thinker_hidden_size, self.connector_hidden_size, bias=False)
-        else:
-            self.proj_in = nn.Identity()
+        # Observed layout of mlp/ on the released checkpoint
+        # (inclusionAI/Ming-flash-omni-2.0):
+        #   proj_in.{weight,bias}   : Linear(4096 -> 1536)
+        #   proj_out.{weight,bias}  : Linear(1536 -> 2560)
+        #   query_tokens_dict.16x16 : learnable tokens consumed on the thinker
+        #                             side (NOT loaded here).
+        # ``use_identity_mlp`` from mlp/config.json turned out to be a misnomer
+        # — the real checkpoint ships two bias-full Linear layers here, so we
+        # always build them with ``bias=True`` and load weights unconditionally.
+        logger.info(
+            "[MingConditionEncoder] adding proj_in: %d -> %d (bias=True)",
+            self.thinker_hidden_size,
+            self.connector_hidden_size,
+        )
+        self.proj_in = nn.Linear(self.thinker_hidden_size, self.connector_hidden_size, bias=True)
 
-        # Norm: text_encoder_norm from mlp/config.json.
-        if self.config.text_encoder_norm:
-            eps = getattr(connector_cfg, "rms_norm_eps", 1e-6)
-            self.norm = nn.RMSNorm(self.connector_hidden_size, eps=eps)
-            logger.info("[MingConditionEncoder] using RMSNorm(eps=%g)", eps)
+        # NOTE: ``text_encoder_norm=True`` in Ming's mlp/config.json refers to
+        # applying ``F.normalize(..., dim=-1)`` (L2 normalization) on the
+        # FINAL cap_feats AFTER proj_out — NOT an intermediate RMSNorm. See
+        # modeling_bailingmm2.py::get_condition_embeds_for_image_gen. We keep
+        # ``self.norm = nn.Identity`` and apply the L2 normalize explicitly
+        # at the end of ``forward``.
+        self.norm = nn.Identity()
 
         # proj_out: align connector_hidden_size -> diffusion_c_input_dim.
         c_out = self.config.diffusion_c_input_dim
-        if self.config.use_identity_mlp:
-            if c_out != self.connector_hidden_size:
-                # mlp/config.json says use_identity_mlp=True but the dims
-                # don't line up — fall back to a learnable linear and log.
-                logger.warning(
-                    "[MingConditionEncoder] use_identity_mlp=True but "
-                    "connector_hidden_size (%d) != diffusion_c_input_dim (%d); "
-                    "inserting a fallback Linear. Verify mlp/ weights on real run.",
-                    self.connector_hidden_size,
-                    c_out,
-                )
-                self.proj_out = nn.Linear(self.connector_hidden_size, c_out, bias=False)
-            else:
-                self.proj_out = nn.Identity()
-        else:
-            self.proj_out = nn.Linear(self.connector_hidden_size, c_out, bias=False)
+        logger.info(
+            "[MingConditionEncoder] adding proj_out: %d -> %d (bias=True)",
+            self.connector_hidden_size,
+            c_out,
+        )
+        self.proj_out = nn.Linear(self.connector_hidden_size, c_out, bias=True)
 
         # Attempt to load proj/norm weights from mlp/ subfolder.
         mlp_path = model_path / self.config.mlp_subfolder
@@ -194,10 +207,19 @@ class MingConditionEncoder(nn.Module):
         )
 
     def _load_optional_mlp_weights(self, mlp_path: Path) -> None:
-        """Best-effort loader for the mlp/ subfolder (proj + norm weights).
+        """Load proj_in / proj_out (and optional norm) weights from mlp/.
 
-        The exact tensor names inside mlp/ are unknown until we see the real
-        checkpoint. We try a few common conventions and log everything.
+        Expected keys — observed on inclusionAI/Ming-flash-omni-2.0:
+            proj_in.weight           [1536, 4096]
+            proj_in.bias             [1536]
+            proj_out.weight          [2560, 1536]
+            proj_out.bias            [2560]
+            query_tokens_dict.16x16  [256, 4096]   -> thinker-side, skipped here
+            (optional) norm.weight   [1536]
+
+        Any extra keys are logged as warnings so we don't silently miss new
+        fields. Missing proj weights are fatal: they are required for the
+        condition path to be meaningful.
         """
         if not mlp_path.exists():
             logger.warning(
@@ -210,33 +232,82 @@ class MingConditionEncoder(nn.Module):
 
         try:
             from safetensors.torch import load_file  # type: ignore
+        except ImportError:
+            logger.exception("[MingConditionEncoder] safetensors not installed")
+            return
 
-            candidates = sorted(mlp_path.glob("*.safetensors"))
-            if not candidates:
-                candidates = sorted(mlp_path.glob("*.bin"))
-            if not candidates:
-                logger.warning("[MingConditionEncoder] no weight files under %s", mlp_path)
-                return
-            state: dict[str, torch.Tensor] = {}
-            for p in candidates:
-                logger.info("[MingConditionEncoder] reading mlp weights: %s", p)
-                if p.suffix == ".safetensors":
-                    state.update(load_file(str(p)))
-                else:
-                    state.update(torch.load(str(p), map_location="cpu"))
+        candidates = sorted(mlp_path.glob("*.safetensors"))
+        if not candidates:
+            candidates = sorted(mlp_path.glob("*.bin"))
+        if not candidates:
+            logger.warning("[MingConditionEncoder] no weight files under %s", mlp_path)
+            return
+
+        state: dict[str, torch.Tensor] = {}
+        for p in candidates:
+            logger.info("[MingConditionEncoder] reading mlp weights: %s", p)
+            if p.suffix == ".safetensors":
+                state.update(load_file(str(p)))
+            else:
+                state.update(torch.load(str(p), map_location="cpu"))
+        logger.info(
+            "[MingConditionEncoder] mlp/ keys: %s",
+            sorted(state.keys()),
+        )
+
+        handled: set[str] = set()
+
+        def _copy(dst: nn.Parameter | torch.Tensor, src_key: str) -> bool:
+            src = state.get(src_key)
+            if src is None:
+                logger.error("[MingConditionEncoder] mlp/ missing key %r", src_key)
+                return False
+            if tuple(src.shape) != tuple(dst.shape):
+                logger.error(
+                    "[MingConditionEncoder] mlp/%s shape mismatch: checkpoint=%s, module=%s",
+                    src_key,
+                    tuple(src.shape),
+                    tuple(dst.shape),
+                )
+                return False
+            with torch.no_grad():
+                dst.copy_(src.to(dtype=dst.dtype, device=dst.device))
+            handled.add(src_key)
             logger.info(
-                "[MingConditionEncoder] mlp/ keys: %s",
-                list(state.keys())[:16],
+                "[MingConditionEncoder] loaded mlp/%s -> %s",
+                src_key,
+                tuple(dst.shape),
             )
-            # TODO: once we see the real key names, map them onto
-            # self.proj_in / self.proj_out / self.norm. For now, log and bail.
-            logger.warning(
-                "[MingConditionEncoder] mlp/ key mapping is unimplemented in "
-                "Phase 1 — using randomly-initialized proj/norm. Patch me once "
-                "the real key names are observed on hardware."
+            return True
+
+        ok_w = _copy(self.proj_in.weight, "proj_in.weight")
+        ok_b = _copy(self.proj_in.bias, "proj_in.bias")
+        ok_ow = _copy(self.proj_out.weight, "proj_out.weight")
+        ok_ob = _copy(self.proj_out.bias, "proj_out.bias")
+        if not (ok_w and ok_b and ok_ow and ok_ob):
+            logger.error(
+                "[MingConditionEncoder] proj_in/proj_out NOT fully loaded; diffusion conditioning will be garbage."
             )
-        except Exception:  # noqa: BLE001
-            logger.exception("[MingConditionEncoder] failed to load mlp/ weights")
+
+        # Optional norm weight (Ming uses plain RMSNorm; may or may not ship).
+        if "norm.weight" in state and hasattr(self.norm, "weight"):
+            _copy(self.norm.weight, "norm.weight")
+
+        # query_tokens_dict lives in mlp/ but is consumed on the thinker side
+        # — we neither need nor load it here. Just log the shape so the
+        # thinker-side patch knows what to expect.
+        for k, v in state.items():
+            if k.startswith("query_tokens_dict"):
+                logger.info(
+                    "[MingConditionEncoder] thinker-side parameter %s shape=%s (NOT loaded here; thinker must own it)",
+                    k,
+                    tuple(v.shape),
+                )
+                handled.add(k)
+
+        leftover = set(state.keys()) - handled
+        if leftover:
+            logger.warning("[MingConditionEncoder] mlp/ unhandled keys: %s", sorted(leftover))
 
     # ------------------------------------------------------------------
     # Forward
@@ -265,31 +336,62 @@ class MingConditionEncoder(nn.Module):
             raise ValueError(f"expected [B, N, H], got shape {tuple(thinker_hidden_states.shape)}")
 
         b, n, _ = thinker_hidden_states.shape
+        logger.info("[MingCondEnc] %s", _tstats("STEP0 thinker_hidden_states", thinker_hidden_states))
+        logger.info(
+            "[MingCondEnc] proj_in  weight %s bias %s",
+            _tstats("", self.proj_in.weight),
+            _tstats("", self.proj_in.bias) if self.proj_in.bias is not None else "None",
+        )
+
+        x = self.proj_in(thinker_hidden_states)  # [B, N, conn_hidden]
+        logger.info("[MingCondEnc] %s", _tstats("STEP1 after proj_in", x))
+
+        # Ming's ``get_condition_embeds_for_image_gen`` passes a 4D full-ones
+        # attention mask of shape [B, 1, N, N] to the Qwen2 connector,
+        # forcing full bidirectional self-attention over all query positions
+        # (as opposed to the default causal mask). Match that here.
         if attention_mask is None:
             attention_mask = torch.ones(
-                (b, n),
-                dtype=torch.long,
-                device=thinker_hidden_states.device,
+                (b, 1, n, n),
+                dtype=x.dtype,
+                device=x.device,
             )
+        elif attention_mask.dim() == 2:
+            # Caller passed a 2D [B, N] mask — broadcast it into [B, 1, N, N]
+            mask_2d = attention_mask.to(x.dtype)
+            attention_mask = mask_2d[:, None, None, :].expand(b, 1, n, n)
 
-        x = self.proj_in(thinker_hidden_states)
-        # Qwen2 base model accepts inputs_embeds directly, letting us skip the
-        # tokenizer/embed-layer path entirely.
         out = self.connector(
             inputs_embeds=x,
             attention_mask=attention_mask,
             use_cache=False,
-            output_hidden_states=False,
+            output_hidden_states=True,
             return_dict=True,
         )
-        hidden = out.last_hidden_state  # [B, N, conn_hidden]
-        hidden = self.norm(hidden)
+        # Ming uses hidden_states[-1] (last layer).
+        hidden = out.hidden_states[-1]  # [B, N, conn_hidden]
+        logger.info("[MingCondEnc] %s", _tstats("STEP2 after connector", hidden))
+
         cap_feats = self.proj_out(hidden)  # [B, N, diffusion_c_input_dim]
-        logger.debug(
-            "[MingConditionEncoder.forward] in=%s -> cap_feats=%s",
-            tuple(thinker_hidden_states.shape),
-            tuple(cap_feats.shape),
-        )
+        logger.info("[MingCondEnc] %s", _tstats("STEP3 after proj_out", cap_feats))
+
+        # Final L2 normalization along the feature dim — matches the tail
+        # of Ming's ``get_condition_embeds_for_image_gen``.
+        cap_feats = torch.nn.functional.normalize(cap_feats, dim=-1)
+        logger.info("[MingCondEnc] %s", _tstats("STEP4 after F.normalize", cap_feats))
+
+        # Ming wraps the DiT in ``ZImageModel_withMLP`` which, when
+        # ``text_encoder_norm=True`` + ``use_identity_mlp=True`` (both true
+        # on Ming-flash-omni-2.0), applies ``F.normalize(x, dim=-1) * 1000.0``
+        # to encoder_hidden_states before feeding the transformer — the ×1000
+        # restores the magnitude of the original Z-image text encoder output
+        # (see zimage_loss.py::ZImageModel_withMLP.forward lines 88-91).
+        # Our pipeline does not include that wrapper, so we fold the same
+        # rescale into the condition encoder output directly.
+        if self.config.text_encoder_norm:
+            cap_feats = cap_feats * 1000.0
+            logger.info("[MingCondEnc] %s", _tstats("STEP5 after *1000", cap_feats))
+
         return cap_feats
 
     # ------------------------------------------------------------------

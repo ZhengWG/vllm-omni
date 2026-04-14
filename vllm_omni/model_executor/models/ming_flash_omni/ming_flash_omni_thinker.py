@@ -101,9 +101,73 @@ class MingAudioInput(TensorSchema):
     ]
 
 
+_BAILING_MOE_V2_COMPAT_DEFAULTS: dict[str, int] = {
+    # Fields missing from the upstream Ming ``configuration_bailing_moe_v2.py``
+    # but referenced by vllm-omni thinker code. Values match the defaults in
+    # ``vllm_omni/transformers_utils/configs/ming_flash_omni.py::BailingMoeV2Config``.
+    # If Ming later publishes official values, the existing field takes
+    # precedence — we only set missing ones via ``hasattr`` check.
+    "image_end_token": 157159,
+    "video_end_token": 157161,
+    "audio_patch_token": 157168,
+    "audio_start_token": 157169,
+    "audio_end_token": 157170,
+}
+
+
+def _augment_bailing_moe_v2_compat(cfg) -> None:
+    """Inject missing multimodal token-id fields onto a loaded config.
+
+    When ``trust_remote_code=True`` and the model directory contains
+    ``configuration_bailing_moe_v2.py``, transformers dynamically loads a
+    ``BailingMoeV2Config`` class under ``transformers_modules.*`` that is
+    NOT the same as our registered ``vllm_omni.transformers_utils.configs.
+    ming_flash_omni.BailingMoeV2Config`` — so its defaults do not apply.
+
+    Rather than scatter ``getattr(..., default)`` through the codebase, this
+    helper augments the dynamically loaded config object once by setting any
+    fields listed in ``_BAILING_MOE_V2_COMPAT_DEFAULTS`` that are not already
+    present. The helper is idempotent (runs without harm on repeated calls)
+    and is safe to apply to already-augmented configs.
+
+    The augmentation targets ``cfg.llm_config`` — the ``BailingMoeV2Config``
+    instance nested inside ``BailingMM2Config``.
+    """
+    llm_cfg = getattr(cfg, "llm_config", None)
+    if llm_cfg is None:
+        return
+    if getattr(llm_cfg, "_vllm_omni_compat_augmented", False):
+        return
+    added: list[str] = []
+    for name, default in _BAILING_MOE_V2_COMPAT_DEFAULTS.items():
+        if not hasattr(llm_cfg, name):
+            setattr(llm_cfg, name, default)
+            added.append(name)
+    # Mark so subsequent calls short-circuit.
+    setattr(llm_cfg, "_vllm_omni_compat_augmented", True)
+    if added:
+        logger.info(
+            "[MingFlashOmniThinker] augmented llm_config with compat defaults: %s",
+            added,
+        )
+
+
 class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
     def get_hf_config(self) -> BailingMM2Config:
-        return self.ctx.get_hf_config(BailingMM2Config)
+        # NOTE: we intentionally bypass ``ctx.get_hf_config(BailingMM2Config)``
+        # which does a strict isinstance check. When ``trust_remote_code=True``
+        # and the model directory contains ``configuration_bailingmm2.py``,
+        # transformers dynamically loads a second BailingMM2Config under
+        # ``transformers_modules.*`` that is not the same Python class as
+        # our registered copy — the fields are identical but isinstance fails.
+        # Duck-typing here is safe because every field we read (llm_config,
+        # vision_config, audio_config, mlp_depth, image_gen_config, etc.) is
+        # present on both definitions.
+        cfg = self.ctx.model_config.hf_config
+        if not hasattr(cfg, "llm_config"):
+            raise TypeError(f"hf_config {type(cfg).__name__} is not a BailingMM2-compatible config")
+        _augment_bailing_moe_v2_compat(cfg)
+        return cfg  # type: ignore[return-value]
 
     def get_hf_processor(self, **kwargs: object):
         return self.ctx.get_hf_processor(MingFlashOmniProcessor, **kwargs)
@@ -137,7 +201,14 @@ class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
 
         return mm_max_tokens
 
-    def get_feature_extractor(self, **kwargs: object) -> MingWhisperFeatureExtractor:
+    def get_feature_extractor(self, **kwargs: object):
+        """Return the audio feature extractor from the processor.
+
+        The processor may be loaded via trust_remote_code paths that return
+        a stock transformers ``WhisperFeatureExtractor`` rather than
+        vllm-omni's subclass ``MingWhisperFeatureExtractor``. We accept both
+        as long as the caller-needed attributes (``sampling_rate``) exist.
+        """
         hf_processor = self.get_hf_processor(**kwargs)
         feature_extractor = hf_processor.audio_processor
         assert isinstance(feature_extractor, MingWhisperFeatureExtractor)
@@ -221,7 +292,10 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         # vocab = tokenizer.get_vocab()
         thinker_config = self.info.get_hf_config()
 
-        # patch/delimiter token IDs (used in replacement sequences)
+        # patch/delimiter token IDs (used in replacement sequences).
+        # These fields must be present on the llm_config. If the upstream
+        # Ming checkpoint's configuration_bailing_moe_v2.py is missing any
+        # of them, add the defaults there — do NOT paper over in this file.
         image_start_token_id = thinker_config.llm_config.image_start_token
         image_patch_token_id = thinker_config.llm_config.image_patch_token
         image_end_token_id = thinker_config.llm_config.image_end_token
@@ -409,6 +483,22 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         through `MingFlashOmniProcessor.__call__`) so that the high-level
         placeholder tokens remain **unexpanded** in the tokenized output.
         """
+        # Defense in depth: if somehow a request with ``image_gen_mode=True``
+        # but no pre-expansion reaches this path, append the image-gen
+        # suffix here. The real expansion happens in
+        # ``serving_chat.py`` because text-only requests skip this method
+        # entirely (vllm short-circuits to the tokenizer when mm_data is
+        # empty).
+        if mm_kwargs.get("image_gen_mode") and "<imagePatch>" not in prompt:
+            image_gen_config = getattr(self.info.ctx.model_config.hf_config, "image_gen_config", None)
+            num_query_tokens = int(image_gen_config.num_query_tokens) if image_gen_config is not None else 256
+            prompt = f"{prompt}<image>{'<imagePatch>' * num_query_tokens}</image>"
+            logger.info(
+                "[MingFlashOmniThinker] (fallback) auto-expanded image-gen prompt: "
+                "appended <image>%d*<imagePatch></image>",
+                num_query_tokens,
+            )
+
         hf_processor = self.info.get_hf_processor()
         tokenizer = self.info.get_tokenizer()
 
@@ -548,10 +638,69 @@ class MingFlashOmniThinkerForConditionalGeneration(
             )
         logger.info("Initialized WhisperAudioEncoder and AudioProjector")
 
+        # Image-generation learnable query tokens. Stored as a ParameterDict
+        # keyed by scale name (e.g. "16x16" -> [256, hidden_size]) to mirror
+        # the upstream Ming layout in ``mlp/query_tokens_dict.<scale>``. These
+        # are substituted in at ``<imagePatch>`` token positions during
+        # text-to-image requests; image-comprehension requests continue to
+        # fill those positions with vision features as before.
+        self.query_tokens_dict = nn.ParameterDict()
+        self._load_image_gen_query_tokens(vllm_config.model_config.model)
+
         # Expose interfaces
         self.make_empty_intermediate_tensors = self.language_model.make_empty_intermediate_tensors
 
-        logger.info("MingFlashOmniThinker initialized with vision and audio towers")
+        logger.info(
+            f"MingFlashOmniThinker initialized with: "
+            f"vision={'yes' if self.vision else 'no'}, "
+            f"audio={'yes' if self.audio else 'no'}, "
+            f"image_gen_scales={list(self.query_tokens_dict.keys())}"
+        )
+
+    def _load_image_gen_query_tokens(self, model_path: str) -> None:
+        """Load learnable query tokens used for image generation.
+
+        Expected layout (observed on inclusionAI/Ming-flash-omni-2.0):
+            <model_path>/mlp/model.safetensors
+                key ``query_tokens_dict.<scale>`` -> [num_tokens, hidden_size]
+                e.g. ``query_tokens_dict.16x16`` -> [256, 4096]
+
+        Missing files are logged as a warning and image-gen is disabled
+        (text-only inference still works).
+        """
+        from pathlib import Path
+
+        p = Path(model_path) / "mlp" / "model.safetensors"
+        if not p.exists():
+            logger.warning(
+                "[MingFlashOmniThinker] mlp/model.safetensors not found at %s; "
+                "text-to-image will be disabled (text-only inference still works).",
+                p,
+            )
+            return
+        try:
+            from safetensors.torch import load_file  # type: ignore
+
+            state = load_file(str(p))
+        except Exception:
+            logger.exception("[MingFlashOmniThinker] failed to read %s", p)
+            return
+        loaded = 0
+        for key, tensor in state.items():
+            if not key.startswith("query_tokens_dict."):
+                continue
+            scale_name = key.split(".", 1)[1]
+            param = nn.Parameter(tensor.clone(), requires_grad=False)
+            self.query_tokens_dict[scale_name] = param
+            loaded += 1
+            logger.info(
+                "[MingFlashOmniThinker] loaded query_tokens_dict[%s] shape=%s dtype=%s",
+                scale_name,
+                tuple(tensor.shape),
+                tensor.dtype,
+            )
+        if loaded == 0:
+            logger.warning("[MingFlashOmniThinker] no query_tokens_dict.* keys in mlp/model.safetensors")
 
     def extract_image_feature(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         """Extract and project image features.
@@ -733,6 +882,16 @@ class MingFlashOmniThinkerForConditionalGeneration(
         inputs_embeds = self.language_model.model.word_embeddings(input_ids)
 
         if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
+            # Two sub-cases:
+            #   (a) plain text request: no <imagePatch> tokens -> nothing to do
+            #   (b) text-to-image request: <imagePatch> tokens are present but
+            #       no vision features were extracted; fill those positions
+            #       with learnable query_tokens_dict entries. Ming reuses the
+            #       same <imagePatch> token id for both comprehension and
+            #       generation -> the absence of multimodal_embeddings plus
+            #       the presence of patch tokens unambiguously signals gen.
+            if len(self.query_tokens_dict) > 0:
+                self._maybe_inject_image_gen_query_embeds(input_ids, inputs_embeds)
             return inputs_embeds
 
         assert is_multimodal is not None, "`is_multimodal` mask required when `multimodal_embeddings` provided"
@@ -740,6 +899,55 @@ class MingFlashOmniThinkerForConditionalGeneration(
             inputs_embeds=inputs_embeds,
             multimodal_embeddings=multimodal_embeddings,
             is_multimodal=is_multimodal,
+        )
+
+    def _maybe_inject_image_gen_query_embeds(
+        self,
+        input_ids: torch.Tensor,
+        inputs_embeds: torch.Tensor,
+    ) -> None:
+        """Replace ``<imagePatch>`` positions with learnable query tokens.
+
+        Operates in-place on ``inputs_embeds``. The scale (e.g. ``16x16``) is
+        picked by matching the number of consecutive patch-token positions
+        against the available entries in ``self.query_tokens_dict``.
+        """
+        patch_token_id = self.config.image_patch_token
+        patch_mask = input_ids == patch_token_id
+        num_patches = int(patch_mask.sum().item())
+        if num_patches == 0:
+            return
+
+        # Pick the scale whose num_tokens matches. For img_gen_scales=[16]
+        # there is only one entry (16x16 -> 256).
+        scale_name = None
+        for name, param in self.query_tokens_dict.items():
+            if param.shape[0] == num_patches:
+                scale_name = name
+                break
+        if scale_name is None:
+            logger.warning(
+                "[MingFlashOmniThinker] image-gen request with %d patch tokens "
+                "but no query_tokens_dict entry matches; available=%s",
+                num_patches,
+                {k: tuple(v.shape) for k, v in self.query_tokens_dict.items()},
+            )
+            return
+
+        query_embeds = self.query_tokens_dict[scale_name].to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        q = query_embeds.detach().float()
+        logger.info(
+            "[MingFlashOmniThinker] query_embeds[%s]: mean=%+.4f std=%.4f |x|/tok=%.3f",
+            scale_name,
+            q.mean().item(),
+            q.std().item(),
+            q.norm(dim=-1).mean().item(),
+        )
+        inputs_embeds[patch_mask] = query_embeds
+        logger.info(
+            "[MingFlashOmniThinker] injected %d image-gen query embeddings at <imagePatch> positions (scale=%s)",
+            num_patches,
+            scale_name,
         )
 
     def forward(
@@ -765,6 +973,27 @@ class MingFlashOmniThinkerForConditionalGeneration(
         multimodal_outputs = {
             "final_hidden_states": hidden_states,
         }
+
+        # Image-gen: if <imagePatch> tokens were present in the input, export
+        # their final hidden states for the downstream imagegen stage. This
+        # fires for BOTH comprehension and generation requests — the imagegen
+        # stage is only invoked for generation by the stage router, so the
+        # extra payload on comprehension requests is harmless.
+        patch_token_id = self.config.image_patch_token
+        patch_mask = input_ids == patch_token_id
+        if patch_mask.any():
+            gen_hidden = hidden_states[patch_mask]  # [num_patch, hidden]
+            multimodal_outputs["ming_imagegen_hidden_states"] = gen_hidden
+            g = gen_hidden.detach().float()
+            logger.info(
+                "[MingFlashOmniThinker] exported patch-token hidden_states "
+                "shape=%s dtype=%s mean=%+.4f std=%.4f |x|/tok=%.3f",
+                tuple(gen_hidden.shape),
+                gen_hidden.dtype,
+                g.mean().item(),
+                g.std().item(),
+                g.norm(dim=-1).mean().item(),
+            )
 
         return OmniOutput(
             text_hidden_states=hidden_states,

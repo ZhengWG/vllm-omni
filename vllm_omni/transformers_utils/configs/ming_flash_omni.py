@@ -296,8 +296,10 @@ class MingImageGenConfig(PretrainedConfig):
         # Phase 1 feature toggles.
         enable_byte5: bool = False,
         # Default sampling parameters for the diffusion pipeline.
+        # These match Ming's defaults in ``modeling_bailingmm2.py::generate``
+        # (``image_gen_steps=30``, ``image_gen_cfg=2.0``).
         num_inference_steps: int = 30,
-        guidance_scale: float = 4.0,
+        guidance_scale: float = 2.0,
         default_height: int = 1024,
         default_width: int = 1024,
         **kwargs,

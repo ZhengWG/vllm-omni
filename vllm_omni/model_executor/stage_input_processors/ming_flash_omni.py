@@ -55,12 +55,15 @@ logger = logging.getLogger(__name__)
 HIDDEN_STATES_PAYLOAD_KEY = "ming_imagegen_hidden_states"
 ATTENTION_MASK_PAYLOAD_KEY = "ming_imagegen_attention_mask"
 
-# Special token marker inserted by the prompt preprocessor to indicate where
-# the learnable query tokens should be appended. The actual numeric token id
-# must come from the Ming tokenizer; for Phase 1 we store the STRING marker
-# and resolve it to an id at runtime via the tokenizer attached to the
-# thinker's engine.
-QUERY_TOKEN_PLACEHOLDER = "<|image_gen_query|>"
+# Ming reuses the ``<imagePatch>`` token (id=157157 in BailingMoeV2 vocab) as
+# the insertion slot for BOTH image comprehension and image generation; the
+# distinction is made inside ``MingFlashOmniThinker.embed_input_ids`` by
+# whether vision features are present. For image generation we wrap the patch
+# run with ``<image>...</image>`` to mirror the comprehension prompt shape.
+IMAGE_PATCH_TOKEN_STR = "<imagePatch>"
+IMAGE_START_TOKEN_STR = "<image>"
+IMAGE_END_TOKEN_STR = "</image>"
+IMAGE_PATCH_TOKEN_ID = 157157  # BailingMoeV2 image_patch_token
 
 
 @dataclass
@@ -91,21 +94,27 @@ def expand_prompt_for_image_gen(
     *,
     num_query_tokens: int,
 ) -> dict[str, Any] | str:
-    """Append ``num_query_tokens`` learnable query tokens to the user prompt.
+    """Append ``<image><imagePatch>*N</image>`` to the user prompt.
 
-    Called by the stage-0 prompt preprocessor when ``modalities`` includes
-    ``"image"``. Returns a new prompt dict (the caller is responsible for
-    passing it into the thinker engine).
+    Mirrors the upstream Ming convention (reuses ``image_patch_token`` for
+    image generation, distinguished from comprehension by the absence of
+    vision features — see ``MingFlashOmniThinker.embed_input_ids``).
+
+    Called by the stage-0 prompt preprocessor when the request is a
+    text-to-image request. Returns a new prompt dict — the caller passes it
+    into the thinker engine.
     """
     if not isinstance(prompt, dict):
         prompt = {"prompt": prompt, "modalities": ["image"]}
 
     base_text = prompt.get("prompt", "")
-    suffix = QUERY_TOKEN_PLACEHOLDER * num_query_tokens
+    patches = IMAGE_PATCH_TOKEN_STR * num_query_tokens
+    suffix = f"{IMAGE_START_TOKEN_STR}{patches}{IMAGE_END_TOKEN_STR}"
     new_prompt = dict(prompt)
     new_prompt["prompt"] = f"{base_text}{suffix}"
     logger.info(
-        "[MingImageGen.expand_prompt] appended %d query tokens (original len=%d, new len=%d)",
+        "[MingImageGen.expand_prompt] appended <image>%s*%d</image> (original len=%d, new len=%d)",
+        IMAGE_PATCH_TOKEN_STR,
         num_query_tokens,
         len(base_text),
         len(new_prompt["prompt"]),
@@ -117,8 +126,8 @@ def extract_query_token_hidden_states(
     hidden_states: torch.Tensor,
     token_ids: torch.Tensor,
     *,
-    query_token_id: int,
-    num_query_tokens: int,
+    query_token_id: int = IMAGE_PATCH_TOKEN_ID,
+    num_query_tokens: int = 256,
 ) -> torch.Tensor:
     """Slice the thinker's final-layer hidden states at query-token positions.
 
@@ -173,6 +182,159 @@ def extract_query_token_hidden_states(
 
 
 # ----------------------------------------------------------------------
+# Dual-stage transport: thinker -> imagegen
+# ----------------------------------------------------------------------
+
+
+def _validate_stage_inputs(stage_list, engine_input_source):
+    """Mirror of qwen3_omni._validate_stage_inputs."""
+    if not engine_input_source:
+        raise ValueError("engine_input_source cannot be empty")
+    stage_id = engine_input_source[0]
+    if stage_id >= len(stage_list):
+        raise IndexError(f"Invalid stage_id: {stage_id}")
+    stage = stage_list[stage_id]
+    if stage.engine_outputs is None:
+        raise RuntimeError(f"Stage {stage_id} has no outputs yet")
+    return stage.engine_outputs
+
+
+def thinker2imagegen(
+    stage_list: list[Any],
+    engine_input_source: list[int],
+    prompt: Any | None = None,  # noqa: ARG001
+    requires_multimodal_data: bool = False,  # noqa: ARG001
+) -> list[Any]:
+    """Bridge thinker stage outputs to the imagegen stage.
+
+    Reads each thinker output's ``multimodal_output["final_hidden_states"]``
+    (the full prompt sequence hidden states, shape ``[L, H]``), masks it to
+    the positions where ``prompt_token_ids == image_patch_token (157157)``,
+    and packages the resulting ``[256, H]`` tensor as
+    ``additional_information`` on a dummy ``OmniTokensPrompt`` for the
+    imagegen stage.
+
+    NOTE: an earlier attempt added a ``ming_imagegen_hidden_states`` key on
+    the thinker side, but vllm-omni's stage output serialization only
+    surfaces a fixed set of keys (``final_hidden_states``, ``latent``, …),
+    so that custom key never made it across. Slicing happens on the
+    receiver (this function) instead — zero infra change, zero new keys.
+
+    Args:
+        stage_list: Upstream stage list injected by the runtime.
+        engine_input_source: Source stage IDs (``[0]`` for thinker).
+        prompt: Original user prompt (unused — imagegen needs only the
+            hidden-state tensor).
+        requires_multimodal_data: Unused.
+
+    Returns:
+        ``list[OmniTokensPrompt]`` — one per thinker output, each with
+        ``additional_information[HIDDEN_STATES_PAYLOAD_KEY]`` set.
+    """
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+    thinker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    imagegen_inputs: list[Any] = []
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    for i, thinker_output in enumerate(thinker_outputs):
+        output = thinker_output.outputs[0]
+        mm_out = getattr(output, "multimodal_output", None) or {}
+
+        # The thinker ships the full prompt sequence hidden states under
+        # ``final_hidden_states`` ([L, H] or [B, L, H]). We select only the
+        # positions that correspond to ``<imagePatch>`` tokens — that is
+        # where the learnable query embeddings were injected and where the
+        # thinker produced the conditioning hidden states we need.
+        full_hidden = mm_out.get("final_hidden_states")
+        if full_hidden is None:
+            logger.warning(
+                "[thinker2imagegen] request %d: missing 'final_hidden_states' in multimodal_output (keys=%s); skipping",
+                i,
+                list(mm_out.keys()),
+            )
+            continue
+
+        prompt_ids = _ensure_list(thinker_output.prompt_token_ids)
+        prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=full_hidden.device)
+        patch_mask = prompt_ids_t == IMAGE_PATCH_TOKEN_ID  # [L]
+        num_patches = int(patch_mask.sum().item())
+        if num_patches == 0:
+            logger.warning(
+                "[thinker2imagegen] request %d: no <imagePatch> tokens in "
+                "prompt_ids (length=%d); cannot build imagegen conditioning",
+                i,
+                len(prompt_ids),
+            )
+            continue
+
+        # Normalize full_hidden shape to [L, H] before masking.
+        if full_hidden.dim() == 3:
+            # [B, L, H] — assume batch size 1 (vllm prefills one request at a time)
+            assert full_hidden.shape[0] == 1, f"unexpected batch dim: {full_hidden.shape}"
+            full_hidden = full_hidden[0]
+        if full_hidden.dim() != 2:
+            logger.warning(
+                "[thinker2imagegen] request %d: unexpected final_hidden_states shape %s; skipping",
+                i,
+                tuple(full_hidden.shape),
+            )
+            continue
+        if full_hidden.shape[0] != patch_mask.shape[0]:
+            logger.warning(
+                "[thinker2imagegen] request %d: hidden length %d != prompt length %d; skipping",
+                i,
+                full_hidden.shape[0],
+                patch_mask.shape[0],
+            )
+            continue
+
+        hidden = full_hidden[patch_mask].detach().to(device=device)  # [N, H]
+        # vllm-omni's cross-stage ``serialize_additional_information`` uses
+        # ``tensor.cpu().numpy().tobytes()`` which numpy does not support for
+        # bfloat16 / float16. Cast to float32 here; the condition encoder
+        # recasts back to its own dtype on the receiver side.
+        if hidden.dtype in (torch.bfloat16, torch.float16):
+            hidden = hidden.to(torch.float32)
+        f = hidden.float()
+        logger.info(
+            "[thinker2imagegen] request %d: sliced %s dtype=%s "
+            "mean=%+.4f std=%.4f |x|/tok=%.3f (found %d <imagePatch> positions)",
+            i,
+            tuple(hidden.shape),
+            hidden.dtype,
+            f.mean().item(),
+            f.std().item(),
+            f.norm(dim=-1).mean().item(),
+            num_patches,
+        )
+
+        info: dict[str, Any] = {HIDDEN_STATES_PAYLOAD_KEY: hidden}
+        imagegen_inputs.append(
+            OmniTokensPrompt(
+                prompt_token_ids=[0],  # dummy — imagegen only runs prefill once
+                additional_information=info,
+                multi_modal_data=None,
+                mm_processor_kwargs=None,
+            )
+        )
+
+    return imagegen_inputs
+
+
+def _ensure_list(x) -> list[int]:
+    """Convert ConstantList / tensor-like to plain list (qwen3_omni pattern)."""
+    if hasattr(x, "_x"):
+        return list(x._x)
+    if isinstance(x, list):
+        return x
+    if hasattr(x, "tolist"):
+        return x.tolist()
+    return list(x)
+
+
+# ----------------------------------------------------------------------
 # Stage 1: imagegen side — payload ingestion
 # ----------------------------------------------------------------------
 
@@ -203,9 +365,13 @@ def load_payload_from_cross_stage(payload: dict[str, Any]) -> dict[str, torch.Te
 __all__ = [
     "HIDDEN_STATES_PAYLOAD_KEY",
     "ATTENTION_MASK_PAYLOAD_KEY",
-    "QUERY_TOKEN_PLACEHOLDER",
+    "IMAGE_PATCH_TOKEN_STR",
+    "IMAGE_START_TOKEN_STR",
+    "IMAGE_END_TOKEN_STR",
+    "IMAGE_PATCH_TOKEN_ID",
     "MingImageGenRequestMeta",
     "expand_prompt_for_image_gen",
     "extract_query_token_hidden_states",
     "load_payload_from_cross_stage",
+    "thinker2imagegen",
 ]
