@@ -851,26 +851,44 @@ class Orchestrator:
         )
         self.request_states[request_id] = req_state
 
-        # Choose a replica for logical stage 0
-        client_index = self._choose_client_index(logical_stage_id, req_state)
         req_state.stage_submit_ts[logical_stage_id] = _time.time()
 
-        # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest
-        # (pre-processed by AsyncOmniEngine.add_request, output processor
-        # already registered there) - submit directly.
         request = prompt
-        stage_client = self.stage_clients[client_index]
-        if stage_client.stage_type == "diffusion":
+        stage0_pool = self.stage_pools[logical_stage_id]
+
+        # Diffusion: no output_processor on stage 0, just select + submit.
+        if stage0_pool.replicas[0].client.stage_type == "diffusion":
+            replica = stage0_pool.select_replica(req_state)
             if isinstance(prompt, list):
-                await stage_client.add_batch_request_async(
+                await replica.client.add_batch_request_async(
                     request_id,
                     prompt,
                     params,
                 )
             else:
-                await stage_client.add_request_async(request_id, prompt, params)
+                await replica.client.add_request_async(request_id, prompt, params)
         else:
-            await stage_client.add_request_async(request)
+            # LLM: atomically pick a replica and register on its output
+            # processor.  Registration must target the same replica that
+            # will serve the request or the raw outputs come back to a
+            # processor that has never seen the req_id.
+            output_prompt_text = msg.get("output_prompt_text")
+            replica = stage0_pool.admit(req_state, request, output_prompt_text)
+            try:
+                await replica.client.add_request_async(request)
+            except Exception:
+                # Roll back the processor registration so we don't leak a
+                # half-admitted request on a failed submit.
+                try:
+                    replica.output_processor.abort_requests([request_id], internal=False)
+                except Exception:
+                    logger.exception(
+                        "[Orchestrator] Failed to roll back output_processor registration "
+                        "for req=%s after submit failure",
+                        request_id,
+                    )
+                self.request_states.pop(request_id, None)
+                raise
 
         if self.async_chunk and logical_stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
@@ -1003,10 +1021,11 @@ class Orchestrator:
         self.request_states[companion_id] = companion_state
 
         # CFG companions must land on the same stage-0 replica as their
-        # parent so the diffusion stage can fetch both KV caches from a
-        # single device.  Pass affinity_from explicitly; if the parent is
-        # already gone (aborted between add_request and add_companion) fall
-        # back to round-robin rather than failing the companion.
+        # parent so (a) the diffusion stage can fetch both KV caches from
+        # one device and (b) the output_processor that gets the companion's
+        # raw outputs is the same one that admit() registered it against.
+        # Pass affinity_from explicitly; if the parent is already gone
+        # (aborted between add_request and add_companion) fall back to RR.
         stage0_pool = self.stage_pools[0]
         parent_state = self.request_states.get(parent_id)
         parent_replica: StageReplica | None = None
@@ -1015,15 +1034,33 @@ class Orchestrator:
             if parent_flat is not None:
                 parent_replica = stage0_pool.get_replica_by_flat_index(parent_flat)
 
-        companion_replica = stage0_pool.select_replica(
-            companion_state,
-            affinity_from=parent_replica,
-        )
-
         companion_state.stage_submit_ts[0] = _time.time()
 
         request = companion_prompt  # Already a processed OmniEngineCoreRequest
-        await companion_replica.client.add_request_async(request)
+        companion_prompt_text = msg.get("companion_prompt_text")
+        companion_replica = stage0_pool.admit(
+            companion_state,
+            request,
+            companion_prompt_text,
+            affinity_from=parent_replica,
+        )
+        try:
+            await companion_replica.client.add_request_async(request)
+        except Exception:
+            try:
+                companion_replica.output_processor.abort_requests([companion_id], internal=False)
+            except Exception:
+                logger.exception(
+                    "[Orchestrator] Failed to roll back companion registration for %s",
+                    companion_id,
+                )
+            # Undo companion tracking so parent can proceed (parent may still
+            # succeed without this companion — expected in CFG fallback mode).
+            self.request_states.pop(companion_id, None)
+            self._companion_ids.discard(companion_id)
+            self._companion_to_parent.pop(companion_id, None)
+            self._companion_map.get(parent_id, {}).pop(role, None)
+            raise
 
         logger.info(
             "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, stage-0 replica-%s)",

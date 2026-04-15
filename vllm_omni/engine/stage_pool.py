@@ -90,6 +90,33 @@ class StagePool:
         req_state.chosen_client_index[self.logical_stage_id] = chosen.flat_index
         return chosen
 
+    def admit(
+        self,
+        req_state: OrchestratorRequestState,
+        request: Any,
+        prompt_text: Any,
+        *,
+        affinity_from: StageReplica | None = None,
+    ) -> StageReplica:
+        """Select a replica and register *request* on its output_processor.
+
+        Atomically couples replica selection with output_processor registration
+        so that "which replica will serve this request" and "which processor
+        knows about this request" are the same by construction.  Call sites
+        must follow up with ``replica.client.add_request_async(request)`` and
+        on submission failure call ``replica.output_processor.abort_requests
+        ([request.request_id], internal=False)`` to roll back the registration.
+        """
+        replica = self.select_replica(req_state, affinity_from=affinity_from)
+        replica.output_processor.add_request(
+            request=request,
+            prompt=prompt_text,
+            parent_req=None,
+            request_index=0,
+            queue=None,
+        )
+        return replica
+
 
 def build_stage_pools(
     stage_clients: list[Any],

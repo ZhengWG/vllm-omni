@@ -1146,6 +1146,11 @@ class AsyncOmniEngine:
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
+        # Text forwarded to the stage-0 output processor at registration time.
+        # Populated only on the LLM path below; for diffusion / pre-built
+        # EngineCoreRequest paths it stays None (the orchestrator's admit()
+        # still works — prompt text is optional on add_request).
+        output_prompt_text: Any = None
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
             if isinstance(prompt, dict):
@@ -1184,17 +1189,15 @@ class AsyncOmniEngine:
             request.external_req_id = request_id
             request = _apply_omni_final_stage_metadata(request, final_stage_id)
 
-            # Register with stage 0's output processor.
+            # Registration with stage 0's output processor is deferred to the
+            # orchestrator thread (see Orchestrator._handle_add_request).  The
+            # orchestrator must know which replica it picked via select_replica
+            # before it can register on the correct per-replica processor; a
+            # hardcoded ``output_processors[0]`` here would misalign for any
+            # stage-0 request routed to replica > 0.
             output_prompt_text = prompt_text
             if output_prompt_text is None and isinstance(original_prompt, dict):
                 output_prompt_text = original_prompt.get("prompt")
-            self.output_processors[0].add_request(
-                request=request,
-                prompt=output_prompt_text,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
             prompt = request
 
         return {
@@ -1202,6 +1205,7 @@ class AsyncOmniEngine:
             "request_id": request_id,
             "prompt": prompt,
             "original_prompt": original_prompt,
+            "output_prompt_text": output_prompt_text,
             "sampling_params_list": effective_sampling_params_list,
             "final_stage_id": final_stage_id,
         }
@@ -1241,14 +1245,10 @@ class AsyncOmniEngine:
             request = _upgrade_to_omni_request(request, companion_prompt)
             request.external_req_id = cid
 
-            self.output_processors[0].add_request(
-                request=request,
-                prompt=companion_prompt,
-                parent_req=None,
-                request_index=0,
-                queue=None,
-            )
-
+            # Registration of this companion on stage-0's output processor
+            # is deferred to Orchestrator._handle_add_companion, which calls
+            # stage_pools[0].admit(..., affinity_from=parent_replica) so that
+            # select + register + submit all land on the same replica.
             self.request_queue.sync_q.put_nowait(
                 {
                     "type": "add_companion_request",
@@ -1256,6 +1256,7 @@ class AsyncOmniEngine:
                     "parent_id": parent_id,
                     "role": ep.role,
                     "prompt": request,
+                    "companion_prompt_text": companion_prompt,
                     "sampling_params_list": companion_spl,
                 }
             )
