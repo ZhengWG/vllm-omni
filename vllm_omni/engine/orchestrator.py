@@ -28,7 +28,7 @@ from vllm_omni.engine import (
     OmniEngineCoreRequest,
 )
 from vllm_omni.engine.serialization import serialize_additional_information
-from vllm_omni.engine.stage_pool import StagePool, StageReplica, build_stage_pools
+from vllm_omni.engine.stage_pool import StagePool, StageReplica
 from vllm_omni.metrics.stats import StageRequestStats as StageRequestMetrics
 from vllm_omni.metrics.stats import StageStats
 from vllm_omni.metrics.utils import count_tokens_from_outputs
@@ -94,6 +94,15 @@ def build_engine_core_request_from_tokens(
 
 
 @dataclass
+class _ReplicaMetrics:
+    """Per-replica metrics accumulators owned by Orchestrator (not StagePool)."""
+
+    batch_seq: int = 0
+    agg_total_tokens: int = 0
+    agg_total_gen_time_ms: float = 0.0
+
+
+@dataclass
 class OrchestratorRequestState:
     """Per-request bookkeeping inside the Orchestrator."""
 
@@ -105,10 +114,12 @@ class OrchestratorRequestState:
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
 
-    # Multi-replica: maps logical_stage_id -> client_index chosen for this
+    # Multi-replica: maps logical_stage_id -> StageReplica chosen for this
     # request.  Ensures the same request always hits the same replica within
-    # a given logical stage (KV / intermediate-state affinity).
-    chosen_client_index: dict[int, int] = field(default_factory=dict)
+    # a given logical stage (KV / intermediate-state affinity + processor
+    # alignment).  Stored as an object handle, not an int, so pool internals
+    # (flat index / replica index) stay encapsulated.
+    chosen_replica: dict[int, StageReplica] = field(default_factory=dict)
 
 
 class Orchestrator:
@@ -123,54 +134,19 @@ class Orchestrator:
         request_async_queue: janus.AsyncQueue[dict[str, Any]],
         output_async_queue: janus.AsyncQueue[dict[str, Any]],
         rpc_async_queue: janus.AsyncQueue[dict[str, Any]],
-        stage_clients: list[Any],
-        output_processors: list[Any],
-        stage_vllm_configs: list[Any],
+        stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
-        logical_stage_to_clients: list[list[int]] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
         self.rpc_async_queue = rpc_async_queue
 
-        self.num_clients = len(stage_clients)
         self.async_chunk = bool(async_chunk)
 
-        # Flat-list view: retained as a compatibility layer so existing call
-        # sites that index by flat client_index (metrics, shutdown, collective
-        # RPC fan-out, etc.) keep working.  StagePool below is the canonical
-        # path for replica selection and should be preferred in new code.
-        # TODO(stage-pool): migrate remaining flat-list readers onto
-        # self.stage_pools and drop these attributes.
-        self.stage_clients: list[Any] = stage_clients
-        self.output_processors: list[Any] = output_processors
-        self.stage_vllm_configs: list[Any] = stage_vllm_configs
+        self.num_logical_stages = len(stage_pools)
 
-        # Multi-replica mapping: logical_stage_id -> list of client indices.
-        # When not provided (single-replica), default to identity mapping.
-        if logical_stage_to_clients is not None:
-            self.logical_stage_to_clients = logical_stage_to_clients
-        else:
-            self.logical_stage_to_clients = [[i] for i in range(self.num_clients)]
-        self.num_logical_stages = len(self.logical_stage_to_clients)
-
-        # Canonical per-logical-stage replica container.
-        self.stage_pools: list[StagePool] = build_stage_pools(
-            stage_clients,
-            output_processors,
-            stage_vllm_configs,
-            self.logical_stage_to_clients,
-        )
-
-        # Reverse mappings: client_index -> (logical_stage_id, replica_index).
-        # Kept for metrics/shutdown log lines that index by flat client_index.
-        self._client_to_logical: list[int] = [0] * self.num_clients
-        self._client_to_replica: list[int] = [0] * self.num_clients
-        for logical_id, client_indices in enumerate(self.logical_stage_to_clients):
-            for ri, ci in enumerate(client_indices):
-                self._client_to_logical[ci] = logical_id
-                self._client_to_replica[ci] = ri
+        self.stage_pools: list[StagePool] = stage_pools
 
         # Backward compat: num_stages now means num_logical_stages
         self.num_stages = self.num_logical_stages
@@ -185,32 +161,14 @@ class Orchestrator:
         self._companion_done: dict[str, set[str]] = {}
         self._deferred_parents: dict[str, dict[str, Any]] = {}
 
-        # Per-client metrics accumulators.
-        self._batch_seq: list[int] = [0] * self.num_clients
-        self._agg_total_tokens: list[int] = [0] * self.num_clients
-        self._agg_total_gen_time_ms: list[float] = [0.0] * self.num_clients
+        # Per-replica metrics accumulators (keyed by StageReplica identity).
+        self._replica_metrics: dict[StageReplica, _ReplicaMetrics] = {
+            replica: _ReplicaMetrics() for pool in self.stage_pools for replica in pool.replicas
+        }
 
         # Shutdown coordination
         self._shutdown_event = asyncio.Event()
         self._stages_shutdown = False
-
-    def _choose_client_index(
-        self,
-        logical_stage_id: int,
-        req_state: OrchestratorRequestState,
-    ) -> int:
-        """Pick a flat client_index for *logical_stage_id* via the stage pool.
-
-        Thin wrapper that delegates to ``StagePool.select_replica`` so the
-        flat-index-based call sites keep working.  New code should call the
-        pool directly when the StageReplica object itself is useful.
-        """
-        replica = self.stage_pools[logical_stage_id].select_replica(req_state)
-        return replica.flat_index
-
-    def _resolve_client_index(self, stage_id: int, replica_index: int = 0) -> int:
-        """Resolve (stage_id, replica_index) to a flat client index."""
-        return self.logical_stage_to_clients[stage_id][replica_index]
 
     async def run(self) -> None:
         """Main entry point for the Orchestrator event loop."""
@@ -295,25 +253,20 @@ class Orchestrator:
 
         Control flow: poll raw → process through output processor → route.
 
-        Multi-replica: iterates over every (stage_id, replica_index) pair,
-        resolves to a flat client_index internally for resource access.
+        Iterates every replica across all logical stages via stage_pools.
         """
         while not self._shutdown_event.is_set():
             idle = True
-            for stage_id in range(self.num_logical_stages):
-                for replica_index in range(len(self.logical_stage_to_clients[stage_id])):
+            for pool in self.stage_pools:
+                for replica in pool.replicas:
                     if self._shutdown_event.is_set():
                         return
 
-                    client_index = self._resolve_client_index(stage_id, replica_index)
+                    stage_id = replica.logical_stage_id
 
                     # 1) Diffusion stage: poll non-blocking queue
-                    # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
-                    # which is different from EngineCoreOutputs (LLM stages). We may want to unify
-                    # the output format in the future to simplify the processing logic in Orchestrator.
-                    stage_client = self.stage_clients[client_index]
-                    if stage_client.stage_type == "diffusion":
-                        output = stage_client.get_diffusion_output_nowait()
+                    if replica.client.stage_type == "diffusion":
+                        output = replica.client.get_diffusion_output_nowait()
                         if output is not None:
                             idle = False
                             req_state = self.request_states.get(output.request_id)
@@ -336,25 +289,23 @@ class Orchestrator:
                                     continue
 
                                 stage_metrics = self._build_stage_metrics(
-                                    stage_id,
+                                    replica,
                                     output.request_id,
                                     [output],
                                     req_state,
-                                    replica_index=replica_index,
                                 )
                                 await self._route_output(
-                                    stage_id,
+                                    replica,
                                     output,
                                     req_state,
                                     stage_metrics,
-                                    replica_index=replica_index,
                                 )
                         continue
 
                     # 1) Poll raw outputs from the stage replica
                     try:
                         raw_outputs = await asyncio.wait_for(
-                            self._poll_stage_raw(stage_id, replica_index=replica_index),
+                            self._poll_stage_raw(replica),
                             timeout=0.001,
                         )
                     except asyncio.TimeoutError:
@@ -367,7 +318,7 @@ class Orchestrator:
                         logger.exception(
                             "[Orchestrator] _poll_stage_raw failed for stage-%s replica-%s",
                             stage_id,
-                            replica_index,
+                            replica.replica_index,
                         )
                         raise
 
@@ -377,16 +328,14 @@ class Orchestrator:
 
                     # Handle prefill-finished KV-ready signals before finished outputs.
                     await self._handle_kv_ready_raw_outputs(
-                        stage_id,
+                        replica,
                         raw_outputs,
-                        replica_index=replica_index,
                     )
 
                     # 2) Process raw outputs through the output processor
                     request_outputs = await self._process_stage_outputs(
-                        stage_id,
+                        replica,
                         raw_outputs,
-                        replica_index=replica_index,
                     )
 
                     # 3) Route each processed output
@@ -398,25 +347,23 @@ class Orchestrator:
                                 "at stage-%s replica-%s (known reqs: %s)",
                                 output.request_id,
                                 stage_id,
-                                replica_index,
+                                replica.replica_index,
                                 list(self.request_states.keys()),
                             )
                             continue
                         stage_metrics = None
                         if output.finished:
                             stage_metrics = self._build_stage_metrics(
-                                stage_id,
+                                replica,
                                 output.request_id,
                                 [output],
                                 req_state,
-                                replica_index=replica_index,
                             )
                         await self._route_output(
-                            stage_id,
+                            replica,
                             output,
                             req_state,
                             stage_metrics,
-                            replica_index=replica_index,
                         )
 
             if idle:
@@ -426,24 +373,16 @@ class Orchestrator:
 
     async def _route_output(
         self,
-        stage_id: int,
+        replica: StageReplica,
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
-        *,
-        replica_index: int = 0,
     ) -> None:
-        """Route a processed output: send to main thread and/or forward to next stage.
-
-        Args:
-            stage_id: Logical stage id.
-            replica_index: Replica index within the logical stage.
-        """
-        client_index = self._resolve_client_index(stage_id, replica_index)
+        """Route a processed output: send to main thread and/or forward to next stage."""
+        stage_id = replica.logical_stage_id
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
-        stage_client = self.stage_clients[client_index]
 
         # CFG companion handling: companions don't produce user-visible output
         # and don't forward to the next stage directly.
@@ -452,7 +391,7 @@ class Orchestrator:
             self.request_states.pop(req_id, None)
             return
 
-        if stage_client.final_output:
+        if replica.client.final_output:
             await self.output_async_queue.put(
                 {
                     "type": "output",
@@ -485,15 +424,14 @@ class Orchestrator:
                 self._deferred_parents[req_id] = {
                     "stage_id": stage_id,
                     "output": output,
-                    "replica_index": replica_index,
+                    "replica": replica,
                 }
             else:
                 await self._forward_to_next_stage(
                     req_id,
-                    stage_id,
+                    replica,
                     output,
                     req_state,
-                    replica_index=replica_index,
                 )
 
         if finished and stage_id == req_state.final_stage_id:
@@ -535,22 +473,20 @@ class Orchestrator:
             if parent_state is not None and not self._next_stage_already_submitted(deferred["stage_id"], parent_state):
                 await self._forward_to_next_stage(
                     parent_id,
-                    deferred["stage_id"],
+                    deferred["replica"],
                     deferred["output"],
                     parent_state,
-                    replica_index=deferred.get("replica_index", 0),
                 )
 
     async def _handle_kv_ready_raw_outputs(
         self,
-        stage_id: int,
+        replica: StageReplica,
         raw_outputs: EngineCoreOutputs,
-        *,
-        replica_index: int = 0,
     ) -> None:
         """Forward split requests once stage-0 KV is ready, not only when decode fully finishes."""
         if self.async_chunk:
             return
+        stage_id = replica.logical_stage_id
         for raw_output in raw_outputs.outputs:
             kv_params = getattr(raw_output, "kv_transfer_params", None)
             if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
@@ -570,32 +506,29 @@ class Orchestrator:
                 self._deferred_parents[req_id] = {
                     "stage_id": stage_id,
                     "output": raw_output,
-                    "replica_index": replica_index,
+                    "replica": replica,
                 }
             else:
                 await self._forward_to_next_stage(
                     req_id,
-                    stage_id,
+                    replica,
                     raw_output,
                     req_state,
-                    replica_index=replica_index,
                 )
 
     def _build_stage_metrics(
         self,
-        stage_id: int,
+        replica: StageReplica,
         req_id: str,
         request_outputs: list[RequestOutput],
         req_state: OrchestratorRequestState,
-        *,
-        replica_index: int = 0,
     ) -> StageRequestMetrics:
         """Build StageRequestMetrics for a finished request at a stage replica.
 
         Reuses StageRequestMetrics so OrchestratorMetrics and downstream
         metric handlers can consume a stable schema.
         """
-        client_index = self._resolve_client_index(stage_id, replica_index)
+        stage_id = replica.logical_stage_id
         now = _time.time()
         submit_ts = req_state.stage_submit_ts.get(stage_id, now)
         stage_gen_time_ms = (now - submit_ts) * 1000.0
@@ -608,13 +541,14 @@ class Orchestrator:
                 if ptids is not None:
                     num_tokens_in += len(ptids)
 
-        # Monotonic batch counter per client.
-        self._batch_seq[client_index] += 1
-        batch_id = self._batch_seq[client_index]
+        # Monotonic batch counter per replica.
+        metrics = self._replica_metrics[replica]
+        metrics.batch_seq += 1
+        batch_id = metrics.batch_seq
 
         # Accumulate for running-average stage_stats
-        self._agg_total_tokens[client_index] += num_tokens_out
-        self._agg_total_gen_time_ms[client_index] += stage_gen_time_ms
+        metrics.agg_total_tokens += num_tokens_out
+        metrics.agg_total_gen_time_ms += stage_gen_time_ms
 
         return StageRequestMetrics(
             num_tokens_in=num_tokens_in,
@@ -626,8 +560,8 @@ class Orchestrator:
             rx_transfer_bytes=0,
             rx_in_flight_time_ms=0.0,
             stage_stats=StageStats(
-                total_token=self._agg_total_tokens[client_index],
-                total_gen_time_ms=self._agg_total_gen_time_ms[client_index],
+                total_token=metrics.agg_total_tokens,
+                total_gen_time_ms=metrics.agg_total_gen_time_ms,
             ),
         )
 
@@ -638,7 +572,7 @@ class Orchestrator:
             if sender_stage_id < 0 or sender_stage_id >= self.num_stages:
                 continue
 
-            sender_stage = self.stage_clients[sender_stage_id]
+            sender_stage = self.stage_pools[sender_stage_id].replicas[0].client
             get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
             if not callable(get_sender_info):
                 continue
@@ -655,37 +589,41 @@ class Orchestrator:
 
         return sender_infos or None
 
+    def _stage_client_list_for_legacy(self) -> list[Any]:
+        """First-replica client per logical stage.
+
+        Legacy helper for ``process_engine_inputs`` and
+        ``custom_process_input_func`` which expect a flat list indexed by
+        logical stage id.  Will be removed once those interfaces are
+        refactored to accept StagePool directly.
+        """
+        return [pool.replicas[0].client for pool in self.stage_pools]
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
-        stage_id: int,
+        replica: StageReplica,
         output: Any,
         req_state: OrchestratorRequestState,
-        *,
-        replica_index: int = 0,
     ) -> None:
         """Forward output from current stage to the next stage.
 
         Handles the full pipeline: set outputs on current stage, compute
         next-stage inputs, build lightweight requests, and submit them.
-
-        Args:
-            stage_id: Logical stage id that produced the output.
-            replica_index: Replica index of the stage that produced the output.
         """
-        client_index = self._resolve_client_index(stage_id, replica_index)
-
+        stage_id = replica.logical_stage_id
         next_logical = stage_id + 1
-        next_ci = self._choose_client_index(next_logical, req_state)
-        next_client = self.stage_clients[next_ci]
+        next_pool = self.stage_pools[next_logical]
+        next_replica = next_pool.select_replica(req_state)
         params = req_state.sampling_params_list[next_logical]
 
-        if next_client.stage_type == "diffusion":
-            self.stage_clients[client_index].set_engine_outputs([output])
-            if next_client.custom_process_input_func is not None:
-                diffusion_prompt = next_client.custom_process_input_func(
-                    self.stage_clients,
-                    next_client.engine_input_source,
+        if next_replica.client.stage_type == "diffusion":
+            replica.client.set_engine_outputs([output])
+            if next_replica.client.custom_process_input_func is not None:
+                stage_list = self._stage_client_list_for_legacy()
+                diffusion_prompt = next_replica.client.custom_process_input_func(
+                    stage_list,
+                    next_replica.client.engine_input_source,
                     req_state.prompt,
                     False,
                 )
@@ -709,17 +647,17 @@ class Orchestrator:
                         req_id,
                     )
 
-            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [stage_id])
+            source_stage_ids = list(getattr(next_replica.client, "engine_input_source", None) or [stage_id])
             kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
             if isinstance(diffusion_prompt, list):
-                await next_client.add_batch_request_async(
+                await next_replica.client.add_batch_request_async(
                     req_id,
                     diffusion_prompt,
                     params,
                     kv_sender_info=kv_sender_info,
                 )
             else:
-                await next_client.add_request_async(
+                await next_replica.client.add_request_async(
                     req_id,
                     diffusion_prompt,
                     params,
@@ -729,21 +667,22 @@ class Orchestrator:
             return
 
         # Set outputs on the client that actually produced them
-        self.stage_clients[client_index].set_engine_outputs([output])
+        replica.client.set_engine_outputs([output])
 
         # Process inputs for next stage
+        stage_list = self._stage_client_list_for_legacy()
         try:
-            next_inputs = next_client.process_engine_inputs(
-                stage_list=self.stage_clients,
+            next_inputs = next_replica.client.process_engine_inputs(
+                stage_list=stage_list,
                 prompt=req_state.prompt,
-                source_client=self.stage_clients[client_index],
+                source_client=replica.client,
             )
         except Exception:
             logger.exception(
                 "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s replica-%s",
                 req_id,
                 next_logical,
-                self._client_to_replica[next_ci],
+                next_replica.replica_index,
             )
             raise
 
@@ -753,13 +692,13 @@ class Orchestrator:
                 request_id=req_id,
                 prompt=next_input,
                 params=params,
-                model_config=self.stage_vllm_configs[next_ci].model_config,
+                model_config=next_replica.vllm_config.model_config,
             )
 
             # TODO: Here we directly use the req id to assign.
             request.external_req_id = request.request_id
 
-            self.output_processors[next_ci].add_request(
+            next_replica.output_processor.add_request(
                 request=request,
                 prompt=None,
                 parent_req=None,
@@ -767,41 +706,31 @@ class Orchestrator:
                 queue=None,
             )
 
-            await next_client.add_request_async(request)
+            await next_replica.client.add_request_async(request)
 
         # Record submit timestamp for the next logical stage
         req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _poll_stage_raw(
         self,
-        stage_id: int,
-        *,
-        replica_index: int = 0,
+        replica: StageReplica,
     ) -> EngineCoreOutputs | None:
-        """Pull raw EngineCoreOutputs from a stage replica without processing.
-
-        Returns the raw outputs object, or None when there is nothing
-        to consume.
-        """
-        client_index = self._resolve_client_index(stage_id, replica_index)
-        outputs = await self.stage_clients[client_index].get_output_async()
+        """Pull raw EngineCoreOutputs from a stage replica without processing."""
+        outputs = await replica.client.get_output_async()
         if not outputs.outputs:
             return None
         return outputs
 
     async def _process_stage_outputs(
         self,
-        stage_id: int,
+        replica: StageReplica,
         raw_outputs: EngineCoreOutputs,
-        *,
-        replica_index: int = 0,
     ) -> list[RequestOutput]:
         """Run the output processor on raw outputs, returning RequestOutputs.
 
         Also handles abort forwarding and scheduler stats updates.
         """
-        client_index = self._resolve_client_index(stage_id, replica_index)
-        processor = self.output_processors[client_index]
+        processor = replica.output_processor
 
         processed = processor.process_outputs(
             raw_outputs.outputs,
@@ -810,7 +739,7 @@ class Orchestrator:
         )
 
         if processed.reqs_to_abort:
-            await self.stage_clients[client_index].abort_requests_async(processed.reqs_to_abort)
+            await replica.client.abort_requests_async(processed.reqs_to_abort)
 
         if raw_outputs.scheduler_stats is not None:
             processor.update_scheduler_stats(raw_outputs.scheduler_stats)
@@ -914,12 +843,15 @@ class Orchestrator:
             req_state.sampling_params_list = msg["sampling_params_list"]
 
         req_state.stage_submit_ts[stage_id] = _time.time()
-        stage_client = self.stage_clients[stage_id]
-        if stage_client.stage_type == "diffusion":
+        # Streaming updates re-use the already-chosen replica from initial submit.
+        replica = req_state.chosen_replica.get(stage_id)
+        if replica is None:
+            replica = self.stage_pools[stage_id].select_replica(req_state)
+        if replica.client.stage_type == "diffusion":
             params = req_state.sampling_params_list[stage_id]
-            await stage_client.add_request_async(request_id, request, params)
+            await replica.client.add_request_async(request_id, request, params)
         else:
-            await stage_client.add_request_async(request)
+            await replica.client.add_request_async(request)
 
     async def _prewarm_async_chunk_stages(
         self,
@@ -933,8 +865,8 @@ class Orchestrator:
         so downstream stages should be armed once at request start instead of waiting
         for stage-finished forwarding.
 
-        Multi-replica: uses _choose_client_index so the prewarm targets align
-        with the orchestration-face chosen replicas.
+        Multi-replica: uses stage_pools[].select_replica so the prewarm
+        targets align with the orchestration-face chosen replicas.
         """
         if req_state.final_stage_id <= 0:
             return
@@ -962,14 +894,13 @@ class Orchestrator:
         base_input["mm_processor_kwargs"] = None
 
         for next_logical in range(1, req_state.final_stage_id + 1):
-            next_ci = self._choose_client_index(next_logical, req_state)
-            next_client = self.stage_clients[next_ci]
+            next_replica = self.stage_pools[next_logical].select_replica(req_state)
             params = req_state.sampling_params_list[next_logical]
 
-            if next_client.stage_type == "diffusion":
-                source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [next_logical - 1])
+            if next_replica.client.stage_type == "diffusion":
+                source_stage_ids = list(getattr(next_replica.client, "engine_input_source", None) or [next_logical - 1])
                 kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
-                await next_client.add_request_async(
+                await next_replica.client.add_request_async(
                     request_id,
                     req_state.prompt,
                     params,
@@ -982,18 +913,18 @@ class Orchestrator:
                 request_id=request_id,
                 prompt=base_input,
                 params=params,
-                model_config=self.stage_vllm_configs[next_ci].model_config,
+                model_config=next_replica.vllm_config.model_config,
             )
             request.external_req_id = request.request_id
 
-            self.output_processors[next_ci].add_request(
+            next_replica.output_processor.add_request(
                 request=request,
                 prompt=None,
                 parent_req=None,
                 request_index=0,
                 queue=None,
             )
-            await next_client.add_request_async(request)
+            await next_replica.client.add_request_async(request)
             req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
@@ -1030,9 +961,7 @@ class Orchestrator:
         parent_state = self.request_states.get(parent_id)
         parent_replica: StageReplica | None = None
         if parent_state is not None:
-            parent_flat = parent_state.chosen_client_index.get(0)
-            if parent_flat is not None:
-                parent_replica = stage0_pool.get_replica_by_flat_index(parent_flat)
+            parent_replica = parent_state.chosen_replica.get(0)
 
         companion_state.stage_submit_ts[0] = _time.time()
 
@@ -1086,8 +1015,9 @@ class Orchestrator:
             self._deferred_parents.pop(req_id, None)
 
         all_ids_to_abort = list(request_ids) + companion_ids_to_abort
-        for ci in range(self.num_clients):
-            await self.stage_clients[ci].abort_requests_async(all_ids_to_abort)
+        for pool in self.stage_pools:
+            for replica in pool.replicas:
+                await replica.client.abort_requests_async(all_ids_to_abort)
         for req_id in request_ids:
             self.request_states.pop(req_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
@@ -1105,34 +1035,25 @@ class Orchestrator:
         args = tuple(msg.get("args", ()))
         kwargs = dict(msg.get("kwargs") or {})
         requested_stage_ids = msg.get("stage_ids")
-        # When stage_ids are provided they refer to logical stages; expand
-        # to all client indices belonging to those logical stages.
+
+        # Collect the replicas to target.
+        target_replicas: list[StageReplica] = []
         if requested_stage_ids is None:
-            stage_ids = list(range(self.num_clients))
+            for pool in self.stage_pools:
+                target_replicas.extend(pool.replicas)
         else:
-            stage_ids = []
             for lid in requested_stage_ids:
                 if 0 <= lid < self.num_logical_stages:
-                    stage_ids.extend(self.logical_stage_to_clients[lid])
-                else:
-                    stage_ids.append(lid)  # keep invalid id for error reporting
+                    target_replicas.extend(self.stage_pools[lid].replicas)
+                # else: silently skip invalid stage ids
 
         results: list[Any] = []
-        for stage_id in stage_ids:
-            if stage_id < 0 or stage_id >= self.num_clients:
-                results.append(
-                    {
-                        "supported": False,
-                        "todo": True,
-                        "error": f"Invalid client index {stage_id}",
-                    }
-                )
-                continue
-
-            stage_client = self.stage_clients[stage_id]
+        stage_ids: list[int] = []
+        for replica in target_replicas:
+            stage_ids.append(replica.logical_stage_id)
             try:
-                if hasattr(stage_client, "collective_rpc_async"):
-                    stage_result = await stage_client.collective_rpc_async(
+                if hasattr(replica.client, "collective_rpc_async"):
+                    stage_result = await replica.client.collective_rpc_async(
                         method=method,
                         timeout=timeout,
                         args=args,
@@ -1142,12 +1063,13 @@ class Orchestrator:
                     stage_result = {
                         "supported": False,
                         "todo": True,
-                        "reason": (f"{stage_client.__class__.__name__}.collective_rpc_async is not implemented yet"),
+                        "reason": (f"{replica.client.__class__.__name__}.collective_rpc_async is not implemented yet"),
                     }
             except Exception as exc:
                 logger.exception(
-                    "[Orchestrator] collective_rpc failed: stage=%s method=%s",
-                    stage_id,
+                    "[Orchestrator] collective_rpc failed: stage=%s replica=%s method=%s",
+                    replica.logical_stage_id,
+                    replica.replica_index,
                     method,
                 )
                 stage_result = {
@@ -1173,19 +1095,21 @@ class Orchestrator:
             return
 
         self._stages_shutdown = True
-        logger.info("[Orchestrator] Shutting down all %d client(s)", self.num_clients)
-        for ci, stage_client in enumerate(self.stage_clients):
-            try:
-                stage_client.shutdown()
-                logger.info(
-                    "[Orchestrator] Stage %d replica %d shut down",
-                    self._client_to_logical[ci],
-                    self._client_to_replica[ci],
-                )
-            except Exception as e:
-                logger.warning(
-                    "[Orchestrator] Failed to shutdown stage %d replica %d: %s",
-                    self._client_to_logical[ci],
-                    self._client_to_replica[ci],
-                    e,
-                )
+        total = sum(pool.num_replicas for pool in self.stage_pools)
+        logger.info("[Orchestrator] Shutting down all %d client(s)", total)
+        for pool in self.stage_pools:
+            for replica in pool.replicas:
+                try:
+                    replica.client.shutdown()
+                    logger.info(
+                        "[Orchestrator] Stage %d replica %d shut down",
+                        replica.logical_stage_id,
+                        replica.replica_index,
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "[Orchestrator] Failed to shutdown stage %d replica %d: %s",
+                        replica.logical_stage_id,
+                        replica.replica_index,
+                        e,
+                    )

@@ -81,6 +81,7 @@ from vllm_omni.engine.stage_init_utils import (
     split_devices_for_replicas,
     terminate_alive_proc,
 )
+from vllm_omni.engine.stage_pool import build_stage_pools
 from vllm_omni.entrypoints.utils import load_and_resolve_stage_configs
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
@@ -1071,11 +1072,13 @@ class AsyncOmniEngine:
                 request_async_queue=self.request_queue.async_q,
                 output_async_queue=self.output_queue.async_q,
                 rpc_async_queue=self.rpc_output_queue.async_q,
+                stage_pools=build_stage_pools(
+                    self.stage_clients,
+                    self.output_processors,
+                    self.stage_vllm_configs,
+                    self.logical_stage_to_clients,
+                ),
                 async_chunk=self.async_chunk,
-                stage_clients=self.stage_clients,
-                output_processors=self.output_processors,
-                stage_vllm_configs=self.stage_vllm_configs,
-                logical_stage_to_clients=self.logical_stage_to_clients,
             )
             if not startup_future.done():
                 startup_future.set_result(asyncio.get_running_loop())

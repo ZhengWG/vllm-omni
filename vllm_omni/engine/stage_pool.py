@@ -15,18 +15,17 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 
-@dataclass
+@dataclass(eq=False)
 class StageReplica:
     """One replica of a logical stage.
 
-    flat_index is the index into Orchestrator's flat stage_clients list; it
-    is the value cached in OrchestratorRequestState.chosen_client_index so
-    existing call sites that resolve a flat client keep working unchanged.
+    ``eq=False`` keeps identity-based equality/hash so StageReplica instances
+    can be used as dict keys (Orchestrator caches them on req_state and in
+    per-replica metrics accumulators).
     """
 
     logical_stage_id: int
     replica_index: int
-    flat_index: int
     client: Any
     output_processor: Any
     vllm_config: Any
@@ -47,14 +46,10 @@ class StagePool:
         self.stage_type = stage_type
         self.replicas: list[StageReplica] = replicas
         self._rr_cursor = 0
-        self._by_flat_index: dict[int, StageReplica] = {r.flat_index: r for r in replicas}
 
     @property
     def num_replicas(self) -> int:
         return len(self.replicas)
-
-    def get_replica_by_flat_index(self, flat_index: int) -> StageReplica:
-        return self._by_flat_index[flat_index]
 
     def select_replica(
         self,
@@ -70,9 +65,9 @@ class StagePool:
              inheriting its parent's replica at stage 0).
           3. Round-robin across replicas.
         """
-        cached = req_state.chosen_client_index.get(self.logical_stage_id)
+        cached = req_state.chosen_replica.get(self.logical_stage_id)
         if cached is not None:
-            return self._by_flat_index[cached]
+            return cached
 
         if affinity_from is not None:
             if affinity_from.logical_stage_id != self.logical_stage_id:
@@ -87,7 +82,7 @@ class StagePool:
             chosen = self.replicas[self._rr_cursor % self.num_replicas]
             self._rr_cursor += 1
 
-        req_state.chosen_client_index[self.logical_stage_id] = chosen.flat_index
+        req_state.chosen_replica[self.logical_stage_id] = chosen
         return chosen
 
     def admit(
@@ -131,7 +126,6 @@ def build_stage_pools(
             StageReplica(
                 logical_stage_id=logical_id,
                 replica_index=ri,
-                flat_index=ci,
                 client=stage_clients[ci],
                 output_processor=output_processors[ci],
                 vllm_config=stage_vllm_configs[ci],
