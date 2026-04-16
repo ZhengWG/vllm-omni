@@ -257,10 +257,8 @@ class StageMetadata:
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
-    # Multi-replica fields: logical_stage_id is the original stage_id from
-    # the YAML config; replica_index distinguishes replicas of the same
-    # logical stage.  For single-replica stages these default to stage_id / 0.
-    logical_stage_id: int = -1
+    # Multi-replica: replica_index distinguishes replicas of the same stage.
+    # For single-replica stages this defaults to 0.
     replica_index: int = 0
 
 
@@ -339,7 +337,6 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
             model_stage=None,
             runtime_cfg=runtime_cfg,
             cfg_kv_collect_func=cfg_kv_collect_func,
-            logical_stage_id=stage_id,
         )
 
     model_stage = getattr(engine_args, "model_stage", None)
@@ -361,7 +358,6 @@ def extract_stage_metadata(stage_config: Any) -> StageMetadata:
         model_stage=model_stage,
         runtime_cfg=runtime_cfg,
         prompt_expand_func=prompt_expand_func,
-        logical_stage_id=stage_id,
     )
 
 
@@ -447,8 +443,8 @@ def compute_replica_layout(
         replicas_per_stage.append(max(1, num_replicas))
 
     replica_devices_map: dict[int, list[str]] = {}
-    for logical_id, stage_cfg in enumerate(stage_configs):
-        num_replicas = replicas_per_stage[logical_id]
+    for stage_id, stage_cfg in enumerate(stage_configs):
+        num_replicas = replicas_per_stage[stage_id]
         if num_replicas <= 1:
             continue
         runtime_cfg = getattr(stage_cfg, "runtime", {})
@@ -456,18 +452,18 @@ def compute_replica_layout(
             runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
         )
         tp_size = get_stage_tp_size(stage_cfg)
-        replica_devices_map[logical_id] = split_devices_for_replicas(
+        replica_devices_map[stage_id] = split_devices_for_replicas(
             devices_str,
             num_replicas,
             tp_size,
-            logical_id,
+            stage_id,
         )
         logger.info(
             "[stage_init] Stage %s: %d replicas, tp=%d, devices split: %s",
-            logical_id,
+            stage_id,
             num_replicas,
             tp_size,
-            replica_devices_map[logical_id],
+            replica_devices_map[stage_id],
         )
 
     total_llm_replicas = sum(

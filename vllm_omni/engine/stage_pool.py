@@ -28,7 +28,7 @@ class StageReplica:
     per-replica metrics accumulators).
     """
 
-    logical_stage_id: int
+    stage_id: int
     replica_index: int
     client: Any
     output_processor: Any
@@ -40,13 +40,13 @@ class StagePool:
 
     def __init__(
         self,
-        logical_stage_id: int,
+        stage_id: int,
         stage_type: str | None,
         replicas: list[StageReplica],
     ) -> None:
         if not replicas:
-            raise ValueError(f"StagePool for logical stage {logical_stage_id} has no replicas")
-        self.logical_stage_id = logical_stage_id
+            raise ValueError(f"StagePool for stage {stage_id} has no replicas")
+        self.stage_id = stage_id
         self.stage_type = stage_type
         self.replicas: list[StageReplica] = replicas
         self._next_replica_idx = 0
@@ -56,20 +56,20 @@ class StagePool:
     @classmethod
     def build_from_replicas(
         cls,
-        logical_stage_id: int,
+        stage_id: int,
         clients: Sequence[Any],
         output_processors: Sequence[Any],
         vllm_configs: Sequence[Any],
     ) -> StagePool:
         """Build a pool from parallel replica lists.
 
-        Each positional index corresponds to one replica of the same logical
+        Each positional index corresponds to one replica of the same
         stage.  The first replica's ``client.stage_type`` is used as the
         pool-level stage_type.
         """
         replicas = [
             StageReplica(
-                logical_stage_id=logical_stage_id,
+                stage_id=stage_id,
                 replica_index=ri,
                 client=clients[ri],
                 output_processor=output_processors[ri],
@@ -78,12 +78,12 @@ class StagePool:
             for ri in range(len(clients))
         ]
         stage_type = getattr(clients[0], "stage_type", None) if clients else None
-        return cls(logical_stage_id, stage_type, replicas)
+        return cls(stage_id, stage_type, replicas)
 
     @classmethod
     def build_from_diffusion_client(
         cls,
-        logical_stage_id: int,
+        stage_id: int,
         client: Any,
     ) -> StagePool:
         """Build a single-replica pool for a diffusion stage.
@@ -92,13 +92,13 @@ class StagePool:
         orchestrator side.
         """
         replica = StageReplica(
-            logical_stage_id=logical_stage_id,
+            stage_id=stage_id,
             replica_index=0,
             client=client,
             output_processor=None,
             vllm_config=None,
         )
-        return cls(logical_stage_id, "diffusion", [replica])
+        return cls(stage_id, "diffusion", [replica])
 
     # ---- Selection / admission ----
 
@@ -120,15 +120,15 @@ class StagePool:
              inheriting its parent's replica at stage 0).
           3. Round-robin across replicas.
         """
-        cached = req_state.chosen_replica.get(self.logical_stage_id)
+        cached = req_state.chosen_replica.get(self.stage_id)
         if cached is not None:
             return cached
 
         if affinity_from is not None:
-            if affinity_from.logical_stage_id != self.logical_stage_id:
+            if affinity_from.stage_id != self.stage_id:
                 raise ValueError(
-                    f"affinity_from is for logical stage {affinity_from.logical_stage_id}, "
-                    f"cannot be used to select in stage {self.logical_stage_id}"
+                    f"affinity_from is for stage {affinity_from.stage_id}, "
+                    f"cannot be used to select in stage {self.stage_id}"
                 )
             chosen = affinity_from
         elif self.num_replicas == 1:
@@ -137,7 +137,7 @@ class StagePool:
             chosen = self.replicas[self._next_replica_idx]
             self._next_replica_idx = (self._next_replica_idx + 1) % self.num_replicas
 
-        req_state.chosen_replica[self.logical_stage_id] = chosen
+        req_state.chosen_replica[self.stage_id] = chosen
         return chosen
 
     def admit(

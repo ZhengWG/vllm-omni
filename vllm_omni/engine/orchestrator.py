@@ -114,10 +114,9 @@ class OrchestratorRequestState:
     # Metrics: timestamp when request was submitted to each stage
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
 
-    # Multi-replica: maps logical_stage_id -> StageReplica chosen for this
-    # request.  Ensures the same request always hits the same replica within
-    # a given logical stage (KV / intermediate-state affinity + processor
-    # alignment).
+    # Multi-replica: maps stage_id -> StageReplica chosen for this request.
+    # Ensures the same request always hits the same replica within a given
+    # stage (KV / intermediate-state affinity + processor alignment).
     chosen_replica: dict[int, StageReplica] = field(default_factory=dict)
 
 
@@ -250,7 +249,7 @@ class Orchestrator:
                     if self._shutdown_event.is_set():
                         return
 
-                    stage_id = stage_replica.logical_stage_id
+                    stage_id = stage_replica.stage_id
 
                     # 1) Diffusion stage: poll non-blocking queue
                     # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
@@ -370,7 +369,7 @@ class Orchestrator:
         stage_metrics: Any,
     ) -> None:
         """Route a processed output: send to main thread and/or forward to next stage."""
-        stage_id = stage_replica.logical_stage_id
+        stage_id = stage_replica.stage_id
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
@@ -477,7 +476,7 @@ class Orchestrator:
         """Forward split requests once stage-0 KV is ready, not only when decode fully finishes."""
         if self.async_chunk:
             return
-        stage_id = stage_replica.logical_stage_id
+        stage_id = stage_replica.stage_id
         for raw_output in raw_outputs.outputs:
             kv_params = getattr(raw_output, "kv_transfer_params", None)
             if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
@@ -519,7 +518,7 @@ class Orchestrator:
         Reuses StageRequestMetrics so OrchestratorMetrics and downstream
         metric handlers can consume a stable schema.
         """
-        stage_id = stage_replica.logical_stage_id
+        stage_id = stage_replica.stage_id
         now = _time.time()
         submit_ts = req_state.stage_submit_ts.get(stage_id, now)
         stage_gen_time_ms = (now - submit_ts) * 1000.0
@@ -602,7 +601,7 @@ class Orchestrator:
         Handles the full pipeline: set outputs on current stage, compute
         next-stage inputs, build lightweight requests, and submit them.
         """
-        stage_id = stage_replica.logical_stage_id
+        stage_id = stage_replica.stage_id
         next_logical = stage_id + 1
         next_pool = self.stage_pools[next_logical]
         next_replica = next_pool.select_replica(req_state)
@@ -1011,7 +1010,7 @@ class Orchestrator:
         results: list[Any] = []
         stage_ids: list[int] = []
         for stage_replica in target_replicas:
-            stage_ids.append(stage_replica.logical_stage_id)
+            stage_ids.append(stage_replica.stage_id)
             try:
                 if hasattr(stage_replica.client, "collective_rpc_async"):
                     stage_result = await stage_replica.client.collective_rpc_async(
@@ -1031,7 +1030,7 @@ class Orchestrator:
             except Exception as exc:
                 logger.exception(
                     "[Orchestrator] collective_rpc failed: stage=%s replica=%s method=%s",
-                    stage_replica.logical_stage_id,
+                    stage_replica.stage_id,
                     stage_replica.replica_index,
                     method,
                 )
@@ -1066,13 +1065,13 @@ class Orchestrator:
                     stage_replica.client.shutdown()
                     logger.info(
                         "[Orchestrator] Stage %d replica %d shut down",
-                        stage_replica.logical_stage_id,
+                        stage_replica.stage_id,
                         stage_replica.replica_index,
                     )
                 except Exception as e:
                     logger.warning(
                         "[Orchestrator] Failed to shutdown stage %d replica %d: %s",
-                        stage_replica.logical_stage_id,
+                        stage_replica.stage_id,
                         stage_replica.replica_index,
                         e,
                     )
