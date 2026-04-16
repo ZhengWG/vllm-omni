@@ -425,6 +425,57 @@ def get_stage_tp_size(stage_cfg: Any) -> int:
     return int(getattr(engine_args, "tensor_parallel_size", 1) or 1)
 
 
+def compute_replica_layout(
+    stage_configs: Sequence[Any],
+) -> tuple[list[int], dict[int, list[str]], int]:
+    """Compute per-stage replica counts and device assignments.
+
+    Returns:
+        replicas_per_stage: num_replicas per logical stage.
+        replica_devices_map: stage_idx -> per-replica device strings
+            (only for stages with num_replicas > 1).
+        total_llm_replicas: total LLM replica count across all stages.
+    """
+    replicas_per_stage: list[int] = []
+    for stage_cfg in stage_configs:
+        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        num_replicas = int(
+            runtime_cfg.get("num_replicas", 1)
+            if hasattr(runtime_cfg, "get")
+            else getattr(runtime_cfg, "num_replicas", 1)
+        )
+        replicas_per_stage.append(max(1, num_replicas))
+
+    replica_devices_map: dict[int, list[str]] = {}
+    for logical_id, stage_cfg in enumerate(stage_configs):
+        num_replicas = replicas_per_stage[logical_id]
+        if num_replicas <= 1:
+            continue
+        runtime_cfg = getattr(stage_cfg, "runtime", {})
+        devices_str = (
+            runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else getattr(runtime_cfg, "devices", None)
+        )
+        tp_size = get_stage_tp_size(stage_cfg)
+        replica_devices_map[logical_id] = split_devices_for_replicas(
+            devices_str,
+            num_replicas,
+            tp_size,
+            logical_id,
+        )
+        logger.info(
+            "[stage_init] Stage %s: %d replicas, tp=%d, devices split: %s",
+            logical_id,
+            num_replicas,
+            tp_size,
+            replica_devices_map[logical_id],
+        )
+
+    total_llm_replicas = sum(
+        replicas_per_stage[i] for i, cfg in enumerate(stage_configs) if getattr(cfg, "stage_type", "llm") != "diffusion"
+    )
+    return replicas_per_stage, replica_devices_map, total_llm_replicas
+
+
 def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
     """Device mapping via set_stage_devices for a single stage."""
     physical_devices = set_stage_devices(

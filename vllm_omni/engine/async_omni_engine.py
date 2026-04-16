@@ -69,6 +69,7 @@ from vllm_omni.engine.stage_init_utils import (
     build_vllm_config,
     cleanup_failed_stage_initialization,
     close_started_llm_stage,
+    compute_replica_layout,
     extract_stage_metadata,
     finalize_initialized_stages,
     get_stage_connector_spec,
@@ -80,7 +81,7 @@ from vllm_omni.engine.stage_init_utils import (
     setup_stage_devices,
     terminate_alive_proc,
 )
-from vllm_omni.engine.stage_pool import StagePool, compute_replica_layout
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.entrypoints.utils import (
     inject_omni_kv_config,
     load_and_resolve_stage_configs,
