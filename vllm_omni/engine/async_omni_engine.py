@@ -806,17 +806,12 @@ class AsyncOmniEngine:
                     # a stage runs remotely (doesn't match the local filter)
                     # replica fan-out is delegated to the remote process, so
                     # we launch exactly one client future per such stage.
-                    # TODO(stage-pool): support remote multi-replica by looping
-                    # num_replicas times here (like the local branch below),
-                    # calling _create_remote_llm_stage(..., replica_index=ri)
-                    # for each. Requires OmniMasterServer protocol to support
-                    # per-replica addressing: (stage_id, replica_index).
-                    is_remote_llm_stage = (
+                    # TODO: support remote multi-replica with stage-pool
+                    if (
                         self.single_stage_mode
                         and self._single_stage_id_filter is not None
                         and configured_stage_id != self._single_stage_id_filter
-                    )
-                    if is_remote_llm_stage:
+                    ):
                         assert self._omni_master_server is not None
                         if num_replicas > 1:
                             logger.warning(
@@ -1083,10 +1078,6 @@ class AsyncOmniEngine:
         original_prompt = prompt
 
         stage_type = self.stage_metadata[0].get("stage_type")
-        # Text forwarded to the stage-0 output processor at registration time.
-        # Populated only on the LLM path below; for diffusion / pre-built
-        # EngineCoreRequest paths it stays None (the orchestrator's admit()
-        # still works — prompt text is optional on add_request).
         output_prompt_text: Any = None
         if stage_type != "diffusion" and not isinstance(prompt, EngineCoreRequest):
             # Inject global_request_id into the raw prompt.
@@ -1129,9 +1120,7 @@ class AsyncOmniEngine:
             # Registration with stage 0's output processor is deferred to the
             # orchestrator thread (see Orchestrator._handle_add_request).  The
             # orchestrator must know which replica it picked via select_replica
-            # before it can register on the correct per-replica processor; a
-            # hardcoded ``output_processors[0]`` here would misalign for any
-            # stage-0 request routed to replica > 0.
+            # before it can register on the correct per-replica processor.
             output_prompt_text = prompt_text
             if output_prompt_text is None and isinstance(original_prompt, dict):
                 output_prompt_text = original_prompt.get("prompt")

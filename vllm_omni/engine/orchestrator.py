@@ -117,8 +117,7 @@ class OrchestratorRequestState:
     # Multi-replica: maps logical_stage_id -> StageReplica chosen for this
     # request.  Ensures the same request always hits the same replica within
     # a given logical stage (KV / intermediate-state affinity + processor
-    # alignment).  Stored as an object handle, not an int, so pool internals
-    # (flat index / replica index) stay encapsulated.
+    # alignment).
     chosen_replica: dict[int, StageReplica] = field(default_factory=dict)
 
 
@@ -144,12 +143,8 @@ class Orchestrator:
 
         self.async_chunk = bool(async_chunk)
 
-        self.num_logical_stages = len(stage_pools)
-
+        self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
-
-        # Backward compat: num_stages now means num_logical_stages
-        self.num_stages = self.num_logical_stages
 
         # Per-request state
         self.request_states: dict[str, OrchestratorRequestState] = {}
@@ -210,14 +205,7 @@ class Orchestrator:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     async def _request_handler(self) -> None:
-        """Read messages from the main thread via request_async_queue.
-
-        TODO(stage-pool): the while loop below has no top-level try/except, so
-        any unhandled exception inside a _handle_* coroutine kills this task
-        and leaves the orchestrator unable to consume further messages.  Wrap
-        each dispatch in a per-message try/except so one bad request can't
-        wedge the whole engine.
-        """
+        """Read messages from the main thread via request_async_queue."""
         while True:
             msg = await self.request_async_queue.get()
             msg_type = msg.get("type")
@@ -265,6 +253,9 @@ class Orchestrator:
                     stage_id = stage_replica.logical_stage_id
 
                     # 1) Diffusion stage: poll non-blocking queue
+                    # TODO (Peiqi): the output of diffusion stage is OmniRequestOutput,
+                    # which is different from EngineCoreOutputs (LLM stages). We may want to unify
+                    # the output format in the future to simplify the processing logic in Orchestrator.
                     if stage_replica.client.stage_type == "diffusion":
                         output = stage_replica.client.get_diffusion_output_nowait()
                         if output is not None:
@@ -666,7 +657,6 @@ class Orchestrator:
             req_state.stage_submit_ts[next_logical] = _time.time()
             return
 
-        # Set outputs on the client that actually produced them
         stage_replica.client.set_engine_outputs([output])
 
         # Process inputs for next stage
@@ -748,7 +738,7 @@ class Orchestrator:
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
-        logical_stage_id = 0
+        stage_id = 0
         request_id = msg["request_id"]
         prompt = msg["prompt"]
         original_prompt = msg.get("original_prompt", prompt)
@@ -762,7 +752,7 @@ class Orchestrator:
             "[Orchestrator] _handle_add_request: stage=%s req=%s "
             "prompt_type=%s original_prompt_type=%s final_stage=%s "
             "num_sampling_params=%d",
-            logical_stage_id,
+            stage_id,
             request_id,
             type(prompt).__name__,
             type(original_prompt).__name__,
@@ -780,10 +770,10 @@ class Orchestrator:
         )
         self.request_states[request_id] = req_state
 
-        req_state.stage_submit_ts[logical_stage_id] = _time.time()
+        req_state.stage_submit_ts[stage_id] = _time.time()
 
         request = prompt
-        stage0_pool = self.stage_pools[logical_stage_id]
+        stage0_pool = self.stage_pools[stage_id]
 
         # Diffusion: no output_processor on stage 0, just select + submit.
         if stage0_pool.replicas[0].client.stage_type == "diffusion":
@@ -800,14 +790,11 @@ class Orchestrator:
             # LLM: atomically pick a stage replica and register on its
             # output processor so select + register + submit all target
             # the same replica.
-            # TODO(stage-pool): when _request_handler gets per-message error
-            # handling, add rollback here (abort_requests + state cleanup)
-            # so a failed submit releases resources without killing the loop.
             output_prompt_text = msg.get("output_prompt_text")
             stage_replica = stage0_pool.admit(req_state, request, output_prompt_text)
             await stage_replica.client.add_request_async(request)
 
-        if self.async_chunk and logical_stage_id == 0 and final_stage_id > 0:
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
             await self._prewarm_async_chunk_stages(request_id, request, req_state)
 
     async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
@@ -881,12 +868,14 @@ class Orchestrator:
         base_input["multi_modal_data"] = None
         base_input["mm_processor_kwargs"] = None
 
-        for next_logical in range(1, req_state.final_stage_id + 1):
-            next_replica = self.stage_pools[next_logical].select_replica(req_state)
-            params = req_state.sampling_params_list[next_logical]
+        for next_stage_id in range(1, req_state.final_stage_id + 1):
+            next_replica = self.stage_pools[next_stage_id].select_replica(req_state)
+            params = req_state.sampling_params_list[next_stage_id]
 
             if next_replica.client.stage_type == "diffusion":
-                source_stage_ids = list(getattr(next_replica.client, "engine_input_source", None) or [next_logical - 1])
+                source_stage_ids = list(
+                    getattr(next_replica.client, "engine_input_source", None) or [next_stage_id - 1]
+                )
                 kv_sender_info = self._build_kv_sender_info(sender_stage_ids=source_stage_ids)
                 await next_replica.client.add_request_async(
                     request_id,
@@ -894,7 +883,7 @@ class Orchestrator:
                     params,
                     kv_sender_info=kv_sender_info,
                 )
-                req_state.stage_submit_ts[next_logical] = _time.time()
+                req_state.stage_submit_ts[next_stage_id] = _time.time()
                 continue
 
             request = build_engine_core_request_from_tokens(
@@ -913,7 +902,7 @@ class Orchestrator:
                 queue=None,
             )
             await next_replica.client.add_request_async(request)
-            req_state.stage_submit_ts[next_logical] = _time.time()
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""
@@ -961,10 +950,6 @@ class Orchestrator:
             companion_prompt_text,
             affinity_from=parent_replica,
         )
-        # TODO(stage-pool): when _request_handler gets per-message error
-        # handling, add rollback here (abort_requests + companion state
-        # cleanup) so a failed submit releases resources without killing
-        # the orchestrator loop.
         await companion_replica.client.add_request_async(request)
 
         logger.info(
@@ -1019,9 +1004,9 @@ class Orchestrator:
                 target_replicas.extend(pool.replicas)
         else:
             for lid in requested_stage_ids:
-                if 0 <= lid < self.num_logical_stages:
+                if 0 <= lid < self.num_stages:
                     target_replicas.extend(self.stage_pools[lid].replicas)
-                # else: silently skip invalid stage ids
+                # TODO: currently silently skip invalid stage ids, need to add error handling here.
 
         results: list[Any] = []
         stage_ids: list[int] = []
