@@ -658,6 +658,10 @@ class AsyncOmniEngine:
           2. Launch all stage engine processes (parallel via ThreadPoolExecutor).
           3. Attach launched engines (parallel) and collect clients/processors.
           4. Build StagePool list and finalize stage metadata.
+
+        TODO(stage-pool): move per-stage launch + attach logic into a
+        StagePool.build_from_config() classmethod so this method only
+        iterates stage_configs, collects pools, and finalizes metadata.
         """
         device_control_env = current_omni_platform.device_control_env_var
         num_stages = self.num_stages
@@ -794,6 +798,11 @@ class AsyncOmniEngine:
                     # a stage runs remotely (doesn't match the local filter)
                     # replica fan-out is delegated to the remote process, so
                     # we launch exactly one client future per such stage.
+                    # TODO(stage-pool): support remote multi-replica by looping
+                    # num_replicas times here (like the local branch below),
+                    # calling _create_remote_llm_stage(..., replica_index=ri)
+                    # for each. Requires OmniMasterServer protocol to support
+                    # per-replica addressing: (stage_id, replica_index).
                     is_remote_llm_stage = (
                         self.single_stage_mode
                         and self._single_stage_id_filter is not None
@@ -913,10 +922,10 @@ class AsyncOmniEngine:
 
             for logical_id in range(num_stages):
                 if logical_id in diffusion_clients:
-                    stage_pools.append(StagePool.from_diffusion_client(logical_id, diffusion_clients[logical_id]))
+                    stage_pools.append(StagePool.build_from_diffusion_client(logical_id, diffusion_clients[logical_id]))
                 else:
                     stage_pools.append(
-                        StagePool.from_attach_results(
+                        StagePool.build_from_replicas(
                             logical_id,
                             clients=stage_attach_results[logical_id],
                             output_processors=stage_output_proc_results[logical_id],
@@ -955,6 +964,8 @@ class AsyncOmniEngine:
 
         # Derive flat views for external readers (entrypoints/async_omni.py).
         self.stage_clients = [sr.client for pool in stage_pools for sr in pool.replicas]
+        self.stage_vllm_configs = [sr.vllm_config for pool in stage_pools for sr in pool.replicas]
+        self.output_processors = [sr.output_processor for pool in stage_pools for sr in pool.replicas]
 
         # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()

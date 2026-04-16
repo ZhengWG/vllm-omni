@@ -54,7 +54,7 @@ class StagePool:
     # ---- Construction helpers ----
 
     @classmethod
-    def from_attach_results(
+    def build_from_replicas(
         cls,
         logical_stage_id: int,
         clients: Sequence[Any],
@@ -81,7 +81,7 @@ class StagePool:
         return cls(logical_stage_id, stage_type, replicas)
 
     @classmethod
-    def from_diffusion_client(
+    def build_from_diffusion_client(
         cls,
         logical_stage_id: int,
         client: Any,
