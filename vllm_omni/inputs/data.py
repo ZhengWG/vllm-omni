@@ -16,22 +16,7 @@ except ImportError:
 
 
 import torch
-from vllm.inputs import EmbedsPrompt, TextPrompt, TokensPrompt
-
-try:
-    from vllm.inputs import TokensInput  # type: ignore[attr-defined]
-except ImportError:
-    # Newer vllm releases dropped TokensInput in favor of the
-    # ``token_inputs(...)`` constructor. Fall back to a TypedDict shim so
-    # the rest of this module can still subclass it structurally.
-    from typing import TypedDict as _TypedDict
-
-    class TokensInput(_TypedDict, total=False):  # type: ignore[no-redef]
-        prompt_token_ids: list[int]
-        token_type_ids: list[int]
-        prompt: str
-        multi_modal_data: Any
-        mm_processor_kwargs: dict[str, Any]
+from vllm.inputs import EmbedsPrompt, TextPrompt, TokensInput, TokensPrompt
 
 
 class OmniTextPrompt(TextPrompt):

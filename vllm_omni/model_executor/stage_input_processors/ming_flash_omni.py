@@ -134,18 +134,19 @@ def thinker2imagegen(
             continue
 
         hidden = full_hidden[patch_mask].detach().contiguous()  # [N, H]
-        f = hidden.float()
-        logger.info(
-            "[thinker2imagegen] req %d: sliced %s dtype=%s "
-            "mean=%+.4f std=%.4f |x|/tok=%.3f (found %d <imagePatch> positions)",
-            i,
-            tuple(hidden.shape),
-            hidden.dtype,
-            f.mean().item(),
-            f.std().item(),
-            f.norm(dim=-1).mean().item(),
-            num_patches,
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            f = hidden.float()
+            logger.debug(
+                "[thinker2imagegen] req %d: sliced %s dtype=%s "
+                "mean=%+.4f std=%.4f |x|/tok=%.3f (found %d <imagePatch> positions)",
+                i,
+                tuple(hidden.shape),
+                hidden.dtype,
+                f.mean().item(),
+                f.std().item(),
+                f.norm(dim=-1).mean().item(),
+                num_patches,
+            )
 
         imagegen_inputs.append(
             {

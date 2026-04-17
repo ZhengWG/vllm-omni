@@ -6,6 +6,7 @@
 
 """Ming-flash-omni-2.0 Thinker stage implementation (multimodal understanding)."""
 
+import logging
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Annotated, Any
 
@@ -64,7 +65,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
+from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config, BailingMoeV2Config
 from vllm_omni.transformers_utils.processors.ming import (
     PLACEHOLDER_AUDIO_TOKEN_IN_TEXT,
     PLACEHOLDER_IMAGE_TOKEN_IN_TEXT,
@@ -101,18 +102,17 @@ class MingAudioInput(TensorSchema):
     ]
 
 
-_BAILING_MOE_V2_COMPAT_DEFAULTS: dict[str, int] = {
-    # Fields missing from the upstream Ming ``configuration_bailing_moe_v2.py``
-    # but referenced by vllm-omni thinker code. Values match the defaults in
-    # ``vllm_omni/transformers_utils/configs/ming_flash_omni.py::BailingMoeV2Config``.
-    # If Ming later publishes official values, the existing field takes
-    # precedence — we only set missing ones via ``hasattr`` check.
-    "image_end_token": 157159,
-    "video_end_token": 157161,
-    "audio_patch_token": 157168,
-    "audio_start_token": 157169,
-    "audio_end_token": 157170,
-}
+# Multimodal token-id fields that vllm-omni thinker code reads. Upstream
+# Ming's ``configuration_bailing_moe_v2.py`` (the dynamic trust_remote_code
+# copy) is missing some of them; fill from our canonical BailingMoeV2Config
+# defaults rather than duplicating literal IDs here.
+_BAILING_MOE_V2_COMPAT_FIELDS: tuple[str, ...] = (
+    "image_end_token",
+    "video_end_token",
+    "audio_patch_token",
+    "audio_start_token",
+    "audio_end_token",
+)
 
 
 def _augment_bailing_moe_v2_compat(cfg) -> None:
@@ -124,26 +124,21 @@ def _augment_bailing_moe_v2_compat(cfg) -> None:
     NOT the same as our registered ``vllm_omni.transformers_utils.configs.
     ming_flash_omni.BailingMoeV2Config`` — so its defaults do not apply.
 
-    Rather than scatter ``getattr(..., default)`` through the codebase, this
-    helper augments the dynamically loaded config object once by setting any
-    fields listed in ``_BAILING_MOE_V2_COMPAT_DEFAULTS`` that are not already
-    present. The helper is idempotent (runs without harm on repeated calls)
-    and is safe to apply to already-augmented configs.
-
-    The augmentation targets ``cfg.llm_config`` — the ``BailingMoeV2Config``
-    instance nested inside ``BailingMM2Config``.
+    This helper augments the dynamically loaded ``cfg.llm_config`` once by
+    copying values for ``_BAILING_MOE_V2_COMPAT_FIELDS`` from our canonical
+    config whenever the field is not already present. Idempotent.
     """
     llm_cfg = getattr(cfg, "llm_config", None)
     if llm_cfg is None:
         return
     if getattr(llm_cfg, "_vllm_omni_compat_augmented", False):
         return
+    canonical = BailingMoeV2Config()
     added: list[str] = []
-    for name, default in _BAILING_MOE_V2_COMPAT_DEFAULTS.items():
+    for name in _BAILING_MOE_V2_COMPAT_FIELDS:
         if not hasattr(llm_cfg, name):
-            setattr(llm_cfg, name, default)
+            setattr(llm_cfg, name, getattr(canonical, name))
             added.append(name)
-    # Mark so subsequent calls short-circuit.
     setattr(llm_cfg, "_vllm_omni_compat_augmented", True)
     if added:
         logger.info(
@@ -926,16 +921,17 @@ class MingFlashOmniThinkerForConditionalGeneration(
             return
 
         query_embeds = self.query_tokens_dict[scale_name].to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-        q = query_embeds.detach().float()
-        logger.info(
-            "[MingFlashOmniThinker] query_embeds[%s]: mean=%+.4f std=%.4f |x|/tok=%.3f",
-            scale_name,
-            q.mean().item(),
-            q.std().item(),
-            q.norm(dim=-1).mean().item(),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            q = query_embeds.detach().float()
+            logger.debug(
+                "[MingFlashOmniThinker] query_embeds[%s]: mean=%+.4f std=%.4f |x|/tok=%.3f",
+                scale_name,
+                q.mean().item(),
+                q.std().item(),
+                q.norm(dim=-1).mean().item(),
+            )
         inputs_embeds[patch_mask] = query_embeds
-        logger.info(
+        logger.debug(
             "[MingFlashOmniThinker] injected %d image-gen query embeddings at <imagePatch> positions (scale=%s)",
             num_patches,
             scale_name,
@@ -975,16 +971,17 @@ class MingFlashOmniThinkerForConditionalGeneration(
         if patch_mask.any():
             gen_hidden = hidden_states[patch_mask]  # [num_patch, hidden]
             multimodal_outputs["ming_imagegen_hidden_states"] = gen_hidden
-            g = gen_hidden.detach().float()
-            logger.info(
-                "[MingFlashOmniThinker] exported patch-token hidden_states "
-                "shape=%s dtype=%s mean=%+.4f std=%.4f |x|/tok=%.3f",
-                tuple(gen_hidden.shape),
-                gen_hidden.dtype,
-                g.mean().item(),
-                g.std().item(),
-                g.norm(dim=-1).mean().item(),
-            )
+            if logger.isEnabledFor(logging.DEBUG):
+                g = gen_hidden.detach().float()
+                logger.debug(
+                    "[MingFlashOmniThinker] exported patch-token hidden_states "
+                    "shape=%s dtype=%s mean=%+.4f std=%.4f |x|/tok=%.3f",
+                    tuple(gen_hidden.shape),
+                    gen_hidden.dtype,
+                    g.mean().item(),
+                    g.std().item(),
+                    g.norm(dim=-1).mean().item(),
+                )
 
         return OmniOutput(
             text_hidden_states=hidden_states,

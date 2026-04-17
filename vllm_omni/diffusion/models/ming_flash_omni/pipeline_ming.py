@@ -3,10 +3,6 @@
 
 """Ming-flash-omni-2.0 image generation pipeline for vllm-omni diffusion engine.
 
-This module replaces the Phase 2 v0 ``MingFlashOmniImageGenModel`` hack that
-ran imagegen on an AR worker (``stage_type: llm``) with a proper
-``stage_type: diffusion`` pipeline, following the glm_image/bagel pattern.
-
 Cross-stage data flow:
 
     Stage 0 (thinker, llm)           Stage 1 (imagegen, diffusion)
@@ -366,7 +362,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         hidden = hidden.to(device=target_device, dtype=target_dtype)
         if hidden.dim() == 2:
             hidden = hidden.unsqueeze(0)  # [N, H] -> [1, N, H]
-        logger.info(
+        logger.debug(
             "[MingImagePipeline.forward] thinker_hidden_states=%s on %s (%s)",
             tuple(hidden.shape),
             target_device,
@@ -375,7 +371,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         # ----- Condition encoder → cap_feats
         cap_feats = self.condition_encoder(hidden)
-        logger.info("[MingImagePipeline.forward] cap_feats=%s", tuple(cap_feats.shape))
+        logger.debug("[MingImagePipeline.forward] cap_feats=%s", tuple(cap_feats.shape))
 
         # ----- Sampling knobs (with Ming defaults).
         sp = req.sampling_params
@@ -416,7 +412,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             sampling_params=z_sp,
         )
 
-        logger.info(
+        logger.debug(
             "[MingImagePipeline.forward] running z_pipeline hw=(%d,%d) steps=%d cfg=%.2f",
             height,
             width,
@@ -445,12 +441,13 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             raw = output
         if not isinstance(raw, torch.Tensor):
             raise RuntimeError(f"ZImagePipeline returned non-tensor output: {type(raw).__name__}")
-        logger.info(
-            "[MingImagePipeline.forward] produced image tensor shape=%s range=[%.3f,%.3f]",
-            tuple(raw.shape),
-            raw.float().min().item(),
-            raw.float().max().item(),
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "[MingImagePipeline.forward] produced image tensor shape=%s range=[%.3f,%.3f]",
+                tuple(raw.shape),
+                raw.float().min().item(),
+                raw.float().max().item(),
+            )
         return DiffusionOutput(output=raw)
 
 
@@ -564,15 +561,13 @@ def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     Registered via ``_DIFFUSION_POST_PROCESS_FUNCS["MingImagePipeline"]``
     in vllm_omni/diffusion/registry.py.
     """
-    from diffusers.image_processor import VaeImageProcessor  # local import
+    import json
 
     model_path = od_config.model
     vae_config_path = os.path.join(model_path, "vae", "config.json")
     try:
-        import json as _json
-
         with open(vae_config_path) as f:
-            vae_cfg = _json.load(f)
+            vae_cfg = json.load(f)
         block_out_channels = vae_cfg.get("block_out_channels", [128, 256, 512, 512])
         vae_scale_factor = 2 ** (len(block_out_channels) - 1)
     except Exception:

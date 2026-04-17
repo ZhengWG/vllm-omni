@@ -8,33 +8,23 @@
 
 Pipeline (runs inside the imagegen stage):
 
-    thinker hidden states at query-token positions  [B, N, 4096]
+    thinker hidden states at query-token positions     [B, N, 4096]
                          │
-                         ▼
-        Qwen2ForCausalLM connector (is_causal=False)
-             — loaded from <checkpoint>/connector/
+                         ▼ proj_in (Linear, bias=True)
+                                                       [B, N, 1536]
                          │
-        final layer hidden states                    [B, N, 1536]
+                         ▼ Qwen2ForCausalLM connector (is_causal=False)
+                           loaded from <checkpoint>/connector/
+                                                       [B, N, 1536]
                          │
-           RMSNorm  (text_encoder_norm=True)         [B, N, 1536]
+                         ▼ proj_out (Linear, bias=True)
+                                                       [B, N, 2560]
                          │
-        proj_out (optional; identity when            [B, N, 2560]
-                 use_identity_mlp=True in mlp/config.json)
+                         ▼ F.normalize(dim=-1) × 1000  (text_encoder_norm)
+                                                       [B, N, 2560]
                          │
                          ▼
             cap_feats consumed by ZImageTransformer2DModel
-                 (expects cap_feat_dim=2560)
-
-IMPORTANT (to be validated on real hardware):
-  - Current implementation assumes ``use_identity_mlp=True`` AND the connector
-    hidden_size (1536) aligns with ``diffusion_c_input_dim`` (2560) via a
-    single linear ``proj_out``. The real mapping may instead rely on the
-    connector's LM head projecting to 2560. The LoadWeights path logs shape
-    mismatches loudly so the first real run tells us what to fix.
-  - ``text_encoder_norm`` in mlp/config.json is True for the released
-    checkpoint. We therefore always apply an RMSNorm here in Phase 1.
-  - ``ByT5`` branch is NOT implemented (Phase 2). If enabled in config we
-    raise early rather than silently skip.
 """
 
 from __future__ import annotations
@@ -95,9 +85,6 @@ class MingConditionEncoder(nn.Module):
         self.thinker_hidden_size = thinker_hidden_size
         self._target_device = torch.device(device) if device is not None else None
         self._target_dtype = dtype
-
-        if image_gen_config.enable_byte5:
-            raise NotImplementedError("ByT5 text enhancement is Phase 2; set enable_byte5=False in MingImageGenConfig.")
 
         # Populated lazily by ``load_from_checkpoint`` to keep this module
         # cheap to construct (useful for dummy-init paths and unit tests).
@@ -163,9 +150,6 @@ class MingConditionEncoder(nn.Module):
         #   proj_out.{weight,bias}  : Linear(1536 -> 2560)
         #   query_tokens_dict.16x16 : learnable tokens consumed on the thinker
         #                             side (NOT loaded here).
-        # ``use_identity_mlp`` from mlp/config.json turned out to be a misnomer
-        # — the real checkpoint ships two bias-full Linear layers here, so we
-        # always build them with ``bias=True`` and load weights unconditionally.
         logger.info(
             "[MingConditionEncoder] adding proj_in: %d -> %d (bias=True)",
             self.thinker_hidden_size,
@@ -336,15 +320,17 @@ class MingConditionEncoder(nn.Module):
             raise ValueError(f"expected [B, N, H], got shape {tuple(thinker_hidden_states.shape)}")
 
         b, n, _ = thinker_hidden_states.shape
-        logger.info("[MingCondEnc] %s", _tstats("STEP0 thinker_hidden_states", thinker_hidden_states))
-        logger.info(
-            "[MingCondEnc] proj_in  weight %s bias %s",
-            _tstats("", self.proj_in.weight),
-            _tstats("", self.proj_in.bias) if self.proj_in.bias is not None else "None",
-        )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[MingCondEnc] %s", _tstats("STEP0 thinker_hidden_states", thinker_hidden_states))
+            logger.debug(
+                "[MingCondEnc] proj_in  weight %s bias %s",
+                _tstats("", self.proj_in.weight),
+                _tstats("", self.proj_in.bias) if self.proj_in.bias is not None else "None",
+            )
 
         x = self.proj_in(thinker_hidden_states)  # [B, N, conn_hidden]
-        logger.info("[MingCondEnc] %s", _tstats("STEP1 after proj_in", x))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[MingCondEnc] %s", _tstats("STEP1 after proj_in", x))
 
         # Ming's ``get_condition_embeds_for_image_gen`` passes a 4D full-ones
         # attention mask of shape [B, 1, N, N] to the Qwen2 connector,
@@ -370,27 +356,31 @@ class MingConditionEncoder(nn.Module):
         )
         # Ming uses hidden_states[-1] (last layer).
         hidden = out.hidden_states[-1]  # [B, N, conn_hidden]
-        logger.info("[MingCondEnc] %s", _tstats("STEP2 after connector", hidden))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[MingCondEnc] %s", _tstats("STEP2 after connector", hidden))
 
         cap_feats = self.proj_out(hidden)  # [B, N, diffusion_c_input_dim]
-        logger.info("[MingCondEnc] %s", _tstats("STEP3 after proj_out", cap_feats))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[MingCondEnc] %s", _tstats("STEP3 after proj_out", cap_feats))
 
         # Final L2 normalization along the feature dim — matches the tail
         # of Ming's ``get_condition_embeds_for_image_gen``.
         cap_feats = torch.nn.functional.normalize(cap_feats, dim=-1)
-        logger.info("[MingCondEnc] %s", _tstats("STEP4 after F.normalize", cap_feats))
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug("[MingCondEnc] %s", _tstats("STEP4 after F.normalize", cap_feats))
 
         # Ming wraps the DiT in ``ZImageModel_withMLP`` which, when
-        # ``text_encoder_norm=True`` + ``use_identity_mlp=True`` (both true
-        # on Ming-flash-omni-2.0), applies ``F.normalize(x, dim=-1) * 1000.0``
-        # to encoder_hidden_states before feeding the transformer — the ×1000
-        # restores the magnitude of the original Z-image text encoder output
-        # (see zimage_loss.py::ZImageModel_withMLP.forward lines 88-91).
-        # Our pipeline does not include that wrapper, so we fold the same
-        # rescale into the condition encoder output directly.
+        # ``text_encoder_norm=True`` (set on Ming-flash-omni-2.0), applies
+        # ``F.normalize(x, dim=-1) * 1000.0`` to encoder_hidden_states before
+        # feeding the transformer — the ×1000 restores the magnitude of the
+        # original Z-image text encoder output (see zimage_loss.py
+        # ::ZImageModel_withMLP.forward lines 88-91). Our pipeline does not
+        # include that wrapper, so we fold the same rescale into the
+        # condition encoder output directly.
         if self.config.text_encoder_norm:
             cap_feats = cap_feats * 1000.0
-            logger.info("[MingCondEnc] %s", _tstats("STEP5 after *1000", cap_feats))
+            if logger.isEnabledFor(logging.DEBUG):
+                logger.debug("[MingCondEnc] %s", _tstats("STEP5 after *1000", cap_feats))
 
         return cap_feats
 
@@ -403,11 +393,7 @@ class MingConditionEncoder(nn.Module):
         self,
         cap_feats: torch.Tensor,
     ) -> torch.Tensor:
-        """Return a zero tensor shaped like ``cap_feats`` for CFG negatives.
-
-        Phase 1 uses a pure zero embedding as the unconditional branch, which
-        is the simplest valid negative for classifier-free guidance.
-        """
+        """Return a zero tensor shaped like ``cap_feats`` for CFG negatives."""
         return torch.zeros_like(cap_feats)
 
     def extra_repr(self) -> str:
@@ -415,8 +401,7 @@ class MingConditionEncoder(nn.Module):
             f"thinker_hidden_size={self.thinker_hidden_size}, "
             f"connector_hidden_size={self.connector_hidden_size}, "
             f"diffusion_c_input_dim={self.config.diffusion_c_input_dim}, "
-            f"text_encoder_norm={self.config.text_encoder_norm}, "
-            f"use_identity_mlp={self.config.use_identity_mlp}"
+            f"text_encoder_norm={self.config.text_encoder_norm}"
         )
 
 

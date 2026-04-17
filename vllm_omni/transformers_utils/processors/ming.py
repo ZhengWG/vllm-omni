@@ -34,13 +34,11 @@ DEFAULT_AUDIO_PATCH_TOKEN = "<audioPatch>"
 DEFAULT_AU_START_TOKEN = "<audio>"
 DEFAULT_AU_END_TOKEN = "</audio>"
 
-# High-level placeholders used in user prompts.
-# Aligned with Qwen3-Omni-style chat template pad tokens — required for
-# audio mm_pad to find anchor positions in the prompt (see thread
-# discussion in the Phase 1 / 2 enablement notes).
-PLACEHOLDER_IMAGE_TOKEN_IN_TEXT = "<|image_pad|>"
-PLACEHOLDER_VIDEO_TOKEN_IN_TEXT = "<|video_pad|>"
-PLACEHOLDER_AUDIO_TOKEN_IN_TEXT = "<|audio_pad|>"
+# High-level placeholders used in user prompts. Must match the values
+# returned by ``MingFlashOmniThinkerForConditionalGeneration.get_placeholder_str``.
+PLACEHOLDER_IMAGE_TOKEN_IN_TEXT = "<IMAGE>"
+PLACEHOLDER_VIDEO_TOKEN_IN_TEXT = "<VIDEO>"
+PLACEHOLDER_AUDIO_TOKEN_IN_TEXT = "<AUDIO>"
 
 # Chat template constants
 USER_PREFIX = "<role>HUMAN</role>"

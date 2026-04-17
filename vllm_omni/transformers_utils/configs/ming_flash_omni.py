@@ -260,44 +260,30 @@ class BailingMM2Config(PretrainedConfig):
         return self.llm_config
 
 
-class MingFlashOmniThinkerConfig(BailingMM2Config):
-    # Override model type
-    model_type = "ming_flash_omni_thinker"
-
-
 class MingImageGenConfig(PretrainedConfig):
     """Configuration for Ming-flash-omni-2.0 image generation stage.
 
     Mirrors the layout of the HF checkpoint at
     https://huggingface.co/inclusionAI/Ming-flash-omni-2.0 where image-gen
     components live in sibling subfolders (``connector/``, ``transformer/``,
-    ``vae/``, ``scheduler/``, ``mlp/``, ``byt5/``).
-
-    The fields under ``mlp_config`` come directly from ``mlp/config.json``.
+    ``vae/``, ``scheduler/``, ``mlp/``).
     """
 
     model_type = "ming_flash_omni_imagegen"
 
     def __init__(
         self,
-        # Subfolder names inside the unified Ming checkpoint.
         connector_subfolder: str = "connector",
         transformer_subfolder: str = "transformer",
         vae_subfolder: str = "vae",
         scheduler_subfolder: str = "scheduler",
         mlp_subfolder: str = "mlp",
-        byte5_subfolder: str = "byte5",
-        # Fields from mlp/config.json.
-        dit_type: str = "zimage",
         diffusion_c_input_dim: int = 2560,
         img_gen_scales: list[int] | None = None,
         text_encoder_norm: bool = True,
-        use_identity_mlp: bool = True,
-        # Phase 1 feature toggles.
-        enable_byte5: bool = False,
-        # Default sampling parameters for the diffusion pipeline.
-        # These match Ming's defaults in ``modeling_bailingmm2.py::generate``
-        # (``image_gen_steps=30``, ``image_gen_cfg=2.0``).
+        # Default sampling parameters — match Ming's defaults in
+        # ``modeling_bailingmm2.py::generate`` (``image_gen_steps=30``,
+        # ``image_gen_cfg=2.0``).
         num_inference_steps: int = 30,
         guidance_scale: float = 2.0,
         default_height: int = 1024,
@@ -310,13 +296,9 @@ class MingImageGenConfig(PretrainedConfig):
         self.vae_subfolder = vae_subfolder
         self.scheduler_subfolder = scheduler_subfolder
         self.mlp_subfolder = mlp_subfolder
-        self.byte5_subfolder = byte5_subfolder
-        self.dit_type = dit_type
         self.diffusion_c_input_dim = diffusion_c_input_dim
         self.img_gen_scales = img_gen_scales if img_gen_scales is not None else [16]
         self.text_encoder_norm = text_encoder_norm
-        self.use_identity_mlp = use_identity_mlp
-        self.enable_byte5 = enable_byte5
         self.num_inference_steps = num_inference_steps
         self.guidance_scale = guidance_scale
         self.default_height = default_height
@@ -338,15 +320,14 @@ class MingFlashOmniConfig(PretrainedConfig):
     model_type = "ming_flash_omni"
     is_composition = True
     sub_configs: ClassVar = {
-        "thinker_config": MingFlashOmniThinkerConfig,
+        "thinker_config": BailingMM2Config,
         "image_gen_config": MingImageGenConfig,
     }
 
     def __init__(
         self,
-        thinker_config: MingFlashOmniThinkerConfig | None = None,
+        thinker_config: BailingMM2Config | dict[str, Any] | None = None,
         image_gen_config: MingImageGenConfig | dict[str, Any] | None = None,
-        talker_config: dict[str, Any] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -363,9 +344,6 @@ class MingFlashOmniConfig(PretrainedConfig):
         else:
             self.image_gen_config = image_gen_config
 
-        # Talker config (for future implementation)
-        self.talker_config = talker_config
-
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         return self.thinker_config.get_text_config()
 
@@ -373,7 +351,6 @@ class MingFlashOmniConfig(PretrainedConfig):
 # Register model_type -> config class for AutoConfig
 AutoConfig.register(BailingMoeV2Config.model_type, BailingMoeV2Config)
 AutoConfig.register(BailingMM2Config.model_type, BailingMM2Config)
-AutoConfig.register(MingFlashOmniThinkerConfig.model_type, MingFlashOmniThinkerConfig)
 AutoConfig.register(MingImageGenConfig.model_type, MingImageGenConfig)
 AutoConfig.register(MingFlashOmniConfig.model_type, MingFlashOmniConfig)
 
