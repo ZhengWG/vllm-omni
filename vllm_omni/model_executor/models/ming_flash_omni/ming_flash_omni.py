@@ -164,20 +164,23 @@ class MingFlashOmniForConditionalGeneration(
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loaded_weights = set()
         thinker_weights = []
+        talker_weights = []
 
         for name, value in weights:
             if name.startswith("thinker."):
                 thinker_weights.append((name, value))
-            elif name.startswith("imagegen.") or name.startswith("talker."):
+            elif name.startswith("imagegen."):
                 # Imagegen weights are loaded by MingImagePipeline (diffusion
-                # stage) from its own checkpoint subfolders; talker is not
-                # implemented yet. Silently drop either here.
+                # stage) from its own checkpoint subfolders;Silently drop either here.
                 continue
+            elif name.startswith("talker."):
+                talker_weights.append((name, value))
             else:
                 # Weights without prefix go to thinker by default
                 thinker_weights.append((name, value))
 
         if self.model_stage == "thinker" and thinker_weights:
+            # Remove "thinker." prefix before loading
             thinker_weights_stripped = [
                 (name.replace("thinker.", "", 1) if name.startswith("thinker.") else name, value)
                 for name, value in thinker_weights

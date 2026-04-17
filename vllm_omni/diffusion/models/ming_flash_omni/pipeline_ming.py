@@ -52,12 +52,6 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenCon
 logger = logging.getLogger(__name__)
 
 
-# Key used by thinker2imagegen to stash the sliced hidden states on the
-# per-request prompt dict (under the "extra" sub-dict). The pipeline reads
-# from the same key on the receiver side.
-THINKER_HIDDEN_STATES_KEY = "thinker_hidden_states"
-
-
 class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     """Ming-flash-omni-2.0 text-to-image diffusion pipeline.
 
@@ -68,9 +62,9 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
       * ``vae``               — AutoencoderKL (Flux format, latent=16)
 
     The pipeline's ``forward(req)`` reads the thinker-side hidden states from
-    ``req.prompts[0]["extra"][THINKER_HIDDEN_STATES_KEY]`` (placed there by
-    the ``thinker2imagegen`` custom_process_input_func), runs the full
-    Ming condition encoder + ZImage diffusion loop, and returns a
+    ``req.prompts[0]["extra"]["thinker_hidden_states"]`` (placed there by the
+    ``thinker2imagegen`` custom_process_input_func), runs the full Ming
+    condition encoder + ZImage diffusion loop, and returns a
     ``DiffusionOutput`` with a raw image tensor under ``.output``.
     """
 
@@ -138,15 +132,17 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         ).to(device=self.device, dtype=dtype)
         self.vae.eval()
 
-        # ----- DiT transformer. Load state_dict ourselves with the
-        # split→merged QKV/FFN rename so the diffusers-format checkpoint
-        # fits vllm-omni's in-tree fused Linear layout.
+        # ----- DiT transformer. The diffusers-format checkpoint ships
+        # split ``.to_{q,k,v}.`` / ``.w{1,3}.`` tensors, while our in-tree
+        # ``ZImageTransformer2DModel`` uses fused ``.to_qkv.`` / ``.w13.``
+        # layers — the mapping is handled automatically by the transformer's
+        # own ``load_weights`` via its ``stacked_params_mapping``, so we
+        # just stream the raw safetensors shards through it.
         logger.info("[MingImagePipeline] loading DiT transformer ...")
         self.transformer = ZImageTransformer2DModel(quant_config=None)
         self._load_transformer_weights(
             self.transformer,
             Path(model_path) / self.image_gen_config.transformer_subfolder,
-            dtype=dtype,
         )
         self.transformer = self.transformer.to(device=self.device, dtype=dtype)
         self.transformer.eval()
@@ -205,8 +201,6 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     def _load_transformer_weights(
         transformer: nn.Module,
         transformer_dir: Path,
-        *,
-        dtype: torch.dtype,  # noqa: ARG004
     ) -> None:
         from safetensors.torch import load_file
 
@@ -218,36 +212,22 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         if not candidates:
             raise FileNotFoundError(f"no weight files in {transformer_dir}")
 
-        state: dict[str, torch.Tensor] = {}
-        for p in candidates:
-            logger.info("[MingImagePipeline] reading transformer weights: %s", p)
-            if p.suffix == ".safetensors":
-                state.update(load_file(str(p)))
-            else:
-                state.update(torch.load(str(p), map_location="cpu"))
-        logger.info("[MingImagePipeline] transformer state_dict: %d keys", len(state))
+        def _weight_iter():
+            for p in candidates:
+                logger.info("[MingImagePipeline] reading transformer weights: %s", p)
+                if p.suffix == ".safetensors":
+                    shard = load_file(str(p))
+                else:
+                    shard = torch.load(str(p), map_location="cpu")
+                yield from shard.items()
 
-        state = _merge_split_qkv_and_gated_ffn(state)
-
-        missing, unexpected = transformer.load_state_dict(state, strict=False)
+        loaded = transformer.load_weights(_weight_iter())
+        total = len(list(transformer.named_parameters()))
         logger.info(
-            "[MingImagePipeline] transformer load summary: loaded=%d, missing=%d, unexpected=%d",
-            len(list(transformer.named_parameters())) - len(missing),
-            len(missing),
-            len(unexpected),
+            "[MingImagePipeline] transformer load summary: loaded=%d / %d params",
+            len(loaded),
+            total,
         )
-        if missing:
-            logger.warning(
-                "[MingImagePipeline] transformer MISSING %d keys: %s",
-                len(missing),
-                missing[:8],
-            )
-        if unexpected:
-            logger.warning(
-                "[MingImagePipeline] transformer UNEXPECTED %d keys: %s",
-                len(unexpected),
-                unexpected[:8],
-            )
 
     def load_weights(self, weights):
         """Mark all sub-module parameters as loaded.
@@ -279,8 +259,9 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         Args:
             req: Diffusion request. The cross-stage thinker hidden states
-                must be present at ``req.prompts[0]["extra"][THINKER_HIDDEN_STATES_KEY]``
-                as a ``[N, H]`` (or ``[1, N, H]``) tensor, placed there by
+                must be present at
+                ``req.prompts[0]["extra"]["thinker_hidden_states"]`` as a
+                ``[N, H]`` (or ``[1, N, H]``) tensor, placed there by
                 ``thinker2imagegen``.
 
         Returns:
@@ -316,11 +297,11 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             prompt_dict = {}
 
         extra = prompt_dict.get("extra") or {}
-        hidden = extra.get(THINKER_HIDDEN_STATES_KEY)
+        hidden = extra.get("thinker_hidden_states")
         if hidden is None:
             # Same dual-path convention as glm_image: also check
             # ``sampling_params.extra_args``.
-            hidden = (req.sampling_params.extra_args or {}).get(THINKER_HIDDEN_STATES_KEY)
+            hidden = (req.sampling_params.extra_args or {}).get("thinker_hidden_states")
         if hidden is None:
             # No thinker hidden states found on the request. Two legitimate
             # causes:
@@ -342,18 +323,17 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 device=self.device,
             )
             logger.warning(
-                "[MingImagePipeline.forward] %s missing from request; "
-                "falling back to zero-conditioning %s. This is expected "
-                "during warmup; for real requests verify that "
-                "`custom_process_input_func: thinker2imagegen` is set on "
-                "the diffusion stage in the YAML.",
-                THINKER_HIDDEN_STATES_KEY,
+                "[MingImagePipeline.forward] 'thinker_hidden_states' missing "
+                "from request; falling back to zero-conditioning %s. This is "
+                "expected during warmup; for real requests verify that "
+                "`custom_process_input_func: thinker2imagegen` is set on the "
+                "diffusion stage in the YAML.",
                 tuple(hidden.shape),
             )
 
         if not isinstance(hidden, torch.Tensor):
             raise TypeError(
-                f"[MingImagePipeline] {THINKER_HIDDEN_STATES_KEY!r} must be a Tensor, got {type(hidden).__name__}"
+                f"[MingImagePipeline] 'thinker_hidden_states' must be a Tensor, got {type(hidden).__name__}"
             )
 
         # Move to the pipeline's device+dtype.
@@ -456,97 +436,6 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 # ----------------------------------------------------------------------
 
 
-def _merge_split_qkv_and_gated_ffn(
-    state: dict[str, torch.Tensor],
-) -> dict[str, torch.Tensor]:
-    """Merge diffusers-style split QKV / gated-FFN weights into vllm-omni form.
-
-    Ming's diffusers-format checkpoint ships:
-        <prefix>.attention.to_{q,k,v}.weight
-        <prefix>.feed_forward.w{1,3}.weight
-
-    vllm-omni's ZImageTransformer2DModel expects the merged form:
-        <prefix>.attention.to_qkv.weight       = cat([q, k, v], dim=0)
-        <prefix>.feed_forward.w13.weight       = cat([w1, w3], dim=0)
-    """
-    out: dict[str, torch.Tensor] = {}
-    qkv_groups: dict[str, dict[str, torch.Tensor]] = {}
-    w13_groups: dict[str, dict[str, torch.Tensor]] = {}
-
-    for name, tensor in state.items():
-        handled = False
-        for qkv_suffix, letter in (
-            (".attention.to_q.weight", "q"),
-            (".attention.to_k.weight", "k"),
-            (".attention.to_v.weight", "v"),
-            (".attention.to_q.bias", "q_b"),
-            (".attention.to_k.bias", "k_b"),
-            (".attention.to_v.bias", "v_b"),
-        ):
-            if name.endswith(qkv_suffix):
-                prefix = name[: -len(qkv_suffix)]
-                qkv_groups.setdefault(prefix, {})[letter] = tensor
-                handled = True
-                break
-        if handled:
-            continue
-        for ffn_suffix, letter in (
-            (".feed_forward.w1.weight", "w1"),
-            (".feed_forward.w3.weight", "w3"),
-            (".feed_forward.w1.bias", "w1_b"),
-            (".feed_forward.w3.bias", "w3_b"),
-        ):
-            if name.endswith(ffn_suffix):
-                prefix = name[: -len(ffn_suffix)]
-                w13_groups.setdefault(prefix, {})[letter] = tensor
-                handled = True
-                break
-        if handled:
-            continue
-        out[name] = tensor
-
-    merged_qkv = 0
-    for prefix, parts in qkv_groups.items():
-        if {"q", "k", "v"}.issubset(parts):
-            out[f"{prefix}.attention.to_qkv.weight"] = torch.cat([parts["q"], parts["k"], parts["v"]], dim=0)
-            merged_qkv += 1
-        else:
-            for letter, t in parts.items():
-                if letter in ("q", "k", "v"):
-                    out[f"{prefix}.attention.to_{letter}.weight"] = t
-        if {"q_b", "k_b", "v_b"}.issubset(parts):
-            out[f"{prefix}.attention.to_qkv.bias"] = torch.cat([parts["q_b"], parts["k_b"], parts["v_b"]], dim=0)
-        else:
-            for letter, t in parts.items():
-                if letter in ("q_b", "k_b", "v_b"):
-                    out[f"{prefix}.attention.to_{letter[0]}.bias"] = t
-
-    merged_w13 = 0
-    for prefix, parts in w13_groups.items():
-        if {"w1", "w3"}.issubset(parts):
-            out[f"{prefix}.feed_forward.w13.weight"] = torch.cat([parts["w1"], parts["w3"]], dim=0)
-            merged_w13 += 1
-        else:
-            for letter, t in parts.items():
-                if letter in ("w1", "w3"):
-                    out[f"{prefix}.feed_forward.{letter}.weight"] = t
-        if {"w1_b", "w3_b"}.issubset(parts):
-            out[f"{prefix}.feed_forward.w13.bias"] = torch.cat([parts["w1_b"], parts["w3_b"]], dim=0)
-        else:
-            for letter, t in parts.items():
-                if letter in ("w1_b", "w3_b"):
-                    out[f"{prefix}.feed_forward.{letter[:2]}.bias"] = t
-
-    logger.info(
-        "[MingImagePipeline] merged QKV groups: %d, merged w13 groups: %d; final state_dict has %d keys (was %d)",
-        merged_qkv,
-        merged_w13,
-        len(out),
-        len(state),
-    )
-    return out
-
-
 def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
     """Return a post-process callable that converts the raw VAE tensor to PIL.
 
@@ -585,6 +474,5 @@ def get_ming_image_post_process_func(od_config: OmniDiffusionConfig):
 
 __all__ = [
     "MingImagePipeline",
-    "THINKER_HIDDEN_STATES_KEY",
     "get_ming_image_post_process_func",
 ]

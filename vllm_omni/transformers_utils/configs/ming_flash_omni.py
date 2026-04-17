@@ -328,6 +328,7 @@ class MingFlashOmniConfig(PretrainedConfig):
         self,
         thinker_config: BailingMM2Config | dict[str, Any] | None = None,
         image_gen_config: MingImageGenConfig | dict[str, Any] | None = None,
+        talker_config: dict[str, Any] | None = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -337,12 +338,16 @@ class MingFlashOmniConfig(PretrainedConfig):
         else:
             self.thinker_config = thinker_config or BailingMM2Config()
 
+        # Image generation config
         if isinstance(image_gen_config, dict):
             self.image_gen_config = MingImageGenConfig(**image_gen_config)
         elif image_gen_config is None:
             self.image_gen_config = MingImageGenConfig()
         else:
             self.image_gen_config = image_gen_config
+
+        # Talker config (for future implementation)
+        self.talker_config = talker_config
 
     def get_text_config(self, decoder: bool = False) -> PretrainedConfig:  # noqa: ARG002
         return self.thinker_config.get_text_config()

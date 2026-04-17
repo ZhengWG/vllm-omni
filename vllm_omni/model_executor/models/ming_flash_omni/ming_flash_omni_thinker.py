@@ -65,7 +65,7 @@ from vllm.utils.tensor_schema import TensorSchema, TensorShape
 
 from vllm_omni.model_executor.custom_process_mixin import CustomProcessMixin
 from vllm_omni.model_executor.models.output_templates import OmniOutput
-from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config, BailingMoeV2Config
+from vllm_omni.transformers_utils.configs.ming_flash_omni import BailingMM2Config
 from vllm_omni.transformers_utils.processors.ming import (
     PLACEHOLDER_AUDIO_TOKEN_IN_TEXT,
     PLACEHOLDER_IMAGE_TOKEN_IN_TEXT,
@@ -102,67 +102,9 @@ class MingAudioInput(TensorSchema):
     ]
 
 
-# Multimodal token-id fields that vllm-omni thinker code reads. Upstream
-# Ming's ``configuration_bailing_moe_v2.py`` (the dynamic trust_remote_code
-# copy) is missing some of them; fill from our canonical BailingMoeV2Config
-# defaults rather than duplicating literal IDs here.
-_BAILING_MOE_V2_COMPAT_FIELDS: tuple[str, ...] = (
-    "image_end_token",
-    "video_end_token",
-    "audio_patch_token",
-    "audio_start_token",
-    "audio_end_token",
-)
-
-
-def _augment_bailing_moe_v2_compat(cfg) -> None:
-    """Inject missing multimodal token-id fields onto a loaded config.
-
-    When ``trust_remote_code=True`` and the model directory contains
-    ``configuration_bailing_moe_v2.py``, transformers dynamically loads a
-    ``BailingMoeV2Config`` class under ``transformers_modules.*`` that is
-    NOT the same as our registered ``vllm_omni.transformers_utils.configs.
-    ming_flash_omni.BailingMoeV2Config`` — so its defaults do not apply.
-
-    This helper augments the dynamically loaded ``cfg.llm_config`` once by
-    copying values for ``_BAILING_MOE_V2_COMPAT_FIELDS`` from our canonical
-    config whenever the field is not already present. Idempotent.
-    """
-    llm_cfg = getattr(cfg, "llm_config", None)
-    if llm_cfg is None:
-        return
-    if getattr(llm_cfg, "_vllm_omni_compat_augmented", False):
-        return
-    canonical = BailingMoeV2Config()
-    added: list[str] = []
-    for name in _BAILING_MOE_V2_COMPAT_FIELDS:
-        if not hasattr(llm_cfg, name):
-            setattr(llm_cfg, name, getattr(canonical, name))
-            added.append(name)
-    setattr(llm_cfg, "_vllm_omni_compat_augmented", True)
-    if added:
-        logger.info(
-            "[MingFlashOmniThinker] augmented llm_config with compat defaults: %s",
-            added,
-        )
-
-
 class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
     def get_hf_config(self) -> BailingMM2Config:
-        # NOTE: we intentionally bypass ``ctx.get_hf_config(BailingMM2Config)``
-        # which does a strict isinstance check. When ``trust_remote_code=True``
-        # and the model directory contains ``configuration_bailingmm2.py``,
-        # transformers dynamically loads a second BailingMM2Config under
-        # ``transformers_modules.*`` that is not the same Python class as
-        # our registered copy — the fields are identical but isinstance fails.
-        # Duck-typing here is safe because every field we read (llm_config,
-        # vision_config, audio_config, mlp_depth, image_gen_config, etc.) is
-        # present on both definitions.
-        cfg = self.ctx.model_config.hf_config
-        if not hasattr(cfg, "llm_config"):
-            raise TypeError(f"hf_config {type(cfg).__name__} is not a BailingMM2-compatible config")
-        _augment_bailing_moe_v2_compat(cfg)
-        return cfg  # type: ignore[return-value]
+        return self.ctx.get_hf_config(BailingMM2Config)
 
     def get_hf_processor(self, **kwargs: object):
         return self.ctx.get_hf_processor(MingFlashOmniProcessor, **kwargs)
@@ -288,9 +230,6 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         thinker_config = self.info.get_hf_config()
 
         # patch/delimiter token IDs (used in replacement sequences).
-        # These fields must be present on the llm_config. If the upstream
-        # Ming checkpoint's configuration_bailing_moe_v2.py is missing any
-        # of them, add the defaults there — do NOT paper over in this file.
         image_start_token_id = thinker_config.llm_config.image_start_token
         image_patch_token_id = thinker_config.llm_config.image_patch_token
         image_end_token_id = thinker_config.llm_config.image_end_token
@@ -465,6 +404,51 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
     ) -> bool:
         return False
 
+    def _apply_hf_processor_main(
+        self,
+        prompt: str | list[int],
+        mm_items: MultiModalDataItems,
+        hf_processor_mm_kwargs: Mapping[str, object],
+        tokenization_kwargs: Mapping[str, object],
+        *,
+        enable_hf_prompt_update: bool,
+    ):
+        """Apply Ming-specific prompt rewrites before delegating to vllm's
+        default text / multimodal processing pipeline.
+
+        This is the single point in the base MM-processor call graph where we
+        still have BOTH the full prompt and the request-level
+        ``hf_processor_mm_kwargs`` together. Downstream, vllm's MM caching
+        design splits the work into
+        :meth:`_apply_hf_processor_text_only` (prompt, empty kwargs) and
+        :meth:`_apply_hf_processor_mm_only` (dummy text, real kwargs), so a
+        per-request flag like ``is_image_gen`` cannot reach the real
+        tokenization from inside :meth:`_call_hf_processor`.
+
+        For Ming-flash-omni-2.0, image-generation requests carry
+        ``mm_processor_kwargs["is_image_gen"] = True`` (set by
+        ``serving_chat.py``). We expand the prompt here with the
+        ``<image><imagePatch>*N</image>`` query-token block so the expanded
+        form flows through both the tokenization and (eventual) MM paths.
+        """
+        if isinstance(prompt, str) and hf_processor_mm_kwargs.get("is_image_gen"):
+            from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
+                DEFAULT_NUM_QUERY_TOKENS,
+                maybe_expand_image_gen_prompt,
+            )
+
+            ig = getattr(self.info.ctx.model_config.hf_config, "image_gen_config", None)
+            num_query_tokens = getattr(ig, "num_query_tokens", DEFAULT_NUM_QUERY_TOKENS)
+            prompt = maybe_expand_image_gen_prompt(prompt, num_query_tokens=int(num_query_tokens))
+
+        return super()._apply_hf_processor_main(
+            prompt=prompt,
+            mm_items=mm_items,
+            hf_processor_mm_kwargs=hf_processor_mm_kwargs,
+            tokenization_kwargs=tokenization_kwargs,
+            enable_hf_prompt_update=enable_hf_prompt_update,
+        )
+
     def _call_hf_processor(
         self,
         prompt: str,
@@ -477,14 +461,12 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         We call the image/audio sub-processors directly (instead of going
         through `MingFlashOmniProcessor.__call__`) so that the high-level
         placeholder tokens remain **unexpanded** in the tokenized output.
-        """
-        # Auto prompt expansion for text-to-image happens in
-        # ``vllm_omni/entrypoints/openai/serving_chat.py`` (the Ming-arch
-        # gated branch appends ``<image><imagePatch>*N</image>`` to the
-        # prompt text). That runs in the API server before vllm sees the
-        # request, so by the time _call_hf_processor is invoked the prompt
-        # already contains the <imagePatch> tokens.
 
+        NOTE: Image-gen prompt expansion is handled in
+        :meth:`_apply_hf_processor_main` — by the time we get here, vllm's
+        MM caching has already split text/mm processing and ``mm_kwargs``
+        is empty on the text-only branch.
+        """
         hf_processor = self.info.get_hf_processor()
         tokenizer = self.info.get_tokenizer()
 

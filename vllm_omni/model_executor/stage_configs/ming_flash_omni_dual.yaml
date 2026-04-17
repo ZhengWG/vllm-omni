@@ -26,7 +26,7 @@ stage_args:
   - stage_id: 0
     stage_type: llm
     runtime:
-      devices: "0,1"
+      devices: "0,1,2,3"
     engine_args:
       model_stage: thinker
       max_num_seqs: 1
@@ -40,7 +40,7 @@ stage_args:
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
       hf_config_name: thinker_config
-      tensor_parallel_size: 2
+      tensor_parallel_size: 4
     is_comprehension: true
     default_sampling_params:
       temperature: 0.4
@@ -55,7 +55,7 @@ stage_args:
   - stage_id: 1
     stage_type: diffusion
     runtime:
-      devices: "3"
+      devices: "4"
     engine_args:
       model_stage: dit
       model_arch: MingImagePipeline  # resolved in vllm_omni/diffusion/registry.py
