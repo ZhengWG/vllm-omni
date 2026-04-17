@@ -592,7 +592,7 @@ class AsyncOmniEngine:
     def _attach_llm_stage(
         self,
         started: StartedLlmStage,
-    ) -> tuple[Any, Any, Any, InputProcessor | None]:
+    ) -> tuple[Any, Any | None, Any, InputProcessor | None]:
         """Attach a READY LLM stage to the orchestrator event loop."""
 
         client_addresses: dict[str, str] = {
@@ -620,17 +620,19 @@ class AsyncOmniEngine:
             raise
 
         try:
-            if started.vllm_config.model_config.skip_tokenizer_init:
-                tokenizer = None
-            else:
-                tokenizer = cached_tokenizer_from_config(
-                    model_config=started.vllm_config.model_config,
+            output_processor = None
+            if getattr(started.metadata, "replica_index", 0) == 0:
+                if started.vllm_config.model_config.skip_tokenizer_init:
+                    tokenizer = None
+                else:
+                    tokenizer = cached_tokenizer_from_config(
+                        model_config=started.vllm_config.model_config,
+                    )
+                output_processor = MultimodalOutputProcessor(
+                    tokenizer=tokenizer,
+                    log_stats=False,
+                    engine_core_output_type=started.metadata.engine_output_type,
                 )
-            output_processor = MultimodalOutputProcessor(
-                tokenizer=tokenizer,
-                log_stats=False,
-                engine_core_output_type=started.metadata.engine_output_type,
-            )
             input_processor = None
             if started.stage_id == 0:
                 # Some omni models (e.g. CosyVoice3) have an empty HF
@@ -895,32 +897,19 @@ class AsyncOmniEngine:
                 stage_attach_results: dict[int, list[Any | None]] = {
                     s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
                 }
-                stage_output_proc_results: dict[int, list[Any | None]] = {
-                    s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
-                }
-                stage_vllm_cfg_results: dict[int, list[Any | None]] = {
-                    s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
-                }
+                stage_output_proc_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
+                stage_vllm_cfg_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
 
                 for future in concurrent.futures.as_completed(attach_futures):
                     stage_idx, replica_idx = attach_futures[future]
                     stage_client, output_processor, vllm_config, stage0_input_processor = future.result()
                     stage_attach_results[stage_idx][replica_idx] = stage_client
-                    stage_output_proc_results[stage_idx][replica_idx] = output_processor
-                    stage_vllm_cfg_results[stage_idx][replica_idx] = vllm_config
+                    if stage_output_proc_results[stage_idx] is None and output_processor is not None:
+                        stage_output_proc_results[stage_idx] = output_processor
+                    if stage_vllm_cfg_results[stage_idx] is None:
+                        stage_vllm_cfg_results[stage_idx] = vllm_config
                     if stage0_input_processor is not None:
                         input_processor = stage0_input_processor
-
-                # Share one output processor across homogeneous LLM replicas
-                # of the same logical stage. Per-request route affinity is
-                # tracked inside StagePool.
-                for stage_idx in llm_stage_ids:
-                    processors = stage_output_proc_results[stage_idx]
-                    if not processors:
-                        continue
-                    shared_processor = processors[0]
-                    for replica_idx in range(1, len(processors)):
-                        processors[replica_idx] = shared_processor
 
             # ---- Build StagePool list + finalize metadata ----
             # Use first replica's client per stage for finalize (default sampling params, metadata).
@@ -943,8 +932,8 @@ class AsyncOmniEngine:
                         StagePool.build_from_replicas(
                             stage_id,
                             clients=stage_attach_results[stage_id],
-                            output_processors=stage_output_proc_results[stage_id],
-                            vllm_configs=stage_vllm_cfg_results[stage_id],
+                            output_processor=stage_output_proc_results[stage_id],
+                            stage_vllm_config=stage_vllm_cfg_results[stage_id],
                         )
                     )
 
@@ -1183,7 +1172,7 @@ class AsyncOmniEngine:
 
             # Registration of this companion on stage-0's output processor is
             # deferred to Orchestrator._handle_add_companion, which routes
-            # admission through StagePool.submit_initial(..., affinity_from=...).
+            # admission through StagePool.submit_initial(..., affinity_request_id=...).
             self.request_queue.sync_q.put_nowait(
                 {
                     "type": "add_companion_request",

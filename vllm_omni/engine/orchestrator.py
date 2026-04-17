@@ -14,13 +14,62 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import janus
+import torch
+from vllm.config import ModelConfig
 from vllm.logger import init_logger
+from vllm.pooling_params import PoolingParams
+from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
+from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.serialization import serialize_additional_information
 
 logger = init_logger(__name__)
+
+
+def build_engine_core_request_from_tokens(
+    request_id: str,
+    prompt: dict[str, Any],
+    params: SamplingParams | PoolingParams,
+    arrival_time: float | None = None,
+    model_config: ModelConfig | None = None,
+) -> OmniEngineCoreRequest:
+    """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
+    if arrival_time is None:
+        arrival_time = _time.time()
+
+    prompt_token_ids = prompt["prompt_token_ids"]
+
+    sampling_params = None
+    pooling_params = None
+    if isinstance(params, SamplingParams):
+        sampling_params = params.clone()
+        if sampling_params.max_tokens is None and model_config is not None:
+            sampling_params.max_tokens = model_config.max_model_len - len(prompt_token_ids)
+    else:
+        pooling_params = params.clone()
+
+    prompt_embeds: torch.Tensor | None = prompt.get("prompt_embeds")
+    additional_info_payload = serialize_additional_information(
+        prompt.get("additional_information"),
+        log_prefix=f"build_engine_core_request_from_tokens req={request_id}",
+    )
+
+    return OmniEngineCoreRequest(
+        request_id=request_id,
+        prompt_token_ids=prompt_token_ids,
+        mm_features=None,
+        sampling_params=sampling_params,
+        pooling_params=pooling_params,
+        arrival_time=arrival_time,
+        lora_request=getattr(params, "lora_request", None),
+        cache_salt=None,
+        data_parallel_rank=None,
+        prompt_embeds=prompt_embeds,
+        additional_information=additional_info_payload,
+    )
 
 
 @dataclass
@@ -147,7 +196,7 @@ class Orchestrator:
                     if self._shutdown_event.is_set():
                         return
 
-                    stage_id = poll_result.stage_id
+                    stage_id = pool.stage_id
                     if poll_result.raw_outputs is not None:
                         await self._handle_kv_ready_raw_outputs(pool, poll_result.raw_outputs)
 
@@ -332,14 +381,52 @@ class Orchestrator:
         """Forward output from the current logical stage to the next one."""
         next_logical = source_pool.stage_id + 1
         next_pool = self.stage_pools[next_logical]
-        await next_pool.submit_from_upstream(
-            request_id=req_id,
-            req_state=req_state,
-            output=output,
-            source_pool=source_pool,
-            stage_pools=self.stage_pools,
-            companion_request_ids=self._cfg_tracker.get_companion_request_ids(req_id),
-        )
+        next_client = next_pool.stage_client
+        params = req_state.sampling_params_list[next_logical]
+        source_outputs = [output]
+        requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
+
+        if next_pool.stage_type == "diffusion":
+            if next_client.custom_process_input_func is not None:
+                diffusion_prompt = next_client.custom_process_input_func(
+                    source_outputs,
+                    req_state.prompt,
+                    requires_multimodal_data,
+                )
+            else:
+                diffusion_prompt = req_state.prompt
+
+            companion_request_ids = self._cfg_tracker.get_companion_request_ids(req_id)
+            if companion_request_ids:
+                from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+                import copy
+
+                if isinstance(params, OmniDiffusionSamplingParams):
+                    params = copy.deepcopy(params)
+                    params.cfg_kv_request_ids = companion_request_ids
+
+            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [source_pool.stage_id])
+            kv_sender_info = self._build_kv_sender_info(source_stage_ids, request_id=req_id)
+            await next_pool.submit_initial(
+                req_id,
+                req_state,
+                diffusion_prompt,
+                submit_kwargs={"kv_sender_info": kv_sender_info},
+            )
+        else:
+            next_inputs = next_client.process_engine_inputs(
+                source_outputs,
+                req_state.prompt,
+            )
+            for next_input in next_inputs:
+                request = build_engine_core_request_from_tokens(
+                    request_id=req_id,
+                    prompt=next_input,
+                    params=params,
+                    model_config=next_pool.stage_vllm_config.model_config,
+                )
+                request.external_req_id = request.request_id
+                await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
         req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
@@ -426,13 +513,78 @@ class Orchestrator:
             return
 
         for next_stage_id in range(1, req_state.final_stage_id + 1):
-            await self.stage_pools[next_stage_id].prewarm(
-                request_id,
-                stage0_request,
-                req_state,
-                stage_pools=self.stage_pools,
-            )
+            next_pool = self.stage_pools[next_stage_id]
+            params = req_state.sampling_params_list[next_stage_id]
+
+            if next_pool.stage_type == "diffusion":
+                source_stage_ids = list(
+                    getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]
+                )
+                kv_sender_info = self._build_kv_sender_info(source_stage_ids, request_id=request_id)
+                await next_pool.submit_initial(
+                    request_id,
+                    req_state,
+                    req_state.prompt,
+                    submit_kwargs={"kv_sender_info": kv_sender_info},
+                )
+            else:
+                from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
+                import copy
+
+                try:
+                    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+                except Exception:
+                    next_prompt_len = max(1, len(prompt_token_ids))
+
+                original_prompt = req_state.prompt
+                if isinstance(original_prompt, dict):
+                    base_input = copy.deepcopy(original_prompt)
+                else:
+                    base_input = {}
+                base_input["prompt_token_ids"] = [0] * next_prompt_len
+                base_input["multi_modal_data"] = None
+                base_input["mm_processor_kwargs"] = None
+
+                request = build_engine_core_request_from_tokens(
+                    request_id=request_id,
+                    prompt=base_input,
+                    params=params,
+                    model_config=next_pool.stage_vllm_config.model_config,
+                )
+                request.external_req_id = request.request_id
+                await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
             req_state.stage_submit_ts[next_stage_id] = _time.time()
+
+    def _build_kv_sender_info(
+        self,
+        sender_stage_ids: list[int],
+        *,
+        request_id: str | None = None,
+    ) -> dict[int, dict[str, Any]] | None:
+        """Build per-request sender info for diffusion KV-transfer receivers."""
+        sender_infos: dict[int, dict[str, Any]] = {}
+        for sender_stage_id in dict.fromkeys(sender_stage_ids):
+            if sender_stage_id < 0 or sender_stage_id >= len(self.stage_pools):
+                continue
+
+            sender_pool = self.stage_pools[sender_stage_id]
+            sender_replica = sender_pool.get_bound_replica(request_id) if request_id is not None else None
+            sender_stage = sender_replica.client if sender_replica is not None else sender_pool.stage_client
+            get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
+            if not callable(get_sender_info):
+                continue
+
+            sender_info = get_sender_info()
+            if not sender_info:
+                logger.warning(
+                    "[Orchestrator] Stage-%s has no KV sender info available",
+                    sender_stage_id,
+                )
+                continue
+
+            sender_infos[sender_stage_id] = sender_info
+
+        return sender_infos or None
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""

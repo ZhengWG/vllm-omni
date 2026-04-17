@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
 logger = logging.getLogger(__name__)
 
 
@@ -53,21 +51,6 @@ class CfgCompanionTracker:
         self._companion_map[parent_id][role] = companion_id
         self._companion_ids.add(companion_id)
         self._companion_to_parent[companion_id] = parent_id
-
-    def attach_cfg_request_ids(self, parent_id: str, sampling_params: Any) -> Any:
-        cfg_ids = self.get_companion_request_ids(parent_id)
-        if not cfg_ids:
-            return sampling_params
-
-        if isinstance(sampling_params, OmniDiffusionSamplingParams):
-            sampling_params = sampling_params.clone()
-            sampling_params.cfg_kv_request_ids = cfg_ids
-            logger.info(
-                "Attaching cfg_kv_request_ids=%s to request %s",
-                cfg_ids,
-                parent_id,
-            )
-        return sampling_params
 
     def on_companion_completed(self, companion_id: str) -> str | None:
         """Mark done. Returns parent_id only if parent is pending and all companions finished."""
