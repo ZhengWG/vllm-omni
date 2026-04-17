@@ -248,11 +248,11 @@ def test_initialize_stages_exposes_logical_stage_views_and_shares_stage_output_p
 
     started_by_stage = {
         0: [
-            types.SimpleNamespace(stage_id=0, metadata=types.SimpleNamespace(replica_index=0), vllm_config=cfg0_r0),
-            types.SimpleNamespace(stage_id=0, metadata=types.SimpleNamespace(replica_index=1), vllm_config=cfg0_r1),
+            types.SimpleNamespace(stage_id=0, metadata=types.SimpleNamespace(replica_id=0), vllm_config=cfg0_r0),
+            types.SimpleNamespace(stage_id=0, metadata=types.SimpleNamespace(replica_id=1), vllm_config=cfg0_r1),
         ],
         1: [
-            types.SimpleNamespace(stage_id=1, metadata=types.SimpleNamespace(replica_index=0), vllm_config=cfg1_r0),
+            types.SimpleNamespace(stage_id=1, metadata=types.SimpleNamespace(replica_id=0), vllm_config=cfg1_r0),
         ],
     }
 
@@ -271,7 +271,7 @@ def test_initialize_stages_exposes_logical_stage_views_and_shares_stage_output_p
         return started_by_stage[idx][launch_idx]
 
     def _fake_attach_llm_stage(started):
-        return attach_outputs[(started.stage_id, started.metadata.replica_index)]
+        return attach_outputs[(started.stage_id, started.metadata.replica_id)]
 
     monkeypatch.setattr(engine, "_launch_llm_stage", _fake_launch_llm_stage)
     monkeypatch.setattr(engine, "_attach_llm_stage", _fake_attach_llm_stage)

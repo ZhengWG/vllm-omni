@@ -21,10 +21,10 @@ from vllm.pooling_params import PoolingParams
 from vllm.sampling_params import SamplingParams
 from vllm.v1.engine import EngineCoreOutputs
 
-from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine import OmniEngineCoreRequest
-from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.serialization import serialize_additional_information
+from vllm_omni.engine.stage_pool import StagePool
 
 logger = init_logger(__name__)
 
@@ -398,8 +398,9 @@ class Orchestrator:
 
             companion_request_ids = self._cfg_tracker.get_companion_request_ids(req_id)
             if companion_request_ids:
-                from vllm_omni.inputs.data import OmniDiffusionSamplingParams
                 import copy
+
+                from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
                 if isinstance(params, OmniDiffusionSamplingParams):
                     params = copy.deepcopy(params)
@@ -528,8 +529,9 @@ class Orchestrator:
                     submit_kwargs={"kv_sender_info": kv_sender_info},
                 )
             else:
-                from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
                 import copy
+
+                from vllm_omni.distributed.omni_connectors.adapter import compute_talker_prompt_ids_length
 
                 try:
                     next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
@@ -568,8 +570,9 @@ class Orchestrator:
                 continue
 
             sender_pool = self.stage_pools[sender_stage_id]
-            sender_replica = sender_pool.get_bound_replica(request_id) if request_id is not None else None
-            sender_stage = sender_replica.client if sender_replica is not None else sender_pool.stage_client
+            sender_stage = sender_pool.get_bound_client(request_id) if request_id is not None else None
+            if sender_stage is None:
+                sender_stage = sender_pool.stage_client
             get_sender_info = getattr(sender_stage, "get_kv_sender_info", None)
             if not callable(get_sender_info):
                 continue
@@ -616,7 +619,7 @@ class Orchestrator:
         companion_state.stage_submit_ts[0] = _time.time()
 
         stage0_pool = self.stage_pools[0]
-        companion_replica = await stage0_pool.submit_initial(
+        companion_replica_id = await stage0_pool.submit_initial(
             companion_id,
             companion_state,
             companion_prompt,
@@ -629,7 +632,7 @@ class Orchestrator:
             companion_id,
             role,
             parent_id,
-            companion_replica.replica_index,
+            companion_replica_id,
         )
 
     async def _handle_abort(self, msg: dict[str, Any]) -> None:

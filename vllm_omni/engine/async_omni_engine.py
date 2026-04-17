@@ -621,7 +621,7 @@ class AsyncOmniEngine:
 
         try:
             output_processor = None
-            if getattr(started.metadata, "replica_index", 0) == 0:
+            if getattr(started.metadata, "replica_id", 0) == 0:
                 if started.vllm_config.model_config.skip_tokenizer_init:
                     tokenizer = None
                 else:
@@ -836,23 +836,23 @@ class AsyncOmniEngine:
                         continue
 
                     stage_futures: list[concurrent.futures.Future[StartedLlmStage]] = []
-                    for replica_idx in range(num_replicas):
+                    for replica_id in range(num_replicas):
                         # For replica > 0, deep-copy stage_cfg and override devices
-                        if replica_idx > 0:
+                        if replica_id > 0:
                             replica_cfg = copy.deepcopy(stage_cfg)
                         else:
                             replica_cfg = stage_cfg
 
                         if stage_idx in replica_devices_map:
-                            replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_idx]
+                            replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
 
                         replica_metadata = extract_stage_metadata(replica_cfg)
-                        replica_metadata.replica_index = replica_idx
+                        replica_metadata.replica_id = replica_id
 
                         logger.info(
                             "[AsyncOmniEngine] Launching stage %s replica %s (devices=%s)",
                             configured_stage_id,
-                            replica_idx,
+                            replica_id,
                             getattr(getattr(replica_cfg, "runtime", None), "devices", "default"),
                         )
 
@@ -877,7 +877,7 @@ class AsyncOmniEngine:
                 for stage_idx in llm_stage_ids:
                     started_llm_stages[stage_idx] = [f.result() for f in llm_launch_futures[stage_idx]]
 
-            # ---- Parallel attach across (stage_idx, replica_idx) pairs ----
+            # ---- Parallel attach across (stage_idx, replica_id) pairs ----
             attach_futures: dict[
                 concurrent.futures.Future[tuple[Any, Any, Any, InputProcessor | None]],
                 tuple[int, int],
@@ -888,10 +888,10 @@ class AsyncOmniEngine:
                 thread_name_prefix="llm-stage-attach",
             ) as attach_executor:
                 for stage_idx in llm_stage_ids:
-                    for replica_idx, started in enumerate(started_llm_stages[stage_idx]):
+                    for replica_id, started in enumerate(started_llm_stages[stage_idx]):
                         attach_futures[attach_executor.submit(self._attach_llm_stage, started)] = (
                             stage_idx,
-                            replica_idx,
+                            replica_id,
                         )
 
                 stage_attach_results: dict[int, list[Any | None]] = {
@@ -901,9 +901,9 @@ class AsyncOmniEngine:
                 stage_vllm_cfg_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
 
                 for future in concurrent.futures.as_completed(attach_futures):
-                    stage_idx, replica_idx = attach_futures[future]
+                    stage_idx, replica_id = attach_futures[future]
                     stage_client, output_processor, vllm_config, stage0_input_processor = future.result()
-                    stage_attach_results[stage_idx][replica_idx] = stage_client
+                    stage_attach_results[stage_idx][replica_id] = stage_client
                     if stage_output_proc_results[stage_idx] is None and output_processor is not None:
                         stage_output_proc_results[stage_idx] = output_processor
                     if stage_vllm_cfg_results[stage_idx] is None:
@@ -946,9 +946,9 @@ class AsyncOmniEngine:
             # Collect all initialized clients for cleanup
             cleanup_clients: list[Any] = list(diffusion_clients.values())
             for pool in stage_pools:
-                for sr in pool.replicas:
-                    if sr.client is not None:
-                        cleanup_clients.append(sr.client)
+                for client in pool.clients:
+                    if client is not None:
+                        cleanup_clients.append(client)
             all_started = [s for stages in started_llm_stages.values() for s in stages]
             logger.exception(
                 "[AsyncOmniEngine] Stage initialization failed; shutting down %s initialized client(s)",

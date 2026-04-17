@@ -31,7 +31,7 @@ def _default_process_engine_inputs(
     source_outputs: list[Any],
     prompt: Any,
     requires_multimodal_data: bool,
-) -> list["OmniTokensPrompt"]:
+) -> list[OmniTokensPrompt]:
     from vllm_omni.inputs.data import OmniTokensPrompt
 
     if not isinstance(prompt, list):
