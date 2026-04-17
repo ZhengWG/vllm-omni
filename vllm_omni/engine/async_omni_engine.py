@@ -292,7 +292,7 @@ class AsyncOmniEngine:
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
         self.stage_pools: list[StagePool] = []
-        self.stage_clients: list[Any] = []  # flat view for external readers
+        self.stage_clients: list[Any] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[Any] = []
@@ -911,6 +911,17 @@ class AsyncOmniEngine:
                     if stage0_input_processor is not None:
                         input_processor = stage0_input_processor
 
+                # Share one output processor across homogeneous LLM replicas
+                # of the same logical stage. Per-request route affinity is
+                # tracked inside StagePool.
+                for stage_idx in llm_stage_ids:
+                    processors = stage_output_proc_results[stage_idx]
+                    if not processors:
+                        continue
+                    shared_processor = processors[0]
+                    for replica_idx in range(1, len(processors)):
+                        processors[replica_idx] = shared_processor
+
             # ---- Build StagePool list + finalize metadata ----
             # Use first replica's client per stage for finalize (default sampling params, metadata).
             logical_stage_clients_for_finalize: list[Any | None] = [None] * num_stages
@@ -966,14 +977,14 @@ class AsyncOmniEngine:
         self.input_processor = input_processor
         self.prompt_expand_func = prompt_expand_func
 
-        # Derive flat views for external readers (entrypoints/async_omni.py).
-        self.stage_clients = [sr.client for pool in stage_pools for sr in pool.replicas]
-        self.stage_vllm_configs = [sr.vllm_config for pool in stage_pools for sr in pool.replicas]
-        self.output_processors = [sr.output_processor for pool in stage_pools for sr in pool.replicas]
+        # Derive logical-stage views for external readers (entrypoints/async_omni.py).
+        self.stage_clients = [pool.stage_client for pool in stage_pools]
+        self.stage_vllm_configs = [pool.stage_vllm_config for pool in stage_pools]
+        self.output_processors = [pool.output_processor for pool in stage_pools]
 
         # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()
-        if any(getattr(sr.client, "is_comprehension", False) for pool in stage_pools for sr in pool.replicas):
+        if any(getattr(pool.stage_client, "is_comprehension", False) for pool in stage_pools):
             supported_tasks.add("generate")
         if any(m.get("final_output_type") == "audio" for m in stage_metadata_list):
             supported_tasks.add("speech")
@@ -1119,9 +1130,8 @@ class AsyncOmniEngine:
             request = _apply_omni_final_stage_metadata(request, final_stage_id)
 
             # Registration with stage 0's output processor is deferred to the
-            # orchestrator thread (see Orchestrator._handle_add_request).  The
-            # orchestrator must know which replica it picked via select_replica
-            # before it can register on the correct per-replica processor.
+            # orchestrator thread (see Orchestrator._handle_add_request), which
+            # now routes admission through StagePool.submit_initial().
             output_prompt_text = prompt_text
             if output_prompt_text is None and isinstance(original_prompt, dict):
                 output_prompt_text = original_prompt.get("prompt")
@@ -1171,10 +1181,9 @@ class AsyncOmniEngine:
             )
             request.external_req_id = cid
 
-            # Registration of this companion on stage-0's output processor
-            # is deferred to Orchestrator._handle_add_companion, which calls
-            # stage_pools[0].admit(..., affinity_from=parent_replica) so that
-            # select + register + submit all land on the same replica.
+            # Registration of this companion on stage-0's output processor is
+            # deferred to Orchestrator._handle_add_companion, which routes
+            # admission through StagePool.submit_initial(..., affinity_from=...).
             self.request_queue.sync_q.put_nowait(
                 {
                     "type": "add_companion_request",

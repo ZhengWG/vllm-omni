@@ -31,6 +31,10 @@ class CfgCompanionTracker:
     def has_companions(self, parent_id: str) -> bool:
         return parent_id in self._companion_map
 
+    def get_parent_id(self, req_id: str) -> str | None:
+        """Return the parent request id for a companion, or None."""
+        return self._companion_to_parent.get(req_id)
+
     def all_companions_done(self, parent_id: str) -> bool:
         role_map = self._companion_map.get(parent_id, {})
         done_set = self._done.get(parent_id, set())
