@@ -259,7 +259,7 @@ class Orchestrator:
                             req_state = self.request_states.get(output.request_id)
                             if req_state is not None:
                                 if getattr(output, "error", None) is not None:
-                                    parent_id = self._companion_to_parent.get(output.request_id, output.request_id)
+                                    parent_id = self._get_cfg_parent_id(output.request_id)
                                     await self.output_async_queue.put(
                                         {
                                             "type": "error",
@@ -268,10 +268,10 @@ class Orchestrator:
                                             "error": output.error,
                                         }
                                     )
-                                    role_map = self._companion_map.get(parent_id, {})
-                                    for cid in role_map.values():
-                                        self.request_states.pop(cid, None)
-                                    self._cleanup_companion_state(parent_id)
+                                    all_request_ids = [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)]
+                                    await self._abort_request_ids(all_request_ids)
+                                    for rid in all_request_ids:
+                                        self.request_states.pop(rid, None)
                                     self.request_states.pop(parent_id, None)
                                     continue
 
@@ -424,6 +424,12 @@ class Orchestrator:
     def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
         return (stage_id + 1) in req_state.stage_submit_ts
 
+    def _get_cfg_parent_id(self, request_id: str) -> str:
+        """Resolve a request ID to the parent request for CFG companions."""
+        if self._cfg_tracker.is_companion(request_id):
+            return self._cfg_tracker._companion_to_parent.get(request_id, request_id)
+        return request_id
+
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
         parent_id = self._cfg_tracker.on_companion_completed(req_id)
@@ -432,17 +438,29 @@ class Orchestrator:
         deferred = self._cfg_tracker.pop_pending_parent(parent_id)
         if deferred is None:
             return
-        done_set.add(req_id)
-        if parent_id in self._deferred_parents and self._all_companions_done(parent_id):
-            deferred = self._deferred_parents.pop(parent_id)
-            parent_state = self.request_states.get(parent_id)
-            if parent_state is not None and not self._next_stage_already_submitted(deferred["stage_id"], parent_state):
-                await self._forward_to_next_stage(
-                    parent_id,
-                    deferred["stage_replica"],
-                    deferred["output"],
-                    parent_state,
-                )
+        parent_state = self.request_states.get(parent_id)
+        if parent_state is None:
+            return
+
+        stage_id = deferred["stage_id"]
+        if self._next_stage_already_submitted(stage_id, parent_state):
+            return
+
+        stage_replica = parent_state.chosen_replica.get(stage_id)
+        if stage_replica is None:
+            logger.warning(
+                "[Orchestrator] Missing chosen replica for deferred parent req=%s stage=%s",
+                parent_id,
+                stage_id,
+            )
+            return
+
+        await self._forward_to_next_stage(
+            parent_id,
+            stage_replica,
+            deferred["engine_outputs"],
+            parent_state,
+        )
 
     async def _handle_kv_ready_raw_outputs(
         self,
@@ -916,11 +934,18 @@ class Orchestrator:
         """Handle an abort message from the main thread."""
         request_ids = msg["request_ids"]
         all_ids_to_abort = self._cfg_tracker.abort_parents(request_ids)
-        for stage_id in range(self.num_stages):
-            await self.stage_clients[stage_id].abort_requests_async(all_ids_to_abort)
+        await self._abort_request_ids(all_ids_to_abort)
         for req_id in all_ids_to_abort:
             self.request_states.pop(req_id, None)
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+
+    async def _abort_request_ids(self, request_ids: list[str]) -> None:
+        """Broadcast abort requests to all stage replicas."""
+        if not request_ids:
+            return
+        for pool in self.stage_pools:
+            for stage_replica in pool.replicas:
+                await stage_replica.client.abort_requests_async(request_ids)
 
     async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
         """Handle a control-plane RPC request from the main thread.
