@@ -322,7 +322,7 @@ class StageEngineCoreClientBase:
     def process_engine_inputs(
         self,
         source_outputs: list[Any],
-        prompt: OmniTokensPrompt | list[OmniTokensPrompt] | None = None,
+        prompt: Any = None,
     ) -> list[OmniTokensPrompt]:
         """Process inputs from upstream stages.
 

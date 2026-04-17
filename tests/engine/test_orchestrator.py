@@ -68,10 +68,7 @@ class FakeStageClient:
         except queue.Empty:
             return None
 
-    def set_engine_outputs(self, outputs) -> None:
-        return None
-
-    def process_engine_inputs(self, stage_list, prompt=None, source_client=None):
+    def process_engine_inputs(self, source_outputs, prompt=None):
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:
@@ -145,22 +142,19 @@ def _build_request_output(
 def _build_stage_pools(
     stage_clients: list[list[FakeStageClient]],
     *,
-    output_processors: list[list[FakeOutputProcessor]] | None = None,
-    stage_vllm_configs: list[list[object]] | None = None,
+    output_processors: list[FakeOutputProcessor] | None = None,
+    stage_vllm_configs: list[object] | None = None,
 ) -> list[StagePool]:
     """Build StagePool list from per-stage replica lists.
 
     ``stage_clients[i]`` is the list of FakeStageClient replicas for stage i.
-    For backward compat, callers may pass a flat list of single-replica clients
-    via the ``_build_harness`` wrapper.
     """
     num_stages = len(stage_clients)
     if output_processors is None:
-        output_processors = [[FakeOutputProcessor() for _ in replicas] for replicas in stage_clients]
+        output_processors = [FakeOutputProcessor() for _ in stage_clients]
     if stage_vllm_configs is None:
         stage_vllm_configs = [
-            [SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in replicas]
-            for replicas in stage_clients
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients
         ]
 
     pools: list[StagePool] = []
@@ -173,8 +167,8 @@ def _build_stage_pools(
                 StagePool.build_from_replicas(
                     stage_id,
                     clients=clients,
-                    output_processors=output_processors[stage_id],
-                    vllm_configs=stage_vllm_configs[stage_id],
+                    output_processor=output_processors[stage_id],
+                    stage_vllm_config=stage_vllm_configs[stage_id],
                 )
             )
     return pools
@@ -191,17 +185,15 @@ def _build_harness(
     """Build an Orchestrator test harness.
 
     Accepts either pre-built ``stage_pools`` or flat lists of single-replica
-    clients/processors (legacy convenience interface).
+    clients/processors.
     """
     if stage_pools is None:
         # Wrap flat lists into per-stage single-replica lists.
         nested_clients = [[c] for c in stage_clients]
-        nested_procs = [[p] for p in output_processors] if output_processors else None
-        nested_cfgs = [[c] for c in stage_vllm_configs] if stage_vllm_configs else None
         stage_pools = _build_stage_pools(
             nested_clients,
-            output_processors=nested_procs,
-            stage_vllm_configs=nested_cfgs,
+            output_processors=output_processors,
+            stage_vllm_configs=stage_vllm_configs,
         )
 
     ready_future: concurrent.futures.Future[tuple[Orchestrator, janus.Queue, janus.Queue, janus.Queue]] = (
@@ -584,15 +576,14 @@ async def test_multi_replica_round_robin_distribution(orchestrator_factory) -> N
         next_inputs=[{"prompt_token_ids": [7, 8]}],
     )
 
-    proc0_r0 = FakeOutputProcessor(request_outputs=[_build_request_output("req-0", token_ids=[3], finished=True)])
-    proc0_r1 = FakeOutputProcessor(request_outputs=[_build_request_output("req-1", token_ids=[4], finished=True)])
+    proc0 = FakeOutputProcessor(request_outputs=[_build_request_output("req-0", token_ids=[3], finished=True)])
     proc1 = FakeOutputProcessor(request_outputs=[_build_request_output("req-0", token_ids=[10], finished=True)])
 
     default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
     stage_pools = _build_stage_pools(
         [[stage0_r0, stage0_r1], [stage1]],
-        output_processors=[[proc0_r0, proc0_r1], [proc1]],
-        stage_vllm_configs=[[default_vllm_cfg, default_vllm_cfg], [default_vllm_cfg]],
+        output_processors=[proc0, proc1],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
     )
 
     orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
@@ -647,15 +638,14 @@ async def test_multi_replica_abort_broadcasts_to_all_replicas(orchestrator_facto
     stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
     stage1 = FakeStageClient(stage_type="llm", final_output=True)
 
-    proc0_r0 = FakeOutputProcessor()
-    proc0_r1 = FakeOutputProcessor()
+    proc0 = FakeOutputProcessor()
     proc1 = FakeOutputProcessor()
 
     default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
     stage_pools = _build_stage_pools(
         [[stage0_r0, stage0_r1], [stage1]],
-        output_processors=[[proc0_r0, proc0_r1], [proc1]],
-        stage_vllm_configs=[[default_vllm_cfg, default_vllm_cfg], [default_vllm_cfg]],
+        output_processors=[proc0, proc1],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
     )
     orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
 
@@ -692,7 +682,7 @@ async def test_multi_replica_shutdown_all_replicas(orchestrator_factory) -> None
     default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
     stage_pools = _build_stage_pools(
         [[stage0_r0, stage0_r1], [stage1]],
-        stage_vllm_configs=[[default_vllm_cfg, default_vllm_cfg], [default_vllm_cfg]],
+        stage_vllm_configs=[default_vllm_cfg, default_vllm_cfg],
     )
     orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
 
