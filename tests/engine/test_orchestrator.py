@@ -153,9 +153,7 @@ def _build_stage_pools(
     if output_processors is None:
         output_processors = [FakeOutputProcessor() for _ in stage_clients]
     if stage_vllm_configs is None:
-        stage_vllm_configs = [
-            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients
-        ]
+        stage_vllm_configs = [SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)) for _ in stage_clients]
 
     pools: list[StagePool] = []
     for stage_id in range(num_stages):

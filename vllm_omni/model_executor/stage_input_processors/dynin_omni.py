@@ -108,7 +108,7 @@ def _bridge_tokens(
             token_ids = list(getattr(output, "token_ids", []) or [])
         if not token_ids:
             raise RuntimeError(
-                f"Stage {source_stage_id} output for request {source_output.request_id} has no token_ids"
+                f"Stage output for request {source_output.request_id} has no token_ids"
             )
 
         detok_id = _to_int(mm_out.get("detok_id"), default=0)

@@ -22,6 +22,8 @@ def test_register_companion_and_cleanup():
     assert sorted(removed) == ["req1__cfg_img", "req1__cfg_text"]
     assert not tracker.is_companion("req1__cfg_text")
     assert tracker.get_companion_request_ids("req1") == {}
+
+
 def test_abort_parent_expands_to_companions_and_cleans_up_deferred_parent():
     tracker = CfgCompanionTracker()
     tracker.register_companion("req1", "cfg_text", "req1__cfg_text")
