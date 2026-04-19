@@ -187,7 +187,7 @@ def _slice_patch_hidden(
 def thinker2imagegen(
     stage_list: list[Any],
     engine_input_source: list[int],
-    prompt: Any | None = None,  # noqa: ARG001
+    prompt: Any | None = None,
     requires_multimodal_data: bool = False,  # noqa: ARG001
 ) -> list[dict[str, Any]]:
     """Bridge thinker AR outputs into image-generation DiT inputs.
@@ -223,6 +223,14 @@ def thinker2imagegen(
         neg_hidden = _slice_patch_hidden(negative_output, image_patch_token_id, tag="cfg_text")
         if neg_hidden is not None:
             extra["negative_thinker_hidden_states"] = neg_hidden
+
+    # img2img: forward the reference image PIL/tensor to the diffusion stage.
+    # The thinker request carries it under ``multi_modal_data["img2img"]``
+    # (wired by serving_chat for ``modalities == ["img2img"]``).
+    if isinstance(prompt, dict):
+        ref_image = (prompt.get("multi_modal_data") or {}).get("img2img")
+        if ref_image is not None:
+            extra["reference_image"] = ref_image
 
     return [{"prompt": "", "extra": extra}]
 

@@ -39,10 +39,10 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.models.ming_flash_omni.condition_encoder import (
     MingConditionEncoder,
 )
-from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
-from vllm_omni.diffusion.models.z_image.z_image_transformer import (
-    ZImageTransformer2DModel,
+from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
+    MingZImageTransformer2DModel,
 )
+from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
     DiffusionPipelineProfilerMixin,
 )
@@ -139,7 +139,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # own ``load_weights`` via its ``stacked_params_mapping``, so we
         # just stream the raw safetensors shards through it.
         logger.info("[MingImagePipeline] loading DiT transformer ...")
-        self.transformer = ZImageTransformer2DModel(quant_config=None)
+        self.transformer = MingZImageTransformer2DModel(quant_config=None)
         self._load_transformer_weights(
             self.transformer,
             Path(model_path) / self.image_gen_config.transformer_subfolder,
@@ -248,6 +248,25 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             consumed,
         )
         return {name for name, _ in self.named_parameters()}
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    @torch.inference_mode()
+    def _encode_reference_image(self, ref, height: int, width: int) -> torch.Tensor | None:
+        """Turn a PIL/tensor reference image into a VAE latent for ``ref_x``.
+
+        Applies the same shift/scale Ming uses (``(z - shift_factor) * scaling_factor``)
+        so the concatenated frame lives in the DiT's latent space.
+        """
+        if ref is None:
+            return None
+        if not isinstance(ref, torch.Tensor):
+            ref = self.image_processor.preprocess(ref, height, width)
+        ref = ref.to(device=self.device, dtype=self.vae.dtype)
+        latent = self.vae.encode(ref).latent_dist.mode()
+        return (latent - self.vae.config.shift_factor) * self.vae.config.scaling_factor
 
     # ------------------------------------------------------------------
     # Forward
@@ -421,14 +440,21 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             sampling_params=z_sp,
         )
 
+        # Reference image (img2img) → VAE-encoded latent stashed on transformer.
+        # Every request (re)sets this unconditionally, so there's no cleanup in
+        # between — the next request always overwrites before reading.
+        ref_latent = self._encode_reference_image(extra.get("reference_image"), height, width)
+        self.transformer.set_ref_latent(ref_latent)
+
         logger.debug(
-            "[MingImagePipeline.forward] running z_pipeline hw=(%d,%d) steps=%d cfg=%.2f seed=%s overrides=%s",
+            "[MingImagePipeline.forward] running z_pipeline hw=(%d,%d) steps=%d cfg=%.2f seed=%s overrides=%s ref=%s",
             height,
             width,
             num_inference_steps,
             guidance_scale,
             seed,
             ig,
+            None if ref_latent is None else tuple(ref_latent.shape),
         )
         output = self._z_pipeline.forward(
             z_req,
