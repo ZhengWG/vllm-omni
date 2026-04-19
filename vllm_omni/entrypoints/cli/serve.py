@@ -99,13 +99,6 @@ class OmniServeCommand(CLISubcommand):
         # stage-config factory can give YAML precedence over argparse defaults.
         args._cli_explicit_keys = detect_explicit_cli_keys(sys.argv[1:], OmniServeCommand._parser)
 
-        # Ming-style checkpoints need their directory on sys.path so that
-        # sibling imports inside ``.py`` files resolve at ``check_imports``
-        # time. Inject it here before any transformers loading happens, so
-        # end users don't need to set PYTHONPATH or drop a .pth file.
-        _maybe_inject_local_trust_remote_code_path(getattr(args, "model", None))
-
-
         if args.headless:
             run_headless(args)
         else:
