@@ -353,6 +353,16 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         cap_feats = self.condition_encoder(hidden)
         logger.debug("[MingImagePipeline.forward] cap_feats=%s", tuple(cap_feats.shape))
 
+        # Real negative CFG conditioning (opt-in). See expand_cfg_prompts.
+        negative_hidden = extra.get("negative_thinker_hidden_states")
+        negative_cap_feats = None
+        if isinstance(negative_hidden, torch.Tensor):
+            negative_hidden = negative_hidden.to(device=target_device, dtype=target_dtype)
+            if negative_hidden.dim() == 2:
+                negative_hidden = negative_hidden.unsqueeze(0)
+            negative_cap_feats = self.condition_encoder(negative_hidden)
+            logger.debug("[MingImagePipeline.forward] negative_cap_feats=%s", tuple(negative_cap_feats.shape))
+
         # Sampling knobs: extra_args.image_gen.* > sampling_params.* > MingImageGenConfig defaults.
         sp = req.sampling_params
         cfg = self.image_gen_config
@@ -384,7 +394,10 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # (one entry per request) — matches ZImagePipeline's contract when
         # prompt_embeds are pre-computed.
         prompt_embeds = [cap_feats[i] for i in range(cap_feats.shape[0])]
-        negative_prompt_embeds = [self.condition_encoder.zero_negative(e) for e in prompt_embeds]
+        if negative_cap_feats is not None:
+            negative_prompt_embeds = [negative_cap_feats[i] for i in range(negative_cap_feats.shape[0])]
+        else:
+            negative_prompt_embeds = [self.condition_encoder.zero_negative(e) for e in prompt_embeds]
 
         # ZImagePipeline.forward reads a number of fields from req /
         # req.sampling_params. The real ``req`` already has most of them;

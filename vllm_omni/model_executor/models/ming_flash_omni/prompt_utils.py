@@ -55,6 +55,7 @@ def maybe_expand_image_gen_prompt(
     if IMAGE_PATCH_TOKEN in prompt:
         return prompt
 
+    # TODO(multi-scale): single-block emission assumes img_gen_scales=[16].
     suffix = _IMAGE_OPEN_TOKEN + (IMAGE_PATCH_TOKEN * num_query_tokens) + _IMAGE_CLOSE_TOKEN
     return prompt + suffix
 

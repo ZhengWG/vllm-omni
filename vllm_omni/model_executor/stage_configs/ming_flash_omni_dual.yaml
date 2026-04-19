@@ -25,11 +25,15 @@
 stage_args:
   - stage_id: 0
     stage_type: llm
+    # CFG prompt expansion: when a request carries ``negative_prompt``, one
+    # companion is spawned so both positive and negative hidden states reach
+    # the diffusion stage (consumed by MingImagePipeline as real CFG negatives).
+    prompt_expand_func: vllm_omni.model_executor.stage_input_processors.ming_flash_omni.expand_cfg_prompts
     runtime:
       devices: "0,1,2,3"
     engine_args:
       model_stage: thinker
-      max_num_seqs: 1
+      max_num_seqs: 2  # parent + 1 CFG-text companion (negative prompt)
       model_arch: MingFlashOmniForConditionalGeneration
       worker_type: ar
       scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler

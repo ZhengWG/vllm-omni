@@ -359,9 +359,9 @@ class Orchestrator:
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         stage_client = self.stage_clients[stage_id]
 
-        # CFG companion handling: companions don't produce user-visible output
-        # and don't forward to the next stage directly.
+        # CFG companion: stash output for the parent to bundle at forward time.
         if finished and self._cfg_tracker.is_companion(req_id):
+            self._cfg_tracker.set_companion_output(req_id, output)
             await self._handle_cfg_companion_ready(req_id)
             self.request_states.pop(req_id, None)
             return
@@ -625,7 +625,17 @@ class Orchestrator:
         next_stage_resumable = is_streaming_session and not is_final_update
 
         if next_client.stage_type == "diffusion":
-            self.stage_clients[stage_id].set_engine_outputs([output])
+            companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
+            expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
+            if expected > len(companion_outputs):
+                logger.warning(
+                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
+                    "downstream CFG conditioning may degrade",
+                    req_id,
+                    len(companion_outputs),
+                    expected,
+                )
+            self.stage_clients[stage_id].set_engine_outputs([output, *companion_outputs])
             if next_client.custom_process_input_func is not None:
                 diffusion_prompt = next_client.custom_process_input_func(
                     self.stage_clients,
