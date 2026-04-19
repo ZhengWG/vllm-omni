@@ -29,6 +29,7 @@ Pipeline (runs inside the imagegen stage):
 
 from __future__ import annotations
 
+import json
 import logging
 from pathlib import Path
 
@@ -174,8 +175,11 @@ class MingConditionEncoder(nn.Module):
         )
         self.proj_out = nn.Linear(self.connector_hidden_size, c_out, bias=True)
 
-        # Attempt to load proj/norm weights from mlp/ subfolder.
         mlp_path = model_path / self.config.mlp_subfolder
+        mlp_cfg_path = mlp_path / "config.json"
+        if mlp_cfg_path.exists() and not json.loads(mlp_cfg_path.read_text()).get("use_identity_mlp", False):
+            # MingImagePipeline skips ZImageModel_withMLP, only correct when its inner MLP is Identity.
+            raise NotImplementedError(f"{mlp_cfg_path} has use_identity_mlp=False; ToClipMLP path not implemented.")
         self._load_optional_mlp_weights(mlp_path)
 
         if self._target_device is not None:

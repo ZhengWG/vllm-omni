@@ -353,16 +353,32 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         cap_feats = self.condition_encoder(hidden)
         logger.debug("[MingImagePipeline.forward] cap_feats=%s", tuple(cap_feats.shape))
 
-        # ----- Sampling knobs (with Ming defaults).
+        # Sampling knobs: extra_args.image_gen.* > sampling_params.* > MingImageGenConfig defaults.
         sp = req.sampling_params
         cfg = self.image_gen_config
-        height = int(sp.height) if sp.height is not None else cfg.default_height
-        width = int(sp.width) if sp.width is not None else cfg.default_width
-        num_inference_steps = int(sp.num_inference_steps or cfg.num_inference_steps)
-        guidance_scale = sp.guidance_scale if sp.guidance_scale else cfg.guidance_scale
+        ig = (sp.extra_args or {}).get("image_gen") or {}
+        resolved: dict[str, Any] = {}
+        for ig_key, sp_attr, default in (
+            ("height", "height", cfg.default_height),
+            ("width", "width", cfg.default_width),
+            ("steps", "num_inference_steps", cfg.num_inference_steps),
+            ("cfg", "guidance_scale", cfg.guidance_scale),
+            ("seed", "seed", None),
+        ):
+            for v in (ig.get(ig_key), getattr(sp, sp_attr), default):
+                if v is not None:
+                    resolved[ig_key] = v
+                    break
+
+        height = int(resolved["height"])
+        width = int(resolved["width"])
+        num_inference_steps = int(resolved["steps"])
+        guidance_scale = float(resolved["cfg"])
+        seed = resolved.get("seed")
+
         generator = sp.generator
-        if generator is None and sp.seed is not None:
-            generator = torch.Generator(device=target_device).manual_seed(int(sp.seed))
+        if generator is None and seed is not None:
+            generator = torch.Generator(device=target_device).manual_seed(int(seed))
 
         # Format prompt_embeds / negative_prompt_embeds as list[Tensor]
         # (one entry per request) — matches ZImagePipeline's contract when
@@ -393,11 +409,13 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
 
         logger.debug(
-            "[MingImagePipeline.forward] running z_pipeline hw=(%d,%d) steps=%d cfg=%.2f",
+            "[MingImagePipeline.forward] running z_pipeline hw=(%d,%d) steps=%d cfg=%.2f seed=%s overrides=%s",
             height,
             width,
             num_inference_steps,
             guidance_scale,
+            seed,
+            ig,
         )
         output = self._z_pipeline.forward(
             z_req,
