@@ -36,6 +36,9 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.models.ming_flash_omni.byte5_encoder import (
+    MingByT5Encoder,
+)
 from vllm_omni.diffusion.models.ming_flash_omni.condition_encoder import (
     MingConditionEncoder,
 )
@@ -151,6 +154,16 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         self.text_encoder = None
         self.tokenizer = None
 
+        # Optional ByT5 glyph/text encoder. Only loaded when the checkpoint
+        # ships ``byt5/``; otherwise the feature silently stays off and
+        # ``extra_args.image_gen.byte5_text`` requests will be ignored.
+        byte5_dir = Path(model_path) / "byte5"
+        if byte5_dir.exists():
+            self.byte5 = MingByT5Encoder.from_checkpoint(byte5_dir, device=self.device, dtype=dtype)
+        else:
+            self.byte5 = None
+            logger.info("[MingImagePipeline] no byt5/ subfolder at %s; ByT5 enhancement disabled", byte5_dir)
+
         self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
 
@@ -252,6 +265,28 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _resolve_byte5_texts(extra: dict, sampling_params) -> list[str]:
+        """Resolve byte5 glyph texts.
+
+        Two sources, in order of priority:
+          1. ``extra["byte5_text"]`` — auto-extracted from the user prompt's
+             quoted spans by ``thinker2imagegen`` (mirrors Ming's default UX).
+          2. ``sampling_params.extra_args["image_gen"]["byte5_text"]`` — an
+             explicit override for programmatic callers.
+        """
+        for raw in (
+            extra.get("byte5_text"),
+            ((getattr(sampling_params, "extra_args", None) or {}).get("image_gen") or {}).get("byte5_text"),
+        ):
+            if isinstance(raw, str):
+                raw = [raw]
+            if isinstance(raw, list):
+                cleaned = [t for t in raw if isinstance(t, str) and t.strip()]
+                if cleaned:
+                    return cleaned
+        return []
 
     @torch.inference_mode()
     def _encode_reference_image(self, ref, height: int, width: int) -> torch.Tensor | None:
@@ -381,6 +416,17 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
                 negative_hidden = negative_hidden.unsqueeze(0)
             negative_cap_feats = self.condition_encoder(negative_hidden)
             logger.debug("[MingImagePipeline.forward] negative_cap_feats=%s", tuple(negative_cap_feats.shape))
+
+        # ByT5 text enhancement (opt-in). Appends glyph-aware features along
+        # the sequence dim; negative side gets zeros for the byte5 portion so
+        # CFG doesn't push away from the rendered text.
+        byte5_texts = self._resolve_byte5_texts(extra, req.sampling_params)
+        if byte5_texts and self.byte5 is not None:
+            byte5_feats = self.byte5(byte5_texts).to(device=target_device, dtype=target_dtype)
+            cap_feats = torch.cat((cap_feats, byte5_feats), dim=1)
+            if negative_cap_feats is not None:
+                negative_cap_feats = torch.cat((negative_cap_feats, torch.zeros_like(byte5_feats)), dim=1)
+            logger.debug("[MingImagePipeline.forward] byte5 cat'd: cap_feats=%s", tuple(cap_feats.shape))
 
         # Sampling knobs: extra_args.image_gen.* > sampling_params.* > MingImageGenConfig defaults.
         sp = req.sampling_params

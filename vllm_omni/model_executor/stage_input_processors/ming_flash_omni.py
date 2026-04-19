@@ -19,6 +19,7 @@ Two functions are wired from ``ming_flash_omni_dual.yaml``:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from typing import Any
 
@@ -33,6 +34,62 @@ CFG_TEXT_SUFFIX = "__cfg_text"
 # Fallback when stage config introspection fails; matches
 # llm_config.image_patch_token on the released Ming-flash-omni-2.0 checkpoint.
 _DEFAULT_IMAGE_PATCH_TOKEN_ID = 157157
+
+
+# Ming's byte5 glyph text is auto-extracted from the user prompt's quoted
+# spans (ASCII double quotes / Chinese curly quotes). Patterns and regex
+# taken verbatim from Ming ``processing_bailingmm2.py::get_text_from_prompt``.
+_GLYPH_QUOTE_PATTERNS = [r"\"(.*?)\"", r"‘(.*?)’", r"“(.*?)”"]
+_GLYPH_REMOVE_KEYWORDS = ("remove", "delete", "erase")
+
+
+def _check_single_quotes(s: str) -> bool:
+    """Decide whether ASCII single quotes in ``s`` act as glyph delimiters.
+
+    Mirrors Ming's heuristic: count Chinese chars as weight 3, others as 1;
+    if any paired-single-quote span crosses weight 20 we assume the quotes are
+    apostrophes (e.g. "don't"), not glyph markers.
+    """
+    if s.count("'") % 2 != 0:
+        return False
+    positions = [i for i, ch in enumerate(s) if ch == "'"]
+    for i in range(0, len(positions), 2):
+        start, end = positions[i], positions[i + 1]
+        inner = s[start + 1 : end]
+        chinese = sum(1 for c in inner if "\u4e00" <= c <= "\u9fff")
+        total = 3 * chinese + (len(inner) - chinese)
+        if total >= 20:
+            return False
+    return True
+
+
+def _extract_byte5_glyph_text(prompt: str) -> str:
+    """Return ``Ming``-style ``'Text "<glyph>". '`` or ``""`` when no glyph."""
+    if not isinstance(prompt, str) or not prompt:
+        return ""
+    if "'" in prompt and _check_single_quotes(prompt):
+        prompt = prompt.replace("'", '"')
+
+    texts: list[str] = []
+    for pattern in _GLYPH_QUOTE_PATTERNS:
+        texts.extend(re.findall(pattern, prompt))
+
+    if len(texts) == 1:
+        # Treat "remove/delete/erase ..." as a glyph-removal intent, not generation.
+        text_start = min(
+            (prompt.find(q) for q in ('"', "‘", "“") if prompt.find(q) >= 0),
+            default=-1,
+        )
+        lower = prompt.lower()
+        for kw in _GLYPH_REMOVE_KEYWORDS:
+            idx = lower.find(kw)
+            if 0 <= idx < text_start:
+                return ""
+
+    if not texts:
+        return ""
+    # Only the last quoted span is used (Ming's choice; keeps the most recent edit target).
+    return f'Text "{texts[-1]}". '
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +288,12 @@ def thinker2imagegen(
         ref_image = (prompt.get("multi_modal_data") or {}).get("img2img")
         if ref_image is not None:
             extra["reference_image"] = ref_image
+
+        # Ming-style auto-extraction of quoted glyph text for ByT5 (no API change
+        # needed on the caller side — writing the text inside quotes is enough).
+        glyph = _extract_byte5_glyph_text(prompt.get("prompt", ""))
+        if glyph:
+            extra["byte5_text"] = [glyph]
 
     return [{"prompt": "", "extra": extra}]
 
