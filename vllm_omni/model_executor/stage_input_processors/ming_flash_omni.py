@@ -147,6 +147,52 @@ def expand_cfg_prompts(
 # ---------------------------------------------------------------------------
 
 
+def _resolve_num_query_tokens(stage: Any) -> int | None:
+    """Return the image-gen ``num_query_tokens`` from the source stage's config.
+
+    Falls back to 256 (``img_gen_scales=[16]``) when the stage config lacks
+    a ``MingImageGenConfig``. Cached on the stage object for O(1) re-reads.
+    """
+    cached = getattr(stage, "_ming_num_query_tokens", None)
+    if isinstance(cached, int):
+        return cached
+    n = 256  # Ming-flash-omni-2.0 default (img_gen_scales=[16])
+    try:
+        hf_config = stage.vllm_config.model_config.hf_config
+        ig = getattr(hf_config, "image_gen_config", None)
+        resolved = getattr(ig, "num_query_tokens", None)
+        if isinstance(resolved, int) and resolved > 0:
+            n = resolved
+    except AttributeError:
+        pass
+    try:
+        stage._ming_num_query_tokens = n
+    except AttributeError:
+        pass
+    return n
+
+
+def _resolve_image_end_token_id(stage: Any) -> int | None:
+    """Return the ``<image_end>`` token id from *stage*'s HF config, cached on first call."""
+    cached = getattr(stage, "_image_end_token_id", None)
+    if isinstance(cached, int):
+        return cached
+    token_id: int | None = None
+    try:
+        hf_config = stage.vllm_config.model_config.hf_config
+        llm_config = getattr(hf_config, "llm_config", None)
+        resolved = getattr(llm_config, "image_end_token", None)
+        if isinstance(resolved, int):
+            token_id = resolved
+    except AttributeError:
+        pass
+    try:
+        stage._image_end_token_id = token_id
+    except AttributeError:
+        pass
+    return token_id
+
+
 def _resolve_image_patch_token_id(stage: Any) -> int:
     """Return the ``<imagePatch>`` token id from *stage*'s HF config, cached on first call."""
     cached = getattr(stage, "_image_patch_token_id", None)
@@ -197,8 +243,23 @@ def _slice_patch_hidden(
     thinker_output: Any,
     image_patch_token_id: int,
     tag: str,
+    num_query_tokens: int | None = None,
+    image_end_token_id: int | None = None,
 ) -> torch.Tensor | None:
-    """Return ``[N, H]`` hidden at ``<imagePatch>`` positions, or ``None`` if unrecoverable."""
+    """Return ``[N, H]`` hidden at the image-gen query-token block.
+
+    The image-gen block is always appended at the prompt tail as
+    ``<image_start><imagePatch>*N<image_end>`` by
+    ``maybe_expand_image_gen_prompt``. We find the exact trailing window by
+    anchoring on the final ``image_end_token`` and walking back N positions,
+    verifying they're all ``image_patch_token``. Without that signature check
+    we'd risk slicing ref-image patches (img2img case) or comprehension-only
+    patch blocks.
+
+    Falls back to "all patch positions" if ``image_end_token_id`` or
+    ``num_query_tokens`` is not provided — matches the pre-img2img t2i-only
+    behavior used by older callers.
+    """
     output = thinker_output.outputs[0]
     mm_out = getattr(output, "multimodal_output", None) or {}
     full_hidden = mm_out.get("final_hidden_states")
@@ -208,35 +269,60 @@ def _slice_patch_hidden(
 
     prompt_ids = _ensure_list(thinker_output.prompt_token_ids)
     prompt_ids_t = torch.tensor(prompt_ids, dtype=torch.long, device=full_hidden.device)
-    patch_mask = prompt_ids_t == image_patch_token_id
-    num_patches = int(patch_mask.sum().item())
-    if num_patches == 0:
+    patch_indices = (prompt_ids_t == image_patch_token_id).nonzero(as_tuple=False).squeeze(-1)
+    total_patches = int(patch_indices.numel())
+    if total_patches == 0:
         logger.warning("[thinker2imagegen] %s: no <imagePatch> tokens in prompt (len=%d)", tag, len(prompt_ids))
         return None
 
     if full_hidden.dim() == 3:
         assert full_hidden.shape[0] == 1, f"expected batch=1, got {full_hidden.shape}"
         full_hidden = full_hidden[0]
-    if full_hidden.dim() != 2 or full_hidden.shape[0] != patch_mask.shape[0]:
+    if full_hidden.dim() != 2 or full_hidden.shape[0] != prompt_ids_t.shape[0]:
         logger.warning(
             "[thinker2imagegen] %s: hidden shape %s inconsistent with prompt len %d",
             tag,
             tuple(full_hidden.shape),
-            patch_mask.shape[0],
+            prompt_ids_t.shape[0],
         )
         return None
 
-    hidden = full_hidden[patch_mask].detach().contiguous()
+    selected_indices = patch_indices
+    if num_query_tokens is not None and image_end_token_id is not None:
+        L = int(prompt_ids_t.numel())
+        if L >= num_query_tokens + 1 and int(prompt_ids_t[-1].item()) == image_end_token_id:
+            tail_start = L - 1 - num_query_tokens
+            tail_end = L - 1  # exclusive
+            tail_slice = prompt_ids_t[tail_start:tail_end]
+            if (tail_slice == image_patch_token_id).all():
+                selected_indices = torch.arange(tail_start, tail_end, dtype=torch.long, device=full_hidden.device)
+            else:
+                logger.warning(
+                    "[thinker2imagegen] %s: tail signature mismatch (expected N patches "
+                    "before <image_end>); falling back to all patch positions",
+                    tag,
+                )
+        else:
+            logger.warning(
+                "[thinker2imagegen] %s: image-gen block signature not found at prompt tail "
+                "(len=%d, last_tok=%s); falling back to all patch positions",
+                tag,
+                L,
+                int(prompt_ids_t[-1].item()) if L else None,
+            )
+
+    hidden = full_hidden[selected_indices].detach().contiguous()
     if logger.isEnabledFor(logging.DEBUG):
         f = hidden.float()
         logger.debug(
-            "[thinker2imagegen] %s sliced=%s mean=%+.4f std=%.4f |x|/tok=%.3f (%d patches)",
+            "[thinker2imagegen] %s sliced=%s (%d of %d patches) mean=%+.4f std=%.4f |x|/tok=%.3f",
             tag,
             tuple(hidden.shape),
+            int(selected_indices.numel()),
+            total_patches,
             f.mean().item(),
             f.std().item(),
             f.norm(dim=-1).mean().item(),
-            num_patches,
         )
     return hidden
 
@@ -257,6 +343,8 @@ def thinker2imagegen(
     """
     source_stage, thinker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
     image_patch_token_id = _resolve_image_patch_token_id(source_stage)
+    image_end_token_id = _resolve_image_end_token_id(source_stage)
+    num_query_tokens = _resolve_num_query_tokens(source_stage)
 
     parent_output = None
     negative_output = None
@@ -271,21 +359,44 @@ def thinker2imagegen(
         logger.warning("[thinker2imagegen] no parent output in engine_outputs; skipping")
         return []
 
-    parent_hidden = _slice_patch_hidden(parent_output, image_patch_token_id, tag="parent")
+    parent_hidden = _slice_patch_hidden(
+        parent_output,
+        image_patch_token_id,
+        tag="parent",
+        num_query_tokens=num_query_tokens,
+        image_end_token_id=image_end_token_id,
+    )
     if parent_hidden is None:
         return []
 
     extra: dict[str, Any] = {"thinker_hidden_states": parent_hidden}
     if negative_output is not None:
-        neg_hidden = _slice_patch_hidden(negative_output, image_patch_token_id, tag="cfg_text")
+        neg_hidden = _slice_patch_hidden(
+            negative_output,
+            image_patch_token_id,
+            tag="cfg_text",
+            num_query_tokens=num_query_tokens,
+            image_end_token_id=image_end_token_id,
+        )
         if neg_hidden is not None:
             extra["negative_thinker_hidden_states"] = neg_hidden
 
     # img2img: forward the reference image PIL/tensor to the diffusion stage.
-    # The thinker request carries it under ``multi_modal_data["img2img"]``
-    # (wired by serving_chat for ``modalities == ["img2img"]``).
+    # serving_chat's img2img branch originally writes the PIL to
+    # ``multi_modal_data["img2img"]``; ``_MingMultiModalDataParser`` then
+    # rewrites that key to ``multi_modal_data["image"]`` in-place so the
+    # thinker can embed it as a regular vision input. Read from whichever
+    # key the PIL ends up at — prefer ``image`` (the post-parser location)
+    # and fall back to ``img2img`` in case the parser didn't run (e.g. tests).
     if isinstance(prompt, dict):
-        ref_image = (prompt.get("multi_modal_data") or {}).get("img2img")
+        mm_data = prompt.get("multi_modal_data") or {}
+        ref_image = mm_data.get("image")
+        if isinstance(ref_image, list) and ref_image:
+            ref_image = ref_image[0]
+        if ref_image is None:
+            ref_image = mm_data.get("img2img")
+            if isinstance(ref_image, list) and ref_image:
+                ref_image = ref_image[0]
         if ref_image is not None:
             extra["reference_image"] = ref_image
 

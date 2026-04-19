@@ -362,7 +362,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         engine_prompt_image = None
 
                 # Override the prompts produced by chat-template preprocessing.
-                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
+                # For img2img, prepend ``<IMAGE>`` so the thinker-side prompt
+                # replacement can locate the ref-image placeholder — needs to
+                # survive MM caching (when the ref image is cache-warm, the
+                # thinker sees 0 missing items and cannot know to inject the
+                # placeholder itself).
+                effective_prompt = "<IMAGE>" + extracted_prompt if is_img2img else extracted_prompt
+                tprompt: OmniTextPrompt = {"prompt": effective_prompt}
                 if is_img2img:
                     tprompt["modalities"] = ["img2img"]
                 else:
@@ -374,9 +380,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     mm_processor_kwargs["target_h"] = height
                 if width is not None:
                     mm_processor_kwargs["target_w"] = width
-                if not is_img2img:
-                    # Mark the request as a text-to-image generation request.
-                    mm_processor_kwargs["is_image_gen"] = True
+                # Image-gen models (Ming reads this flag) use it to trigger
+                # per-request query-token expansion in their MM processor.
+                # Both pure t2i and img2img (edit with reference image) are
+                # image-gen cases — the presence of a reference image does
+                # not disable image generation, it augments it.
+                mm_processor_kwargs["is_image_gen"] = True
                 if mm_processor_kwargs:
                     tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:

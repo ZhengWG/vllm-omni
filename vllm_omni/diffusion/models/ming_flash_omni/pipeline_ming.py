@@ -451,9 +451,17 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         guidance_scale = float(resolved["cfg"])
         seed = resolved.get("seed")
 
-        generator = sp.generator
-        if generator is None and seed is not None:
+        # Always rebuild the generator from the resolved seed. Reusing
+        # ``sp.generator`` causes two problems:
+        #   (1) if the caller pre-seeded it with sp.seed (e.g. the top-level
+        #       ``seed`` key on OmniDiffusionSamplingParams), any override via
+        #       ``extra_args.image_gen.seed`` would be silently ignored; and
+        #   (2) a persistent generator instance accumulates state across
+        #       requests → same-seed replays produce different outputs.
+        if seed is not None:
             generator = torch.Generator(device=target_device).manual_seed(int(seed))
+        else:
+            generator = sp.generator
 
         # Format prompt_embeds / negative_prompt_embeds as list[Tensor]
         # (one entry per request) — matches ZImagePipeline's contract when

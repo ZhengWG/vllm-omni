@@ -114,7 +114,9 @@ class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
         return 1
 
     def get_supported_mm_limits(self) -> Mapping[str, int | None]:
-        return {"image": None, "video": None, "audio": None}
+        # ``img2img`` is the serving-layer alias for a reference image in the
+        # image-gen path; treated as a regular image by ``_MingMultiModalDataParser``.
+        return {"image": None, "video": None, "audio": None, "img2img": 1}
 
     def get_mm_max_tokens_per_item(
         self,
@@ -153,11 +155,54 @@ class MingFlashOmniThinkerProcessingInfo(Qwen2VLProcessingInfo):
 
     def get_data_parser(self):
         feature_extractor = self.get_feature_extractor()
-        return MultiModalDataParser(
+        return _MingMultiModalDataParser(
             target_sr=feature_extractor.sampling_rate,
             target_channels=self.get_target_channels(),
             expected_hidden_size=self._get_expected_hidden_size(),
         )
+
+
+class _MingMultiModalDataParser(MultiModalDataParser):
+    """Rewrite ``img2img`` → ``image`` in-place so the thinker embeds the ref.
+
+    Matches Ming's upstream (``processing_bailingmm2.py::__call__``): when
+    ``images`` is provided the image_processor runs → pixel_values + image_grid_thw,
+    and ``_expand_image_tokens`` expands ``<IMAGE>`` placeholders in the text
+    to ``<imagePatch>*N``. The same PIL then ALSO goes to the diffusion stage
+    as ``image_gen_pixel_values_reference``.
+
+    On vllm-omni's serving path serving_chat emits
+    ``multi_modal_data={"img2img": PIL}`` (Bagel convention). We mutate the
+    caller's mm_data dict here — moving the PIL from the ``img2img`` key into
+    the ``image`` key — so that:
+
+      * vLLM's renderer validator sees consistent keys in
+        ``mm_data`` and the parser output (``mm_data_items["image"]``)
+      * The thinker-side image path (``_call_hf_processor`` reads
+        ``mm_data["images"]``, ``_get_prompt_updates`` replaces ``<IMAGE>``
+        placeholders, ``_get_mm_fields_config`` declares image field layout)
+        all run normally with the ref PIL acting as a regular image input
+      * ``thinker2imagegen`` still finds the ref PIL — but now under
+        ``multi_modal_data["image"]`` rather than ``["img2img"]``.
+
+    A companion prepend in ``_apply_hf_processor_main`` ensures the prompt
+    text carries a matching ``<IMAGE>`` placeholder when needed.
+    """
+
+    def parse_mm_data(self, mm_data):
+        if "img2img" in mm_data:
+            img2img = mm_data.pop("img2img")
+            if not isinstance(img2img, list):
+                img2img = [img2img]
+            existing = mm_data.get("image")
+            if existing is None:
+                existing_list: list[Any] = []
+            elif isinstance(existing, list):
+                existing_list = list(existing)
+            else:
+                existing_list = [existing]
+            mm_data["image"] = existing_list + img2img
+        return super().parse_mm_data(mm_data)
 
 
 class MingFlashOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MingFlashOmniThinkerProcessingInfo]):
@@ -545,8 +590,13 @@ class MingFlashOmniThinkerForConditionalGeneration(
             return "<VIDEO>"
         elif modality.startswith("audio"):
             return "<AUDIO>"
+        elif modality == "img2img":
+            # Ming's img2img ref image is consumed only by the diffusion stage
+            # (``thinker2imagegen`` reads the raw PIL). No text-side placeholder
+            # is emitted for the thinker.
+            return None
 
-        raise ValueError("Only image, video, or audio modality is supported")
+        raise ValueError("Only image, video, audio, or img2img modality is supported")
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -849,74 +899,86 @@ class MingFlashOmniThinkerForConditionalGeneration(
     ) -> torch.Tensor:
         inputs_embeds = self.language_model.model.word_embeddings(input_ids)
 
-        if multimodal_embeddings is None or len(multimodal_embeddings) == 0:
-            # Two sub-cases:
-            #   (a) plain text request: no <imagePatch> tokens -> nothing to do
-            #   (b) text-to-image request: <imagePatch> tokens are present but
-            #       no vision features were extracted; fill those positions
-            #       with learnable query_tokens_dict entries. Ming reuses the
-            #       same <imagePatch> token id for both comprehension and
-            #       generation -> the absence of multimodal_embeddings plus
-            #       the presence of patch tokens unambiguously signals gen.
-            if len(self.query_tokens_dict) > 0:
-                self._maybe_inject_image_gen_query_embeds(input_ids, inputs_embeds)
-            return inputs_embeds
+        # Step 1: if vision/audio features were extracted, merge them into
+        # inputs_embeds at their <patch> positions first. This fills ref-image
+        # and other normal vision-input positions with real features.
+        if multimodal_embeddings is not None and len(multimodal_embeddings) > 0:
+            assert is_multimodal is not None, "`is_multimodal` mask required when `multimodal_embeddings` provided"
+            inputs_embeds = _merge_multimodal_embeddings(
+                inputs_embeds=inputs_embeds,
+                multimodal_embeddings=multimodal_embeddings,
+                is_multimodal=is_multimodal,
+            )
 
-        assert is_multimodal is not None, "`is_multimodal` mask required when `multimodal_embeddings` provided"
-        return _merge_multimodal_embeddings(
-            inputs_embeds=inputs_embeds,
-            multimodal_embeddings=multimodal_embeddings,
-            is_multimodal=is_multimodal,
-        )
+        # Step 2: image-gen query tokens are appended at the tail of the prompt
+        # as a contiguous block of ``<imagePatch>`` tokens. Inject the learnable
+        # ``query_tokens_dict`` entries at those positions. Running AFTER step 1
+        # is safe because the query-token block is disjoint from ref-image
+        # patch positions (ref patches are earlier in the prompt, filled by
+        # step 1; query tokens occupy the trailing block and get overwritten
+        # here). Injecting always — including when multimodal embeddings are
+        # present — matches Ming's img2img-edit flow where BOTH a real image
+        # input AND the learnable query tokens need to reach the LLM.
+        if len(self.query_tokens_dict) > 0:
+            self._maybe_inject_image_gen_query_embeds(input_ids, inputs_embeds)
+        return inputs_embeds
 
     def _maybe_inject_image_gen_query_embeds(
         self,
         input_ids: torch.Tensor,
         inputs_embeds: torch.Tensor,
     ) -> None:
-        """Replace ``<imagePatch>`` positions with learnable query tokens.
+        """Overwrite the trailing ``<imagePatch>`` block with learnable query tokens.
 
-        Operates in-place on ``inputs_embeds``. The scale (e.g. ``16x16``) is
-        picked by matching the number of consecutive patch-token positions
-        against the available entries in ``self.query_tokens_dict``.
+        The image-gen query-token block is appended at the tail of the prompt
+        by ``maybe_expand_image_gen_prompt`` as literal text
+        ``<image><imagePatch>*N</image>``. After tokenization:
+
+            ... <image_start_token> <imagePatch>*N <image_end_token>
+
+        is the exact trailing pattern. We verify that signature before
+        injecting — without the check, a pure vision-understanding request
+        whose final ref-image block ends in N or more ``<imagePatch>`` tokens
+        would be misidentified as image-gen and its vision features silently
+        overwritten. Decode-phase calls (``input_ids`` is one next-token)
+        naturally fail the signature check and return early.
         """
+        if input_ids.numel() == 0:
+            return
         patch_token_id = self.config.image_patch_token
-        patch_mask = input_ids == patch_token_id
-        num_patches = int(patch_mask.sum().item())
-        if num_patches == 0:
+        image_end_token_id = getattr(self.config, "image_end_token", None)
+        if image_end_token_id is None:
             return
 
-        # Pick the scale whose num_tokens matches. For img_gen_scales=[16]
-        # there is only one entry (16x16 -> 256).
-        scale_name = None
-        for name, param in self.query_tokens_dict.items():
-            if param.shape[0] == num_patches:
-                scale_name = name
-                break
-        if scale_name is None:
-            logger.warning(
-                "[MingFlashOmniThinker] image-gen request with %d patch tokens "
-                "but no query_tokens_dict entry matches; available=%s",
-                num_patches,
-                {k: tuple(v.shape) for k, v in self.query_tokens_dict.items()},
-            )
+        scale_items = list(self.query_tokens_dict.items())
+        if not scale_items:
+            return
+        scale_name, query_param = scale_items[-1]
+        num_query_tokens = int(query_param.shape[0])
+
+        flat = input_ids.view(-1)
+        L = int(flat.numel())
+        # Need at least num_query_tokens patch tokens + 1 <image_end> token.
+        if L < num_query_tokens + 1:
             return
 
-        query_embeds = self.query_tokens_dict[scale_name].to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
-        if logger.isEnabledFor(logging.DEBUG):
-            q = query_embeds.detach().float()
-            logger.debug(
-                "[MingFlashOmniThinker] query_embeds[%s]: mean=%+.4f std=%.4f |x|/tok=%.3f",
-                scale_name,
-                q.mean().item(),
-                q.std().item(),
-                q.norm(dim=-1).mean().item(),
-            )
-        inputs_embeds[patch_mask] = query_embeds
+        # Signature: the prompt must end with <image_end_token>, and the
+        # N positions immediately before it must all be <imagePatch>.
+        if int(flat[-1].item()) != image_end_token_id:
+            return
+        tail_start = L - 1 - num_query_tokens
+        tail_end = L - 1  # exclusive — last index is <image_end_token>
+        if not (flat[tail_start:tail_end] == patch_token_id).all():
+            return
+
+        query_embeds = query_param.to(dtype=inputs_embeds.dtype, device=inputs_embeds.device)
+        inputs_embeds[tail_start:tail_end] = query_embeds
         logger.debug(
-            "[MingFlashOmniThinker] injected %d image-gen query embeddings at <imagePatch> positions (scale=%s)",
-            num_patches,
+            "[MingFlashOmniThinker] injected %d image-gen query embeddings (scale=%s) at positions [%d, %d)",
+            num_query_tokens,
             scale_name,
+            tail_start,
+            tail_end,
         )
 
     def forward(
