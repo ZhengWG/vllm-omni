@@ -183,65 +183,37 @@ class Orchestrator:
         """Poll stage pools and route logical outputs."""
         while not self._shutdown_event.is_set():
             idle = True
-            for pool in self.stage_pools:
-                if self._shutdown_event.is_set():
-                    return
+            for stage_id in range(self.num_stages):
+                pool = self.stage_pools[stage_id]
+                for replica_id in range(pool.num_replicas):
+                    if self._shutdown_event.is_set():
+                        return
 
-                if pool.stage_type == "diffusion":
-                    had_activity = await self._poll_diffusion_stage(pool)
-                else:
-                    had_activity = await self._poll_llm_stage(pool, timeout_s=0.001)
+                    if pool.stage_type == "diffusion":
+                        output = pool.poll_diffusion_output(replica_id)
+                        if output is None:
+                            continue
 
-                if not had_activity:
-                    continue
+                        await self._handle_processed_outputs(stage_id, replica_id, [output])
+                        idle = False
+                    else:
+                        raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=0.001)
+                        if raw_outputs is None:
+                            continue
 
-                idle = False
+                        await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                        raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
+                        await self._handle_processed_outputs(stage_id, replica_id, raw_output)
+                        idle = False
 
             if idle:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
 
-    async def _poll_llm_stage(self, pool: StagePool, *, timeout_s: float) -> bool:
-        """Poll one LLM stage pool and route any resulting outputs."""
-        had_activity = False
-        for replica_id in range(pool.num_replicas):
-            if self._shutdown_event.is_set():
-                return had_activity
-
-            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=timeout_s)
-            if raw_outputs is None:
-                continue
-
-            await self._handle_kv_ready_raw_outputs(pool, raw_outputs)
-            had_activity = True
-            await self._handle_processed_outputs(
-                pool,
-                replica_id,
-                await pool.process_llm_raw_outputs(replica_id, raw_outputs),
-            )
-
-        return had_activity
-
-    async def _poll_diffusion_stage(self, pool: StagePool) -> bool:
-        """Poll one diffusion stage pool and route any ready outputs."""
-        had_activity = False
-        for replica_id in range(pool.num_replicas):
-            if self._shutdown_event.is_set():
-                return had_activity
-
-            output = pool.poll_diffusion_output(replica_id)
-            if output is None:
-                continue
-
-            had_activity = True
-            await self._handle_processed_outputs(pool, replica_id, [output])
-
-        return had_activity
-
-    async def _handle_processed_outputs(self, pool: StagePool, replica_id: int, outputs: list[Any]) -> None:
+    async def _handle_processed_outputs(self, stage_id: int, replica_id: int, outputs: list[Any]) -> None:
         """Route processed stage outputs produced by one stage poll."""
-        stage_id = pool.stage_id
+        pool = self.stage_pools[stage_id]
         for output in outputs:
             req_state = self.request_states.get(output.request_id)
             if req_state is None:
@@ -254,7 +226,7 @@ class Orchestrator:
                 continue
 
             if getattr(output, "error", None) is not None:
-                await self._handle_stage_error(pool, output)
+                await self._handle_stage_error(stage_id, output)
                 continue
 
             stage_metrics = None
@@ -265,9 +237,9 @@ class Orchestrator:
                     replica_id=replica_id,
                 )
 
-            await self._route_output(pool, output, req_state, stage_metrics)
+            await self._route_output(stage_id, output, req_state, stage_metrics)
 
-    async def _handle_stage_error(self, source_pool: StagePool, output: Any) -> None:
+    async def _handle_stage_error(self, stage_id: int, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
         if self._cfg_tracker.is_companion(output.request_id):
             parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
@@ -277,7 +249,7 @@ class Orchestrator:
             {
                 "type": "error",
                 "request_id": parent_id,
-                "stage_id": source_pool.stage_id,
+                "stage_id": stage_id,
                 "error": output.error,
             }
         )
@@ -316,13 +288,12 @@ class Orchestrator:
 
     async def _route_output(
         self,
-        source_pool: StagePool,
+        stage_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
         stage_metrics: Any,
     ) -> None:
         """Route a processed output: send to frontend and/or forward."""
-        stage_id = source_pool.stage_id
         req_id = output.request_id
         finished = output.finished
         submit_ts = req_state.stage_submit_ts.get(stage_id)
@@ -332,7 +303,7 @@ class Orchestrator:
             await self._cleanup_request_ids([req_id])
             return
 
-        if source_pool.final_output:
+        if self.stage_pools[stage_id].final_output:
             await self.output_async_queue.put(
                 {
                     "type": "output",
@@ -364,7 +335,7 @@ class Orchestrator:
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
                 self._cfg_tracker.defer_parent(req_id, output, stage_id)
             else:
-                await self._forward_to_next_stage(req_id, source_pool, output, req_state)
+                await self._forward_to_next_stage(req_id, stage_id, output, req_state)
 
         if finished and stage_id == req_state.final_stage_id:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
@@ -389,21 +360,20 @@ class Orchestrator:
 
         await self._forward_to_next_stage(
             parent_id,
-            self.stage_pools[stage_id],
+            stage_id,
             deferred["engine_outputs"],
             parent_state,
         )
 
     async def _handle_kv_ready_raw_outputs(
         self,
-        source_pool: StagePool,
+        stage_id: int,
         raw_outputs: EngineCoreOutputs,
     ) -> None:
         """Forward split requests once stage-0 KV is ready."""
         if self.async_chunk:
             return
 
-        stage_id = source_pool.stage_id
         for raw_output in raw_outputs.outputs:
             kv_params = getattr(raw_output, "kv_transfer_params", None)
             if not (isinstance(kv_params, dict) and kv_params.get("kv_ready")):
@@ -424,17 +394,17 @@ class Orchestrator:
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
                 self._cfg_tracker.defer_parent(req_id, raw_output, stage_id)
             else:
-                await self._forward_to_next_stage(req_id, source_pool, raw_output, req_state)
+                await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
 
     async def _forward_to_next_stage(
         self,
         req_id: str,
-        source_pool: StagePool,
+        src_stage_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
-        next_logical = source_pool.stage_id + 1
+        next_logical = src_stage_id + 1
         next_pool = self.stage_pools[next_logical]
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
@@ -458,7 +428,7 @@ class Orchestrator:
                 diffusion_prompt,
                 submit_kwargs={
                     "kv_sender_info": self._build_kv_sender_info(
-                        list(getattr(next_client, "engine_input_source", None) or [source_pool.stage_id]),
+                        list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
                         request_id=req_id,
                     )
                 },

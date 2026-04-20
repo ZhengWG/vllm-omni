@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import time as _time
-from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -36,47 +35,25 @@ class StagePool:
     def __init__(
         self,
         stage_id: int,
-        clients: list[Any],
+        clients: Any | list[Any],
         *,
         output_processor: Any = None,
         stage_vllm_config: Any = None,
     ) -> None:
-        if not clients:
+        if isinstance(clients, list):
+            normalized_clients = list(clients)
+        else:
+            normalized_clients = [clients]
+
+        if not normalized_clients:
             raise ValueError(f"StagePool for stage {stage_id} has no replicas")
         self.stage_id = stage_id
-        self.clients: list[Any] = list(clients)
+        self.clients: list[Any] = normalized_clients
         self._output_processor = output_processor
         self._stage_vllm_config = stage_vllm_config
         self._next_replica_id = 0
         self._request_bindings: dict[str, int] = {}
         self._replica_metrics: list[_ReplicaMetrics] = [_ReplicaMetrics() for _ in self.clients]
-
-    # ---- Construction helpers ----
-
-    @classmethod
-    def build_from_replicas(
-        cls,
-        stage_id: int,
-        clients: Sequence[Any],
-        output_processor: Any,
-        stage_vllm_config: Any,
-    ) -> StagePool:
-        """Build a pool from client replicas plus stage-level shared state."""
-        return cls(
-            stage_id,
-            list(clients),
-            output_processor=output_processor,
-            stage_vllm_config=stage_vllm_config,
-        )
-
-    @classmethod
-    def build_from_diffusion_client(
-        cls,
-        stage_id: int,
-        client: Any,
-    ) -> StagePool:
-        """Build a single-replica pool for a diffusion stage."""
-        return cls(stage_id, [client], output_processor=None, stage_vllm_config=None)
 
     # ---- Stage-level properties ----
 

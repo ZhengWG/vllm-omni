@@ -926,12 +926,12 @@ class AsyncOmniEngine:
 
             for stage_id in range(num_stages):
                 if stage_id in diffusion_clients:
-                    stage_pools.append(StagePool.build_from_diffusion_client(stage_id, diffusion_clients[stage_id]))
+                    stage_pools.append(StagePool(stage_id, diffusion_clients[stage_id]))
                 else:
                     stage_pools.append(
-                        StagePool.build_from_replicas(
+                        StagePool(
                             stage_id,
-                            clients=stage_attach_results[stage_id],
+                            stage_attach_results[stage_id],
                             output_processor=stage_output_proc_results[stage_id],
                             stage_vllm_config=stage_vllm_cfg_results[stage_id],
                         )

@@ -159,12 +159,12 @@ def _build_stage_pools(
     for stage_id in range(num_stages):
         clients = stage_clients[stage_id]
         if clients[0].stage_type == "diffusion":
-            pools.append(StagePool.build_from_diffusion_client(stage_id, clients[0]))
+            pools.append(StagePool(stage_id, clients[0]))
         else:
             pools.append(
-                StagePool.build_from_replicas(
+                StagePool(
                     stage_id,
-                    clients=clients,
+                    clients,
                     output_processor=output_processors[stage_id],
                     stage_vllm_config=stage_vllm_configs[stage_id],
                 )

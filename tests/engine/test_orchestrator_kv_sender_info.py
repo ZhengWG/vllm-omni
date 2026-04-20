@@ -45,9 +45,9 @@ class _DummyDiffusionStage:
 
 
 def _build_sender_pool(stage_id: int, sender_info: dict[str, object]) -> StagePool:
-    return StagePool.build_from_replicas(
+    return StagePool(
         stage_id,
-        clients=[_DummySenderStage(sender_info)],
+        _DummySenderStage(sender_info),
         output_processor=object(),
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
@@ -138,7 +138,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
-    diffusion_pool = StagePool.build_from_diffusion_client(1, diffusion_stage)
+    diffusion_pool = StagePool(1, diffusion_stage)
 
     orchestrator.num_stages = 2
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
@@ -167,7 +167,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     source_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
     previous_pool = _build_sender_pool(1, {"host": "10.0.0.9", "zmq_port": 59999})
-    diffusion_pool = StagePool.build_from_diffusion_client(2, diffusion_stage)
+    diffusion_pool = StagePool(2, diffusion_stage)
 
     orchestrator.num_stages = 3
     orchestrator.stage_pools = [source_pool, previous_pool, diffusion_pool]
@@ -193,7 +193,7 @@ def test_prewarm_diffusion_attaches_kv_sender_info():
     orchestrator = object.__new__(Orchestrator)
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     sender_pool = _build_sender_pool(0, {"host": "10.0.0.3", "zmq_port": 50151})
-    diffusion_pool = StagePool.build_from_diffusion_client(1, diffusion_stage)
+    diffusion_pool = StagePool(1, diffusion_stage)
 
     orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator.num_stages = 2
