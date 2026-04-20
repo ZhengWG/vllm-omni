@@ -390,6 +390,7 @@ class StageDeployConfig:
     max_model_len: int | None = None
     async_scheduling: bool | None = None
     devices: str = "0"
+    num_replicas: int = 1
     output_connectors: dict[str, str] | None = None
     input_connectors: dict[str, str] | None = None
     default_sampling_params: dict[str, Any] | None = None
@@ -431,6 +432,7 @@ _STAGE_NON_ENGINE_KEYS = frozenset(
     {
         "stage_id",
         "devices",
+        "num_replicas",
         "output_connectors",
         "input_connectors",
         "default_sampling_params",
@@ -445,13 +447,20 @@ _STAGE_DEPLOY_FIELDS = {f.name: f for f in fields(StageDeployConfig) if f.name n
 def _parse_stage_deploy(stage_data: dict[str, Any]) -> StageDeployConfig:
     """Parse a single stage entry from deploy YAML into StageDeployConfig."""
     if "engine_args" in stage_data:
+        runtime_cfg = dict(stage_data.get("runtime", {}))
         engine_args = dict(stage_data["engine_args"])
-        devices = stage_data.get("runtime", {}).get("devices", stage_data.get("devices", "0"))
+        devices = runtime_cfg.get("devices", stage_data.get("devices", "0"))
+        num_replicas = runtime_cfg.get("num_replicas", stage_data.get("num_replicas", 1))
     else:
         engine_args = {k: v for k, v in stage_data.items() if k not in _STAGE_NON_ENGINE_KEYS and k != "stage_id"}
         devices = stage_data.get("devices", "0")
+        num_replicas = stage_data.get("num_replicas", stage_data.get("runtime", {}).get("num_replicas", 1))
 
-    kwargs: dict[str, Any] = {"stage_id": stage_data["stage_id"], "devices": devices}
+    kwargs: dict[str, Any] = {
+        "stage_id": stage_data["stage_id"],
+        "devices": devices,
+        "num_replicas": int(num_replicas),
+    }
     for name, f in _STAGE_DEPLOY_FIELDS.items():
         if name in engine_args:
             kwargs[name] = engine_args.pop(name)
@@ -604,7 +613,11 @@ def _extract_platform_overrides(ps: dict[str, Any]) -> tuple[dict[str, Any], str
     the flat layout. ``devices`` is ``None`` when no override is set.
     """
     if "engine_args" in ps:
-        return dict(ps["engine_args"]), ps.get("runtime", {}).get("devices")
+        overrides = dict(ps["engine_args"])
+        runtime_cfg = ps.get("runtime", {})
+        if "num_replicas" in runtime_cfg:
+            overrides["num_replicas"] = runtime_cfg["num_replicas"]
+        return overrides, runtime_cfg.get("devices")
     overrides = {k: v for k, v in ps.items() if k not in ("stage_id", "devices")}
     return overrides, ps.get("devices")
 
@@ -780,6 +793,7 @@ def merge_pipeline_deploy(
         runtime: dict[str, Any] = {"process": True}
         if ds is not None:
             runtime["devices"] = ds.devices
+            runtime["num_replicas"] = ds.num_replicas
 
         result.append(
             StageConfig(

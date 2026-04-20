@@ -27,6 +27,14 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
     --deploy-config /path/to/your_deploy_config.yaml
 ```
 
+For the bundled 3x-GPU multi-replica layout (talker/code2wav scale-out),
+use:
+
+```bash
+vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni --port 8091 \
+    --deploy-config vllm_omni/deploy/qwen3_omni_moe_multi_replicas.yaml
+```
+
 ### Tuning deployment parameters
 
 Most engine knobs (`max_num_batched_tokens`, `max_model_len`, `enforce_eager`,
