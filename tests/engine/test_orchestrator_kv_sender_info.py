@@ -153,7 +153,7 @@ def test_forward_to_diffusion_attaches_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-1", finished=True)
-    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", sender_pool, output, req_state))
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-1", sender_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["request_id"] == "req-1"
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
@@ -182,7 +182,7 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
     )
 
     output = SimpleNamespace(request_id="req-3", finished=True)
-    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", previous_pool, output, req_state))
+    asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-3", previous_pool.stage_id, output, req_state))
 
     assert diffusion_stage.calls[0]["kv_sender_info"] == {
         0: {"host": "10.0.0.2", "zmq_port": 50151},

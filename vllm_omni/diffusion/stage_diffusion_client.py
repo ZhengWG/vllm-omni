@@ -110,9 +110,9 @@ class StageDiffusionClient:
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
         self.default_sampling_params = metadata.default_sampling_params
-        self.requires_multimodal_data = metadata.requires_multimodal_data
-        self.custom_process_input_func = metadata.custom_process_input_func
-        self.engine_input_source = metadata.engine_input_source
+        self.requires_multimodal_data = getattr(metadata, "requires_multimodal_data", False)
+        self.custom_process_input_func = getattr(metadata, "custom_process_input_func", None)
+        self.engine_input_source = getattr(metadata, "engine_input_source", [])
         self._proc = proc
         self._owns_process = proc is not None
 

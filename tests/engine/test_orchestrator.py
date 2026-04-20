@@ -14,7 +14,7 @@ import pytest
 from vllm.outputs import CompletionOutput, RequestOutput
 from vllm.sampling_params import SamplingParams
 
-from vllm_omni.engine.orchestrator import Orchestrator
+from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
 from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
@@ -691,3 +691,98 @@ async def test_multi_replica_shutdown_all_replicas(orchestrator_factory) -> None
     assert not orchestrator_fixture.thread.is_alive()
     for client in [stage0_r0, stage0_r1, stage1]:
         assert client.shutdown_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
+    """A request admitted to one replica must keep using that replica on updates."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0_r0, stage0_r1],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    req0_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+    req1_state = OrchestratorRequestState(
+        request_id="req-1",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    await pool.submit_initial("req-0", req0_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]))
+    await pool.submit_update("req-0", req0_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[3]))
+    await pool.submit_initial("req-1", req1_state, SimpleNamespace(request_id="req-1", prompt_token_ids=[4, 5]))
+    await pool.submit_update("req-1", req1_state, SimpleNamespace(request_id="req-1", prompt_token_ids=[6]))
+
+    assert pool.get_bound_replica_id("req-0") == 0
+    assert pool.get_bound_replica_id("req-1") == 1
+    assert len(stage0_r0.add_request_calls) == 2
+    assert len(stage0_r1.add_request_calls) == 2
+    assert stage0_r0.add_request_calls[0][0].request_id == "req-0"
+    assert stage0_r0.add_request_calls[1][0].request_id == "req-0"
+    assert stage0_r1.add_request_calls[0][0].request_id == "req-1"
+    assert stage0_r1.add_request_calls[1][0].request_id == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_multi_replica_cfg_companion_inherits_parent_affinity(orchestrator_factory) -> None:
+    """CFG companions should be routed to the same stage-0 replica as their parent."""
+    stage0_r0 = FakeStageClient(stage_type="llm", final_output=False)
+    stage0_r1 = FakeStageClient(stage_type="llm", final_output=False)
+    default_vllm_cfg = SimpleNamespace(model_config=SimpleNamespace(max_model_len=64))
+    stage_pools = _build_stage_pools(
+        [[stage0_r0, stage0_r1]],
+        output_processors=[FakeOutputProcessor()],
+        stage_vllm_configs=[default_vllm_cfg],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        # Consume replica-0 first so the parent request binds to replica-1.
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="warmup",
+            prompt=SimpleNamespace(request_id="warmup", prompt_token_ids=[0]),
+            original_prompt={"prompt": "warmup"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
+
+        await _enqueue_add_request(
+            orchestrator_fixture,
+            request_id="parent",
+            prompt=SimpleNamespace(request_id="parent", prompt_token_ids=[1, 2]),
+            original_prompt={"prompt": "parent"},
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 1)
+
+        orchestrator_fixture.request_sync_q.put_nowait(
+            {
+                "type": "add_companion_request",
+                "companion_id": "parent-neg",
+                "parent_id": "parent",
+                "role": "negative",
+                "prompt": SimpleNamespace(request_id="parent-neg", prompt_token_ids=[9]),
+                "companion_prompt_text": {"prompt": "negative"},
+                "sampling_params_list": [_sampling_params()],
+            }
+        )
+        await _wait_for(lambda: len(stage0_r1.add_request_calls) == 2)
+
+        assert stage_pools[0].get_bound_replica_id("parent") == 1
+        assert stage_pools[0].get_bound_replica_id("parent-neg") == 1
+        assert len(stage0_r0.add_request_calls) == 1
+        assert stage0_r1.add_request_calls[0][0].request_id == "parent"
+        assert stage0_r1.add_request_calls[1][0].request_id == "parent-neg"
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
