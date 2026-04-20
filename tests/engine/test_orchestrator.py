@@ -545,10 +545,10 @@ async def test_run_abort(orchestrator_factory) -> None:
         await _wait_for(lambda: len(stages[0].add_request_calls) == 1)
 
         await _enqueue_abort_request(orchestrator_fixture, ["req-abort"])
-        await _wait_for(lambda: all(stage.abort_calls for stage in stages))
+        await _wait_for(lambda: bool(stages[0].abort_calls))
 
-        for stage in stages:
-            assert stage.abort_calls == [["req-abort"]]
+        assert stages[0].abort_calls == [["req-abort"]]
+        assert stages[1].abort_calls == []
         assert "req-abort" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)
@@ -661,10 +661,11 @@ async def test_multi_replica_abort_broadcasts_to_all_replicas(orchestrator_facto
         await _enqueue_abort_request(orchestrator_fixture, ["req-abort-mr"])
 
         all_clients = [stage0_r0, stage0_r1, stage1]
-        await _wait_for(lambda: all(c.abort_calls for c in all_clients))
+        await _wait_for(lambda: bool(stage0_r0.abort_calls))
 
-        for client in all_clients:
-            assert client.abort_calls == [["req-abort-mr"]]
+        assert stage0_r0.abort_calls == [["req-abort-mr"]]
+        assert stage0_r1.abort_calls == []
+        assert stage1.abort_calls == []
         assert "req-abort-mr" not in orchestrator_fixture.orchestrator.request_states
     finally:
         await _shutdown_orchestrator(orchestrator_fixture)

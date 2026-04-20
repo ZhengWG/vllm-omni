@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import time as _time
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 from vllm.logger import init_logger
@@ -19,14 +19,6 @@ if TYPE_CHECKING:
     from vllm_omni.engine.orchestrator import OrchestratorRequestState
 
 logger = init_logger(__name__)
-
-
-@dataclass
-class StagePollResult:
-    """Stage-local poll result returned to the orchestrator."""
-
-    outputs: list[Any] = field(default_factory=list)
-    raw_outputs: EngineCoreOutputs | None = None
 
 
 @dataclass
@@ -129,6 +121,11 @@ class StagePool:
         """Drop the route binding for *request_id* in this stage."""
         self._request_bindings.pop(request_id, None)
 
+    def release_bindings(self, request_ids: list[str]) -> None:
+        """Drop route bindings for the given request ids in this stage."""
+        for request_id in request_ids:
+            self.release_binding(request_id)
+
     def select_replica_id(
         self,
         request_id: str,
@@ -155,16 +152,12 @@ class StagePool:
 
     def build_stage_metrics(
         self,
-        request_id: str,
         request_outputs: list[Any],
         *,
         submit_ts: float,
+        replica_id: int,
     ) -> StageRequestMetrics:
-        """Build stage metrics using the bound route for *request_id*."""
-        replica_id = self.get_bound_replica_id(request_id)
-        if replica_id is None:
-            replica_id = 0
-
+        """Build stage metrics for outputs produced on one replica."""
         now = _time.time()
         stage_gen_time_ms = (now - submit_ts) * 1000.0
 
@@ -208,9 +201,10 @@ class StagePool:
         prompt_text: Any = None,
         affinity_request_id: str | None = None,
         submit_kwargs: dict[str, Any] | None = None,
+        params_override: Any = None,
     ) -> int:
         """Submit a stage-entry request into this pool."""
-        params = req_state.sampling_params_list[self.stage_id]
+        params = params_override if params_override is not None else req_state.sampling_params_list[self.stage_id]
         submit_kwargs = dict(submit_kwargs or {})
         if self.stage_type == "diffusion":
             replica_id = self.select_replica_id(
@@ -265,13 +259,13 @@ class StagePool:
             return None
         return outputs
 
-    async def _process_stage_outputs(
+    async def process_llm_raw_outputs(
         self,
         replica_id: int,
-        client: Any,
         raw_outputs: EngineCoreOutputs,
     ) -> list[Any]:
-        """Run the output processor on raw outputs, returning processed outputs."""
+        """Run the shared LLM output processor on one raw poll result."""
+        client = self.clients[replica_id]
         processor = self.output_processor
         processed = processor.process_outputs(
             raw_outputs.outputs,
@@ -287,110 +281,106 @@ class StagePool:
 
         return processed.request_outputs
 
-    async def poll_ready_outputs(self, *, timeout_s: float = 0.001) -> list[StagePollResult]:
-        """Poll this stage pool once and return all ready outputs."""
-        poll_results: list[StagePollResult] = []
-
-        for replica_id, client in enumerate(self.clients):
-            if client.stage_type == "diffusion":
-                output = client.get_diffusion_output_nowait()
-                if output is not None:
-                    poll_results.append(StagePollResult(outputs=[output]))
-                continue
-
-            try:
-                raw_outputs = await asyncio.wait_for(
-                    self._poll_stage_raw(client),
-                    timeout=timeout_s,
-                )
-            except asyncio.TimeoutError:
-                continue
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                logger.exception(
-                    "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
-                    self.stage_id,
-                    replica_id,
-                )
-                raise
-
-            if raw_outputs is None:
-                continue
-
-            request_outputs = await self._process_stage_outputs(replica_id, client, raw_outputs)
-            poll_results.append(
-                StagePollResult(
-                    outputs=request_outputs,
-                    raw_outputs=raw_outputs,
-                )
+    async def poll_llm_raw_output(
+        self,
+        replica_id: int,
+        *,
+        timeout_s: float = 0.001,
+    ) -> EngineCoreOutputs | None:
+        """Poll raw EngineCore outputs from one LLM replica once."""
+        client = self.clients[replica_id]
+        try:
+            return await asyncio.wait_for(
+                self._poll_stage_raw(client),
+                timeout=timeout_s,
             )
+        except asyncio.TimeoutError:
+            return None
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception(
+                "[StagePool] _poll_stage_raw failed for stage-%s replica-%s",
+                self.stage_id,
+                replica_id,
+            )
+            raise
 
-        return poll_results
+    def poll_diffusion_output(self, replica_id: int) -> Any | None:
+        """Drain one ready diffusion output from the given replica if present."""
+        return self.clients[replica_id].get_diffusion_output_nowait()
 
     # ---- Stage-local control plane ----
 
     async def abort_requests(self, request_ids: list[str]) -> None:
-        """Abort the given requests across all physical routes in this pool."""
-        for client in self.clients:
-            await client.abort_requests_async(request_ids)
+        """Abort the given requests in this stage pool.
+
+        Request-bound abort routing stays inside the pool because route affinity
+        (`request_id -> replica_id`) is pool-owned.
+        """
+        if not request_ids:
+            return
+
+        request_ids_by_replica: dict[int, list[str]] = {}
+        for request_id in request_ids:
+            replica_id = self.get_bound_replica_id(request_id)
+            if replica_id is None:
+                continue
+            request_ids_by_replica.setdefault(replica_id, []).append(request_id)
+
+        for replica_id, replica_request_ids in request_ids_by_replica.items():
+            await self.clients[replica_id].abort_requests_async(replica_request_ids)
 
     async def collective_rpc(
         self,
+        replica_id: int,
         method: str,
         timeout: float | None = None,
         args: tuple[Any, ...] = (),
         kwargs: dict[str, Any] | None = None,
-    ) -> list[Any]:
-        """Dispatch a stage-scoped control-plane RPC across this pool."""
+    ) -> Any:
+        """Dispatch a stage-scoped control-plane RPC to one physical route."""
         kwargs = dict(kwargs or {})
-        results: list[Any] = []
-
-        for replica_id, client in enumerate(self.clients):
-            try:
-                if hasattr(client, "collective_rpc_async"):
-                    stage_result = await client.collective_rpc_async(
-                        method=method,
-                        timeout=timeout,
-                        args=args,
-                        kwargs=kwargs,
-                    )
-                else:
-                    stage_result = {
-                        "supported": False,
-                        "todo": True,
-                        "reason": f"{client.__class__.__name__}.collective_rpc_async is not implemented yet",
-                    }
-            except Exception as exc:
-                logger.exception(
-                    "[StagePool] collective_rpc failed: stage=%s replica=%s method=%s",
-                    self.stage_id,
-                    replica_id,
-                    method,
+        client = self.clients[replica_id]
+        try:
+            if hasattr(client, "collective_rpc_async"):
+                return await client.collective_rpc_async(
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
                 )
-                stage_result = {
-                    "supported": False,
-                    "error": str(exc),
-                }
+            return {
+                "supported": False,
+                "todo": True,
+                "reason": f"{client.__class__.__name__}.collective_rpc_async is not implemented yet",
+            }
+        except Exception as exc:
+            logger.exception(
+                "[StagePool] collective_rpc failed: stage=%s replica=%s method=%s",
+                self.stage_id,
+                replica_id,
+                method,
+            )
+            return {
+                "supported": False,
+                "error": str(exc),
+            }
 
-            results.append(stage_result)
-
-        return results
-
-    def shutdown(self) -> None:
-        """Shutdown all backend handles in this stage pool."""
-        for replica_id, client in enumerate(self.clients):
-            try:
-                client.shutdown()
-                logger.info(
-                    "[StagePool] Stage %d replica %d shut down",
-                    self.stage_id,
-                    replica_id,
-                )
-            except Exception as e:
-                logger.warning(
-                    "[StagePool] Failed to shutdown stage %d replica %d: %s",
-                    self.stage_id,
-                    replica_id,
-                    e,
-                )
+    def shutdown_replica(self, replica_id: int) -> None:
+        """Shutdown one backend handle in this stage pool."""
+        client = self.clients[replica_id]
+        try:
+            client.shutdown()
+            logger.info(
+                "[StagePool] Stage %d replica %d shut down",
+                self.stage_id,
+                replica_id,
+            )
+        except Exception as e:
+            logger.warning(
+                "[StagePool] Failed to shutdown stage %d replica %d: %s",
+                self.stage_id,
+                replica_id,
+                e,
+            )

@@ -187,52 +187,92 @@ class Orchestrator:
                 if self._shutdown_event.is_set():
                     return
 
-                poll_results = await pool.poll_ready_outputs(timeout_s=0.001)
-                if not poll_results:
+                if pool.stage_type == "diffusion":
+                    had_activity = await self._poll_diffusion_stage(pool)
+                else:
+                    had_activity = await self._poll_llm_stage(pool, timeout_s=0.001)
+
+                if not had_activity:
                     continue
 
                 idle = False
-                for poll_result in poll_results:
-                    if self._shutdown_event.is_set():
-                        return
-
-                    stage_id = pool.stage_id
-                    if poll_result.raw_outputs is not None:
-                        await self._handle_kv_ready_raw_outputs(pool, poll_result.raw_outputs)
-
-                    for output in poll_result.outputs:
-                        req_state = self.request_states.get(output.request_id)
-                        if req_state is None:
-                            logger.warning(
-                                "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
-                                output.request_id,
-                                stage_id,
-                                list(self.request_states.keys()),
-                            )
-                            continue
-
-                        if getattr(output, "error", None) is not None:
-                            await self._handle_stage_error(pool, output)
-                            continue
-
-                        stage_metrics = None
-                        if output.finished:
-                            stage_metrics = pool.build_stage_metrics(
-                                output.request_id,
-                                [output],
-                                submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
-                            )
-
-                        await self._route_output(pool, output, req_state, stage_metrics)
 
             if idle:
                 await asyncio.sleep(0.001)
             else:
                 await asyncio.sleep(0)
 
+    async def _poll_llm_stage(self, pool: StagePool, *, timeout_s: float) -> bool:
+        """Poll one LLM stage pool and route any resulting outputs."""
+        had_activity = False
+        for replica_id in range(pool.num_replicas):
+            if self._shutdown_event.is_set():
+                return had_activity
+
+            raw_outputs = await pool.poll_llm_raw_output(replica_id, timeout_s=timeout_s)
+            if raw_outputs is None:
+                continue
+
+            await self._handle_kv_ready_raw_outputs(pool, raw_outputs)
+            had_activity = True
+            await self._handle_processed_outputs(
+                pool,
+                replica_id,
+                await pool.process_llm_raw_outputs(replica_id, raw_outputs),
+            )
+
+        return had_activity
+
+    async def _poll_diffusion_stage(self, pool: StagePool) -> bool:
+        """Poll one diffusion stage pool and route any ready outputs."""
+        had_activity = False
+        for replica_id in range(pool.num_replicas):
+            if self._shutdown_event.is_set():
+                return had_activity
+
+            output = pool.poll_diffusion_output(replica_id)
+            if output is None:
+                continue
+
+            had_activity = True
+            await self._handle_processed_outputs(pool, replica_id, [output])
+
+        return had_activity
+
+    async def _handle_processed_outputs(self, pool: StagePool, replica_id: int, outputs: list[Any]) -> None:
+        """Route processed stage outputs produced by one stage poll."""
+        stage_id = pool.stage_id
+        for output in outputs:
+            req_state = self.request_states.get(output.request_id)
+            if req_state is None:
+                logger.warning(
+                    "[Orchestrator] Dropping output for unknown req %s at stage-%s (known reqs: %s)",
+                    output.request_id,
+                    stage_id,
+                    list(self.request_states.keys()),
+                )
+                continue
+
+            if getattr(output, "error", None) is not None:
+                await self._handle_stage_error(pool, output)
+                continue
+
+            stage_metrics = None
+            if output.finished:
+                stage_metrics = pool.build_stage_metrics(
+                    [output],
+                    submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
+                    replica_id=replica_id,
+                )
+
+            await self._route_output(pool, output, req_state, stage_metrics)
+
     async def _handle_stage_error(self, source_pool: StagePool, output: Any) -> None:
         """Emit a frontend-visible error and clean up request state."""
-        parent_id = self._get_cfg_parent_id(output.request_id)
+        if self._cfg_tracker.is_companion(output.request_id):
+            parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
+        else:
+            parent_id = output.request_id
         await self.output_async_queue.put(
             {
                 "type": "error",
@@ -241,11 +281,38 @@ class Orchestrator:
                 "error": output.error,
             }
         )
-        all_request_ids = [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)]
-        await self._abort_request_ids(all_request_ids)
-        self._release_request_bindings(all_request_ids)
-        for rid in all_request_ids:
-            self.request_states.pop(rid, None)
+        await self._cleanup_request_ids(
+            [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
+            abort=True,
+        )
+
+    async def _cleanup_request_ids(self, request_ids: list[str], *, abort: bool = False) -> None:
+        """Release pool bindings and logical request state for the given ids."""
+        if not request_ids:
+            return
+
+        if abort:
+            await self._abort_request_ids(request_ids)
+        self._release_request_bindings(request_ids)
+        for request_id in request_ids:
+            self.request_states.pop(request_id, None)
+
+    def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
+        """Attach CFG companion ids to diffusion sampling params when needed."""
+        companion_request_ids = self._cfg_tracker.get_companion_request_ids(request_id)
+        if not companion_request_ids:
+            return params
+
+        import copy
+
+        from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+        if not isinstance(params, OmniDiffusionSamplingParams):
+            return params
+
+        params = copy.deepcopy(params)
+        params.cfg_kv_request_ids = companion_request_ids
+        return params
 
     async def _route_output(
         self,
@@ -262,8 +329,7 @@ class Orchestrator:
 
         if finished and self._cfg_tracker.is_companion(req_id):
             await self._handle_cfg_companion_ready(req_id)
-            self._release_request_bindings([req_id])
-            self.request_states.pop(req_id, None)
+            await self._cleanup_request_ids([req_id])
             return
 
         if source_pool.final_output:
@@ -293,7 +359,7 @@ class Orchestrator:
             finished
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
-            and not self._next_stage_already_submitted(stage_id, req_state)
+            and (stage_id + 1) not in req_state.stage_submit_ts
         ):
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
                 self._cfg_tracker.defer_parent(req_id, output, stage_id)
@@ -301,18 +367,7 @@ class Orchestrator:
                 await self._forward_to_next_stage(req_id, source_pool, output, req_state)
 
         if finished and stage_id == req_state.final_stage_id:
-            companion_ids = self._cfg_tracker.cleanup_parent(req_id)
-            self._release_request_bindings([req_id, *companion_ids])
-            self.request_states.pop(req_id, None)
-
-    def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
-        return (stage_id + 1) in req_state.stage_submit_ts
-
-    def _get_cfg_parent_id(self, request_id: str) -> str:
-        """Resolve a request ID to the parent request for CFG companions."""
-        if self._cfg_tracker.is_companion(request_id):
-            return self._cfg_tracker.get_parent_id(request_id) or request_id
-        return request_id
+            await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
 
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
@@ -329,7 +384,7 @@ class Orchestrator:
             return
 
         stage_id = deferred["stage_id"]
-        if self._next_stage_already_submitted(stage_id, parent_state):
+        if (stage_id + 1) in parent_state.stage_submit_ts:
             return
 
         await self._forward_to_next_stage(
@@ -363,7 +418,7 @@ class Orchestrator:
                 continue
             if stage_id >= req_state.final_stage_id:
                 continue
-            if self._next_stage_already_submitted(stage_id, req_state):
+            if (stage_id + 1) in req_state.stage_submit_ts:
                 continue
 
             if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
@@ -396,25 +451,21 @@ class Orchestrator:
             else:
                 diffusion_prompt = req_state.prompt
 
-            companion_request_ids = self._cfg_tracker.get_companion_request_ids(req_id)
-            if companion_request_ids:
-                import copy
-
-                from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-
-                if isinstance(params, OmniDiffusionSamplingParams):
-                    params = copy.deepcopy(params)
-                    params.cfg_kv_request_ids = companion_request_ids
-
-            source_stage_ids = list(getattr(next_client, "engine_input_source", None) or [source_pool.stage_id])
-            kv_sender_info = self._build_kv_sender_info(source_stage_ids, request_id=req_id)
+            req_state.stage_submit_ts.setdefault(next_logical, _time.time())
             await next_pool.submit_initial(
                 req_id,
                 req_state,
                 diffusion_prompt,
-                submit_kwargs={"kv_sender_info": kv_sender_info},
+                submit_kwargs={
+                    "kv_sender_info": self._build_kv_sender_info(
+                        list(getattr(next_client, "engine_input_source", None) or [source_pool.stage_id]),
+                        request_id=req_id,
+                    )
+                },
+                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
             )
         else:
+            req_state.stage_submit_ts.setdefault(next_logical, _time.time())
             next_inputs = next_client.process_engine_inputs(
                 source_outputs,
                 req_state.prompt,
@@ -428,7 +479,6 @@ class Orchestrator:
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
-        req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _handle_add_request(self, msg: dict[str, Any]) -> None:
         """Handle an add_request message from the main thread."""
@@ -461,7 +511,6 @@ class Orchestrator:
         )
         self.request_states[request_id] = req_state
         req_state.stage_submit_ts[stage_id] = _time.time()
-
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -517,16 +566,19 @@ class Orchestrator:
             next_pool = self.stage_pools[next_stage_id]
             params = req_state.sampling_params_list[next_stage_id]
 
+            req_state.stage_submit_ts[next_stage_id] = _time.time()
+
             if next_pool.stage_type == "diffusion":
-                source_stage_ids = list(
-                    getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]
-                )
-                kv_sender_info = self._build_kv_sender_info(source_stage_ids, request_id=request_id)
                 await next_pool.submit_initial(
                     request_id,
                     req_state,
                     req_state.prompt,
-                    submit_kwargs={"kv_sender_info": kv_sender_info},
+                    submit_kwargs={
+                        "kv_sender_info": self._build_kv_sender_info(
+                            list(getattr(next_pool.stage_client, "engine_input_source", None) or [next_stage_id - 1]),
+                            request_id=request_id,
+                        )
+                    },
                 )
             else:
                 import copy
@@ -543,6 +595,7 @@ class Orchestrator:
                     base_input = copy.deepcopy(original_prompt)
                 else:
                     base_input = {}
+
                 base_input["prompt_token_ids"] = [0] * next_prompt_len
                 base_input["multi_modal_data"] = None
                 base_input["mm_processor_kwargs"] = None
@@ -555,7 +608,6 @@ class Orchestrator:
                 )
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(request_id, req_state, request, prompt_text=None)
-            req_state.stage_submit_ts[next_stage_id] = _time.time()
 
     def _build_kv_sender_info(
         self,
@@ -617,9 +669,7 @@ class Orchestrator:
         )
         self.request_states[companion_id] = companion_state
         companion_state.stage_submit_ts[0] = _time.time()
-
-        stage0_pool = self.stage_pools[0]
-        companion_replica_id = await stage0_pool.submit_initial(
+        companion_replica_id = await self.stage_pools[0].submit_initial(
             companion_id,
             companion_state,
             companion_prompt,
@@ -638,15 +688,14 @@ class Orchestrator:
     async def _handle_abort(self, msg: dict[str, Any]) -> None:
         """Handle an abort message from the main thread."""
         request_ids = msg["request_ids"]
-        all_ids_to_abort = self._cfg_tracker.abort_parents(request_ids)
-        await self._abort_request_ids(all_ids_to_abort)
-        self._release_request_bindings(all_ids_to_abort)
-        for req_id in all_ids_to_abort:
-            self.request_states.pop(req_id, None)
+        await self._cleanup_request_ids(
+            self._cfg_tracker.abort_parents(request_ids),
+            abort=True,
+        )
         logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
 
     async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Broadcast abort requests to all stage pools."""
+        """Forward abort requests to all stage pools."""
         if not request_ids:
             return
         for pool in self.stage_pools:
@@ -654,11 +703,8 @@ class Orchestrator:
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
-        if not request_ids:
-            return
         for pool in self.stage_pools:
-            for req_id in request_ids:
-                pool.release_binding(req_id)
+            pool.release_bindings(request_ids)
 
     async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
         """Handle a control-plane RPC request from the main thread."""
@@ -680,14 +726,16 @@ class Orchestrator:
         results: list[Any] = []
         stage_ids: list[int] = []
         for pool in target_pools:
-            stage_results = await pool.collective_rpc(
-                method=method,
-                timeout=timeout,
-                args=args,
-                kwargs=kwargs,
-            )
-            stage_ids.extend([pool.stage_id] * len(stage_results))
-            results.extend(stage_results)
+            for replica_id in range(pool.num_replicas):
+                stage_result = await pool.collective_rpc(
+                    replica_id=replica_id,
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                )
+                stage_ids.append(pool.stage_id)
+                results.append(stage_result)
 
         await self.rpc_async_queue.put(
             {
@@ -708,4 +756,5 @@ class Orchestrator:
         total = sum(pool.num_replicas for pool in self.stage_pools)
         logger.info("[Orchestrator] Shutting down all %d client(s)", total)
         for pool in self.stage_pools:
-            pool.shutdown()
+            for replica_id in range(pool.num_replicas):
+                pool.shutdown_replica(replica_id)
