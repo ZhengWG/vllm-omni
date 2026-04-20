@@ -292,6 +292,127 @@ def test_initialize_stages_exposes_logical_stage_views_and_shares_stage_output_p
     assert engine.output_processors[0] is stage0_pool.output_processor
 
 
+def test_initialize_stages_launches_all_replicas_with_split_devices(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.num_stages = 2
+    engine.async_chunk = False
+    engine.diffusion_batch_size = 1
+    engine.single_stage_mode = False
+    engine._single_stage_id_filter = None
+    engine._omni_master_server = None
+    engine.stage_configs = [
+        types.SimpleNamespace(stage_id=0, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="0")),
+        types.SimpleNamespace(
+            stage_id=1,
+            stage_type="llm",
+            engine_args={},
+            runtime=types.SimpleNamespace(devices="1,2,3"),
+        ),
+    ]
+
+    cfg0_r0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg1_r0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg1_r1 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg1_r2 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+
+    metadata_map = {
+        0: types.SimpleNamespace(
+            stage_id=0,
+            stage_type="llm",
+            runtime_cfg={"devices": "0"},
+            prompt_expand_func=None,
+            final_output=False,
+            final_output_type=None,
+            default_sampling_params=types.SimpleNamespace(),
+            custom_process_input_func=None,
+            engine_input_source=[],
+            engine_output_type="token_ids",
+        ),
+        1: types.SimpleNamespace(
+            stage_id=1,
+            stage_type="llm",
+            runtime_cfg={"devices": "1,2,3"},
+            prompt_expand_func=None,
+            final_output=True,
+            final_output_type="audio",
+            default_sampling_params=types.SimpleNamespace(),
+            custom_process_input_func=None,
+            engine_input_source=[0],
+            engine_output_type="token_ids",
+        ),
+    }
+
+    monkeypatch.setattr(engine_mod, "prepare_engine_environment", lambda: None)
+    monkeypatch.setattr(engine_mod, "load_omni_transfer_config_for_model", lambda *_: None)
+    monkeypatch.setattr(engine_mod, "get_stage_connector_spec", lambda **_: {})
+    monkeypatch.setattr(engine_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+    monkeypatch.setattr(engine_mod, "compute_replica_layout", lambda _cfgs: ([1, 3], {1: ["1", "2", "3"]}, 4))
+    monkeypatch.setattr(
+        engine_mod,
+        "extract_stage_metadata",
+        lambda cfg: types.SimpleNamespace(**metadata_map[cfg.stage_id].__dict__),
+    )
+    monkeypatch.setattr(
+        engine_mod,
+        "finalize_initialized_stages",
+        lambda stage_clients, _input_processor: (
+            stage_clients,
+            [types.SimpleNamespace(), types.SimpleNamespace()],
+            [{"final_output_type": None}, {"final_output_type": "audio"}],
+        ),
+    )
+
+    launch_records: list[tuple[int, int, str]] = []
+    launch_records_lock = threading.Lock()
+    started_cfgs = {
+        (0, 0): cfg0_r0,
+        (1, 0): cfg1_r0,
+        (1, 1): cfg1_r1,
+        (1, 2): cfg1_r2,
+    }
+
+    def _fake_launch_llm_stage(stage_cfg, metadata, *_args, **_kwargs):
+        device_str = getattr(getattr(stage_cfg, "runtime", None), "devices", "")
+        with launch_records_lock:
+            launch_records.append((metadata.stage_id, metadata.replica_id, device_str))
+        return types.SimpleNamespace(
+            stage_id=metadata.stage_id,
+            metadata=types.SimpleNamespace(replica_id=metadata.replica_id),
+            vllm_config=started_cfgs[(metadata.stage_id, metadata.replica_id)],
+        )
+
+    def _fake_attach_llm_stage(started):
+        stage_id = started.stage_id
+        replica_id = started.metadata.replica_id
+        return (
+            types.SimpleNamespace(stage_type="llm", is_comprehension=(stage_id == 0 and replica_id == 0)),
+            object() if replica_id == 0 else None,
+            started_cfgs[(stage_id, replica_id)],
+            object() if stage_id == 0 and replica_id == 0 else None,
+        )
+
+    monkeypatch.setattr(engine, "_launch_llm_stage", _fake_launch_llm_stage)
+    monkeypatch.setattr(engine, "_attach_llm_stage", _fake_attach_llm_stage)
+
+    engine._initialize_stages(stage_init_timeout=1)
+
+    assert sorted(launch_records) == [
+        (0, 0, "0"),
+        (1, 0, "1"),
+        (1, 1, "2"),
+        (1, 2, "3"),
+    ]
+    assert engine.stage_pools[0].num_replicas == 1
+    assert engine.stage_pools[1].num_replicas == 3
+    assert len(engine.stage_pools[1].clients) == 3
+    assert engine.stage_vllm_configs[0] is cfg0_r0
+    assert engine.stage_vllm_configs[1] is cfg1_r0
+
+
 def test_launch_llm_stage_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
     """Regression test for stage_init_timeout reaching complete_stage_handshake
     in the LLM stage path.

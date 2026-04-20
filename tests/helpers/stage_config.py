@@ -411,6 +411,42 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         },
     },
+    "qwen3_omni_moe_multi_replicas_4gpu": {
+        "base_config": "qwen3_omni_moe.yaml",
+        "async_chunk": True,
+        "stages": [
+            {
+                "stage_id": 0,
+                "devices": "0",
+                "gpu_memory_utilization": 0.72,
+                "max_num_seqs": 6,
+                "max_model_len": 32768,
+                "mm_processor_cache_gb": 0,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 150, "ignore_eos": False},
+            },
+            {
+                "stage_id": 1,
+                "devices": "1,2,3",
+                "num_replicas": 3,
+                "gpu_memory_utilization": 0.2,
+                "max_num_seqs": 2,
+                "max_model_len": 32768,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 1000},
+            },
+            {
+                "stage_id": 2,
+                "devices": "1,2,3",
+                "num_replicas": 3,
+                "gpu_memory_utilization": 0.08,
+                "max_num_seqs": 2,
+                "max_num_batched_tokens": 65536,
+                "load_format": "dummy",
+                "default_sampling_params": {"max_tokens": 2000},
+            },
+        ],
+    },
     # Single-stage thinker-only topology for the abort test.
     "qwen2_5_omni_thinker_only": {
         "async_chunk": False,
