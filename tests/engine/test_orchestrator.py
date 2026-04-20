@@ -659,8 +659,6 @@ async def test_multi_replica_abort_broadcasts_to_all_replicas(orchestrator_facto
         await _wait_for(lambda: len(stage0_r0.add_request_calls) == 1)
 
         await _enqueue_abort_request(orchestrator_fixture, ["req-abort-mr"])
-
-        all_clients = [stage0_r0, stage0_r1, stage1]
         await _wait_for(lambda: bool(stage0_r0.abort_calls))
 
         assert stage0_r0.abort_calls == [["req-abort-mr"]]
