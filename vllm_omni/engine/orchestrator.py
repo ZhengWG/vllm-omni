@@ -413,9 +413,7 @@ class Orchestrator:
                             req_state = self.request_states.get(getattr(eco, "request_id", None))
                             if req_state is None:
                                 continue
-                            req_state.streaming.segment_finished = bool(
-                                getattr(eco, "is_segment_finished", False)
-                            )
+                            req_state.streaming.segment_finished = bool(getattr(eco, "is_segment_finished", False))
                             req_state.streaming.new_prompt_len_snapshot = getattr(
                                 eco,
                                 "new_prompt_len_snapshot",
@@ -692,6 +690,7 @@ class Orchestrator:
             decode_kv_params,
         )
         return sp
+
     async def _forward_to_next_stage(
         self,
         req_id: str,
@@ -742,7 +741,6 @@ class Orchestrator:
 
         # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
         if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
-
             params = self._build_pd_decode_params(req_id, params)
 
             # Use the original user prompt for the decode stage (not processed embeddings)
