@@ -824,13 +824,7 @@ class TestDeployConfigLoading:
             pytest.skip("Deploy config not found")
 
         overlay = tmp_path / "multi_replicas.yaml"
-        overlay.write_text(
-            f"base_config: {base}\n"
-            "stages:\n"
-            "  - stage_id: 1\n"
-            '    devices: "1,2"\n'
-            "    num_replicas: 2\n"
-        )
+        overlay.write_text(f'base_config: {base}\nstages:\n  - stage_id: 1\n    devices: "1,2"\n    num_replicas: 2\n')
 
         deploy = load_deploy_config(overlay)
         assert deploy.stages[1].num_replicas == 2
