@@ -713,11 +713,22 @@ class Orchestrator:
 
         if next_pool.stage_type == "diffusion":
             if next_client.custom_process_input_func is not None:
+                _t_ar2d = _time.perf_counter()
                 diffusion_prompt = next_client.custom_process_input_func(
                     source_outputs,
                     req_state.prompt,
                     requires_multimodal_data,
                 )
+                _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                logger.info(
+                    "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
+                    req_id,
+                    _dt_ar2d,
+                    src_stage_id,
+                    next_logical,
+                )
+                if already_submitted and isinstance(diffusion_prompt, list) and len(diffusion_prompt) == 1:
+                    diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
 
