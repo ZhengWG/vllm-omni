@@ -68,7 +68,10 @@ class FakeStageClient:
         except queue.Empty:
             return None
 
-    def process_engine_inputs(self, source_outputs, prompt=None):
+    def set_engine_outputs(self, outputs) -> None:
+        return None
+
+    def process_engine_inputs(self, source_outputs, prompt=None, streaming_context=None):
         return list(self.next_inputs)
 
     async def abort_requests_async(self, request_ids: list[str]) -> None:

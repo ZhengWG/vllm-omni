@@ -6,6 +6,7 @@ Directly inherits from vLLM's AsyncMPClient to reuse EngineCore architecture.
 
 from __future__ import annotations
 
+import inspect
 import socket
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
@@ -323,6 +324,7 @@ class StageEngineCoreClientBase:
         self,
         source_outputs: list[Any],
         prompt: Any = None,
+        streaming_context: Any | None = None,
     ) -> list[OmniTokensPrompt]:
         """Process inputs from upstream stages.
 
@@ -330,6 +332,14 @@ class StageEngineCoreClientBase:
         and the original prompt.
         """
         if self.custom_process_input_func is not None:
+            signature = inspect.signature(self.custom_process_input_func)
+            if len(signature.parameters) >= 4:
+                return self.custom_process_input_func(
+                    source_outputs,
+                    prompt,
+                    self.requires_multimodal_data,
+                    streaming_context,
+                )
             return self.custom_process_input_func(
                 source_outputs,
                 prompt,

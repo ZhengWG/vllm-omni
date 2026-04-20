@@ -35,6 +35,8 @@ def build_engine_core_request_from_tokens(
     params: SamplingParams | PoolingParams,
     arrival_time: float | None = None,
     model_config: ModelConfig | None = None,
+    resumable: bool = False,
+    mm_features: list | None = None,
 ) -> OmniEngineCoreRequest:
     """Build an OmniEngineCoreRequest directly from an OmniTokensPrompt."""
     if arrival_time is None:
@@ -60,7 +62,7 @@ def build_engine_core_request_from_tokens(
     return OmniEngineCoreRequest(
         request_id=request_id,
         prompt_token_ids=prompt_token_ids,
-        mm_features=None,
+        mm_features=mm_features,
         sampling_params=sampling_params,
         pooling_params=pooling_params,
         arrival_time=arrival_time,
@@ -68,6 +70,7 @@ def build_engine_core_request_from_tokens(
         cache_salt=None,
         data_parallel_rank=None,
         prompt_embeds=prompt_embeds,
+        resumable=resumable,
         additional_information=additional_info_payload,
     )
 
@@ -83,6 +86,23 @@ class OrchestratorRequestState:
 
     # Metrics: timestamp when request was submitted to each stage.
     stage_submit_ts: dict[int, float] = field(default_factory=dict)
+    mm_processor_kwargs: dict | None = None
+    mm_features: list | None = None
+    pd_prefill_multimodal_output: dict[str, Any] | None = None
+
+    streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
+
+
+@dataclass
+class StreamingInputState:
+    # Flag of streaming input request
+    enabled: bool = False
+    # Flag of segment of streaming input finished
+    segment_finished: bool = False
+    # Streaming update prompt length
+    new_prompt_len_snapshot: int | None = None
+    # Model/bridge-specific runtime states (e.g., thinker->talker)
+    bridge_states: dict[str, Any] = field(default_factory=dict)
 
 
 class Orchestrator:
@@ -96,6 +116,7 @@ class Orchestrator:
         stage_pools: list[StagePool],
         *,
         async_chunk: bool = False,
+        pd_config: dict[str, Any] | None = None,
     ) -> None:
         self.request_async_queue = request_async_queue
         self.output_async_queue = output_async_queue
@@ -105,6 +126,15 @@ class Orchestrator:
         self.num_stages = len(stage_pools)
         self.stage_pools: list[StagePool] = stage_pools
 
+        # PD disaggregation state
+        self._pd_pair: tuple[int, int] | None = None
+        self._pd_bootstrap_addr: str | None = None
+        self._pd_prefill_engine_id: str | None = None
+        self._pd_kv_params: dict[str, Any] = {}
+        if pd_config is not None:
+            self._pd_pair = pd_config.get("pd_pair")
+            self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
+            self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
         self._cfg_tracker = CfgCompanionTracker()
 
@@ -201,8 +231,10 @@ class Orchestrator:
             prompt=original_prompt,
             sampling_params_list=sampling_params_list,
             final_stage_id=final_stage_id,
+            mm_features=getattr(prompt, "mm_features", None),
         )
         self.request_states[request_id] = req_state
+        req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
         await self.stage_pools[stage_id].submit_initial(
             request_id,
@@ -234,6 +266,7 @@ class Orchestrator:
         if "sampling_params_list" in msg and msg["sampling_params_list"]:
             req_state.sampling_params_list = msg["sampling_params_list"]
 
+        req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
         await self.stage_pools[stage_id].submit_update(request_id, req_state, request)
 
@@ -376,6 +409,18 @@ class Orchestrator:
                             continue
 
                         await self._handle_kv_ready_raw_outputs(stage_id, raw_outputs)
+                        for eco in raw_outputs.outputs:
+                            req_state = self.request_states.get(getattr(eco, "request_id", None))
+                            if req_state is None:
+                                continue
+                            req_state.streaming.segment_finished = bool(
+                                getattr(eco, "is_segment_finished", False)
+                            )
+                            req_state.streaming.new_prompt_len_snapshot = getattr(
+                                eco,
+                                "new_prompt_len_snapshot",
+                                None,
+                            )
                         raw_output = await pool.process_llm_raw_outputs(replica_id, raw_outputs)
                         await self._handle_processed_outputs(stage_id, replica_id, raw_output)
                         idle = False
@@ -443,6 +488,7 @@ class Orchestrator:
             await self._abort_request_ids(request_ids)
         self._release_request_bindings(request_ids)
         for request_id in request_ids:
+            self._pd_kv_params.pop(request_id, None)
             self.request_states.pop(request_id, None)
 
     def _maybe_clone_diffusion_params_for_cfg(self, request_id: str, params: Any) -> Any:
@@ -502,19 +548,49 @@ class Orchestrator:
                 }
             )
 
+        if self._pd_pair is not None and finished and stage_id == self._pd_pair[0]:
+            kv_params = getattr(output, "kv_transfer_params", None)
+            if kv_params is not None:
+                self._pd_kv_params[req_id] = kv_params if isinstance(kv_params, dict) else dict(kv_params)
+            req_state.pd_prefill_multimodal_output = getattr(output, "multimodal_output", None)
+
         if (
-            finished
+            (finished or (req_state.streaming.enabled and req_state.streaming.segment_finished))
             and stage_id < req_state.final_stage_id
             and not self.async_chunk
-            and (stage_id + 1) not in req_state.stage_submit_ts
+            and (not self._next_stage_already_submitted(stage_id, req_state) or req_state.streaming.enabled)
         ):
-            if self._cfg_tracker.has_companions(req_id) and not self._cfg_tracker.all_companions_done(req_id):
+            if (
+                finished
+                and self._cfg_tracker.has_companions(req_id)
+                and not self._cfg_tracker.all_companions_done(req_id)
+            ):
                 self._cfg_tracker.defer_parent(req_id, output, stage_id)
             else:
-                await self._forward_to_next_stage(req_id, stage_id, output, req_state)
+                await self._forward_to_next_stage(
+                    req_id,
+                    stage_id,
+                    output,
+                    req_state,
+                    is_streaming_session=req_state.streaming.enabled,
+                    is_final_update=False,
+                )
+                if req_state.streaming.enabled and finished:
+                    # For streaming sessions, send the terminal (resumable=False) update only on a finish
+                    await self._forward_to_next_stage(
+                        req_id,
+                        stage_id,
+                        output,
+                        req_state,
+                        is_streaming_session=True,
+                        is_final_update=True,
+                    )
 
         if finished and stage_id == req_state.final_stage_id:
             await self._cleanup_request_ids([req_id, *self._cfg_tracker.cleanup_parent(req_id)])
+
+    def _next_stage_already_submitted(self, stage_id: int, req_state: OrchestratorRequestState) -> bool:
+        return (stage_id + 1) in req_state.stage_submit_ts
 
     async def _handle_cfg_companion_ready(self, req_id: str) -> None:
         """Mark a CFG companion as done; if all companions are done, flush deferred parent."""
@@ -572,12 +648,59 @@ class Orchestrator:
             else:
                 await self._forward_to_next_stage(req_id, stage_id, raw_output, req_state)
 
+    def _build_pd_decode_params(self, req_id: str, sp: Any) -> Any:
+        """Build decode-side sampling params with KV transfer params for PD routing.
+
+        Clones the sampling params and injects kv_transfer_params that tell the
+        decode engine where to pull the KV cache from (prefill engine's bootstrap addr).
+        """
+        sp = sp.clone()
+        if sp.extra_args is None:
+            sp.extra_args = {}
+
+        # Get KV params captured from the prefill output (must include remote_request_id).
+        kv_prefill_params = self._pd_kv_params.pop(req_id, None)
+        if not kv_prefill_params or "remote_request_id" not in kv_prefill_params:
+            raise RuntimeError(
+                f"[Orchestrator][PD] Missing prefill kv_transfer_params.remote_request_id for req={req_id}"
+            )
+
+        decode_kv_params: dict[str, Any] = {
+            "transfer_id": f"xfer-{req_id}",
+        }
+
+        if self._pd_bootstrap_addr:
+            decode_kv_params["remote_bootstrap_addr"] = self._pd_bootstrap_addr
+
+        if self._pd_prefill_engine_id:
+            decode_kv_params["remote_engine_id"] = self._pd_prefill_engine_id
+
+        # Overlay params from prefill side (includes remote_request_id set by monkey patch).
+        decode_kv_params.update(kv_prefill_params)
+
+        # Ensure these flags are set correctly after any overlay.
+        decode_kv_params["do_remote_prefill"] = True
+        decode_kv_params["do_remote_decode"] = False
+        if not decode_kv_params.get("transfer_id"):
+            decode_kv_params["transfer_id"] = f"xfer-{req_id}"
+
+        sp.extra_args["kv_transfer_params"] = decode_kv_params
+
+        logger.debug(
+            "[Orchestrator][PD] decode kv_transfer_params for req=%s: %s",
+            req_id,
+            decode_kv_params,
+        )
+        return sp
     async def _forward_to_next_stage(
         self,
         req_id: str,
         src_stage_id: int,
         output: Any,
         req_state: OrchestratorRequestState,
+        *,
+        is_streaming_session: bool = False,
+        is_final_update: bool = False,
     ) -> None:
         """Forward output from the current logical stage to the next one."""
         next_logical = src_stage_id + 1
@@ -585,6 +708,8 @@ class Orchestrator:
         next_client = next_pool.stage_client
         params = req_state.sampling_params_list[next_logical]
         source_outputs = [output]
+        next_stage_resumable = is_streaming_session and not is_final_update
+        already_submitted = self._next_stage_already_submitted(src_stage_id, req_state)
         requires_multimodal_data = getattr(next_client, "requires_multimodal_data", False)
 
         if next_pool.stage_type == "diffusion":
@@ -597,34 +722,106 @@ class Orchestrator:
             else:
                 diffusion_prompt = req_state.prompt
 
-            req_state.stage_submit_ts.setdefault(next_logical, _time.time())
-            await next_pool.submit_initial(
-                req_id,
-                req_state,
-                diffusion_prompt,
-                submit_kwargs={
-                    "kv_sender_info": self._build_kv_sender_info(
-                        list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
-                        request_id=req_id,
+            if already_submitted:
+                await next_pool.submit_update(req_id, req_state, diffusion_prompt)
+            else:
+                await next_pool.submit_initial(
+                    req_id,
+                    req_state,
+                    diffusion_prompt,
+                    submit_kwargs={
+                        "kv_sender_info": self._build_kv_sender_info(
+                            list(getattr(next_client, "engine_input_source", None) or [src_stage_id]),
+                            request_id=req_id,
+                        )
+                    },
+                    params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
+                )
+            req_state.stage_submit_ts[next_logical] = _time.time()
+            return
+
+        # PD disaggregation: prefill → decode routing uses original prompt + KV transfer params
+        if self._pd_pair is not None and (src_stage_id, next_logical) == self._pd_pair:
+
+            params = self._build_pd_decode_params(req_id, params)
+
+            # Use the original user prompt for the decode stage (not processed embeddings)
+            original_prompt = req_state.prompt
+            raw_decode_inputs = [original_prompt] if not isinstance(original_prompt, list) else original_prompt
+
+            decode_inputs: list[dict[str, Any]] = []
+            for decode_input in raw_decode_inputs:
+                if isinstance(decode_input, dict):
+                    decode_inputs.append(decode_input)
+                    continue
+                prompt_token_ids = getattr(decode_input, "prompt_token_ids", None)
+                if prompt_token_ids is None:
+                    raise TypeError(
+                        "[Orchestrator][PD] decode input must be dict or have prompt_token_ids, "
+                        f"got {type(decode_input).__name__} for req={req_id}"
                     )
-                },
-                params_override=self._maybe_clone_diffusion_params_for_cfg(req_id, params),
-            )
-        else:
-            req_state.stage_submit_ts.setdefault(next_logical, _time.time())
+                decode_inputs.append({"prompt_token_ids": list(prompt_token_ids)})
+
+            for decode_input in decode_inputs:
+                request = build_engine_core_request_from_tokens(
+                    request_id=req_id,
+                    prompt=decode_input,
+                    params=params,
+                    model_config=next_pool.stage_vllm_config.model_config,
+                    mm_features=req_state.mm_features,
+                    resumable=next_stage_resumable,
+                )
+                request.external_req_id = request.request_id
+                if already_submitted:
+                    await next_pool.submit_update(req_id, req_state, request)
+                else:
+                    await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+
+            req_state.stage_submit_ts[next_logical] = _time.time()
+            return
+
+        if req_state.pd_prefill_multimodal_output is not None:
+            req_state.streaming.bridge_states.setdefault(
+                "pd_prefill_multimodal_output_by_req",
+                {},
+            )[req_id] = req_state.pd_prefill_multimodal_output
+
+        try:
             next_inputs = next_client.process_engine_inputs(
                 source_outputs,
                 req_state.prompt,
+                streaming_context=req_state.streaming,
             )
-            for next_input in next_inputs:
-                request = build_engine_core_request_from_tokens(
-                    request_id=req_id,
-                    prompt=next_input,
-                    params=params,
-                    model_config=next_pool.stage_vllm_config.model_config,
-                )
-                request.external_req_id = request.request_id
+        except Exception:
+            logger.exception(
+                "[Orchestrator] req=%s process_engine_inputs FAILED for stage-%s",
+                req_id,
+                next_logical,
+            )
+            raise
+
+        # Build and submit requests for each input
+        for next_input in next_inputs:
+            # Only AR thinker stages consume encoder mm_features; downstream
+            # (talker/code2wav/…) must not see them (avoids encoder-cache misses).
+            model_stage = getattr(next_client, "model_stage", None)
+            mm_features = req_state.mm_features if model_stage == "thinker" else None
+            request = build_engine_core_request_from_tokens(
+                request_id=req_id,
+                prompt=next_input,
+                params=params,
+                model_config=next_pool.stage_vllm_config.model_config,
+                mm_features=mm_features,
+                resumable=next_stage_resumable,
+            )
+
+            request.external_req_id = request.request_id
+            if already_submitted:
+                await next_pool.submit_update(req_id, req_state, request)
+            else:
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
+
+        req_state.stage_submit_ts[next_logical] = _time.time()
 
     async def _prewarm_async_chunk_stages(
         self,
