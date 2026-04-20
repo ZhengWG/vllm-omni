@@ -147,6 +147,8 @@ class Orchestrator:
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
+    # ---- Request handling ----
+
     async def _request_handler(self) -> None:
         """Read messages from the main thread via request_async_queue."""
         while True:
@@ -170,6 +172,178 @@ class Orchestrator:
                 break
             else:
                 logger.warning("[Orchestrator] Unknown message type: %s", msg_type)
+
+    async def _handle_add_request(self, msg: dict[str, Any]) -> None:
+        """Handle an add_request message from the main thread."""
+        stage_id = 0
+        request_id = msg["request_id"]
+        prompt = msg["prompt"]
+        original_prompt = msg.get("original_prompt", prompt)
+        sampling_params_list = msg["sampling_params_list"]
+        if not sampling_params_list:
+            raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
+        final_stage_id = msg["final_stage_id"]
+
+        logger.info(
+            "[Orchestrator] _handle_add_request: stage=%s req=%s "
+            "prompt_type=%s original_prompt_type=%s final_stage=%s "
+            "num_sampling_params=%d",
+            stage_id,
+            request_id,
+            type(prompt).__name__,
+            type(original_prompt).__name__,
+            final_stage_id,
+            len(sampling_params_list),
+        )
+
+        req_state = OrchestratorRequestState(
+            request_id=request_id,
+            prompt=original_prompt,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=final_stage_id,
+        )
+        self.request_states[request_id] = req_state
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        await self.stage_pools[stage_id].submit_initial(
+            request_id,
+            req_state,
+            prompt,
+            prompt_text=msg.get("output_prompt_text"),
+        )
+
+        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
+            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
+
+    async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
+        """Handle a streaming_update message for an existing request."""
+        stage_id = 0
+        request_id = msg["request_id"]
+        request = msg["prompt"]
+
+        req_state = self.request_states.get(request_id)
+        if req_state is None:
+            logger.warning(
+                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
+                request_id,
+            )
+            fallback_msg = dict(msg)
+            fallback_msg["type"] = "add_request"
+            await self._handle_add_request(fallback_msg)
+            return
+
+        if "sampling_params_list" in msg and msg["sampling_params_list"]:
+            req_state.sampling_params_list = msg["sampling_params_list"]
+
+        req_state.stage_submit_ts[stage_id] = _time.time()
+        await self.stage_pools[stage_id].submit_update(request_id, req_state, request)
+
+    async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
+        """Handle an add_companion_request message: submit companion to stage 0."""
+        companion_id = msg["companion_id"]
+        parent_id = msg["parent_id"]
+        role = msg["role"]
+        companion_prompt = msg["prompt"]
+        sampling_params_list = msg["sampling_params_list"]
+
+        parent_state = self.request_states.get(parent_id)
+        if parent_state is None:
+            logger.info(
+                "[Orchestrator] Dropping CFG companion %s (role=%s): parent %s is no longer active",
+                companion_id,
+                role,
+                parent_id,
+            )
+            return
+
+        self._cfg_tracker.register_companion(parent_id, role, companion_id)
+
+        companion_state = OrchestratorRequestState(
+            request_id=companion_id,
+            prompt=companion_prompt,
+            sampling_params_list=sampling_params_list,
+            final_stage_id=0,
+        )
+        self.request_states[companion_id] = companion_state
+        companion_state.stage_submit_ts[0] = _time.time()
+        companion_replica_id = await self.stage_pools[0].submit_initial(
+            companion_id,
+            companion_state,
+            companion_prompt,
+            prompt_text=msg.get("companion_prompt_text"),
+            affinity_request_id=parent_id,
+        )
+
+        logger.info(
+            "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, stage-0 replica-%s)",
+            companion_id,
+            role,
+            parent_id,
+            companion_replica_id,
+        )
+
+    async def _handle_abort(self, msg: dict[str, Any]) -> None:
+        """Handle an abort message from the main thread."""
+        request_ids = msg["request_ids"]
+        await self._cleanup_request_ids(
+            self._cfg_tracker.abort_parents(request_ids),
+            abort=True,
+        )
+        logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
+
+    async def _abort_request_ids(self, request_ids: list[str]) -> None:
+        """Forward abort requests to all stage pools."""
+        if not request_ids:
+            return
+        for pool in self.stage_pools:
+            await pool.abort_requests(request_ids)
+
+    def _release_request_bindings(self, request_ids: list[str]) -> None:
+        """Release all stage-local route bindings for the given request ids."""
+        for pool in self.stage_pools:
+            pool.release_bindings(request_ids)
+
+    async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
+        """Handle a control-plane RPC request from the main thread."""
+        rpc_id = msg["rpc_id"]
+        method = msg["method"]
+        timeout = msg.get("timeout")
+        args = tuple(msg.get("args", ()))
+        kwargs = dict(msg.get("kwargs") or {})
+        requested_stage_ids = msg.get("stage_ids")
+
+        target_pools: list[StagePool] = []
+        if requested_stage_ids is None:
+            target_pools.extend(self.stage_pools)
+        else:
+            for lid in requested_stage_ids:
+                if 0 <= lid < self.num_stages:
+                    target_pools.append(self.stage_pools[lid])
+
+        results: list[Any] = []
+        stage_ids: list[int] = []
+        for pool in target_pools:
+            for replica_id in range(pool.num_replicas):
+                stage_result = await pool.collective_rpc(
+                    replica_id=replica_id,
+                    method=method,
+                    timeout=timeout,
+                    args=args,
+                    kwargs=kwargs,
+                )
+                stage_ids.append(pool.stage_id)
+                results.append(stage_result)
+
+        await self.rpc_async_queue.put(
+            {
+                "type": "collective_rpc_result",
+                "rpc_id": rpc_id,
+                "method": method,
+                "stage_ids": stage_ids,
+                "results": results,
+            }
+        )
+
+    # ---- Orchestration loop ----
 
     async def _orchestration_output_handler(self) -> None:
         """Poll all stages, handle transfers, send final outputs to main."""
@@ -257,6 +431,8 @@ class Orchestrator:
             [parent_id, *self._cfg_tracker.cleanup_parent(parent_id)],
             abort=True,
         )
+
+    # ---- Shared helpers ----
 
     async def _cleanup_request_ids(self, request_ids: list[str], *, abort: bool = False) -> None:
         """Release pool bindings and logical request state for the given ids."""
@@ -450,70 +626,6 @@ class Orchestrator:
                 request.external_req_id = request.request_id
                 await next_pool.submit_initial(req_id, req_state, request, prompt_text=None)
 
-    async def _handle_add_request(self, msg: dict[str, Any]) -> None:
-        """Handle an add_request message from the main thread."""
-        stage_id = 0
-        request_id = msg["request_id"]
-        prompt = msg["prompt"]
-        original_prompt = msg.get("original_prompt", prompt)
-        sampling_params_list = msg["sampling_params_list"]
-        if not sampling_params_list:
-            raise ValueError(f"Missing sampling params for stage 0. Got {len(sampling_params_list)} stage params.")
-        final_stage_id = msg["final_stage_id"]
-
-        logger.info(
-            "[Orchestrator] _handle_add_request: stage=%s req=%s "
-            "prompt_type=%s original_prompt_type=%s final_stage=%s "
-            "num_sampling_params=%d",
-            stage_id,
-            request_id,
-            type(prompt).__name__,
-            type(original_prompt).__name__,
-            final_stage_id,
-            len(sampling_params_list),
-        )
-
-        req_state = OrchestratorRequestState(
-            request_id=request_id,
-            prompt=original_prompt,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=final_stage_id,
-        )
-        self.request_states[request_id] = req_state
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        await self.stage_pools[stage_id].submit_initial(
-            request_id,
-            req_state,
-            prompt,
-            prompt_text=msg.get("output_prompt_text"),
-        )
-
-        if self.async_chunk and stage_id == 0 and final_stage_id > 0:
-            await self._prewarm_async_chunk_stages(request_id, prompt, req_state)
-
-    async def _handle_streaming_update(self, msg: dict[str, Any]) -> None:
-        """Handle a streaming_update message for an existing request."""
-        stage_id = 0
-        request_id = msg["request_id"]
-        request = msg["prompt"]
-
-        req_state = self.request_states.get(request_id)
-        if req_state is None:
-            logger.warning(
-                "[Orchestrator] streaming_update for unknown req=%s, falling back to add_request",
-                request_id,
-            )
-            fallback_msg = dict(msg)
-            fallback_msg["type"] = "add_request"
-            await self._handle_add_request(fallback_msg)
-            return
-
-        if "sampling_params_list" in msg and msg["sampling_params_list"]:
-            req_state.sampling_params_list = msg["sampling_params_list"]
-
-        req_state.stage_submit_ts[stage_id] = _time.time()
-        await self.stage_pools[stage_id].submit_update(request_id, req_state, request)
-
     async def _prewarm_async_chunk_stages(
         self,
         request_id: str,
@@ -611,111 +723,7 @@ class Orchestrator:
 
         return sender_infos or None
 
-    async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
-        """Handle an add_companion_request message: submit companion to stage 0."""
-        companion_id = msg["companion_id"]
-        parent_id = msg["parent_id"]
-        role = msg["role"]
-        companion_prompt = msg["prompt"]
-        sampling_params_list = msg["sampling_params_list"]
-
-        parent_state = self.request_states.get(parent_id)
-        if parent_state is None:
-            logger.info(
-                "[Orchestrator] Dropping CFG companion %s (role=%s): parent %s is no longer active",
-                companion_id,
-                role,
-                parent_id,
-            )
-            return
-
-        self._cfg_tracker.register_companion(parent_id, role, companion_id)
-
-        companion_state = OrchestratorRequestState(
-            request_id=companion_id,
-            prompt=companion_prompt,
-            sampling_params_list=sampling_params_list,
-            final_stage_id=0,
-        )
-        self.request_states[companion_id] = companion_state
-        companion_state.stage_submit_ts[0] = _time.time()
-        companion_replica_id = await self.stage_pools[0].submit_initial(
-            companion_id,
-            companion_state,
-            companion_prompt,
-            prompt_text=msg.get("companion_prompt_text"),
-            affinity_request_id=parent_id,
-        )
-
-        logger.info(
-            "[Orchestrator] CFG companion submitted: %s (role=%s, parent=%s, stage-0 replica-%s)",
-            companion_id,
-            role,
-            parent_id,
-            companion_replica_id,
-        )
-
-    async def _handle_abort(self, msg: dict[str, Any]) -> None:
-        """Handle an abort message from the main thread."""
-        request_ids = msg["request_ids"]
-        await self._cleanup_request_ids(
-            self._cfg_tracker.abort_parents(request_ids),
-            abort=True,
-        )
-        logger.info("[Orchestrator] Aborted request(s) %s", request_ids)
-
-    async def _abort_request_ids(self, request_ids: list[str]) -> None:
-        """Forward abort requests to all stage pools."""
-        if not request_ids:
-            return
-        for pool in self.stage_pools:
-            await pool.abort_requests(request_ids)
-
-    def _release_request_bindings(self, request_ids: list[str]) -> None:
-        """Release all stage-local route bindings for the given request ids."""
-        for pool in self.stage_pools:
-            pool.release_bindings(request_ids)
-
-    async def _handle_collective_rpc(self, msg: dict[str, Any]) -> None:
-        """Handle a control-plane RPC request from the main thread."""
-        rpc_id = msg["rpc_id"]
-        method = msg["method"]
-        timeout = msg.get("timeout")
-        args = tuple(msg.get("args", ()))
-        kwargs = dict(msg.get("kwargs") or {})
-        requested_stage_ids = msg.get("stage_ids")
-
-        target_pools: list[StagePool] = []
-        if requested_stage_ids is None:
-            target_pools.extend(self.stage_pools)
-        else:
-            for lid in requested_stage_ids:
-                if 0 <= lid < self.num_stages:
-                    target_pools.append(self.stage_pools[lid])
-
-        results: list[Any] = []
-        stage_ids: list[int] = []
-        for pool in target_pools:
-            for replica_id in range(pool.num_replicas):
-                stage_result = await pool.collective_rpc(
-                    replica_id=replica_id,
-                    method=method,
-                    timeout=timeout,
-                    args=args,
-                    kwargs=kwargs,
-                )
-                stage_ids.append(pool.stage_id)
-                results.append(stage_result)
-
-        await self.rpc_async_queue.put(
-            {
-                "type": "collective_rpc_result",
-                "rpc_id": rpc_id,
-                "method": method,
-                "stage_ids": stage_ids,
-                "results": results,
-            }
-        )
+    # ---- Shutdown / lifecycle ----
 
     def _shutdown_stages(self) -> None:
         """Shutdown all stage pools."""
