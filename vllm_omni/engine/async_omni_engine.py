@@ -292,7 +292,7 @@ class AsyncOmniEngine:
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
         self.async_chunk = bool(getattr(stage0_args, "async_chunk", False))
         self.stage_pools: list[StagePool] = []
-        self.stage_clients: list[Any] = []  # flat view for external readers
+        self.stage_clients: list[Any] = []  # logical-stage view for external readers
         self.input_processor: InputProcessor | None = None
         self.supported_tasks: tuple[str, ...] = ("generate",)
         self.default_sampling_params_list: list[Any] = []
@@ -592,7 +592,7 @@ class AsyncOmniEngine:
     def _attach_llm_stage(
         self,
         started: StartedLlmStage,
-    ) -> tuple[Any, Any, Any, InputProcessor | None]:
+    ) -> tuple[Any, Any | None, Any, InputProcessor | None]:
         """Attach a READY LLM stage to the orchestrator event loop."""
 
         client_addresses: dict[str, str] = {
@@ -620,17 +620,19 @@ class AsyncOmniEngine:
             raise
 
         try:
-            if started.vllm_config.model_config.skip_tokenizer_init:
-                tokenizer = None
-            else:
-                tokenizer = cached_tokenizer_from_config(
-                    model_config=started.vllm_config.model_config,
+            output_processor = None
+            if getattr(started.metadata, "replica_id", 0) == 0:
+                if started.vllm_config.model_config.skip_tokenizer_init:
+                    tokenizer = None
+                else:
+                    tokenizer = cached_tokenizer_from_config(
+                        model_config=started.vllm_config.model_config,
+                    )
+                output_processor = MultimodalOutputProcessor(
+                    tokenizer=tokenizer,
+                    log_stats=False,
+                    engine_core_output_type=started.metadata.engine_output_type,
                 )
-            output_processor = MultimodalOutputProcessor(
-                tokenizer=tokenizer,
-                log_stats=False,
-                engine_core_output_type=started.metadata.engine_output_type,
-            )
             input_processor = None
             if started.stage_id == 0:
                 # Some omni models (e.g. CosyVoice3) have an empty HF
@@ -834,23 +836,23 @@ class AsyncOmniEngine:
                         continue
 
                     stage_futures: list[concurrent.futures.Future[StartedLlmStage]] = []
-                    for replica_idx in range(num_replicas):
+                    for replica_id in range(num_replicas):
                         # For replica > 0, deep-copy stage_cfg and override devices
-                        if replica_idx > 0:
+                        if replica_id > 0:
                             replica_cfg = copy.deepcopy(stage_cfg)
                         else:
                             replica_cfg = stage_cfg
 
                         if stage_idx in replica_devices_map:
-                            replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_idx]
+                            replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
 
                         replica_metadata = extract_stage_metadata(replica_cfg)
-                        replica_metadata.replica_index = replica_idx
+                        replica_metadata.replica_id = replica_id
 
                         logger.info(
                             "[AsyncOmniEngine] Launching stage %s replica %s (devices=%s)",
                             configured_stage_id,
-                            replica_idx,
+                            replica_id,
                             getattr(getattr(replica_cfg, "runtime", None), "devices", "default"),
                         )
 
@@ -875,7 +877,7 @@ class AsyncOmniEngine:
                 for stage_idx in llm_stage_ids:
                     started_llm_stages[stage_idx] = [f.result() for f in llm_launch_futures[stage_idx]]
 
-            # ---- Parallel attach across (stage_idx, replica_idx) pairs ----
+            # ---- Parallel attach across (stage_idx, replica_id) pairs ----
             attach_futures: dict[
                 concurrent.futures.Future[tuple[Any, Any, Any, InputProcessor | None]],
                 tuple[int, int],
@@ -886,28 +888,26 @@ class AsyncOmniEngine:
                 thread_name_prefix="llm-stage-attach",
             ) as attach_executor:
                 for stage_idx in llm_stage_ids:
-                    for replica_idx, started in enumerate(started_llm_stages[stage_idx]):
+                    for replica_id, started in enumerate(started_llm_stages[stage_idx]):
                         attach_futures[attach_executor.submit(self._attach_llm_stage, started)] = (
                             stage_idx,
-                            replica_idx,
+                            replica_id,
                         )
 
                 stage_attach_results: dict[int, list[Any | None]] = {
                     s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
                 }
-                stage_output_proc_results: dict[int, list[Any | None]] = {
-                    s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
-                }
-                stage_vllm_cfg_results: dict[int, list[Any | None]] = {
-                    s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
-                }
+                stage_output_proc_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
+                stage_vllm_cfg_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
 
                 for future in concurrent.futures.as_completed(attach_futures):
-                    stage_idx, replica_idx = attach_futures[future]
+                    stage_idx, replica_id = attach_futures[future]
                     stage_client, output_processor, vllm_config, stage0_input_processor = future.result()
-                    stage_attach_results[stage_idx][replica_idx] = stage_client
-                    stage_output_proc_results[stage_idx][replica_idx] = output_processor
-                    stage_vllm_cfg_results[stage_idx][replica_idx] = vllm_config
+                    stage_attach_results[stage_idx][replica_id] = stage_client
+                    if stage_output_proc_results[stage_idx] is None and output_processor is not None:
+                        stage_output_proc_results[stage_idx] = output_processor
+                    if stage_vllm_cfg_results[stage_idx] is None:
+                        stage_vllm_cfg_results[stage_idx] = vllm_config
                     if stage0_input_processor is not None:
                         input_processor = stage0_input_processor
 
@@ -926,14 +926,14 @@ class AsyncOmniEngine:
 
             for stage_id in range(num_stages):
                 if stage_id in diffusion_clients:
-                    stage_pools.append(StagePool.build_from_diffusion_client(stage_id, diffusion_clients[stage_id]))
+                    stage_pools.append(StagePool(stage_id, diffusion_clients[stage_id]))
                 else:
                     stage_pools.append(
-                        StagePool.build_from_replicas(
+                        StagePool(
                             stage_id,
-                            clients=stage_attach_results[stage_id],
-                            output_processors=stage_output_proc_results[stage_id],
-                            vllm_configs=stage_vllm_cfg_results[stage_id],
+                            stage_attach_results[stage_id],
+                            output_processor=stage_output_proc_results[stage_id],
+                            stage_vllm_config=stage_vllm_cfg_results[stage_id],
                         )
                     )
 
@@ -946,9 +946,9 @@ class AsyncOmniEngine:
             # Collect all initialized clients for cleanup
             cleanup_clients: list[Any] = list(diffusion_clients.values())
             for pool in stage_pools:
-                for sr in pool.replicas:
-                    if sr.client is not None:
-                        cleanup_clients.append(sr.client)
+                for client in pool.clients:
+                    if client is not None:
+                        cleanup_clients.append(client)
             all_started = [s for stages in started_llm_stages.values() for s in stages]
             logger.exception(
                 "[AsyncOmniEngine] Stage initialization failed; shutting down %s initialized client(s)",
@@ -966,14 +966,14 @@ class AsyncOmniEngine:
         self.input_processor = input_processor
         self.prompt_expand_func = prompt_expand_func
 
-        # Derive flat views for external readers (entrypoints/async_omni.py).
-        self.stage_clients = [sr.client for pool in stage_pools for sr in pool.replicas]
-        self.stage_vllm_configs = [sr.vllm_config for pool in stage_pools for sr in pool.replicas]
-        self.output_processors = [sr.output_processor for pool in stage_pools for sr in pool.replicas]
+        # Derive logical-stage views for external readers (entrypoints/async_omni.py).
+        self.stage_clients = [pool.stage_client for pool in stage_pools]
+        self.stage_vllm_configs = [pool.stage_vllm_config for pool in stage_pools]
+        self.output_processors = [pool.output_processor for pool in stage_pools]
 
         # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()
-        if any(getattr(sr.client, "is_comprehension", False) for pool in stage_pools for sr in pool.replicas):
+        if any(getattr(pool.stage_client, "is_comprehension", False) for pool in stage_pools):
             supported_tasks.add("generate")
         if any(m.get("final_output_type") == "audio" for m in stage_metadata_list):
             supported_tasks.add("speech")
@@ -1119,9 +1119,8 @@ class AsyncOmniEngine:
             request = _apply_omni_final_stage_metadata(request, final_stage_id)
 
             # Registration with stage 0's output processor is deferred to the
-            # orchestrator thread (see Orchestrator._handle_add_request).  The
-            # orchestrator must know which replica it picked via select_replica
-            # before it can register on the correct per-replica processor.
+            # orchestrator thread (see Orchestrator._handle_add_request), which
+            # now routes admission through StagePool.submit_initial().
             output_prompt_text = prompt_text
             if output_prompt_text is None and isinstance(original_prompt, dict):
                 output_prompt_text = original_prompt.get("prompt")
@@ -1171,10 +1170,9 @@ class AsyncOmniEngine:
             )
             request.external_req_id = cid
 
-            # Registration of this companion on stage-0's output processor
-            # is deferred to Orchestrator._handle_add_companion, which calls
-            # stage_pools[0].admit(..., affinity_from=parent_replica) so that
-            # select + register + submit all land on the same replica.
+            # Registration of this companion on stage-0's output processor is
+            # deferred to Orchestrator._handle_add_companion, which routes
+            # admission through StagePool.submit_initial(..., affinity_request_id=...).
             self.request_queue.sync_q.put_nowait(
                 {
                     "type": "add_companion_request",

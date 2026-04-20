@@ -27,6 +27,27 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _default_process_engine_inputs(
+    source_outputs: list[Any],
+    prompt: Any,
+    requires_multimodal_data: bool,
+) -> list[OmniTokensPrompt]:
+    from vllm_omni.inputs.data import OmniTokensPrompt
+
+    if not isinstance(prompt, list):
+        prompt = [prompt]
+
+    mm_data = {so.request_id: p.get("multi_modal_data") for so, p in zip(source_outputs, prompt)}
+
+    return [
+        OmniTokensPrompt(
+            prompt_token_ids=so.outputs[0].token_ids,
+            multi_modal_data=(mm_data[so.request_id] if requires_multimodal_data else None),
+        )
+        for so in source_outputs
+    ]
+
+
 class StageEngineCoreClientBase:
     """Shared stage-aware behavior for async EngineCore clients.
 
@@ -300,46 +321,24 @@ class StageEngineCoreClientBase:
 
     def process_engine_inputs(
         self,
-        stage_list: list[Any],
-        prompt: OmniTokensPrompt | list[OmniTokensPrompt] | None = None,
-        source_client: Any | None = None,
+        source_outputs: list[Any],
+        prompt: Any = None,
     ) -> list[OmniTokensPrompt]:
         """Process inputs from upstream stages.
 
-        Args:
-            source_client: When multi-replica is enabled, the upstream client
-                object that produced the output.  Falls back to
-                ``stage_list[engine_input_source[0]]`` for backward compat.
+        Transition planning is expressed in terms of the upstream outputs
+        and the original prompt.
         """
-        from vllm_omni.inputs.data import OmniTokensPrompt
-
         if self.custom_process_input_func is not None:
             return self.custom_process_input_func(
-                stage_list,
-                self.engine_input_source,
+                source_outputs,
                 prompt,
                 self.requires_multimodal_data,
             )
 
         if not self.engine_input_source:
             raise ValueError(f"engine_input_source empty for stage {self.stage_id}")
-
-        if source_client is None:
-            source_client = stage_list[self.engine_input_source[0]]
-        source_outputs = source_client.engine_outputs
-
-        if not isinstance(prompt, list):
-            prompt = [prompt]
-
-        mm_data = {so.request_id: p.get("multi_modal_data") for so, p in zip(source_outputs, prompt)}
-
-        return [
-            OmniTokensPrompt(
-                prompt_token_ids=so.outputs[0].token_ids,
-                multi_modal_data=(mm_data[so.request_id] if self.requires_multimodal_data else None),
-            )
-            for so in source_outputs
-        ]
+        return _default_process_engine_inputs(source_outputs, prompt, self.requires_multimodal_data)
 
     async def collective_rpc_async(
         self,

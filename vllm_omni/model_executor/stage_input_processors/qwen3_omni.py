@@ -69,21 +69,6 @@ def _ensure_list(x):
     return list(x)
 
 
-def _validate_stage_inputs(stage_list, engine_input_source):
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    stage_id = engine_input_source[0]
-    if stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {stage_id}")
-
-    stage = stage_list[stage_id]
-    if stage.engine_outputs is None:
-        raise RuntimeError(f"Stage {stage_id} has no outputs yet")
-
-    return stage.engine_outputs
-
-
 # =========================
 # Thinker -> Talker
 # =========================
@@ -172,8 +157,7 @@ def thinker2talker_async_chunk(
 
 
 def thinker2talker(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
@@ -186,15 +170,13 @@ def thinker2talker(
     3. Package for talker with additional information
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [0] for thinker)
         prompt: Original prompt data
         requires_multimodal_data: Whether multimodal data is required
 
     Returns:
         List of OmniTokensPrompt for talker stage
     """
-    thinker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    thinker_outputs = source_outputs
     talker_inputs: list[OmniTokensPrompt] = []
 
     device = torch.device(current_platform.device_type)
@@ -310,10 +292,9 @@ def talker2code2wav_async_chunk(
 
 
 def talker2code2wav(
-    stage_list: list[Any],
-    engine_input_source: list[int],
-    prompt: OmniTokensPrompt | TextPrompt | None = None,
-    requires_multimodal_data: bool = False,
+    source_outputs: list[Any],
+    _prompt: OmniTokensPrompt | TextPrompt | None = None,
+    _requires_multimodal_data: bool = False,
 ) -> list[OmniTokensPrompt]:
     """
     Process talker outputs to create code2wav inputs.
@@ -324,15 +305,10 @@ def talker2code2wav(
     3. Package for code2wav stage
 
     Args:
-        stage_list: List of stage objects
-        engine_input_source: Source stage IDs (typically [1] for talker)
-        prompt: Original prompt data
-        requires_multimodal_data: Whether multimodal data is required
-
     Returns:
         List of OmniTokensPrompt for code2wav stage
     """
-    talker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    talker_outputs = source_outputs
     code2wav_inputs: list[OmniTokensPrompt] = []
     # Process each talker output
     for talker_output in talker_outputs:

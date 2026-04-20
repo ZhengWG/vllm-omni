@@ -257,9 +257,9 @@ class StageMetadata:
     runtime_cfg: Any
     prompt_expand_func: Callable | None = None
     cfg_kv_collect_func: Callable | None = None
-    # Multi-replica: replica_index distinguishes replicas of the same stage.
+    # Multi-replica: replica_id distinguishes replicas of the same stage.
     # For single-replica stages this defaults to 0.
-    replica_index: int = 0
+    replica_id: int = 0
 
 
 @dataclass

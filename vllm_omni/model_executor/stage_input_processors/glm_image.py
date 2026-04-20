@@ -141,23 +141,12 @@ def _parse_generated_tokens(
 
 
 def ar2diffusion(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
     requires_multimodal_data: bool = False,
 ) -> list[dict[str, Any]]:
     """Process AR stage outputs to create Diffusion stage inputs."""
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    source_stage_id = engine_input_source[0]
-    if source_stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {source_stage_id}")
-
-    if stage_list[source_stage_id].engine_outputs is None:
-        raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-    ar_outputs = stage_list[source_stage_id].engine_outputs
+    ar_outputs = source_outputs
     diffusion_inputs = []
 
     # Normalize prompt to list
