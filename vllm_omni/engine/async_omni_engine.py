@@ -701,7 +701,8 @@ class AsyncOmniEngine:
         iterates stage_configs, collects pools, and finalizes metadata.
         """
         device_control_env = current_omni_platform.device_control_env_var
-        num_stages = self.num_stages
+        num_stages = len(self.stage_configs)
+        self.num_stages = num_stages
 
         replicas_per_stage, replica_devices_map, total_llm_replicas = compute_replica_layout(self.stage_configs)
 
@@ -804,7 +805,7 @@ class AsyncOmniEngine:
                                         self._omni_master_server,
                                     )
                                 else:
-                                    use_inline = True if self.num_stages == 1 else False
+                                    use_inline = num_stages == 1
                                     diffusion_clients[stage_idx] = initialize_diffusion_stage(
                                         self.model,
                                         stage_cfg,
@@ -922,7 +923,9 @@ class AsyncOmniEngine:
                     s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
                 }
                 stage_output_proc_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
-                stage_vllm_cfg_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
+                stage_vllm_cfg_results: dict[int, list[Any | None]] = {
+                    s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
+                }
 
                 for future in concurrent.futures.as_completed(attach_futures):
                     stage_idx, replica_id = attach_futures[future]
@@ -930,8 +933,7 @@ class AsyncOmniEngine:
                     stage_attach_results[stage_idx][replica_id] = stage_client
                     if stage_output_proc_results[stage_idx] is None and output_processor is not None:
                         stage_output_proc_results[stage_idx] = output_processor
-                    if stage_vllm_cfg_results[stage_idx] is None:
-                        stage_vllm_cfg_results[stage_idx] = vllm_config
+                    stage_vllm_cfg_results[stage_idx][replica_id] = vllm_config
                     if stage0_input_processor is not None:
                         input_processor = stage0_input_processor
 
@@ -957,7 +959,7 @@ class AsyncOmniEngine:
                             stage_id,
                             stage_attach_results[stage_id],
                             output_processor=stage_output_proc_results[stage_id],
-                            stage_vllm_config=stage_vllm_cfg_results[stage_id],
+                            stage_vllm_config=stage_vllm_cfg_results[stage_id][0],
                         )
                     )
 
