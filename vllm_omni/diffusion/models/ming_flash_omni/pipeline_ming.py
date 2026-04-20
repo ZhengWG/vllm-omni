@@ -272,20 +272,39 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         Two sources, in order of priority:
           1. ``extra["byte5_text"]`` — auto-extracted from the user prompt's
-             quoted spans by ``thinker2imagegen`` (mirrors Ming's default UX).
+             quoted spans by ``thinker2imagegen`` (already wrapped as
+             ``'Text "<glyph>". '`` by Ming's ``get_text_from_prompt``).
           2. ``sampling_params.extra_args["image_gen"]["byte5_text"]`` — an
-             explicit override for programmatic callers.
+             explicit override for programmatic callers; raw strings without
+             the ``Text "..."`` wrapper are auto-wrapped here to match the
+             distribution ByT5 was trained on.
         """
-        for raw in (
-            extra.get("byte5_text"),
-            ((getattr(sampling_params, "extra_args", None) or {}).get("image_gen") or {}).get("byte5_text"),
-        ):
-            if isinstance(raw, str):
-                raw = [raw]
-            if isinstance(raw, list):
-                cleaned = [t for t in raw if isinstance(t, str) and t.strip()]
-                if cleaned:
-                    return cleaned
+        # Source 1: auto-extracted, already wrapped. Return as-is if non-empty.
+        raw = extra.get("byte5_text")
+        if isinstance(raw, str):
+            raw = [raw]
+        if isinstance(raw, list):
+            cleaned = [t for t in raw if isinstance(t, str) and t.strip()]
+            if cleaned:
+                return cleaned
+
+        # Source 2: explicit override — wrap raw strings so the byte5 encoder
+        # sees the same ``Text "<glyph>". `` format Ming used during training.
+        raw = ((getattr(sampling_params, "extra_args", None) or {}).get("image_gen") or {}).get("byte5_text")
+        if isinstance(raw, str):
+            raw = [raw]
+        if isinstance(raw, list):
+            out: list[str] = []
+            for t in raw:
+                if not isinstance(t, str):
+                    continue
+                s = t.strip()
+                if not s:
+                    continue
+                # Don't double-wrap if the caller already supplied ``Text "...". ``.
+                out.append(s if s.startswith('Text "') else f'Text "{s}". ')
+            if out:
+                return out
         return []
 
     @torch.inference_mode()

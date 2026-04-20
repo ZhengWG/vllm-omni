@@ -102,6 +102,7 @@ class MingByT5Encoder(nn.Module):
         dtype: torch.dtype,
     ) -> MingByT5Encoder:
         byte5_dir = Path(byte5_dir)
+        # Filesystem layout + JSON keys use Ming's original ``byte5`` spelling.
         cfg_raw = json.loads((byte5_dir / "byte5.json").read_text())
         cfg = SimpleNamespace(**cfg_raw)
         byte5_config = cfg.byte5_config

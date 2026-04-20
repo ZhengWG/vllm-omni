@@ -34,18 +34,27 @@ class _T5EncoderBlock(nn.Module):
         layer_head_mask: torch.Tensor | None = None,
         output_attentions: bool = False,
     ):
+        # HF ``T5LayerSelfAttention.forward`` signature varies across transformers
+        # versions; ``query_length`` was dropped in favour of ``cache_position``.
+        # For pure-encoder usage we pass a plain 0..N-1 range so the inner
+        # ``T5Attention`` can compute the relative attention bias without a KV
+        # cache.
+        cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
         self_attention_outputs = self.layer[0](
             hidden_states,
             attention_mask=attention_mask,
             position_bias=position_bias,
-            query_length=query_length,
             layer_head_mask=layer_head_mask,
             past_key_value=None,
             use_cache=False,
             output_attentions=output_attentions,
+            cache_position=cache_position,
         )
         hidden_states = self_attention_outputs[0]
-        attn_extra = self_attention_outputs[2:]
+        # In modern HF (transformers>=4.x), ``T5LayerSelfAttention.forward``
+        # returns ``(hidden_states, position_bias, ?attn_weights)`` — keep
+        # everything after index 0 so position_bias propagates to the next layer.
+        attn_extra = self_attention_outputs[1:]
 
         if hidden_states.dtype == torch.float16:
             clamp_value = torch.where(
@@ -104,7 +113,6 @@ class T5EncoderBlockByT5Mapper(ModelMixin):
 
         hidden_states = inputs_embeds
         position_bias = None
-        query_length = inputs_embeds.shape[1]
 
         if self.blocks is not None:
             for block in self.blocks:
@@ -112,7 +120,6 @@ class T5EncoderBlockByT5Mapper(ModelMixin):
                     hidden_states,
                     attention_mask=extended_mask,
                     position_bias=position_bias,
-                    query_length=query_length,
                 )
                 hidden_states, position_bias = layer_outputs[0], layer_outputs[1]
 

@@ -274,7 +274,12 @@ class Orchestrator:
                         req_state = self.request_states.get(output.request_id)
                         if req_state is not None:
                             if getattr(output, "error", None) is not None:
-                                parent_id = self._companion_to_parent.get(output.request_id, output.request_id)
+                                # Map companion id → parent id (if this was a CFG companion),
+                                # then report the error under the parent's request_id and
+                                # clean up both parent and companion bookkeeping via the tracker.
+                                parent_id = self._cfg_tracker._companion_to_parent.get(
+                                    output.request_id, output.request_id
+                                )
                                 await self.output_async_queue.put(
                                     {
                                         "type": "error",
@@ -283,10 +288,9 @@ class Orchestrator:
                                         "error": output.error,
                                     }
                                 )
-                                role_map = self._companion_map.get(parent_id, {})
-                                for cid in role_map.values():
+                                companion_ids = self._cfg_tracker.cleanup_parent(parent_id)
+                                for cid in companion_ids:
                                     self.request_states.pop(cid, None)
-                                self._cleanup_companion_state(parent_id)
                                 self.request_states.pop(parent_id, None)
                                 continue
 
