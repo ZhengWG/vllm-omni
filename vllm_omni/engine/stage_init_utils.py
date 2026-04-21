@@ -21,8 +21,8 @@ from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
 from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
-from vllm.v1.executor import Executor
 from vllm.v1.engine.input_processor import InputProcessor
+from vllm.v1.executor import Executor
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.engine.arg_utils import OmniEngineArgs

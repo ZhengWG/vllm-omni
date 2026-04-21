@@ -61,14 +61,14 @@ from vllm_omni.engine.stage_engine_startup import (
     register_stage_with_omni_master,
 )
 from vllm_omni.engine.stage_init_utils import (
-    _inject_inferred_kv_tp_topology,
-    acquire_device_locks,
-    build_llm_stage_output_processor,
-    build_stage0_input_processor,
-    build_diffusion_config,
-    build_engine_args_dict,
     LogicalStageInitPlan,
     ReplicaInitPlan,
+    _inject_inferred_kv_tp_topology,
+    acquire_device_locks,
+    build_diffusion_config,
+    build_engine_args_dict,
+    build_llm_stage_output_processor,
+    build_stage0_input_processor,
     build_vllm_config,
     compute_replica_layout,
     extract_stage_metadata,
@@ -199,6 +199,7 @@ def _weak_shutdown_async_omni_engine(
             q.close()
         except Exception:
             pass
+
 
 class AsyncOmniEngine:
     """Thin proxy that launches an Orchestrator in a background thread.
@@ -423,10 +424,7 @@ class AsyncOmniEngine:
             # OmniMasterServer endpoint allocation per logical stage. Support
             # per-replica startup only after remote/local startup paths are made
             # replica-aware end-to-end.
-            raise ValueError(
-                "single_stage_mode does not support num_replicas > 1 yet; "
-                f"found {unsupported}"
-            )
+            raise ValueError(f"single_stage_mode does not support num_replicas > 1 yet; found {unsupported}")
 
     def _build_logical_stage_init_plans(
         self,
@@ -531,8 +529,7 @@ class AsyncOmniEngine:
 
         if not self._omni_master_address or not self._omni_master_port:
             raise ValueError(
-                "AsyncOmniEngine single_stage_mode requires both "
-                "omni_master_address and omni_master_port to be set."
+                "AsyncOmniEngine single_stage_mode requires both omni_master_address and omni_master_port to be set."
             )
 
         all_stage_ids: list[int] = []
@@ -646,9 +643,9 @@ class AsyncOmniEngine:
                             else:
                                 addresses, proc, handshake_address = spawn_stage_core(
                                     vllm_config=vllm_config,
-                                        executor_class=executor_class,
-                                        log_stats=False,
-                                    )
+                                    executor_class=executor_class,
+                                    log_stats=False,
+                                )
                             logger.info(
                                 "[AsyncOmniEngine] Stage %s engine launch started",
                                 plan.metadata.stage_id,
@@ -800,8 +797,7 @@ class AsyncOmniEngine:
                             current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
             logger.info(
-                "[AsyncOmniEngine] Stage %s replica %s initialized "
-                "(diffusion, batch_size=%d, devices=%s)",
+                "[AsyncOmniEngine] Stage %s replica %s initialized (diffusion, batch_size=%d, devices=%s)",
                 plan.metadata.stage_id,
                 plan.replica_id,
                 self.diffusion_batch_size,

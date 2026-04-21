@@ -231,7 +231,9 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
     monkeypatch.setattr(engine_mod, "setup_stage_devices", lambda *_: None)
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
 
-    def _capture_initialize_diffusion_stage(_model, _stage_cfg, _metadata, *, stage_init_timeout, batch_size, use_inline):
+    def _capture_initialize_diffusion_stage(
+        _model, _stage_cfg, _metadata, *, stage_init_timeout, batch_size, use_inline
+    ):
         captured["stage_init_timeout"] = stage_init_timeout
         captured["batch_size"] = batch_size
         captured["use_inline"] = use_inline
@@ -338,7 +340,9 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     engine._single_stage_id_filter = None
     engine.stage_configs = [
         types.SimpleNamespace(stage_id=0, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="0")),
-        types.SimpleNamespace(stage_id=1, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="1,2,3")),
+        types.SimpleNamespace(
+            stage_id=1, stage_type="llm", engine_args={}, runtime=types.SimpleNamespace(devices="1,2,3")
+        ),
     ]
 
     metadata_by_stage = {
@@ -346,7 +350,11 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
         1: _make_llm_metadata(1),
     }
 
-    monkeypatch.setattr(engine_mod, "extract_stage_metadata", lambda cfg: types.SimpleNamespace(**metadata_by_stage[cfg.stage_id].__dict__))
+    monkeypatch.setattr(
+        engine_mod,
+        "extract_stage_metadata",
+        lambda cfg: types.SimpleNamespace(**metadata_by_stage[cfg.stage_id].__dict__),
+    )
     monkeypatch.setattr(engine_mod, "get_stage_connector_spec", lambda **_: {})
     monkeypatch.setattr(engine_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
     monkeypatch.setattr(engine_mod, "build_engine_args_dict", lambda *_, **__: {})

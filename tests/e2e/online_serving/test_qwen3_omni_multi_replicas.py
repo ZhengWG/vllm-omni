@@ -76,11 +76,15 @@ def _assert_text_outputs(responses: list[OmniResponse]) -> None:
 
 
 def _assert_audio_outputs(responses: list[OmniResponse], *, expect_text: bool) -> None:
-    assert all(resp.audio_bytes is not None and len(resp.audio_bytes) > 128 for resp in responses), "Missing audio output"
+    assert all(resp.audio_bytes is not None and len(resp.audio_bytes) > 128 for resp in responses), (
+        "Missing audio output"
+    )
     if expect_text:
         assert all(resp.text_content is not None for resp in responses), "Missing text output"
     else:
-        assert all(not (resp.text_content or "").strip() for resp in responses), "Audio-only request unexpectedly produced text"
+        assert all(not (resp.text_content or "").strip() for resp in responses), (
+            "Audio-only request unexpectedly produced text"
+        )
 
 
 @pytest.mark.core_model
