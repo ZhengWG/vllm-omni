@@ -70,6 +70,8 @@ class StageEngineCoreClientBase:
     ``engine_manager`` / ``coordinator`` pair created elsewhere.
     """
 
+    replica_id: int = 0
+
     @staticmethod
     def make_async_mp_client(
         vllm_config: Any,
@@ -128,8 +130,10 @@ class StageEngineCoreClientBase:
         manage the process lifecycle on shutdown.
         """
         # -------- Stage metadata (public fields used at runtime) --------
+        self.replica_id = 0
         if metadata is not None:
             self.stage_id = metadata.stage_id
+            self.replica_id = getattr(metadata, "replica_id", 0)
             self.stage_type = metadata.stage_type
             self.engine_output_type = metadata.engine_output_type
             self.is_comprehension = metadata.is_comprehension
@@ -151,9 +155,10 @@ class StageEngineCoreClientBase:
 
         client_name = self.__class__.__name__
         logger.info(
-            "[%s] Stage-%s initializing EngineCore",
+            "[%s] stage-%s [rep-%s] initializing EngineCore",
             client_name,
             self.stage_id,
+            self.replica_id,
         )
         try:
             super().__init__(
@@ -170,17 +175,19 @@ class StageEngineCoreClientBase:
                 self.resources.coordinator = coordinator
         except Exception:
             logger.exception(
-                "[%s] Stage-%s EngineCore init failed",
+                "[%s] stage-%s [rep-%s] EngineCore init failed",
                 client_name,
                 self.stage_id,
+                self.replica_id,
             )
             try:
                 self.shutdown()
             except Exception as shutdown_error:
                 logger.warning(
-                    "[%s] Stage-%s cleanup after init failure failed: %s",
+                    "[%s] stage-%s [rep-%s] cleanup after init failure failed: %s",
                     client_name,
                     self.stage_id,
+                    self.replica_id,
                     shutdown_error,
                 )
             raise
@@ -191,9 +198,10 @@ class StageEngineCoreClientBase:
             self._start_proc_monitor()
 
         logger.info(
-            "[%s] Stage-%s EngineCore running",
+            "[%s] stage-%s [rep-%s] EngineCore running",
             client_name,
             self.stage_id,
+            self.replica_id,
         )
 
     def _start_proc_monitor(self) -> None:
@@ -207,6 +215,7 @@ class StageEngineCoreClientBase:
         proc = self._proc
         resources_ref = weakref.ref(self.resources)
         stage_id = self.stage_id
+        replica_id = self.replica_id
 
         def _monitor() -> None:
             try:
@@ -218,8 +227,9 @@ class StageEngineCoreClientBase:
                 return
             resources.engine_dead = True
             logger.error(
-                "[StageEngineCoreClient] Stage-%s subprocess died unexpectedly (exit code %s).",
+                "[StageEngineCoreClient] stage-%s [rep-%s] subprocess died unexpectedly (exit code %s).",
                 stage_id,
+                replica_id,
                 proc.exitcode,
             )
 
@@ -247,9 +257,10 @@ class StageEngineCoreClientBase:
     async def add_request_async(self, request: EngineCoreRequest) -> None:
         """Add request to the stage engine core."""
         logger.info(
-            "[%s] Stage-%s adding request: %s",
+            "[%s] stage-%s [rep-%s] add request: %s",
             self.__class__.__name__,
             self.stage_id,
+            self.replica_id,
             request.request_id,
         )
         await super().add_request_async(request)
@@ -330,9 +341,10 @@ class StageEngineCoreClientBase:
                 sender_port = int(base_port) + KV_TRANSFER_PORT_OFFSET + int(from_stage)
             except (TypeError, ValueError):
                 logger.warning(
-                    "[StageEngineCoreClient] Stage-%s could not resolve sender_zmq_port "
+                    "[StageEngineCoreClient] stage-%s [rep-%s] could not resolve sender_zmq_port "
                     "from base_port=%s and from_stage=%s",
                     self.stage_id,
+                    self.replica_id,
                     base_port,
                     from_stage,
                 )
