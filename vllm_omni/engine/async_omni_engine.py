@@ -853,12 +853,13 @@ class AsyncOmniEngine:
                 for future in concurrent.futures.as_completed(future_to_replica):
                     stage_idx, replica_id = future_to_replica[future]
                     initialized_clients_by_stage[stage_idx][replica_id] = future.result()
-            except Exception:
+            except Exception as exc:
                 for future, (stage_idx, replica_id) in future_to_replica.items():
                     if not future.done() or future.cancelled() or future.exception() is not None:
                         continue
                     if initialized_clients_by_stage[stage_idx][replica_id] is None:
                         initialized_clients_by_stage[stage_idx][replica_id] = future.result()
+                setattr(exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
                 raise
 
         return initialized_clients_by_stage
@@ -951,7 +952,12 @@ class AsyncOmniEngine:
                 assert stage0_vllm_config is not None
                 input_processor = build_stage0_input_processor(stage0_vllm_config)
             stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients_by_stage)
-        except Exception:
+        except Exception as exc:
+            initialized_clients_by_stage = getattr(
+                exc,
+                "_initialized_clients_by_stage",
+                initialized_clients_by_stage,
+            )
             cleanup_clients = self._collect_initialized_clients_for_cleanup(
                 stage_pools,
                 initialized_clients_by_stage,

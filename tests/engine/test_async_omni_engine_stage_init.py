@@ -1,6 +1,7 @@
 import importlib
 import os
 import threading
+import time
 import types
 
 import pytest
@@ -375,6 +376,81 @@ def test_build_logical_stage_init_plans_applies_replica_device_splits(monkeypatc
     assert [replica.stage_cfg.runtime.devices for replica in stage_plans[1].replicas] == ["1", "2", "3"]
     assert [replica.replica_id for replica in stage_plans[1].replicas] == [0, 1, 2]
     assert all(replica.num_replicas == 3 for replica in stage_plans[1].replicas)
+
+
+def test_initialize_stage_replicas_collects_results_by_stage_and_replica_id(monkeypatch):
+    engine = object.__new__(AsyncOmniEngine)
+
+    cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    cfg1 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    stage_plans = [
+        _make_llm_plan(0, configured_stage_id=0, vllm_config=cfg0, num_replicas=2),
+        _make_llm_plan(1, configured_stage_id=1, vllm_config=cfg1, num_replicas=2),
+    ]
+
+    clients = {
+        (0, 0): types.SimpleNamespace(name="stage0-replica0"),
+        (0, 1): types.SimpleNamespace(name="stage0-replica1"),
+        (1, 0): types.SimpleNamespace(name="stage1-replica0"),
+        (1, 1): types.SimpleNamespace(name="stage1-replica1"),
+    }
+
+    def _initialize_replica(plan, _stage_init_timeout, _stage_launch_lock):
+        time.sleep(0.02 * (3 - plan.metadata.stage_id - plan.replica_id))
+        return clients[(plan.metadata.stage_id, plan.replica_id)]
+
+    monkeypatch.setattr(engine, "_initialize_replica", _initialize_replica)
+
+    initialized_clients = engine._initialize_stage_replicas(stage_plans, stage_init_timeout=123)
+
+    assert initialized_clients == {
+        0: [clients[(0, 0)], clients[(0, 1)]],
+        1: [clients[(1, 0)], clients[(1, 1)]],
+    }
+
+
+def test_initialize_stages_cleans_up_successful_replicas_after_partial_multi_replica_failure(monkeypatch):
+    import vllm_omni.engine.async_omni_engine as engine_mod
+
+    engine = object.__new__(AsyncOmniEngine)
+    engine.model = "dummy-model"
+    engine.config_path = "dummy-config"
+    engine.num_stages = 1
+    engine.async_chunk = False
+    engine.diffusion_batch_size = 1
+    engine.single_stage_mode = False
+    engine._single_stage_id_filter = None
+    engine._omni_master_server = None
+    engine.stage_configs = [types.SimpleNamespace()]
+
+    cfg0 = types.SimpleNamespace(model_config=types.SimpleNamespace(max_model_len=64))
+    stage_plans = [_make_llm_plan(0, configured_stage_id=0, vllm_config=cfg0, num_replicas=2)]
+    initialized_client = types.SimpleNamespace(shutdown=lambda: None)
+
+    monkeypatch.setattr(engine_mod, "prepare_engine_environment", lambda: None)
+    monkeypatch.setattr(engine_mod, "load_omni_transfer_config_for_model", lambda *_: None)
+    monkeypatch.setattr(engine_mod, "compute_replica_layout", lambda _cfgs: ([2], {}))
+    monkeypatch.setattr(engine, "_build_logical_stage_init_plans", lambda *_: (stage_plans, None))
+
+    def _initialize_replica(plan, _stage_init_timeout, _stage_launch_lock):
+        if plan.replica_id == 0:
+            return initialized_client
+        time.sleep(0.05)
+        raise RuntimeError("replica launch failed")
+
+    monkeypatch.setattr(engine, "_initialize_replica", _initialize_replica)
+
+    captured_cleanup: list[list[object]] = []
+
+    def _capture_shutdown(clients):
+        captured_cleanup.append(list(clients))
+
+    monkeypatch.setattr(engine, "_shutdown_initialized_clients", _capture_shutdown)
+
+    with pytest.raises(RuntimeError, match="replica launch failed"):
+        engine._initialize_stages(stage_init_timeout=1)
+
+    assert captured_cleanup == [[initialized_client]]
 
 
 def test_initialize_llm_replica_passes_stage_init_timeout_to_complete_stage_handshake(monkeypatch):
