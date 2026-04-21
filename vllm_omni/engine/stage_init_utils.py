@@ -19,16 +19,44 @@ from typing import Any, Literal
 
 from vllm.logger import init_logger
 from vllm.sampling_params import SamplingParams
+from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.usage.usage_lib import UsageContext
 from vllm.v1.executor import Executor
+from vllm.v1.engine.input_processor import InputProcessor
 
 from vllm_omni.engine.arg_utils import OmniEngineArgs
+from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.entrypoints.stage_utils import _to_dict, set_stage_devices
 from vllm_omni.entrypoints.utils import filter_dataclass_kwargs, resolve_model_config_path
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniSamplingParams
+from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 
 logger = init_logger(__name__)
+
+
+@dataclass
+class ReplicaInitPlan:
+    """One concrete replica startup unit within a logical stage."""
+
+    replica_id: int
+    num_replicas: int
+    launch_mode: str
+    stage_cfg: Any
+    metadata: Any
+    stage_connector_spec: dict[str, Any]
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
+    stage_vllm_config: Any | None = None
+    executor_class: type | None = None
+
+
+@dataclass
+class LogicalStageInitPlan:
+    """Startup plan for one logical stage."""
+
+    stage_idx: int
+    configured_stage_id: int
+    replicas: list[ReplicaInitPlan]
 
 
 def _resolve_model_to_local_path(model: str) -> str:
@@ -80,6 +108,14 @@ def terminate_alive_proc(proc, timeout=5):
         proc.join(timeout=timeout)
         if proc.is_alive():
             proc.kill()
+
+
+def patch_generation_config_if_needed(model_config: Any) -> None:
+    """Guard InputProcessor init for models whose config lacks model_type."""
+    try:
+        model_config.try_get_generation_config()
+    except Exception:
+        model_config.try_get_generation_config = lambda: {}
 
 
 def resolve_worker_cls(engine_args: dict[str, Any]) -> None:
@@ -558,6 +594,35 @@ def build_vllm_config(
     return vllm_config, executor_class
 
 
+def build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
+    """Build one output processor per logical LLM stage."""
+
+    metadata = plan.replicas[0].metadata
+    if stage_vllm_config.model_config.skip_tokenizer_init:
+        tokenizer = None
+    else:
+        tokenizer = cached_tokenizer_from_config(
+            model_config=stage_vllm_config.model_config,
+        )
+    return MultimodalOutputProcessor(
+        tokenizer=tokenizer,
+        log_stats=False,
+        engine_core_output_type=metadata.engine_output_type,
+    )
+
+
+def build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
+    """Build the shared stage-0 input processor."""
+
+    patch_generation_config_if_needed(stage_vllm_config.model_config)
+    input_processor = InputProcessor(vllm_config=stage_vllm_config)
+    input_processor.input_preprocessor = OmniInputPreprocessor(
+        vllm_config=stage_vllm_config,
+        renderer=input_processor.renderer,
+    )
+    return input_processor
+
+
 def acquire_device_locks(
     stage_id: int,
     engine_args_dict: dict[str, Any],
@@ -774,4 +839,3 @@ def initialize_diffusion_stage(
 
     od_config = build_diffusion_config(model, stage_cfg, metadata)
     return create_diffusion_client(model, od_config, metadata, stage_init_timeout, batch_size, use_inline)
-

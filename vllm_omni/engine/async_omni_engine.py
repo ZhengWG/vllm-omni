@@ -20,7 +20,7 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
 import janus
@@ -30,7 +30,6 @@ from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
-from vllm.tokenizers import cached_tokenizer_from_config
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
@@ -46,7 +45,6 @@ from vllm_omni.distributed.omni_connectors.utils.initialization import (
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.orchestrator import Orchestrator
-from vllm_omni.engine.output_processor import MultimodalOutputProcessor
 from vllm_omni.engine.serialization import (
     deserialize_additional_information,
     serialize_additional_information,
@@ -65,8 +63,12 @@ from vllm_omni.engine.stage_engine_startup import (
 from vllm_omni.engine.stage_init_utils import (
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
+    build_llm_stage_output_processor,
+    build_stage0_input_processor,
     build_diffusion_config,
     build_engine_args_dict,
+    LogicalStageInitPlan,
+    ReplicaInitPlan,
     build_vllm_config,
     compute_replica_layout,
     extract_stage_metadata,
@@ -85,7 +87,6 @@ from vllm_omni.entrypoints.utils import (
     inject_omni_kv_config,
     load_and_resolve_stage_configs,
 )
-from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.platforms import current_omni_platform
 
 if TYPE_CHECKING:
@@ -113,16 +114,6 @@ _PARENT_ARGS_STRIP: frozenset[str] = frozenset({"stage_configs_path"})
 # their presence as an override is never a surprise — suppress the
 # "override ignored" warning for these.
 _PARENT_ARGS_NO_WARN: frozenset[str] = frozenset({"model"})
-
-
-def _patch_generation_config_if_needed(model_config: Any) -> None:
-    """Ensure try_get_generation_config won't crash for models whose HF
-    config.json lacks model_type (e.g. CosyVoice3). We probe it once;
-    if it raises, we monkey-patch the method to return None."""
-    try:
-        model_config.try_get_generation_config()
-    except Exception:
-        model_config.try_get_generation_config = lambda: {}
 
 
 def _inject_global_id(target: Any, request_id: str) -> None:
@@ -206,31 +197,6 @@ def _weak_shutdown_async_omni_engine(
             q.close()
         except Exception:
             pass
-
-
-@dataclass
-class ReplicaInitPlan:
-    """One concrete replica startup unit within a logical stage."""
-
-    replica_id: int
-    num_replicas: int
-    launch_mode: str
-    stage_cfg: Any
-    metadata: Any
-    stage_connector_spec: dict[str, Any]
-    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
-    stage_vllm_config: Any | None = None
-    executor_class: type | None = None
-
-
-@dataclass
-class LogicalStageInitPlan:
-    """Startup plan for one logical stage."""
-
-    stage_idx: int
-    configured_stage_id: int
-    replicas: list[ReplicaInitPlan]
-
 
 class AsyncOmniEngine:
     """Thin proxy that launches an Orchestrator in a background thread.
@@ -447,28 +413,6 @@ class AsyncOmniEngine:
                     cleanup_error,
                 )
 
-    @staticmethod
-    def _finalize_initialized_stages(
-        stage_clients: list[Any | None],
-    ) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
-        """Validate successful init and build runtime metadata lists."""
-
-        if any(stage_client is None for stage_client in stage_clients):
-            raise RuntimeError("Stage initialization completed with missing stage clients")
-
-        initialized_stage_clients = [stage_client for stage_client in stage_clients if stage_client is not None]
-        default_sampling_params_list = [stage_client.default_sampling_params for stage_client in initialized_stage_clients]
-        stage_metadata = [
-            {
-                "final_output": stage_client.final_output,
-                "final_output_type": stage_client.final_output_type,
-                "stage_type": stage_client.stage_type,
-            }
-            for stage_client in initialized_stage_clients
-        ]
-
-        return initialized_stage_clients, default_sampling_params_list, stage_metadata
-
     def _validate_single_stage_mode_replica_constraints(self) -> None:
         """Reject replica fan-out in single-stage mode until startup is replica-aware."""
         if not self.single_stage_mode:
@@ -497,15 +441,6 @@ class AsyncOmniEngine:
                 f"found {unsupported}"
             )
 
-    def _get_replica_launch_mode(self, configured_stage_id: int) -> str:
-        if (
-            self.single_stage_mode
-            and self._single_stage_id_filter is not None
-            and configured_stage_id != self._single_stage_id_filter
-        ):
-            return "remote"
-        return "local"
-
     def _build_logical_stage_init_plans(
         self,
         omni_transfer_config: Any,
@@ -530,7 +465,13 @@ class AsyncOmniEngine:
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
             num_replicas = replicas_per_stage[stage_idx]
-            launch_mode = self._get_replica_launch_mode(configured_stage_id)
+            launch_mode = "local"
+            if (
+                self.single_stage_mode
+                and self._single_stage_id_filter is not None
+                and configured_stage_id != self._single_stage_id_filter
+            ):
+                launch_mode = "remote"
 
             replicas: list[ReplicaInitPlan] = []
             stage_vllm_config = None
@@ -598,11 +539,9 @@ class AsyncOmniEngine:
 
         return stage_plans, prompt_expand_func
 
-    def _start_omni_master_server_if_needed(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+    def _start_omni_master_server(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
         """Start OmniMasterServer for single-stage mode."""
 
-        if not self.single_stage_mode:
-            return
         if not self._omni_master_address or not self._omni_master_port:
             raise ValueError(
                 "AsyncOmniEngine single_stage_mode requires both "
@@ -941,62 +880,31 @@ class AsyncOmniEngine:
 
         return initialized_clients_by_stage
 
-    @staticmethod
-    def _build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
-        """Build one output processor per logical LLM stage."""
-
-        metadata = plan.replicas[0].metadata
-        if stage_vllm_config.model_config.skip_tokenizer_init:
-            tokenizer = None
-        else:
-            tokenizer = cached_tokenizer_from_config(
-                model_config=stage_vllm_config.model_config,
-            )
-        return MultimodalOutputProcessor(
-            tokenizer=tokenizer,
-            log_stats=False,
-            engine_core_output_type=metadata.engine_output_type,
-        )
-
-    @staticmethod
-    def _build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
-        """Build the shared stage-0 input processor."""
-
-        _patch_generation_config_if_needed(stage_vllm_config.model_config)
-        input_processor = InputProcessor(vllm_config=stage_vllm_config)
-        input_processor.input_preprocessor = OmniInputPreprocessor(
-            vllm_config=stage_vllm_config,
-            renderer=input_processor.renderer,
-        )
-        return input_processor
-
     def _assemble_stage_pools(
         self,
         stage_plans: Sequence[LogicalStageInitPlan],
         initialized_clients_by_stage: Mapping[int, Sequence[Any | None]],
-    ) -> tuple[list[StagePool], InputProcessor | None, list[Any], list[dict[str, Any]]]:
-        """Assemble logical stage pools and finalize runtime metadata."""
-
-        logical_stage_clients_for_finalize: list[Any | None] = [None] * len(stage_plans)
-        input_processor: InputProcessor | None = None
-
-        for plan in stage_plans:
-            clients = initialized_clients_by_stage[plan.stage_idx]
-            first_client = clients[0]
-            assert first_client is not None
-            logical_stage_clients_for_finalize[plan.stage_idx] = first_client
+    ) -> list[StagePool]:
+        """Assemble logical stage pools and update top-level stage metadata."""
 
         stage_pools: list[StagePool] = []
+        default_sampling_params_list: list[Any] = []
+        stage_metadata_list: list[dict[str, Any]] = []
+
         for plan in stage_plans:
-            clients = [client for client in initialized_clients_by_stage[plan.stage_idx] if client is not None]
+            replica_clients = initialized_clients_by_stage[plan.stage_idx]
+            first_client = replica_clients[0] if replica_clients else None
+            if first_client is None:
+                raise RuntimeError(f"Stage {plan.stage_idx} initialization completed with a missing client")
+
+            clients = [client for client in replica_clients if client is not None]
             stage_vllm_config = None
             output_processor = None
             if plan.replicas[0].metadata.stage_type != "diffusion":
                 stage_vllm_config = plan.replicas[0].stage_vllm_config
                 assert stage_vllm_config is not None
-                output_processor = self._build_llm_stage_output_processor(plan, stage_vllm_config)
-                if input_processor is None and plan.configured_stage_id == 0:
-                    input_processor = self._build_stage0_input_processor(stage_vllm_config)
+                output_processor = build_llm_stage_output_processor(plan, stage_vllm_config)
+
             stage_pools.append(
                 StagePool(
                     plan.stage_idx,
@@ -1005,12 +913,18 @@ class AsyncOmniEngine:
                     stage_vllm_config=stage_vllm_config,
                 )
             )
+            default_sampling_params_list.append(first_client.default_sampling_params)
+            stage_metadata_list.append(
+                {
+                    "final_output": first_client.final_output,
+                    "final_output_type": first_client.final_output_type,
+                    "stage_type": first_client.stage_type,
+                }
+            )
 
-        _, default_sampling_params_list, stage_metadata_list = self._finalize_initialized_stages(
-            logical_stage_clients_for_finalize,
-        )
-
-        return stage_pools, input_processor, list(default_sampling_params_list), list(stage_metadata_list)
+        self.default_sampling_params_list = list(default_sampling_params_list)
+        self.stage_metadata = list(stage_metadata_list)
+        return stage_pools
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self.
@@ -1038,21 +952,27 @@ class AsyncOmniEngine:
             replicas_per_stage,
             replica_devices_map,
         )
-        self._start_omni_master_server_if_needed(stage_plans)
+        if self.single_stage_mode:
+            self._start_omni_master_server(stage_plans)
 
         stage_pools: list[StagePool] = []
+        input_processor: InputProcessor | None = None
         initialized_clients_by_stage: dict[int, list[Any | None]] = {
             plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
 
         try:
             initialized_clients_by_stage = self._initialize_stage_replicas(stage_plans, stage_init_timeout)
-            stage_pools, input_processor, default_sampling_params_list, stage_metadata_list = self._assemble_stage_pools(
-                stage_plans,
+            if stage_plans and stage_plans[0].replicas[0].metadata.stage_type != "diffusion":
+                stage0_vllm_config = stage_plans[0].replicas[0].stage_vllm_config
+                assert stage0_vllm_config is not None
+                input_processor = build_stage0_input_processor(stage0_vllm_config)
+            stage_pools = self._assemble_stage_pools(stage_plans, initialized_clients_by_stage)
+        except Exception:
+            cleanup_clients = self._collect_initialized_clients_for_cleanup(
+                stage_pools,
                 initialized_clients_by_stage,
             )
-        except Exception:
-            cleanup_clients = self._collect_initialized_clients_for_cleanup(stage_pools, initialized_clients_by_stage)
             logger.exception(
                 "[AsyncOmniEngine] Stage initialization failed; shutting down %s initialized client(s)",
                 len(cleanup_clients),
@@ -1070,20 +990,17 @@ class AsyncOmniEngine:
         self.prompt_expand_func = prompt_expand_func
 
         # Derive logical-stage views for external readers (entrypoints/async_omni.py).
-        self.stage_clients = [pool.stage_client for pool in stage_pools]
-        self.stage_vllm_configs = [pool.stage_vllm_config for pool in stage_pools]
-        self.output_processors = [pool.output_processor for pool in stage_pools]
+        self.stage_clients = [pool.stage_client for pool in self.stage_pools]
+        self.stage_vllm_configs = [pool.stage_vllm_config for pool in self.stage_pools]
+        self.output_processors = [pool.output_processor for pool in self.stage_pools]
 
         # TODO(Peiqi): Hack here
         supported_tasks: set[str] = set()
-        if any(getattr(pool.stage_client, "is_comprehension", False) for pool in stage_pools):
+        if any(getattr(pool.stage_client, "is_comprehension", False) for pool in self.stage_pools):
             supported_tasks.add("generate")
-        if any(m.get("final_output_type") == "audio" for m in stage_metadata_list):
+        if any(m.get("final_output_type") == "audio" for m in self.stage_metadata):
             supported_tasks.add("speech")
         self.supported_tasks = tuple(supported_tasks) if supported_tasks else ("generate",)
-
-        self.default_sampling_params_list = list(default_sampling_params_list)
-        self.stage_metadata = list(stage_metadata_list)
 
     def _initialize_janus_queues(self) -> None:
         """Initialize janus queues inside orchestrator thread loop context."""
