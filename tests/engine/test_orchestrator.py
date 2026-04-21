@@ -813,8 +813,15 @@ async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) ->
         stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
     )
 
-    with caplog.at_level(logging.DEBUG):
+    target_logger = logging.getLogger("vllm_omni.engine.stage_pool")
+    target_logger.addHandler(caplog.handler)
+    prev_level = target_logger.level
+    target_logger.setLevel(logging.DEBUG)
+    try:
         await pool.abort_requests(["missing-req"])
+    finally:
+        target_logger.removeHandler(caplog.handler)
+        target_logger.setLevel(prev_level)
 
     assert not stage0.abort_calls
     assert "abort: no binding for req=missing-req in stage-0" in caplog.text
@@ -835,7 +842,11 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
     orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
 
     try:
-        with caplog.at_level(logging.WARNING):
+        target_logger = logging.getLogger("vllm_omni.engine.orchestrator")
+        target_logger.addHandler(caplog.handler)
+        prev_level = target_logger.level
+        target_logger.setLevel(logging.WARNING)
+        try:
             orchestrator_fixture.request_sync_q.put_nowait(
                 {
                     "type": "collective_rpc",
@@ -846,6 +857,9 @@ async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, ca
             )
 
             msg = await _get_rpc_message(orchestrator_fixture)
+        finally:
+            target_logger.removeHandler(caplog.handler)
+            target_logger.setLevel(prev_level)
 
         assert msg["type"] == "collective_rpc_result"
         assert msg["rpc_id"] == "rpc-1"
