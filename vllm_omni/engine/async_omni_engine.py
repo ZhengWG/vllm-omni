@@ -20,7 +20,7 @@ import uuid
 import weakref
 from collections.abc import Mapping, Sequence
 from contextlib import ExitStack
-from dataclasses import asdict
+from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
 import janus
@@ -63,17 +63,13 @@ from vllm_omni.engine.stage_engine_startup import (
     register_stage_with_omni_master,
 )
 from vllm_omni.engine.stage_init_utils import (
-    StartedLlmStage,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
     build_diffusion_config,
     build_engine_args_dict,
     build_vllm_config,
-    cleanup_failed_stage_initialization,
-    close_started_llm_stage,
     compute_replica_layout,
     extract_stage_metadata,
-    finalize_initialized_stages,
     get_stage_connector_spec,
     initialize_diffusion_stage,
     inject_kv_stage_info,
@@ -161,24 +157,9 @@ def _upgrade_to_omni_request(
     if prompt_embeds is None and additional_information is None:
         return request
 
-    return OmniEngineCoreRequest(
-        request_id=request.request_id,
-        prompt_token_ids=request.prompt_token_ids,
-        mm_features=request.mm_features,
-        sampling_params=request.sampling_params,
-        pooling_params=request.pooling_params,
-        arrival_time=request.arrival_time,
-        lora_request=request.lora_request,
-        cache_salt=request.cache_salt,
-        data_parallel_rank=request.data_parallel_rank,
+    return OmniEngineCoreRequest.from_request(
+        request,
         prompt_embeds=prompt_embeds,
-        client_index=request.client_index,
-        current_wave=request.current_wave,
-        priority=request.priority,
-        trace_headers=request.trace_headers,
-        resumable=request.resumable,
-        external_req_id=request.external_req_id,
-        reasoning_ended=request.reasoning_ended,
         additional_information=additional_information,
     )
 
@@ -193,24 +174,8 @@ def _apply_omni_final_stage_metadata(
         merged = deserialize_additional_information(request.additional_information)
     merged["omni_final_stage_id"] = final_stage_id
     payload = serialize_additional_information(merged)
-    return OmniEngineCoreRequest(
-        request_id=request.request_id,
-        prompt_token_ids=request.prompt_token_ids,
-        mm_features=request.mm_features,
-        sampling_params=request.sampling_params,
-        pooling_params=request.pooling_params,
-        arrival_time=request.arrival_time,
-        lora_request=request.lora_request,
-        cache_salt=request.cache_salt,
-        data_parallel_rank=request.data_parallel_rank,
-        prompt_embeds=request.prompt_embeds,
-        client_index=request.client_index,
-        current_wave=request.current_wave,
-        priority=request.priority,
-        trace_headers=request.trace_headers,
-        resumable=request.resumable,
-        external_req_id=request.external_req_id,
-        reasoning_ended=request.reasoning_ended,
+    return OmniEngineCoreRequest.from_request(
+        request,
         additional_information=payload,
     )
 
@@ -241,6 +206,30 @@ def _weak_shutdown_async_omni_engine(
             q.close()
         except Exception:
             pass
+
+
+@dataclass
+class ReplicaInitPlan:
+    """One concrete replica startup unit within a logical stage."""
+
+    replica_id: int
+    num_replicas: int
+    launch_mode: str
+    stage_cfg: Any
+    metadata: Any
+    stage_connector_spec: dict[str, Any]
+    omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None]
+    stage_vllm_config: Any | None = None
+    executor_class: type | None = None
+
+
+@dataclass
+class LogicalStageInitPlan:
+    """Startup plan for one logical stage."""
+
+    stage_idx: int
+    configured_stage_id: int
+    replicas: list[ReplicaInitPlan]
 
 
 class AsyncOmniEngine:
@@ -311,6 +300,7 @@ class AsyncOmniEngine:
             )
 
         self.config_path, self.stage_configs = self._resolve_stage_configs(model, kwargs)
+        self._validate_single_stage_mode_replica_constraints()
 
         self.num_stages = len(self.stage_configs)
         stage0_args = getattr(self.stage_configs[0], "engine_args", None) if self.num_stages > 0 else None
@@ -372,615 +362,702 @@ class AsyncOmniEngine:
 
         logger.info(f"[AsyncOmniEngine] Orchestrator ready with {self.num_stages} stages")
 
-    def _launch_llm_stage(
+    @staticmethod
+    def _cleanup_launched_llm_resources(
+        *,
+        stage_id: int,
+        proc: Any = None,
+        engine_manager: Any = None,
+        coordinator: Any = None,
+    ) -> None:
+        """Release launch-only LLM resources when client creation never completed."""
+
+        if proc is not None:
+            try:
+                terminate_alive_proc(proc)
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[AsyncOmniEngine] Failed to terminate process for stage %s: %s",
+                    stage_id,
+                    cleanup_error,
+                )
+
+        for resource, resource_name in (
+            (engine_manager, "engine manager"),
+            (coordinator, "coordinator"),
+        ):
+            if resource is None:
+                continue
+            shutdown = getattr(resource, "shutdown", None)
+            close = getattr(resource, "close", None)
+            try:
+                if callable(shutdown):
+                    shutdown()
+                elif callable(close):
+                    close()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[AsyncOmniEngine] Failed to cleanup launched %s for stage %s: %s",
+                    resource_name,
+                    stage_id,
+                    cleanup_error,
+                )
+
+    @staticmethod
+    def _collect_initialized_clients_for_cleanup(
+        stage_pools: Sequence[Any],
+        initialized_clients_by_stage: Mapping[int, Sequence[Any | None]],
+    ) -> list[Any]:
+        """Collect initialized clients exactly once for failure cleanup."""
+
+        collected: list[Any] = []
+        seen: set[int] = set()
+
+        def _add_client(client: Any) -> None:
+            if client is None:
+                return
+            client_id = id(client)
+            if client_id in seen:
+                return
+            seen.add(client_id)
+            collected.append(client)
+
+        for pool in stage_pools:
+            for client in getattr(pool, "clients", ()):
+                _add_client(client)
+
+        for clients in initialized_clients_by_stage.values():
+            for client in clients:
+                _add_client(client)
+
+        return collected
+
+    @staticmethod
+    def _shutdown_initialized_clients(clients: Sequence[Any]) -> None:
+        """Best-effort shutdown for attached clients after init failure."""
+
+        for client in reversed(list(clients)):
+            if client is None:
+                continue
+            try:
+                client.shutdown()
+            except Exception as cleanup_error:
+                logger.warning(
+                    "[AsyncOmniEngine] Failed to shutdown initialized client after init failure: %s",
+                    cleanup_error,
+                )
+
+    @staticmethod
+    def _finalize_initialized_stages(
+        stage_clients: list[Any | None],
+    ) -> tuple[list[Any], list[Any], list[dict[str, Any]]]:
+        """Validate successful init and build runtime metadata lists."""
+
+        if any(stage_client is None for stage_client in stage_clients):
+            raise RuntimeError("Stage initialization completed with missing stage clients")
+
+        initialized_stage_clients = [stage_client for stage_client in stage_clients if stage_client is not None]
+        default_sampling_params_list = [stage_client.default_sampling_params for stage_client in initialized_stage_clients]
+        stage_metadata = [
+            {
+                "final_output": stage_client.final_output,
+                "final_output_type": stage_client.final_output_type,
+                "stage_type": stage_client.stage_type,
+            }
+            for stage_client in initialized_stage_clients
+        ]
+
+        return initialized_stage_clients, default_sampling_params_list, stage_metadata
+
+    def _validate_single_stage_mode_replica_constraints(self) -> None:
+        """Reject replica fan-out in single-stage mode until startup is replica-aware."""
+        if not self.single_stage_mode:
+            return
+
+        unsupported: list[tuple[int, int]] = []
+        for idx, stage_cfg in enumerate(self.stage_configs):
+            runtime_cfg = getattr(stage_cfg, "runtime", {})
+            num_replicas = int(
+                runtime_cfg.get("num_replicas", 1)
+                if hasattr(runtime_cfg, "get")
+                else getattr(runtime_cfg, "num_replicas", 1)
+            )
+            if num_replicas <= 1:
+                continue
+            stage_id = int(getattr(stage_cfg, "stage_id", idx))
+            unsupported.append((stage_id, num_replicas))
+
+        if unsupported:
+            # TODO(Peiqi): single_stage_mode / headless launch still assumes one
+            # OmniMasterServer endpoint allocation per logical stage. Support
+            # per-replica startup only after remote/local startup paths are made
+            # replica-aware end-to-end.
+            raise ValueError(
+                "single_stage_mode does not support num_replicas > 1 yet; "
+                f"found {unsupported}"
+            )
+
+    def _get_replica_launch_mode(self, configured_stage_id: int) -> str:
+        if (
+            self.single_stage_mode
+            and self._single_stage_id_filter is not None
+            and configured_stage_id != self._single_stage_id_filter
+        ):
+            return "remote"
+        return "local"
+
+    def _build_logical_stage_init_plans(
         self,
-        stage_cfg: Any,
-        metadata: Any,
-        stage_connector_spec: dict[str, Any],
+        omni_transfer_config: Any,
+        replicas_per_stage: Sequence[int],
+        replica_devices_map: Mapping[int, Sequence[str]],
+    ) -> tuple[list[LogicalStageInitPlan], Any]:
+        """Build startup plans for every logical stage and replica."""
+
+        prompt_expand_func = None
+        stage_plans: list[LogicalStageInitPlan] = []
+
+        for stage_idx, stage_cfg in enumerate(self.stage_configs):
+            base_metadata = extract_stage_metadata(stage_cfg)
+            configured_stage_id = base_metadata.stage_id
+            if base_metadata.prompt_expand_func is not None:
+                prompt_expand_func = base_metadata.prompt_expand_func
+
+            stage_connector_spec = get_stage_connector_spec(
+                omni_transfer_config=omni_transfer_config,
+                stage_id=configured_stage_id,
+                async_chunk=self.async_chunk,
+            )
+            omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
+            num_replicas = replicas_per_stage[stage_idx]
+            launch_mode = self._get_replica_launch_mode(configured_stage_id)
+
+            replicas: list[ReplicaInitPlan] = []
+            stage_vllm_config = None
+            executor_class = None
+            if base_metadata.stage_type != "diffusion":
+                engine_args_dict = build_engine_args_dict(
+                    stage_cfg,
+                    self.model,
+                    stage_connector_spec=stage_connector_spec,
+                )
+                omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                if omni_conn_cfg:
+                    omni_kv = engine_args_dict.get("omni_kv_config") or {}
+                    if not isinstance(omni_kv, dict):
+                        omni_kv = dict(omni_kv)
+                    omni_kv["connector_config"] = omni_conn_cfg
+                    omni_kv["omni_from_stage"] = omni_from
+                    omni_kv["omni_to_stage"] = omni_to
+                    omni_kv.setdefault("stage_id", configured_stage_id)
+                    engine_args_dict["omni_kv_config"] = omni_kv
+                if self.stage_configs:
+                    _inject_inferred_kv_tp_topology(
+                        engine_args_dict.get("omni_kv_config"),
+                        configured_stage_id,
+                        self.stage_configs,
+                    )
+                stage_vllm_config, executor_class = build_vllm_config(
+                    stage_cfg,
+                    self.model,
+                    stage_connector_spec=stage_connector_spec,
+                    engine_args_dict=engine_args_dict,
+                )
+
+            for replica_id in range(num_replicas):
+                replica_cfg = copy.deepcopy(stage_cfg) if replica_id > 0 else stage_cfg
+                if stage_idx in replica_devices_map:
+                    replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
+
+                replica_metadata = extract_stage_metadata(replica_cfg)
+                replica_metadata.replica_id = replica_id
+                if self.single_stage_mode:
+                    replica_metadata.runtime_cfg = None
+
+                replicas.append(
+                    ReplicaInitPlan(
+                        replica_id=replica_id,
+                        num_replicas=num_replicas,
+                        launch_mode=launch_mode,
+                        stage_cfg=replica_cfg,
+                        metadata=replica_metadata,
+                        stage_connector_spec=stage_connector_spec,
+                        omni_kv_connector=omni_kv_connector,
+                        stage_vllm_config=stage_vllm_config,
+                        executor_class=executor_class,
+                    )
+                )
+
+            stage_plans.append(
+                LogicalStageInitPlan(
+                    stage_idx=stage_idx,
+                    configured_stage_id=configured_stage_id,
+                    replicas=replicas,
+                )
+            )
+
+        return stage_plans, prompt_expand_func
+
+    def _start_omni_master_server_if_needed(self, stage_plans: Sequence[LogicalStageInitPlan]) -> None:
+        """Start OmniMasterServer for single-stage mode."""
+
+        if not self.single_stage_mode:
+            return
+        if not self._omni_master_address or not self._omni_master_port:
+            raise ValueError(
+                "AsyncOmniEngine single_stage_mode requires both "
+                "omni_master_address and omni_master_port to be set."
+            )
+
+        all_stage_ids: list[int] = []
+        seen_stage_ids: set[int] = set()
+        for plan in stage_plans:
+            stage_id = plan.configured_stage_id
+            if stage_id in seen_stage_ids:
+                raise ValueError(
+                    f"Duplicate stage_id {stage_id!r} detected among configured stages; stage_ids must be unique."
+                )
+            seen_stage_ids.add(stage_id)
+            all_stage_ids.append(stage_id)
+
+        self._omni_master_server = OmniMasterServer(
+            master_address=self._omni_master_address,
+            master_port=self._omni_master_port,
+            stage_ids=all_stage_ids,
+        )
+        self._omni_master_server.start()
+        logger.info(
+            "[AsyncOmniEngine] OmniMasterServer started for stages %s",
+            all_stage_ids,
+        )
+
+    def _initialize_llm_replica(
+        self,
+        plan: ReplicaInitPlan,
         stage_init_timeout: int,
         llm_stage_launch_lock: threading.Lock,
-        omni_kv_connector: tuple[dict[str, Any] | None, str | None, str | None] = (None, None, None),
-    ) -> StartedLlmStage:
-        """Launch one LLM stage to READY state in a helper thread."""
-        started_stage: StartedLlmStage | None = None
+    ) -> Any:
+        """Initialize one LLM replica end-to-end."""
+
+        proc = None
+        engine_manager = None
+        coordinator = None
+        stage_client = None
         lock_fds: list[int] = []
         device_control_env = current_omni_platform.device_control_env_var
+        stage_cfg = plan.stage_cfg
+
         try:
-            proc = None
-            handshake_address = None
-            with ExitStack() as launch_stack:
-                with llm_stage_launch_lock:
+            if plan.launch_mode == "remote":
+                assert self._omni_master_server is not None
+                raw_stage_cfg = self._omni_master_server.get_stage_config(
+                    plan.metadata.stage_id,
+                    timeout_s=stage_init_timeout,
+                )
+                if raw_stage_cfg is None:
+                    raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
+                vllm_config = plan.stage_vllm_config
+                executor_class = plan.executor_class
+                assert vllm_config is not None
+                assert executor_class is not None
+                vllm_config.parallel_config.data_parallel_size_local = 0
+                launch_cm = connect_remote_engine_cores(
+                    vllm_config=vllm_config,
+                    omni_master_server=self._omni_master_server,
+                    stage_id=plan.metadata.stage_id,
+                )
+                logger.info(
+                    "[AsyncOmniEngine] Stage %s remote engine handshake started",
+                    plan.metadata.stage_id,
+                )
+                with launch_cm as (engine_manager, coordinator, addresses):
+                    client_addresses: dict[str, str] = {
+                        "input_address": addresses.inputs[0],
+                        "output_address": addresses.outputs[0],
+                    }
+                    if addresses.frontend_stats_publish_address is not None:
+                        client_addresses["stats_update_address"] = addresses.frontend_stats_publish_address
+                    stage_client = StageEngineCoreClientBase.make_async_mp_client(
+                        vllm_config=vllm_config,
+                        executor_class=executor_class,
+                        metadata=plan.metadata,
+                        client_addresses=client_addresses,
+                        engine_manager=engine_manager,
+                        coordinator=coordinator,
+                    )
+            else:
+                handshake_address = None
+                with ExitStack() as launch_stack:
+                    with llm_stage_launch_lock:
+                        previous_visible_devices = os.environ.get(device_control_env)
+                        try:
+                            setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
+                            vllm_config = plan.stage_vllm_config
+                            executor_class = plan.executor_class
+                            assert vllm_config is not None
+                            assert executor_class is not None
+                            engine_args_dict = build_engine_args_dict(
+                                stage_cfg,
+                                self.model,
+                                stage_connector_spec=plan.stage_connector_spec,
+                            )
+                            lock_fds = acquire_device_locks(
+                                plan.metadata.stage_id,
+                                engine_args_dict,
+                                stage_init_timeout,
+                            )
+                            if self.single_stage_mode and self._omni_master_server is not None:
+                                engine_manager, coordinator, addresses = launch_stack.enter_context(
+                                    launch_omni_core_engines(
+                                        vllm_config=vllm_config,
+                                        executor_class=executor_class,
+                                        log_stats=False,
+                                        omni_master_server=self._omni_master_server,
+                                        stage_id=plan.metadata.stage_id,
+                                        stage_config=stage_cfg,
+                                    )
+                                )
+                            else:
+                                addresses, proc, handshake_address = spawn_stage_core(
+                                    vllm_config=vllm_config,
+                                        executor_class=executor_class,
+                                        log_stats=False,
+                                    )
+                            logger.info(
+                                "[AsyncOmniEngine] Stage %s engine launch started",
+                                plan.metadata.stage_id,
+                            )
+                        finally:
+                            if previous_visible_devices is None:
+                                current_omni_platform.unset_device_control_env_var()
+                            else:
+                                current_omni_platform.set_device_control_env_var(previous_visible_devices)
+
+                    if self.single_stage_mode and self._omni_master_server is not None:
+                        launch_stack.close()
+                    else:
+                        assert proc is not None
+                        assert handshake_address is not None
+                        complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
+                    logger.info(
+                        "[AsyncOmniEngine] Stage %s engine startup completed",
+                        plan.metadata.stage_id,
+                    )
+
+                    client_addresses: dict[str, str] = {
+                        "input_address": addresses.inputs[0],
+                        "output_address": addresses.outputs[0],
+                    }
+                    if addresses.frontend_stats_publish_address is not None:
+                        client_addresses["stats_update_address"] = addresses.frontend_stats_publish_address
+                    stage_client = StageEngineCoreClientBase.make_async_mp_client(
+                        vllm_config=vllm_config,
+                        executor_class=executor_class,
+                        metadata=plan.metadata,
+                        client_addresses=client_addresses,
+                        proc=proc,
+                        engine_manager=engine_manager,
+                        coordinator=coordinator,
+                    )
+
+            logger.info("[AsyncOmniEngine] Stage %s initialized", plan.metadata.stage_id)
+            return stage_client
+        except Exception:
+            if stage_client is not None:
+                try:
+                    stage_client.shutdown()
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "[AsyncOmniEngine] Failed to cleanup stage %s after attach failure: %s",
+                        plan.metadata.stage_id,
+                        cleanup_error,
+                    )
+            else:
+                self._cleanup_launched_llm_resources(
+                    stage_id=plan.metadata.stage_id,
+                    proc=proc,
+                    engine_manager=engine_manager,
+                    coordinator=coordinator,
+                )
+            raise
+        finally:
+            if lock_fds:
+                release_device_locks(lock_fds)
+
+    def _initialize_diffusion_replica(
+        self,
+        plan: ReplicaInitPlan,
+        stage_init_timeout: int,
+        stage_launch_lock: threading.Lock,
+    ) -> Any:
+        """Initialize one diffusion replica end-to-end."""
+
+        client = None
+        proc = None
+        try:
+            if plan.launch_mode == "remote":
+                assert self._omni_master_server is not None
+                remote_stage_cfg = OmegaConf.create(
+                    self._omni_master_server.get_stage_config(
+                        plan.metadata.stage_id,
+                        timeout_s=stage_init_timeout,
+                    )
+                )
+                remote_metadata = extract_stage_metadata(remote_stage_cfg)
+                addresses = self._omni_master_server.get_zmq_addresses(plan.metadata.stage_id)
+                logger.info(
+                    "[AsyncOmniEngine] Stage %s remote diffusion startup completed",
+                    plan.metadata.stage_id,
+                )
+                client = StageDiffusionClient.from_addresses(
+                    remote_metadata,
+                    request_address=addresses.inputs[0],
+                    response_address=addresses.outputs[0],
+                    batch_size=self.diffusion_batch_size,
+                )
+            else:
+                device_control_env = current_omni_platform.device_control_env_var
+                with stage_launch_lock:
                     previous_visible_devices = os.environ.get(device_control_env)
                     try:
-                        setup_stage_devices(metadata.stage_id, metadata.runtime_cfg)
-                        engine_args_dict = build_engine_args_dict(
-                            stage_cfg,
-                            self.model,
-                            stage_connector_spec=stage_connector_spec,
-                        )
-                        omni_conn_cfg, omni_from, omni_to = omni_kv_connector
+                        setup_stage_devices(plan.metadata.stage_id, plan.metadata.runtime_cfg)
+                        omni_conn_cfg, omni_from, omni_to = plan.omni_kv_connector
                         if omni_conn_cfg:
-                            omni_kv = engine_args_dict.get("omni_kv_config") or {}
-                            if not isinstance(omni_kv, dict):
-                                omni_kv = dict(omni_kv)
-                            omni_kv["connector_config"] = omni_conn_cfg
-                            omni_kv["omni_from_stage"] = omni_from
-                            omni_kv["omni_to_stage"] = omni_to
-                            omni_kv.setdefault("stage_id", metadata.stage_id)
-                            engine_args_dict["omni_kv_config"] = omni_kv
-                        if self.stage_configs:
-                            _inject_inferred_kv_tp_topology(
-                                engine_args_dict.get("omni_kv_config"),
-                                metadata.stage_id,
-                                self.stage_configs,
+                            inject_omni_kv_config(plan.stage_cfg, omni_conn_cfg, omni_from, omni_to)
+                        inject_kv_stage_info(plan.stage_cfg, plan.metadata.stage_id, self.stage_configs)
+                        if self.single_stage_mode:
+                            assert self._omni_master_server is not None
+                            od_config = build_diffusion_config(self.model, plan.stage_cfg, plan.metadata)
+                            handshake_address, request_address, response_address = register_stage_with_omni_master(
+                                omni_master_address=self._omni_master_server.address,
+                                omni_master_port=self._omni_master_server.port,
+                                omni_stage_id=plan.metadata.stage_id,
+                                omni_stage_config=plan.stage_cfg,
+                                return_addresses=True,
                             )
-                        vllm_config, executor_class = build_vllm_config(
-                            stage_cfg,
-                            self.model,
-                            stage_connector_spec=stage_connector_spec,
-                            engine_args_dict=engine_args_dict,
-                        )
-                        lock_fds = acquire_device_locks(
-                            metadata.stage_id,
-                            engine_args_dict,
-                            stage_init_timeout,
-                        )
-                        if self.single_stage_mode and self._omni_master_server is not None:
-                            engine_manager, coordinator, addresses = launch_stack.enter_context(
-                                launch_omni_core_engines(
-                                    vllm_config=vllm_config,
-                                    executor_class=executor_class,
-                                    log_stats=False,
-                                    omni_master_server=self._omni_master_server,
-                                    stage_id=metadata.stage_id,
-                                    stage_config=stage_cfg,
-                                )
+                            logger.info(
+                                "[AsyncOmniEngine] Stage %s diffusion registration completed",
+                                plan.metadata.stage_id,
                             )
-                            started_stage = StartedLlmStage(
-                                stage_id=metadata.stage_id,
-                                metadata=metadata,
-                                vllm_config=vllm_config,
-                                executor_class=executor_class,
-                                addresses=addresses,
-                                engine_manager=engine_manager,
-                                coordinator=coordinator,
+                            proc, _, _, _ = spawn_diffusion_proc(
+                                self.model,
+                                od_config,
+                                handshake_address=handshake_address,
+                                request_address=request_address,
+                                response_address=response_address,
+                            )
+                            complete_diffusion_handshake(proc, handshake_address)
+                            logger.info(
+                                "[AsyncOmniEngine] Stage %s diffusion startup completed",
+                                plan.metadata.stage_id,
+                            )
+                            client = StageDiffusionClient.from_addresses(
+                                plan.metadata,
+                                request_address=request_address,
+                                response_address=response_address,
+                                proc=proc,
+                                batch_size=self.diffusion_batch_size,
                             )
                         else:
-                            addresses, proc, handshake_address = spawn_stage_core(
-                                vllm_config=vllm_config,
-                                executor_class=executor_class,
-                                log_stats=False,
+                            client = initialize_diffusion_stage(
+                                self.model,
+                                plan.stage_cfg,
+                                plan.metadata,
+                                stage_init_timeout=stage_init_timeout,
+                                batch_size=self.diffusion_batch_size,
+                                use_inline=self.num_stages == 1 and plan.num_replicas == 1,
                             )
-                            started_stage = StartedLlmStage(
-                                stage_id=metadata.stage_id,
-                                metadata=metadata,
-                                vllm_config=vllm_config,
-                                executor_class=executor_class,
-                                addresses=addresses,
-                                proc=proc,
-                            )
-                        logger.info("[AsyncOmniEngine] Stage %s engine launch started", metadata.stage_id)
                     finally:
                         if previous_visible_devices is None:
                             current_omni_platform.unset_device_control_env_var()
                         else:
                             current_omni_platform.set_device_control_env_var(previous_visible_devices)
 
-                # After StageEngineCoreProc has been spawned it carries its
-                # stage-specific device visibility into descendants, so the
-                # slow HELLO/READY handshake can run without holding the
-                # process-wide launch lock.
-                if self.single_stage_mode and self._omni_master_server is not None:
-                    launch_stack.close()
-                else:
-                    assert proc is not None
-                    assert handshake_address is not None
-                    complete_stage_handshake(proc, handshake_address, addresses, vllm_config, stage_init_timeout)
-                logger.info("[AsyncOmniEngine] Stage %s engine startup completed", metadata.stage_id)
-
-            assert started_stage is not None
-            return started_stage
-        except Exception:
-            if started_stage is not None:
-                close_started_llm_stage(started_stage)
-            raise
-        finally:
-            if lock_fds:
-                release_device_locks(lock_fds)
-
-    def _create_remote_llm_stage(
-        self,
-        stage_cfg: Any,
-        metadata: Any,
-        stage_connector_spec: dict[str, Any],
-        stage_init_timeout: int,
-        omni_master_server: OmniMasterServer,
-    ) -> StartedLlmStage:
-        """Attach to a remote engine core and wait for its startup handshake."""
-        started_stage: StartedLlmStage | None = None
-        try:
-            raw_stage_cfg = omni_master_server.get_stage_config(
-                metadata.stage_id,
-                timeout_s=stage_init_timeout,
-            )
-            if raw_stage_cfg is None:
-                raise ValueError(f"Remote stage {metadata.stage_id} registered without stage config")
-            stage_cfg = OmegaConf.create(raw_stage_cfg)
-            engine_args_dict = build_engine_args_dict(
-                stage_cfg,
-                self.model,
-                stage_connector_spec=stage_connector_spec,
-            )
-            vllm_config, executor_class = build_vllm_config(
-                stage_cfg,
-                self.model,
-                stage_connector_spec=stage_connector_spec,
-                engine_args_dict=engine_args_dict,
-            )
-            vllm_config.parallel_config.data_parallel_size_local = 0
-            launch_cm = connect_remote_engine_cores(
-                vllm_config=vllm_config,
-                omni_master_server=omni_master_server,
-                stage_id=metadata.stage_id,
-            )
-            logger.info("[AsyncOmniEngine] Stage %s remote engine handshake started", metadata.stage_id)
-            with launch_cm as (engine_manager, coordinator, addresses):
-                started_stage = StartedLlmStage(
-                    stage_id=metadata.stage_id,
-                    metadata=metadata,
-                    vllm_config=vllm_config,
-                    executor_class=executor_class,
-                    engine_manager=engine_manager,
-                    coordinator=coordinator,
-                    addresses=addresses,
-                )
-            logger.info("[AsyncOmniEngine] Stage %s remote engine startup completed", metadata.stage_id)
-            assert started_stage is not None
-            return started_stage
-        except Exception:
-            if started_stage is not None:
-                close_started_llm_stage(started_stage)
-            raise
-
-    def _launch_diffusion_stage(
-        self,
-        stage_cfg: Any,
-        metadata: Any,
-        omni_master_server: OmniMasterServer,
-    ) -> StageDiffusionClient:
-        """Launch a local diffusion stage on OmniMasterServer-allocated sockets."""
-        proc = None
-        try:
-            od_config = build_diffusion_config(self.model, stage_cfg, metadata)
-            handshake_address, request_address, response_address = register_stage_with_omni_master(
-                omni_master_address=omni_master_server.address,
-                omni_master_port=omni_master_server.port,
-                omni_stage_id=metadata.stage_id,
-                omni_stage_config=stage_cfg,
-                return_addresses=True,
-            )
             logger.info(
-                "[AsyncOmniEngine] Stage %s diffusion registration completed",
-                metadata.stage_id,
+                "[AsyncOmniEngine] Stage %s replica %s initialized "
+                "(diffusion, batch_size=%d, devices=%s)",
+                plan.metadata.stage_id,
+                plan.replica_id,
+                self.diffusion_batch_size,
+                getattr(getattr(plan.stage_cfg, "runtime", None), "devices", "default"),
             )
-            proc, _, _, _ = spawn_diffusion_proc(
-                self.model,
-                od_config,
-                handshake_address=handshake_address,
-                request_address=request_address,
-                response_address=response_address,
-            )
-            complete_diffusion_handshake(proc, handshake_address)
-            logger.info(
-                "[AsyncOmniEngine] Stage %s diffusion startup completed",
-                metadata.stage_id,
-            )
-            return StageDiffusionClient.from_addresses(
-                metadata,
-                request_address=request_address,
-                response_address=response_address,
-                proc=proc,
-                batch_size=self.diffusion_batch_size,
-            )
+            return client
         except Exception:
             if proc is not None:
                 terminate_alive_proc(proc)
             raise
 
-    def _create_remote_diffusion_stage(
+    def _initialize_replica(
         self,
-        metadata: Any,
+        plan: ReplicaInitPlan,
         stage_init_timeout: int,
-        omni_master_server: OmniMasterServer,
-    ) -> StageDiffusionClient:
-        """Attach to a remote diffusion stage registered with OmniMasterServer."""
-        remote_stage_cfg = OmegaConf.create(
-            omni_master_server.get_stage_config(
-                metadata.stage_id,
-                timeout_s=stage_init_timeout,
-            )
-        )
-        remote_metadata = extract_stage_metadata(remote_stage_cfg)
-        addresses = omni_master_server.get_zmq_addresses(metadata.stage_id)
-        logger.info(
-            "[AsyncOmniEngine] Stage %s remote diffusion startup completed",
-            metadata.stage_id,
-        )
-        return StageDiffusionClient.from_addresses(
-            remote_metadata,
-            request_address=addresses.inputs[0],
-            response_address=addresses.outputs[0],
-            batch_size=self.diffusion_batch_size,
-        )
+        stage_launch_lock: threading.Lock,
+    ) -> Any:
+        """Initialize one replica, regardless of backend type."""
 
-    def _attach_llm_stage(
+        if plan.metadata.stage_type == "diffusion":
+            return self._initialize_diffusion_replica(plan, stage_init_timeout, stage_launch_lock)
+        return self._initialize_llm_replica(plan, stage_init_timeout, stage_launch_lock)
+
+    def _initialize_stage_replicas(
         self,
-        started: StartedLlmStage,
-    ) -> tuple[Any, Any | None, Any, InputProcessor | None]:
-        """Attach a READY LLM stage to the orchestrator event loop."""
+        stage_plans: Sequence[LogicalStageInitPlan],
+        stage_init_timeout: int,
+    ) -> dict[int, list[Any | None]]:
+        """Initialize all stage replicas in parallel."""
 
-        client_addresses: dict[str, str] = {
-            "input_address": started.addresses.inputs[0],
-            "output_address": started.addresses.outputs[0],
+        stage_launch_lock = threading.Lock()
+        initialized_clients_by_stage: dict[int, list[Any | None]] = {
+            plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
         }
-        if started.addresses.frontend_stats_publish_address is not None:
-            client_addresses["stats_update_address"] = started.addresses.frontend_stats_publish_address
+        total_replicas = sum(len(plan.replicas) for plan in stage_plans)
+        future_to_replica: dict[concurrent.futures.Future[Any], tuple[int, int]] = {}
 
-        try:
-            stage_client = StageEngineCoreClientBase.make_async_mp_client(
-                vllm_config=started.vllm_config,
-                executor_class=started.executor_class,
-                metadata=started.metadata,
-                client_addresses=client_addresses,
-                proc=started.proc,
-                engine_manager=started.engine_manager,
-                coordinator=started.coordinator,
-            )
-            started.proc = None
-            started.engine_manager = None
-            started.coordinator = None
-        except Exception:
-            close_started_llm_stage(started)
-            raise
-
-        try:
-            output_processor = None
-            if getattr(started.metadata, "replica_id", 0) == 0:
-                if started.vllm_config.model_config.skip_tokenizer_init:
-                    tokenizer = None
-                else:
-                    tokenizer = cached_tokenizer_from_config(
-                        model_config=started.vllm_config.model_config,
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=max(1, total_replicas),
+            thread_name_prefix="stage-init",
+        ) as init_executor:
+            for plan in stage_plans:
+                for replica in plan.replicas:
+                    future = init_executor.submit(
+                        self._initialize_replica,
+                        replica,
+                        stage_init_timeout,
+                        stage_launch_lock,
                     )
-                output_processor = MultimodalOutputProcessor(
-                    tokenizer=tokenizer,
-                    log_stats=False,
-                    engine_core_output_type=started.metadata.engine_output_type,
-                )
-            input_processor = None
-            if started.stage_id == 0:
-                # Some omni models (e.g. CosyVoice3) have an empty HF
-                # config.json without model_type, which causes
-                # try_get_generation_config -> AutoConfig.from_pretrained
-                # to raise ValueError. Patch it to return None so
-                # InputProcessor doesn't crash.
-                _patch_generation_config_if_needed(started.vllm_config.model_config)
-                input_processor = InputProcessor(vllm_config=started.vllm_config)
-                # Use omni preprocessor so text-only prompts with
-                # mm_processor_kwargs (e.g. GLM-Image t2i target_h/target_w)
-                # still go through multimodal processor path.
-                input_processor.input_preprocessor = OmniInputPreprocessor(
-                    vllm_config=started.vllm_config,
-                    renderer=input_processor.renderer,
-                )
-        except Exception:
-            try:
-                stage_client.shutdown()
-            except Exception as cleanup_error:
-                logger.warning(
-                    "[AsyncOmniEngine] Failed to cleanup stage %s after attach failure: %s",
-                    started.stage_id,
-                    cleanup_error,
-                )
-            raise
+                    future_to_replica[future] = (plan.stage_idx, replica.replica_id)
 
-        logger.info("[AsyncOmniEngine] Stage %s initialized", started.stage_id)
-        return stage_client, output_processor, started.vllm_config, input_processor
+            try:
+                for future in concurrent.futures.as_completed(future_to_replica):
+                    stage_idx, replica_id = future_to_replica[future]
+                    initialized_clients_by_stage[stage_idx][replica_id] = future.result()
+            except Exception:
+                for future, (stage_idx, replica_id) in future_to_replica.items():
+                    if not future.done() or future.cancelled() or future.exception() is not None:
+                        continue
+                    if initialized_clients_by_stage[stage_idx][replica_id] is None:
+                        initialized_clients_by_stage[stage_idx][replica_id] = future.result()
+                raise
+
+        return initialized_clients_by_stage
+
+    @staticmethod
+    def _build_llm_stage_output_processor(plan: LogicalStageInitPlan, stage_vllm_config: Any) -> Any | None:
+        """Build one output processor per logical LLM stage."""
+
+        metadata = plan.replicas[0].metadata
+        if stage_vllm_config.model_config.skip_tokenizer_init:
+            tokenizer = None
+        else:
+            tokenizer = cached_tokenizer_from_config(
+                model_config=stage_vllm_config.model_config,
+            )
+        return MultimodalOutputProcessor(
+            tokenizer=tokenizer,
+            log_stats=False,
+            engine_core_output_type=metadata.engine_output_type,
+        )
+
+    @staticmethod
+    def _build_stage0_input_processor(stage_vllm_config: Any) -> InputProcessor:
+        """Build the shared stage-0 input processor."""
+
+        _patch_generation_config_if_needed(stage_vllm_config.model_config)
+        input_processor = InputProcessor(vllm_config=stage_vllm_config)
+        input_processor.input_preprocessor = OmniInputPreprocessor(
+            vllm_config=stage_vllm_config,
+            renderer=input_processor.renderer,
+        )
+        return input_processor
+
+    def _assemble_stage_pools(
+        self,
+        stage_plans: Sequence[LogicalStageInitPlan],
+        initialized_clients_by_stage: Mapping[int, Sequence[Any | None]],
+    ) -> tuple[list[StagePool], InputProcessor | None, list[Any], list[dict[str, Any]]]:
+        """Assemble logical stage pools and finalize runtime metadata."""
+
+        logical_stage_clients_for_finalize: list[Any | None] = [None] * len(stage_plans)
+        input_processor: InputProcessor | None = None
+
+        for plan in stage_plans:
+            clients = initialized_clients_by_stage[plan.stage_idx]
+            first_client = clients[0]
+            assert first_client is not None
+            logical_stage_clients_for_finalize[plan.stage_idx] = first_client
+
+        stage_pools: list[StagePool] = []
+        for plan in stage_plans:
+            clients = [client for client in initialized_clients_by_stage[plan.stage_idx] if client is not None]
+            stage_vllm_config = None
+            output_processor = None
+            if plan.replicas[0].metadata.stage_type != "diffusion":
+                stage_vllm_config = plan.replicas[0].stage_vllm_config
+                assert stage_vllm_config is not None
+                output_processor = self._build_llm_stage_output_processor(plan, stage_vllm_config)
+                if input_processor is None and plan.configured_stage_id == 0:
+                    input_processor = self._build_stage0_input_processor(stage_vllm_config)
+            stage_pools.append(
+                StagePool(
+                    plan.stage_idx,
+                    clients,
+                    output_processor=output_processor,
+                    stage_vllm_config=stage_vllm_config,
+                )
+            )
+
+        _, default_sampling_params_list, stage_metadata_list = self._finalize_initialized_stages(
+            logical_stage_clients_for_finalize,
+        )
+
+        return stage_pools, input_processor, list(default_sampling_params_list), list(stage_metadata_list)
 
     def _initialize_stages(self, stage_init_timeout: int) -> None:
         """Initialize stage clients/processors in orchestrator thread and assign to self.
 
         Phases:
           1. Compute replica layout (counts + device splits).
-          2. Launch all stage engine processes (parallel via ThreadPoolExecutor).
-          3. Attach launched engines (parallel) and collect clients/processors.
-          4. Build StagePool list and finalize stage metadata.
+          2. Build per-stage/per-replica startup plans.
+          3. Initialize all replicas in parallel via backend-specific launchers.
+          4. Build logical StagePools and finalize runtime metadata.
 
         TODO(stage-pool): move per-stage launch + attach logic into a
         StagePool.build_from_config() classmethod so this method only
         iterates stage_configs, collects pools, and finalizes metadata.
         """
-        device_control_env = current_omni_platform.device_control_env_var
         num_stages = len(self.stage_configs)
         self.num_stages = num_stages
+        self._validate_single_stage_mode_replica_constraints()
 
-        replicas_per_stage, replica_devices_map, total_llm_replicas = compute_replica_layout(self.stage_configs)
-
-        input_processor: InputProcessor | None = None
-        llm_stage_ids: list[int] = []
-        llm_launch_futures: dict[int, list[concurrent.futures.Future[StartedLlmStage]]] = {}
-        started_llm_stages: dict[int, list[StartedLlmStage]] = {}
-        llm_stage_launch_lock = threading.Lock()
-        diffusion_clients: dict[int, Any] = {}
-        prompt_expand_func = None
-        async_chunk = self.async_chunk
+        replicas_per_stage, replica_devices_map = compute_replica_layout(self.stage_configs)
 
         prepare_engine_environment()
         omni_transfer_config = load_omni_transfer_config_for_model(self.model, self.config_path)
+        stage_plans, prompt_expand_func = self._build_logical_stage_init_plans(
+            omni_transfer_config,
+            replicas_per_stage,
+            replica_devices_map,
+        )
+        self._start_omni_master_server_if_needed(stage_plans)
 
         stage_pools: list[StagePool] = []
-
-        # ------------------------------------------------------------------ #
-        # Single-stage mode: start OmniMasterServer before launching stages.  #
-        # ------------------------------------------------------------------ #
-        if self.single_stage_mode:
-            if not self._omni_master_address or not self._omni_master_port:
-                raise ValueError(
-                    "AsyncOmniEngine single_stage_mode requires both "
-                    "omni_master_address and omni_master_port to be set."
-                )
-            # Collect all configured stage IDs for pre-allocation.
-            all_stage_ids: list[int] = []
-            seen_stage_ids: set[int] = set()
-            for i, sc in enumerate(self.stage_configs):
-                stage_id = int(getattr(sc, "stage_id", i))
-                if stage_id in seen_stage_ids:
-                    raise ValueError(
-                        f"Duplicate stage_id {stage_id!r} detected among configured stages; stage_ids must be unique."
-                    )
-                seen_stage_ids.add(stage_id)
-                all_stage_ids.append(stage_id)
-            self._omni_master_server = OmniMasterServer(
-                master_address=self._omni_master_address,
-                master_port=self._omni_master_port,
-                stage_ids=all_stage_ids,
-            )
-            self._omni_master_server.start()
-            logger.info(
-                "[AsyncOmniEngine] OmniMasterServer started for stages %s",
-                all_stage_ids,
-            )
+        initialized_clients_by_stage: dict[int, list[Any | None]] = {
+            plan.stage_idx: [None] * len(plan.replicas) for plan in stage_plans
+        }
 
         try:
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, total_llm_replicas),
-                thread_name_prefix="llm-stage-launch",
-            ) as launch_executor:
-                for stage_idx, stage_cfg in enumerate(self.stage_configs):
-                    metadata = extract_stage_metadata(stage_cfg)
-                    configured_stage_id = metadata.stage_id
-                    logger.info("[AsyncOmniEngine] Initializing stage %s", configured_stage_id)
-                    if metadata.prompt_expand_func is not None:
-                        prompt_expand_func = metadata.prompt_expand_func
-
-                    if self.single_stage_mode:
-                        metadata.runtime_cfg = None
-
-                    stage_connector_spec = get_stage_connector_spec(
-                        omni_transfer_config=omni_transfer_config,
-                        stage_id=configured_stage_id,
-                        async_chunk=async_chunk,
-                    )
-
-                    omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, configured_stage_id)
-
-                    if metadata.stage_type == "diffusion":
-                        is_remote_diffusion_stage = (
-                            self.single_stage_mode
-                            and self._single_stage_id_filter is not None
-                            and configured_stage_id != self._single_stage_id_filter
-                        )
-                        if is_remote_diffusion_stage:
-                            assert self._omni_master_server is not None
-                            diffusion_clients[stage_idx] = self._create_remote_diffusion_stage(
-                                metadata,
-                                stage_init_timeout,
-                                self._omni_master_server,
-                            )
-                            continue
-
-                        with llm_stage_launch_lock:
-                            previous_visible_devices = os.environ.get(device_control_env)
-                            try:
-                                setup_stage_devices(configured_stage_id, metadata.runtime_cfg)
-                                omni_conn_cfg, omni_from, omni_to = omni_kv_connector
-                                if omni_conn_cfg:
-                                    inject_omni_kv_config(stage_cfg, omni_conn_cfg, omni_from, omni_to)
-                                inject_kv_stage_info(stage_cfg, configured_stage_id, self.stage_configs)
-                                if self.single_stage_mode:
-                                    assert self._omni_master_server is not None
-                                    diffusion_clients[stage_idx] = self._launch_diffusion_stage(
-                                        stage_cfg,
-                                        metadata,
-                                        self._omni_master_server,
-                                    )
-                                else:
-                                    use_inline = num_stages == 1
-                                    diffusion_clients[stage_idx] = initialize_diffusion_stage(
-                                        self.model,
-                                        stage_cfg,
-                                        metadata,
-                                        stage_init_timeout=stage_init_timeout,
-                                        batch_size=self.diffusion_batch_size,
-                                        use_inline=use_inline,
-                                    )
-                                logger.info(
-                                    "[AsyncOmniEngine] Stage %s initialized (diffusion, batch_size=%d)",
-                                    configured_stage_id,
-                                    self.diffusion_batch_size,
-                                )
-                            finally:
-                                if previous_visible_devices is None:
-                                    current_omni_platform.unset_device_control_env_var()
-                                else:
-                                    current_omni_platform.set_device_control_env_var(previous_visible_devices)
-                        continue
-
-                    # Submit one launch future per replica
-                    llm_stage_ids.append(stage_idx)
-                    num_replicas = replicas_per_stage[stage_idx]
-
-                    # single_stage_mode pre-dates multi-replica support; when
-                    # a stage runs remotely (doesn't match the local filter)
-                    # replica fan-out is delegated to the remote process, so
-                    # we launch exactly one client future per such stage.
-                    # TODO: support remote multi-replica with stage-pool
-                    if (
-                        self.single_stage_mode
-                        and self._single_stage_id_filter is not None
-                        and configured_stage_id != self._single_stage_id_filter
-                    ):
-                        assert self._omni_master_server is not None
-                        if num_replicas > 1:
-                            logger.warning(
-                                "[AsyncOmniEngine] Stage %s has num_replicas=%d but runs remotely in "
-                                "single_stage_mode; only one remote client will be created.",
-                                configured_stage_id,
-                                num_replicas,
-                            )
-                        llm_launch_futures[stage_idx] = [
-                            launch_executor.submit(
-                                self._create_remote_llm_stage,
-                                stage_cfg,
-                                metadata,
-                                stage_connector_spec,
-                                stage_init_timeout,
-                                self._omni_master_server,
-                            )
-                        ]
-                        continue
-
-                    stage_futures: list[concurrent.futures.Future[StartedLlmStage]] = []
-                    for replica_id in range(num_replicas):
-                        # For replica > 0, deep-copy stage_cfg and override devices
-                        if replica_id > 0:
-                            replica_cfg = copy.deepcopy(stage_cfg)
-                        else:
-                            replica_cfg = stage_cfg
-
-                        if stage_idx in replica_devices_map:
-                            replica_cfg.runtime.devices = replica_devices_map[stage_idx][replica_id]
-
-                        replica_metadata = extract_stage_metadata(replica_cfg)
-                        replica_metadata.replica_id = replica_id
-
-                        logger.info(
-                            "[AsyncOmniEngine] Launching stage %s replica %s (devices=%s)",
-                            configured_stage_id,
-                            replica_id,
-                            getattr(getattr(replica_cfg, "runtime", None), "devices", "default"),
-                        )
-
-                        stage_futures.append(
-                            launch_executor.submit(
-                                self._launch_llm_stage,
-                                replica_cfg,
-                                replica_metadata,
-                                stage_connector_spec,
-                                stage_init_timeout,
-                                llm_stage_launch_lock,
-                                omni_kv_connector,
-                            )
-                        )
-
-                    llm_launch_futures[stage_idx] = stage_futures
-
-                # Wait for all futures across all stages
-                all_futures = [f for futures in llm_launch_futures.values() for f in futures]
-                concurrent.futures.wait(all_futures)
-
-                for stage_idx in llm_stage_ids:
-                    started_llm_stages[stage_idx] = [f.result() for f in llm_launch_futures[stage_idx]]
-
-            # ---- Parallel attach across (stage_idx, replica_id) pairs ----
-            attach_futures: dict[
-                concurrent.futures.Future[tuple[Any, Any, Any, InputProcessor | None]],
-                tuple[int, int],
-            ] = {}
-            total_replicas_to_attach = sum(len(started_llm_stages[s]) for s in llm_stage_ids)
-            with concurrent.futures.ThreadPoolExecutor(
-                max_workers=max(1, total_replicas_to_attach),
-                thread_name_prefix="llm-stage-attach",
-            ) as attach_executor:
-                for stage_idx in llm_stage_ids:
-                    for replica_id, started in enumerate(started_llm_stages[stage_idx]):
-                        attach_futures[attach_executor.submit(self._attach_llm_stage, started)] = (
-                            stage_idx,
-                            replica_id,
-                        )
-
-                stage_attach_results: dict[int, list[Any | None]] = {
-                    s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
-                }
-                stage_output_proc_results: dict[int, Any | None] = {s: None for s in llm_stage_ids}
-                stage_vllm_cfg_results: dict[int, list[Any | None]] = {
-                    s: [None] * len(started_llm_stages[s]) for s in llm_stage_ids
-                }
-
-                for future in concurrent.futures.as_completed(attach_futures):
-                    stage_idx, replica_id = attach_futures[future]
-                    stage_client, output_processor, vllm_config, stage0_input_processor = future.result()
-                    stage_attach_results[stage_idx][replica_id] = stage_client
-                    if stage_output_proc_results[stage_idx] is None and output_processor is not None:
-                        stage_output_proc_results[stage_idx] = output_processor
-                    stage_vllm_cfg_results[stage_idx][replica_id] = vllm_config
-                    if stage0_input_processor is not None:
-                        input_processor = stage0_input_processor
-
-            # ---- Build StagePool list + finalize metadata ----
-            # Use first replica's client per stage for finalize (default sampling params, metadata).
-            logical_stage_clients_for_finalize: list[Any | None] = [None] * num_stages
-            for stage_idx in llm_stage_ids:
-                logical_stage_clients_for_finalize[stage_idx] = stage_attach_results[stage_idx][0]
-            for stage_idx, diff_client in diffusion_clients.items():
-                logical_stage_clients_for_finalize[stage_idx] = diff_client
-
-            _, default_sampling_params_list, stage_metadata_list = finalize_initialized_stages(
-                logical_stage_clients_for_finalize,
-                input_processor,
+            initialized_clients_by_stage = self._initialize_stage_replicas(stage_plans, stage_init_timeout)
+            stage_pools, input_processor, default_sampling_params_list, stage_metadata_list = self._assemble_stage_pools(
+                stage_plans,
+                initialized_clients_by_stage,
             )
-
-            for stage_id in range(num_stages):
-                if stage_id in diffusion_clients:
-                    stage_pools.append(StagePool(stage_id, diffusion_clients[stage_id]))
-                else:
-                    stage_pools.append(
-                        StagePool(
-                            stage_id,
-                            stage_attach_results[stage_id],
-                            output_processor=stage_output_proc_results[stage_id],
-                            stage_vllm_config=stage_vllm_cfg_results[stage_id][0],
-                        )
-                    )
-
         except Exception:
-            for stage_id, futures in llm_launch_futures.items():
-                for f in futures:
-                    if not f.done() or f.cancelled() or f.exception() is not None:
-                        continue
-                    started_llm_stages.setdefault(stage_id, []).append(f.result())
-            # Collect all initialized clients for cleanup
-            cleanup_clients: list[Any] = list(diffusion_clients.values())
-            for pool in stage_pools:
-                for client in pool.clients:
-                    if client is not None:
-                        cleanup_clients.append(client)
-            all_started = [s for stages in started_llm_stages.values() for s in stages]
+            cleanup_clients = self._collect_initialized_clients_for_cleanup(stage_pools, initialized_clients_by_stage)
             logger.exception(
                 "[AsyncOmniEngine] Stage initialization failed; shutting down %s initialized client(s)",
                 len(cleanup_clients),
             )
-            cleanup_failed_stage_initialization(cleanup_clients, all_started)
+            self._shutdown_initialized_clients(cleanup_clients)
             if self._omni_master_server is not None:
                 try:
                     self._omni_master_server.stop()
