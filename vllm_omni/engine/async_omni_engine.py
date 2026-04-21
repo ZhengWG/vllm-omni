@@ -783,6 +783,7 @@ class AsyncOmniEngine:
                             )
                         else:
                             client = initialize_diffusion_stage(
+                                plan.metadata.stage_id,
                                 self.model,
                                 plan.stage_cfg,
                                 plan.metadata,

@@ -233,8 +233,9 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
     monkeypatch.setattr(engine_mod, "inject_kv_stage_info", lambda *_: None)
 
     def _capture_initialize_diffusion_stage(
-        _model, _stage_cfg, _metadata, *, stage_init_timeout, batch_size, use_inline
+        stage_id, _model, _stage_cfg, _metadata, *, stage_init_timeout, batch_size, use_inline
     ):
+        captured["stage_id"] = stage_id
         captured["stage_init_timeout"] = stage_init_timeout
         captured["batch_size"] = batch_size
         captured["use_inline"] = use_inline
@@ -245,6 +246,7 @@ def test_initialize_diffusion_replica_passes_stage_init_timeout_and_inline_flag(
     engine._initialize_diffusion_replica(plan, stage_init_timeout=302, stage_launch_lock=threading.Lock())
 
     assert captured == {
+        "stage_id": 0,
         "stage_init_timeout": 302,
         "batch_size": 4,
         "use_inline": True,
