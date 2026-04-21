@@ -56,11 +56,6 @@ def _first_source_image(mm_data: Any) -> Any:
     return images
 
 
-def _looks_like_engine_input_source(value: Any) -> bool:
-    """Detect legacy ar2diffusion(stage_list, engine_input_source, ...) calls."""
-    return isinstance(value, list) and all(isinstance(stage_id, int) for stage_id in value)
-
-
 def compute_max_tokens(height: int, width: int, factor: int = 32, is_i2i: bool = False) -> int:
     """
     Compute max_new_tokens for GLM-Image AR generation.
@@ -217,46 +212,20 @@ def _parse_generated_tokens(
 
 
 def ar2diffusion(
-    source_outputs_or_stage_list: list[Any],
-    prompt_or_engine_input_source: Any = None,
-    requires_multimodal_data: Any = False,
-    streaming_context: Any | None = None,
-    *,
+    source_outputs: list[Any],
     prompt: OmniTokensPrompt | TextPrompt | list | None = None,
+    requires_multimodal_data: bool = False,
+    streaming_context: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Process AR stage outputs to create Diffusion stage inputs.
 
-    Supports both:
-    - current stage-pool calls: ar2diffusion(source_outputs, prompt, requires_multimodal_data)
-    - legacy upstream tests/callers: ar2diffusion(stage_list, engine_input_source, prompt=...)
+    This processor accepts the stage-pool transition interface:
+    ``ar2diffusion(source_outputs, prompt, requires_multimodal_data)``.
     """
     del streaming_context
 
     _t_total = time.perf_counter()
-
-    if prompt is None and _looks_like_engine_input_source(prompt_or_engine_input_source):
-        if not isinstance(requires_multimodal_data, bool):
-            prompt = requires_multimodal_data
-            requires_multimodal_data = False
-    elif prompt is None:
-        prompt = prompt_or_engine_input_source
-
-    if _looks_like_engine_input_source(prompt_or_engine_input_source):
-        engine_input_source = prompt_or_engine_input_source
-        stage_list = source_outputs_or_stage_list
-        if not engine_input_source:
-            raise ValueError("engine_input_source cannot be empty")
-
-        source_stage_id = engine_input_source[0]
-        if source_stage_id >= len(stage_list):
-            raise IndexError(f"Invalid stage_id: {source_stage_id}")
-
-        if stage_list[source_stage_id].engine_outputs is None:
-            raise RuntimeError(f"Stage {source_stage_id} has no outputs yet")
-
-        ar_outputs = stage_list[source_stage_id].engine_outputs
-    else:
-        ar_outputs = source_outputs_or_stage_list
+    ar_outputs = source_outputs
     diffusion_inputs = []
 
     # Normalize prompt to list

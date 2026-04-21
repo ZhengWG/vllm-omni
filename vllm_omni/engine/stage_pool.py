@@ -199,14 +199,34 @@ class StagePool:
             request_id,
             affinity_request_id=affinity_request_id,
         )
-        self.output_processor.add_request(
-            request=request,
-            prompt=prompt_text,
-            parent_req=None,
-            request_index=0,
-            queue=None,
-        )
-        await self.clients[replica_id].add_request_async(request, **submit_kwargs)
+        try:
+            self.output_processor.add_request(
+                request=request,
+                prompt=prompt_text,
+                parent_req=None,
+                request_index=0,
+                queue=None,
+            )
+        except Exception:
+            self.release_binding(request_id)
+            raise
+
+        try:
+            await self.clients[replica_id].add_request_async(request, **submit_kwargs)
+        except Exception:
+            self.release_binding(request_id)
+            rollback = getattr(self.output_processor, "remove_request", None)
+            if callable(rollback):
+                try:
+                    rollback(request_id)
+                except Exception as rollback_error:
+                    logger.warning(
+                        "[StagePool] Failed to rollback output processor state for req=%s stage-%s: %s",
+                        request_id,
+                        self.stage_id,
+                        rollback_error,
+                    )
+            raise
         return replica_id
 
     async def submit_update(
@@ -302,6 +322,7 @@ class StagePool:
         for request_id in request_ids:
             replica_id = self.get_bound_replica_id(request_id)
             if replica_id is None:
+                logger.debug("[StagePool] abort: no binding for req=%s in stage-%s", request_id, self.stage_id)
                 continue
             request_ids_by_replica.setdefault(replica_id, []).append(request_id)
 

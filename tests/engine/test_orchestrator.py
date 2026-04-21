@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import logging
 import queue
 import threading
 import time
@@ -86,6 +87,25 @@ class FakeStageClient:
 
     def push_diffusion_output(self, output) -> None:
         self._diffusion_outputs.put_nowait(output)
+
+
+class FakeCollectiveRpcStageClient(FakeStageClient):
+    def __init__(self, *args, rpc_result: Any = None, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.rpc_result = rpc_result
+        self.collective_rpc_calls: list[tuple[str, float | None, tuple[Any, ...], dict[str, Any]]] = []
+
+    async def collective_rpc_async(
+        self,
+        *,
+        method: str,
+        timeout: float | None = None,
+        args: tuple[Any, ...] = (),
+        kwargs: dict[str, Any] | None = None,
+    ) -> Any:
+        normalized_kwargs = dict(kwargs or {})
+        self.collective_rpc_calls.append((method, timeout, args, normalized_kwargs))
+        return self.rpc_result
 
 
 class FakeOutputProcessor:
@@ -279,6 +299,18 @@ async def _get_output_message(orchestrator_fixture: OrchestratorFixture, *, time
             continue
         if msg.get("type") == "output":
             return msg
+
+
+async def _get_rpc_message(orchestrator_fixture: OrchestratorFixture, *, timeout: float = 2.0) -> dict:
+    deadline = time.monotonic() + timeout
+    rpc_sync_q = orchestrator_fixture.queues[2].sync_q
+    while True:
+        if time.monotonic() >= deadline:
+            raise AssertionError("Timed out waiting for orchestrator rpc output")
+        try:
+            return rpc_sync_q.get_nowait()
+        except queue.Empty:
+            await asyncio.sleep(0.01)
 
 
 async def _enqueue_add_request(
@@ -729,6 +761,101 @@ async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
     assert stage0_r0.add_request_calls[1][0].request_id == "req-0"
     assert stage0_r1.add_request_calls[0][0].request_id == "req-1"
     assert stage0_r1.add_request_calls[1][0].request_id == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_submit_initial_rolls_back_output_processor_when_client_submit_fails() -> None:
+    class FailingStageClient(FakeStageClient):
+        async def add_request_async(self, *args, **_kwargs) -> None:
+            raise RuntimeError("submit failed")
+
+    class TrackingOutputProcessor(FakeOutputProcessor):
+        def __init__(self) -> None:
+            super().__init__()
+            self.added_request_ids: list[str] = []
+            self.removed_request_ids: list[str] = []
+
+        def add_request(self, request, *_args, **_kwargs) -> None:
+            self.added_request_ids.append(request.request_id)
+
+        def remove_request(self, request_id: str) -> None:
+            self.removed_request_ids.append(request_id)
+
+    client = FailingStageClient(stage_type="llm", final_output=False)
+    output_processor = TrackingOutputProcessor()
+    pool = StagePool(
+        0,
+        [client],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    with pytest.raises(RuntimeError, match="submit failed"):
+        await pool.submit_initial("req-0", req_state, SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]))
+
+    assert output_processor.added_request_ids == ["req-0"]
+    assert output_processor.removed_request_ids == ["req-0"]
+    assert pool.get_bound_replica_id("req-0") is None
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_abort_requests_logs_when_binding_is_missing(caplog) -> None:
+    stage0 = FakeStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0],
+        output_processor=FakeOutputProcessor(),
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+
+    with caplog.at_level(logging.DEBUG):
+        await pool.abort_requests(["missing-req"])
+
+    assert not stage0.abort_calls
+    assert "abort: no binding for req=missing-req in stage-0" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_collective_rpc_ignores_invalid_stage_ids(orchestrator_factory, caplog) -> None:
+    stage0 = FakeCollectiveRpcStageClient(stage_type="llm", final_output=True, rpc_result={"stage": 0})
+    stage1 = FakeCollectiveRpcStageClient(stage_type="llm", final_output=True, rpc_result={"stage": 1})
+    stage_pools = _build_stage_pools(
+        [[stage0], [stage1]],
+        output_processors=[FakeOutputProcessor(), FakeOutputProcessor()],
+        stage_vllm_configs=[
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+            SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+        ],
+    )
+    orchestrator_fixture = orchestrator_factory([], stage_pools=stage_pools)
+
+    try:
+        with caplog.at_level(logging.WARNING):
+            orchestrator_fixture.request_sync_q.put_nowait(
+                {
+                    "type": "collective_rpc",
+                    "rpc_id": "rpc-1",
+                    "method": "list_loras",
+                    "stage_ids": [99, 1],
+                }
+            )
+
+            msg = await _get_rpc_message(orchestrator_fixture)
+
+        assert msg["type"] == "collective_rpc_result"
+        assert msg["rpc_id"] == "rpc-1"
+        assert msg["stage_ids"] == [1]
+        assert msg["results"] == [{"stage": 1}]
+        assert not stage0.collective_rpc_calls
+        assert len(stage1.collective_rpc_calls) == 1
+        assert "collective_rpc: ignoring invalid stage_id 99" in caplog.text
+    finally:
+        await _shutdown_orchestrator(orchestrator_fixture)
 
 
 @pytest.mark.asyncio

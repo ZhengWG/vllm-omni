@@ -357,8 +357,10 @@ class Orchestrator:
             target_pools.extend(self.stage_pools)
         else:
             for lid in requested_stage_ids:
-                if 0 <= lid < self.num_stages:
-                    target_pools.append(self.stage_pools[lid])
+                if not (0 <= lid < self.num_stages):
+                    logger.warning("[Orchestrator] collective_rpc: ignoring invalid stage_id %s", lid)
+                    continue
+                target_pools.append(self.stage_pools[lid])
 
         results: list[Any] = []
         stage_ids: list[int] = []
