@@ -18,6 +18,7 @@ from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import (
     Qwen3OmniMoeThinkerConfig,
 )
 from vllm.config import ModelConfig, VllmConfig
+from vllm.forward_context import get_forward_context
 from vllm.inputs import PromptType, TokensPrompt
 from vllm.logger import init_logger
 from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
@@ -251,6 +252,23 @@ class Qwen3OmniMoeForConditionalGeneration(
                 multi_modal_data={"audio": remaining},
             )
 
+    def _nullify_talker_scheduler_metadata(self) -> None:
+        """Set FA3 scheduler_metadata to None on talker attention layers.
+
+        Prevents shape mismatch when talker prefill exceeds
+        max_cudagraph_capture_size in the piecewise CUDAGraph path.
+        FA3 falls back to default scheduling (~0.1 ms overhead).
+        """
+        ctx = get_forward_context()
+        attn_metadata = getattr(ctx, "attn_metadata", None)
+        if not isinstance(attn_metadata, dict):
+            return
+        for layer_name, meta in attn_metadata.items():
+            if not layer_name.startswith("talker."):
+                continue
+            if getattr(meta, "scheduler_metadata", None) is not None:
+                meta.scheduler_metadata = None
+
     # ==================== Device utilities ====================
 
     @staticmethod
@@ -381,6 +399,8 @@ class Qwen3OmniMoeForConditionalGeneration(
             # Ensure we have base embeddings when only ids are provided
             if inputs_embeds is None and input_ids is not None:
                 inputs_embeds = self.talker.embed_input_ids(input_ids)
+
+            self._nullify_talker_scheduler_metadata()
 
             # Run talker forward
             with torch.inference_mode():
