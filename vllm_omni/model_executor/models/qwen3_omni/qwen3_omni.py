@@ -252,13 +252,18 @@ class Qwen3OmniMoeForConditionalGeneration(
                 multi_modal_data={"audio": remaining},
             )
 
+    @cached_property
+    def _max_cudagraph_capture_size(self) -> int:
+        return self.vllm_config.compilation_config.max_cudagraph_capture_size or 0
+
     def _nullify_talker_scheduler_metadata(self) -> None:
         """Set FA3 scheduler_metadata to None on talker attention layers.
 
-        Prevents shape mismatch when talker prefill exceeds
-        max_cudagraph_capture_size in the piecewise CUDAGraph path.
-        FA3 falls back to default scheduling (~0.1 ms overhead).
+        Only activates when num_tokens exceeds max_cudagraph_capture_size,
+        where the piecewise CUDAGraph path has a metadata shape mismatch bug.
         """
+        if self._max_cudagraph_capture_size <= 0:
+            return
         ctx = get_forward_context()
         attn_metadata = getattr(ctx, "attn_metadata", None)
         if not isinstance(attn_metadata, dict):
@@ -266,8 +271,12 @@ class Qwen3OmniMoeForConditionalGeneration(
         for layer_name, meta in attn_metadata.items():
             if not layer_name.startswith("talker."):
                 continue
-            if getattr(meta, "scheduler_metadata", None) is not None:
-                meta.scheduler_metadata = None
+            if getattr(meta, "num_actual_tokens", 0) <= self._max_cudagraph_capture_size:
+                return
+            for m in attn_metadata.values():
+                if getattr(m, "scheduler_metadata", None) is not None:
+                    m.scheduler_metadata = None
+            return
 
     # ==================== Device utilities ====================
 
