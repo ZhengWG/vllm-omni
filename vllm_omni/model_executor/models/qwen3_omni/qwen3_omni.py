@@ -268,15 +268,14 @@ class Qwen3OmniMoeForConditionalGeneration(
         attn_metadata = getattr(ctx, "attn_metadata", None)
         if not isinstance(attn_metadata, dict):
             return
-        for layer_name, meta in attn_metadata.items():
-            if not layer_name.startswith("talker."):
-                continue
-            if getattr(meta, "num_actual_tokens", 0) <= self._max_cudagraph_capture_size:
-                return
-            for m in attn_metadata.values():
-                if getattr(m, "scheduler_metadata", None) is not None:
-                    m.scheduler_metadata = None
+        first_meta = next(iter(attn_metadata.values()), None)
+        if first_meta is None:
             return
+        if getattr(first_meta, "num_actual_tokens", 0) <= self._max_cudagraph_capture_size:
+            return
+        for meta in attn_metadata.values():
+            if getattr(meta, "scheduler_metadata", None) is not None:
+                meta.scheduler_metadata = None
 
     # ==================== Device utilities ====================
 
