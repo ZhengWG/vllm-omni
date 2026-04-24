@@ -604,10 +604,15 @@ class TestSingleStageReplicaInitialization:
         )
         fake_manager = mocker.Mock()
         fake_coordinator = mocker.Mock()
+        events: list[str] = []
 
         @contextmanager
         def _fake_connect(**kwargs):
-            yield fake_manager, fake_coordinator, fake_addresses
+            events.append("enter")
+            try:
+                yield fake_manager, fake_coordinator, fake_addresses
+            finally:
+                events.append("exit")
 
         plan = _make_llm_plan(0, configured_stage_id=7, launch_mode="remote", vllm_config=fake_vllm_config).replicas[0]
         sentinel_client = SimpleNamespace()
@@ -616,7 +621,7 @@ class TestSingleStageReplicaInitialization:
         mocker.patch.object(
             StageEngineCoreClientBase,
             "make_async_mp_client",
-            side_effect=lambda **_: sentinel_client,
+            side_effect=lambda **_: (events.append("attach"), sentinel_client)[1],
         )
 
         result = engine._initialize_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
@@ -625,6 +630,7 @@ class TestSingleStageReplicaInitialization:
         engine._omni_master_server.get_stage_config.assert_called_once_with(7, timeout_s=60)
         assert fake_vllm_config.parallel_config.data_parallel_size_local == 0
         assert mock_connect.call_args.kwargs["stage_id"] == 7
+        assert events == ["enter", "exit", "attach"]
 
     def test_initialize_llm_replica_remote_missing_registered_stage_config_raises(self, mocker: MockerFixture):
         engine = object.__new__(AsyncOmniEngine)

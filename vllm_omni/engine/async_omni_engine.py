@@ -599,21 +599,27 @@ class AsyncOmniEngine:
                     "[AsyncOmniEngine] Stage %s remote engine handshake started",
                     plan.metadata.stage_id,
                 )
-                with launch_cm as (engine_manager, coordinator, addresses):
-                    client_addresses: dict[str, str] = {
-                        "input_address": addresses.inputs[0],
-                        "output_address": addresses.outputs[0],
-                    }
-                    if addresses.frontend_stats_publish_address is not None:
-                        client_addresses["stats_update_address"] = addresses.frontend_stats_publish_address
-                    stage_client = StageEngineCoreClientBase.make_async_mp_client(
-                        vllm_config=vllm_config,
-                        executor_class=executor_class,
-                        metadata=plan.metadata,
-                        client_addresses=client_addresses,
-                        engine_manager=engine_manager,
-                        coordinator=coordinator,
-                    )
+                with launch_cm as remote_resources:
+                    engine_manager, coordinator, addresses = remote_resources
+
+                logger.info(
+                    "[AsyncOmniEngine] Stage %s remote engine startup completed",
+                    plan.metadata.stage_id,
+                )
+                client_addresses: dict[str, str] = {
+                    "input_address": addresses.inputs[0],
+                    "output_address": addresses.outputs[0],
+                }
+                if addresses.frontend_stats_publish_address is not None:
+                    client_addresses["stats_update_address"] = addresses.frontend_stats_publish_address
+                stage_client = StageEngineCoreClientBase.make_async_mp_client(
+                    vllm_config=vllm_config,
+                    executor_class=executor_class,
+                    metadata=plan.metadata,
+                    client_addresses=client_addresses,
+                    engine_manager=engine_manager,
+                    coordinator=coordinator,
+                )
             else:
                 handshake_address = None
                 with ExitStack() as launch_stack:
@@ -841,6 +847,7 @@ class AsyncOmniEngine:
         }
         total_replicas = sum(len(plan.replicas) for plan in stage_plans)
         future_to_replica: dict[concurrent.futures.Future[Any], tuple[int, int]] = {}
+        primary_exc: Exception | None = None
 
         with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, total_replicas),
@@ -856,18 +863,23 @@ class AsyncOmniEngine:
                     )
                     future_to_replica[future] = (plan.stage_idx, replica.replica_id)
 
-            try:
-                for future in concurrent.futures.as_completed(future_to_replica):
-                    stage_idx, replica_id = future_to_replica[future]
+            for future in concurrent.futures.as_completed(future_to_replica):
+                stage_idx, replica_id = future_to_replica[future]
+                try:
                     initialized_clients_by_stage[stage_idx][replica_id] = future.result()
-            except Exception as exc:
-                for future, (stage_idx, replica_id) in future_to_replica.items():
-                    if not future.done() or future.cancelled() or future.exception() is not None:
-                        continue
-                    if initialized_clients_by_stage[stage_idx][replica_id] is None:
-                        initialized_clients_by_stage[stage_idx][replica_id] = future.result()
-                setattr(exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
-                raise
+                except concurrent.futures.CancelledError:
+                    continue
+                except Exception as exc:
+                    if primary_exc is None:
+                        primary_exc = exc
+                        for other_future in future_to_replica:
+                            if other_future is future:
+                                continue
+                            other_future.cancel()
+
+        if primary_exc is not None:
+            setattr(primary_exc, "_initialized_clients_by_stage", initialized_clients_by_stage)
+            raise primary_exc
 
         return initialized_clients_by_stage
 
