@@ -106,11 +106,15 @@ The HF baseline runs prompts sequentially with `Qwen3OmniMoeForConditionalGenera
 
 ### 4) Generate comparison plots
 
+The output JSON schema is identical to the qwen3-tts bench, so we reuse its plotter directly:
+
 ```bash
-python benchmarks/qwen3-omni/plot_results.py \
-    --results results/bench_async_chunk_*.json results/bench_hf_transformers_*.json \
+python benchmarks/qwen3-tts/plot_results.py \
+    --results benchmarks/qwen3-omni/results/bench_async_chunk_*.json \
+              benchmarks/qwen3-omni/results/bench_hf_transformers_*.json \
     --labels "vllm-omni" "hf_transformers" \
-    --output results/qwen3_omni_benchmark.png
+    --title "Qwen3-Omni" \
+    --output benchmarks/qwen3-omni/results/qwen3_omni_benchmark.png
 ```
 
 `plot_results.py` also prints a Markdown comparison table on stdout.
@@ -134,3 +138,4 @@ For text-only modalities (`MODALITIES=text`) the audio-related fields stay at ze
 - Each audio delta is a base64-encoded WAV blob; the bench decodes it with `soundfile` to get the true audio duration. If decoding fails it falls back to a 24 kHz / 16-bit / mono PCM assumption.
 - HF transformers offline currently only supports single-batch audio generation, so its `concurrency` is fixed to 1 in the result JSON.
 - Concurrency settings of `1 4 10` mirror the design doc baselines in `docs/design/qwen3_omni_tts_performance_optimization.md`.
+- The shared dataclasses, prompt fixtures, default sampling-params, stats aggregation, and summary printing all live in `benchmarks/qwen3-omni/_common.py`. The plotting code is reused from `benchmarks/qwen3-tts/plot_results.py` since the JSON schemas match.

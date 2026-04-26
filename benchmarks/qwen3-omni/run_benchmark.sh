@@ -256,10 +256,15 @@ if [ "${RUN_HF}" = true ]; then
     fi
 fi
 
-if [ -n "${RESULT_FILES}" ]; then
-    python "${SCRIPT_DIR}/plot_results.py" \
+QWEN3_TTS_PLOTTER="${PROJECT_ROOT}/benchmarks/qwen3-tts/plot_results.py"
+if [ -n "${RESULT_FILES}" ] && [ -f "${QWEN3_TTS_PLOTTER}" ]; then
+    # Reuse the qwen3-tts plotter: the JSON schema produced by this bench
+    # matches qwen3-tts (TTFP/E2E/RTF/audio_throughput per concurrency),
+    # so the existing plotter renders the comparison without changes.
+    python "${QWEN3_TTS_PLOTTER}" \
         --results ${RESULT_FILES} \
         --labels ${LABELS} \
+        --title "Qwen3-Omni" \
         --output "${RESULT_DIR}/qwen3_omni_benchmark_${TIMESTAMP}.png"
 fi
 

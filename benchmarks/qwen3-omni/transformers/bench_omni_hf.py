@@ -2,7 +2,8 @@
 
 Measures E2E latency, RTF, and audio duration for offline (non-serving)
 inference with ``Qwen3OmniMoeForConditionalGeneration``. Results are saved
-in the same JSON format as ``bench_omni_serve.py`` for unified plotting.
+in the same JSON schema as ``bench_omni_serve.py`` (and as the qwen3-tts
+serving runner) so the qwen3-tts plotter can compare them.
 
 Notes:
     * HF transformers offline inference for Qwen3-Omni currently only
@@ -27,8 +28,9 @@ Usage:
 import argparse
 import json
 import os
+import sys
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
@@ -36,93 +38,22 @@ import numpy as np
 import soundfile as sf
 import torch
 
-PROMPTS = [
-    "Explain the system architecture for a scalable audio generation pipeline. Answer in 15 words.",
-    "Describe vLLM in one short paragraph.",
-    "What are the benefits of multi-stage inference pipelines? Answer briefly.",
-    "Summarize the importance of streaming in real-time AI applications.",
-    "List three reasons why multimodal models matter.",
-    "How does a token cache improve LLM serving throughput? Answer in 20 words.",
-    "Explain real-time factor in TTS in two sentences.",
-    "What is tensor parallelism? Keep the answer concise.",
-    "Describe how chunked streaming reduces latency in audio generation.",
-    "Summarize the main idea of Qwen3-Omni in one sentence.",
-    "Why is GPU memory utilization important for LLM inference?",
-    "What does end-to-end latency mean in audio synthesis pipelines?",
-]
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-DEFAULT_AUDIO_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/multimodal_asset/mary_had_lamb.ogg"
-DEFAULT_IMAGE_URL = "https://vllm-public-assets.s3.us-west-2.amazonaws.com/vision_model_images/cherry_blossom.jpg"
-DEFAULT_VIDEO_URL = "https://huggingface.co/datasets/raushan-testing-hf/videos-test/resolve/main/sample_demo_1.mp4"
-
-DEFAULT_SYSTEM_PROMPT = (
-    "You are Qwen, a virtual human developed by the Qwen Team, Alibaba Group, "
-    "capable of perceiving auditory and visual inputs, as well as generating "
-    "text and speech."
+from _common import (  # noqa: E402
+    DEFAULT_SYSTEM_PROMPT,
+    PROMPTS,
+    RequestResult,
+    aggregate_results,
+    build_user_content_hf,
+    print_summary,
 )
 
 
-@dataclass
-class BenchmarkResult:
-    config_name: str = ""
-    query_type: str = ""
-    modalities: str = ""
-    concurrency: int = 1  # HF baseline is always offline / sequential.
-    num_prompts: int = 0
-    completed: int = 0
-    failed: int = 0
-    duration_s: float = 0.0
-    # TTFT/TTFP collapse to E2E for HF offline (no streaming).
-    mean_ttft_ms: float = 0.0
-    median_ttft_ms: float = 0.0
-    p90_ttft_ms: float = 0.0
-    p95_ttft_ms: float = 0.0
-    p99_ttft_ms: float = 0.0
-    mean_ttfp_ms: float = 0.0
-    median_ttfp_ms: float = 0.0
-    std_ttfp_ms: float = 0.0
-    p90_ttfp_ms: float = 0.0
-    p95_ttfp_ms: float = 0.0
-    p99_ttfp_ms: float = 0.0
-    mean_e2e_ms: float = 0.0
-    median_e2e_ms: float = 0.0
-    std_e2e_ms: float = 0.0
-    p90_e2e_ms: float = 0.0
-    p95_e2e_ms: float = 0.0
-    p99_e2e_ms: float = 0.0
-    mean_rtf: float = 0.0
-    median_rtf: float = 0.0
-    std_rtf: float = 0.0
-    p99_rtf: float = 0.0
-    mean_audio_duration_s: float = 0.0
-    total_audio_duration_s: float = 0.0
-    audio_throughput: float = 0.0
-    request_throughput: float = 0.0
-    per_request: list = field(default_factory=list)
-
-
-def build_conversation(prompt: str, query_type: str) -> list[dict]:
-    """Build a Qwen3-Omni conversation in the HF chat-template format."""
-    user_content: list[dict] = []
-    if query_type == "use_audio":
-        user_content.append({"type": "audio", "audio": DEFAULT_AUDIO_URL})
-    elif query_type == "use_image":
-        user_content.append({"type": "image", "image": DEFAULT_IMAGE_URL})
-    elif query_type == "use_video":
-        user_content.append({"type": "video", "video": DEFAULT_VIDEO_URL})
-    elif query_type != "text":
-        raise ValueError(f"Unsupported query_type: {query_type}")
-    user_content.append({"type": "text", "text": prompt})
-
+def _build_conversation(prompt: str, query_type: str) -> list[dict]:
     return [
-        {
-            "role": "system",
-            "content": [{"type": "text", "text": DEFAULT_SYSTEM_PROMPT}],
-        },
-        {
-            "role": "user",
-            "content": user_content,
-        },
+        {"role": "system", "content": [{"type": "text", "text": DEFAULT_SYSTEM_PROMPT}]},
+        {"role": "user", "content": build_user_content_hf(query_type, prompt)},
     ]
 
 
@@ -138,7 +69,7 @@ def run_one(
 ):
     from qwen_omni_utils import process_mm_info  # local import to keep CLI parsing fast
 
-    conversation = build_conversation(prompt, query_type)
+    conversation = _build_conversation(prompt, query_type)
     text = processor.apply_chat_template(conversation, add_generation_prompt=True, tokenize=False)
     audios, images, videos = process_mm_info(conversation, use_audio_in_video=use_audio_in_video)
 
@@ -184,7 +115,7 @@ def run_benchmark(args):
     device = f"cuda:{args.gpu_device}"
     print(f"Loading model: {args.model} on {device}")
 
-    return_audio = args.modalities and "audio" in [m.strip() for m in args.modalities.split(",") if m.strip()]
+    return_audio = bool(args.modalities) and "audio" in [m.strip() for m in args.modalities.split(",") if m.strip()]
 
     model = Qwen3OmniMoeForConditionalGeneration.from_pretrained(
         args.model,
@@ -209,12 +140,11 @@ def run_benchmark(args):
     if args.num_warmups > 0:
         print(f"Warming up with {args.num_warmups} requests...")
         for i in range(args.num_warmups):
-            p = PROMPTS[i % len(PROMPTS)]
             try:
                 run_one(
                     model,
                     processor,
-                    p,
+                    PROMPTS[i % len(PROMPTS)],
                     args.query_type,
                     return_audio=return_audio,
                     speaker=args.speaker,
@@ -227,15 +157,12 @@ def run_benchmark(args):
         print("Warmup done.")
 
     print(f"Running {args.num_prompts} requests sequentially...")
-    e2e_times: list[float] = []
-    rtfs: list[float] = []
-    audio_durations: list[float] = []
-    per_request: list[dict] = []
-    failed = 0
+    results: list[RequestResult] = []
 
     total_start = time.perf_counter()
     prompts = [PROMPTS[i % len(PROMPTS)] for i in range(args.num_prompts)]
     for i, prompt in enumerate(prompts):
+        rr = RequestResult(prompt=prompt)
         try:
             torch.cuda.synchronize(device)
             st = time.perf_counter()
@@ -255,101 +182,40 @@ def run_benchmark(args):
             elapsed = time.perf_counter() - st
 
             audio_dur = float(len(audio_np) / sample_rate) if audio_np is not None else 0.0
-            rtf = elapsed / audio_dur if audio_dur > 0 else 0.0
-
-            e2e_times.append(elapsed)
-            rtfs.append(rtf)
-            audio_durations.append(audio_dur)
-            per_request.append(
-                {
-                    "ttft_ms": elapsed * 1000,
-                    "ttfp_ms": elapsed * 1000,
-                    "e2e_ms": elapsed * 1000,
-                    "rtf": rtf,
-                    "audio_duration_s": audio_dur,
-                    "prompt": prompt,
-                }
-            )
+            # No streaming -> TTFT/TTFP collapse to E2E.
+            rr.success = True
+            rr.e2e = elapsed
+            rr.ttft = elapsed
+            rr.ttfp = elapsed if audio_dur > 0 else 0.0
+            rr.audio_duration = audio_dur
+            rr.rtf = elapsed / audio_dur if audio_dur > 0 else 0.0
 
             if audio_dir is not None and audio_np is not None:
                 sf.write(str(audio_dir / f"output_{i:04d}.wav"), audio_np, sample_rate)
 
             if (i + 1) % 5 == 0 or i == 0:
                 print(
-                    f"  [{i + 1}/{args.num_prompts}] e2e={elapsed * 1000:.0f}ms  rtf={rtf:.3f}  audio={audio_dur:.2f}s"
+                    f"  [{i + 1}/{args.num_prompts}] e2e={elapsed * 1000:.0f}ms  "
+                    f"rtf={rr.rtf:.3f}  audio={audio_dur:.2f}s"
                 )
         except Exception as e:  # pylint: disable=broad-except
+            rr.success = False
+            rr.error = str(e)
             print(f"  [{i + 1}/{args.num_prompts}] FAILED: {e}")
-            failed += 1
+        results.append(rr)
 
     total_duration = time.perf_counter() - total_start
-    completed = len(e2e_times)
 
-    result = BenchmarkResult(
-        config_name=args.config_name,
-        query_type=args.query_type,
-        modalities=args.modalities or "default",
+    bench = aggregate_results(
+        results,
         concurrency=1,
         num_prompts=args.num_prompts,
-        completed=completed,
-        failed=failed,
-        duration_s=total_duration,
+        duration=total_duration,
+        query_type=args.query_type,
+        modalities=args.modalities or "default",
+        config_name=args.config_name,
     )
-
-    if e2e_times:
-        e2e_ms = [t * 1000 for t in e2e_times]
-        result.mean_e2e_ms = float(np.mean(e2e_ms))
-        result.median_e2e_ms = float(np.median(e2e_ms))
-        result.std_e2e_ms = float(np.std(e2e_ms))
-        result.p90_e2e_ms = float(np.percentile(e2e_ms, 90))
-        result.p95_e2e_ms = float(np.percentile(e2e_ms, 95))
-        result.p99_e2e_ms = float(np.percentile(e2e_ms, 99))
-
-        # No streaming -> TTFT/TTFP collapse to E2E.
-        result.mean_ttft_ms = result.mean_e2e_ms
-        result.median_ttft_ms = result.median_e2e_ms
-        result.p90_ttft_ms = result.p90_e2e_ms
-        result.p95_ttft_ms = result.p95_e2e_ms
-        result.p99_ttft_ms = result.p99_e2e_ms
-        result.mean_ttfp_ms = result.mean_e2e_ms
-        result.median_ttfp_ms = result.median_e2e_ms
-        result.std_ttfp_ms = result.std_e2e_ms
-        result.p90_ttfp_ms = result.p90_e2e_ms
-        result.p95_ttfp_ms = result.p95_e2e_ms
-        result.p99_ttfp_ms = result.p99_e2e_ms
-
-        if rtfs:
-            result.mean_rtf = float(np.mean(rtfs))
-            result.median_rtf = float(np.median(rtfs))
-            result.std_rtf = float(np.std(rtfs))
-            result.p99_rtf = float(np.percentile(rtfs, 99))
-
-        if audio_durations:
-            result.mean_audio_duration_s = float(np.mean(audio_durations))
-            result.total_audio_duration_s = float(np.sum(audio_durations))
-            result.audio_throughput = result.total_audio_duration_s / total_duration
-        result.request_throughput = completed / total_duration
-        result.per_request = per_request
-
-    W = 50
-    print("")
-    print(f"{'=' * W}")
-    print(f"{'HF Transformers Benchmark Result':^{W}}")
-    print(f"{'=' * W}")
-    print(f"{'Query type:':<40}{args.query_type:<10}")
-    print(f"{'Modalities:':<40}{result.modalities:<10}")
-    print(f"{'Successful requests:':<40}{completed:<10}")
-    print(f"{'Failed requests:':<40}{failed:<10}")
-    print(f"{'Concurrency:':<40}{1:<10}")
-    print(f"{'Benchmark duration (s):':<40}{total_duration:<10.2f}")
-    print(f"{'Request throughput (req/s):':<40}{result.request_throughput:<10.2f}")
-    print(f"{'-' * W}")
-    print(f"{'Mean E2EL (ms):':<40}{result.mean_e2e_ms:<10.2f}")
-    print(f"{'Mean AUDIO_TTFP (ms):':<40}{result.mean_ttfp_ms:<10.2f}")
-    print(f"{'Mean AUDIO_RTF:':<40}{result.mean_rtf:<10.3f}")
-    print(f"{'Audio throughput (audio-s/wall-s):':<40}{result.audio_throughput:<10.2f}")
-    print(f"{'=' * W}")
-    print("")
+    print_summary(bench, header="HF Transformers Benchmark Result")
 
     result_dir = Path(args.result_dir)
     result_dir.mkdir(parents=True, exist_ok=True)
@@ -357,19 +223,14 @@ def run_benchmark(args):
     result_file = result_dir / f"bench_{args.config_name}_{timestamp}.json"
 
     with open(result_file, "w") as f:
-        json.dump([asdict(result)], f, indent=2)
+        json.dump([asdict(bench)], f, indent=2)
     print(f"Results saved to {result_file}")
-    return result
+    return bench
 
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Qwen3-Omni HF transformers offline benchmark")
-    parser.add_argument(
-        "--model",
-        type=str,
-        default="Qwen/Qwen3-Omni-30B-A3B-Instruct",
-        help="HuggingFace model id or local path.",
-    )
+    parser.add_argument("--model", type=str, default="Qwen/Qwen3-Omni-30B-A3B-Instruct")
     parser.add_argument("--num-prompts", type=int, default=10)
     parser.add_argument("--num-warmups", type=int, default=1)
     parser.add_argument("--gpu-device", type=int, default=0)
@@ -390,23 +251,9 @@ def parse_args():
         ),
     )
     parser.add_argument("--speaker", type=str, default="Ethan")
-    parser.add_argument(
-        "--use-audio-in-video",
-        action="store_true",
-        help="Whether to feed video soundtrack to the model.",
-    )
-    parser.add_argument(
-        "--max-new-tokens",
-        type=int,
-        default=2048,
-        help="Cap on generated tokens for the thinker stage.",
-    )
-    parser.add_argument(
-        "--audio-sample-rate",
-        type=int,
-        default=24000,
-        help="Sample rate to assume when computing audio duration / writing WAVs.",
-    )
+    parser.add_argument("--use-audio-in-video", action="store_true")
+    parser.add_argument("--max-new-tokens", type=int, default=2048)
+    parser.add_argument("--audio-sample-rate", type=int, default=24000)
     parser.add_argument(
         "--flash-attn",
         action="store_true",
@@ -414,20 +261,13 @@ def parse_args():
         help="Enable flash_attention_2 (recommended). Pass --no-flash-attn to disable.",
     )
     parser.add_argument("--no-flash-attn", dest="flash_attn", action="store_false")
-    parser.add_argument(
-        "--config-name",
-        type=str,
-        default="hf_transformers",
-        help="Label for this config (used in result filenames).",
-    )
+    parser.add_argument("--config-name", type=str, default="hf_transformers")
     parser.add_argument("--result-dir", type=str, default="results")
     parser.add_argument("--save-audio", action="store_true")
     return parser.parse_args()
 
 
 if __name__ == "__main__":
-    # Force eager / V0 vLLM path is irrelevant here; we only need transformers,
-    # but we still set spawn for compatibility with multiprocessing libs.
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     args = parse_args()
     run_benchmark(args)
