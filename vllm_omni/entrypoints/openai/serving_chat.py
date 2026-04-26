@@ -4,6 +4,7 @@ import json
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterator, Callable
+from dataclasses import fields, is_dataclass
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from typing import Any, Final, cast
@@ -16,6 +17,7 @@ from pydantic import TypeAdapter
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniTextPrompt
 
 try:
@@ -344,8 +346,15 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         engine_prompt_image = None
 
                 # Override the prompts produced by chat-template preprocessing.
-                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
-                if engine_prompt_image:
+                is_img2img = engine_prompt_image is not None
+                # For img2img (Ming-flash-omni-2.0 image edit), prepend ``<IMAGE>``
+                # so the thinker-side prompt replacement can locate the
+                # ref-image placeholder — needs to survive MM caching (when the
+                # ref image is cache-warm, the thinker sees 0 missing items and
+                # cannot know to inject the placeholder itself).
+                effective_prompt = "<IMAGE>" + extracted_prompt if is_img2img else extracted_prompt
+                tprompt: OmniTextPrompt = {"prompt": effective_prompt}
+                if is_img2img:
                     tprompt["modalities"] = ["img2img"]
                 else:
                     tprompt["modalities"] = ["image"]
@@ -357,6 +366,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     mm_processor_kwargs["target_h"] = height
                 if width is not None:
                     mm_processor_kwargs["target_w"] = width
+                # Image-gen models (Ming reads this flag) use it to trigger
+                # per-request query-token expansion in their MM processor.
+                # Both pure t2i and img2img (edit with reference image) are
+                # image-gen cases — the presence of a reference image does
+                # not disable image generation, it augments it.
+                mm_processor_kwargs["is_image_gen"] = True
                 if mm_processor_kwargs:
                     tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:
@@ -390,6 +405,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 else:
                     # Use standard OpenAI API parameters for comprehension stage
                     sampling_params_list = self._build_sampling_params_list_from_request(request)
+
+                # If this is a streaming (output) request, coerce cumulative outputs
+                # to delta to ensure emitted outputs are correctly drained. Otherwise
+                # convert cumulative to Final Only to ensure the output is correct.
+                sampling_params_list = coerce_param_message_types(sampling_params_list, request.stream)
 
                 # Apply user-specified overrides to diffusion stage(s) for image generation
                 for idx, sp in enumerate(sampling_params_list):
@@ -660,13 +680,31 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         return new_messages
 
-    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[SamplingParams]:
-        final_sampling_params_list = []
-        for sampling_params in sampling_params_list:
+    def _to_sampling_params_list(self, sampling_params_list: list[dict]) -> list[Any]:
+        """Convert request dicts to stage-typed sampling params objects.
+
+        For diffusion stages, build ``OmniDiffusionSamplingParams`` so
+        downstream ``StageDiffusionClient._sampling_params_to_dict`` (which
+        requires a dataclass) works. For LLM stages build ``SamplingParams``.
+        """
+        stage_configs = list(getattr(self.engine_client, "stage_configs", []) or [])
+        final_sampling_params_list: list[Any] = []
+        for idx, sampling_params in enumerate(sampling_params_list):
+            stage_type = get_stage_type(stage_configs[idx]) if idx < len(stage_configs) else "llm"
+            target_cls = OmniDiffusionSamplingParams if stage_type == "diffusion" else SamplingParams
             if isinstance(sampling_params, dict):
-                final_sampling_params_list.append(SamplingParams(**sampling_params))
-            elif isinstance(sampling_params, SamplingParams):
+                final_sampling_params_list.append(target_cls(**sampling_params))
+            elif isinstance(sampling_params, target_cls):
                 final_sampling_params_list.append(sampling_params)
+            elif isinstance(sampling_params, SamplingParams | OmniDiffusionSamplingParams):
+                # Cross-typed (e.g. user passed SamplingParams but this is a
+                # diffusion stage) — rebuild via a dict round-trip so we end
+                # up with the correct target class.
+                as_dict = {
+                    f.name: getattr(sampling_params, f.name)
+                    for f in (fields(sampling_params) if is_dataclass(sampling_params) else [])
+                } or sampling_params.__dict__
+                final_sampling_params_list.append(target_cls(**as_dict))
             else:
                 raise ValueError(f"Invalid sampling params: {sampling_params}")
         return final_sampling_params_list
@@ -705,8 +743,9 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         Starts with YAML defaults and only overrides fields that the user
         explicitly provided (non-None values) in the request.
 
-        For GLM-Image AR stage, if max_tokens is not in YAML and user provides
-        height/width in extra_body, computes max_tokens dynamically.
+        For models needing spatial metadata (e.g. GLM-Image), target_h/w is
+        injected into extra_args so the runner can build M-RoPE position grids.
+        max_tokens is NOT computed dynamically — it uses the deploy YAML default.
 
         Args:
             default_params: Default SamplingParams from stage config YAML.
@@ -736,36 +775,13 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         extra_body = getattr(request, "extra_body", {}) or {}
         height, width = self._resolve_height_width_from_extra_body(extra_body)
 
-        # Best-effort mode detection from user messages.
-        # i2i requests include at least one reference image in message content.
-        _, reference_images = self._extract_diffusion_prompt_and_images_from_messages(request.messages)
-        ref_image_count = len(reference_images)
-        is_img2img = ref_image_count > 0
-
         if height is not None and width is not None:
-            try:
-                from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
-
-                max_tokens = getattr(explicit_fields, "max_tokens", None)
-                if max_tokens is None:
-                    max_tokens = compute_max_tokens(int(height), int(width), is_i2i=is_img2img)
-                params.max_tokens = max_tokens
-                # Keep target size in stage-0 sampling params so runner/model can
-                # build deterministic M-RoPE grids for t2i (no MM features).
-                extra_args = dict(getattr(params, "extra_args", {}) or {})
-                extra_args["target_h"] = int(height)
-                extra_args["target_w"] = int(width)
-                params.extra_args = extra_args
-            except (ImportError, ValueError, TypeError) as e:
-                logger.warning(f"Failed to compute max_tokens: {e}, using default if available")
-        else:
-            logger.info(
-                "[SamplingParams] Skip dynamic max_tokens (height=%s, width=%s, mode=%s, ref_images=%s)",
-                height,
-                width,
-                "i2i" if is_img2img else "t2i",
-                ref_image_count,
-            )
+            # Keep target size in stage-0 sampling params so runner/model can
+            # build deterministic M-RoPE grids for t2i (no MM features).
+            extra_args = dict(getattr(params, "extra_args", {}) or {})
+            extra_args["target_h"] = int(height)
+            extra_args["target_w"] = int(width)
+            params.extra_args = extra_args
 
         return params
 
@@ -1029,12 +1045,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                             cur_channel = harmony_parser.current_channel
                             cur_recipient = harmony_parser.current_recipient
                         else:
-                            # output.text is cumulative, extract only the delta portion
-                            previous_text = previous_texts[i] if previous_texts else ""
-                            if output.text is not None:
-                                delta_text = output.text[len(previous_text) :]
-                            else:
-                                delta_text = ""
+                            delta_text = output.text or ""
 
                         if not delta_text and not output.token_ids and not previous_num_tokens[i]:
                             # Chunked prefill case, don't return empty chunks
@@ -2185,29 +2196,14 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             engine_prompt["mm_processor_kwargs"] = mm_processor_kwargs
         if engine_prompt_data is not None:
             engine_prompt["multi_modal_data"] = engine_prompt_data
+            # Provide multi_modal_uuids so that newer vLLM versions can
+            # validate multi_modal_data / multi_modal_uuids consistency.
+            engine_prompt["multi_modal_uuids"] = {k: [f"img-{k}-{i}"] for i, k in enumerate(engine_prompt_data)}
 
         comprehension_idx = None
         for idx, stage in enumerate(stage_configs):
             if getattr(stage, "is_comprehension", False):
                 comprehension_idx = idx
-                break
-
-        is_glm_image_multistage = False
-        for stage_cfg in stage_configs:
-            if isinstance(stage_cfg, dict):
-                engine_args = stage_cfg.get("engine_args")
-                model_arch = stage_cfg.get("model_arch")
-            else:
-                engine_args = getattr(stage_cfg, "engine_args", None)
-                model_arch = getattr(stage_cfg, "model_arch", None)
-
-            if model_arch is None and engine_args is not None:
-                if isinstance(engine_args, dict):
-                    model_arch = engine_args.get("model_arch")
-                else:
-                    model_arch = getattr(engine_args, "model_arch", None)
-            if model_arch in {"GlmImageForConditionalGeneration", "GlmImagePipeline"}:
-                is_glm_image_multistage = True
                 break
 
         sampling_params_list: list[Any] = []
@@ -2232,6 +2228,18 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 and hasattr(default_stage_params, "seed")
             ):
                 default_stage_params.seed = seed
+
+            # Inject target_h/w into comprehension (AR) stage sampling params
+            # for models that need M-RoPE position pre-computation (e.g.
+            # GLM-Image).  max_tokens is handled via the deploy YAML default
+            # (upper-bound ceiling) rather than computed dynamically here.
+            if comprehension_idx is not None and idx == comprehension_idx and height is not None and width is not None:
+                extra_args = getattr(default_stage_params, "extra_args", None)
+                if extra_args is None:
+                    extra_args = {}
+                    default_stage_params.extra_args = extra_args
+                extra_args["target_h"] = int(height)
+                extra_args["target_w"] = int(width)
 
             if stage_type == "diffusion":
                 self._set_if_supported(
@@ -2258,25 +2266,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                                 default_stage_params.lora_scale = lora_scale
                     except Exception as e:  # pragma: no cover - safeguard
                         logger.warning("Failed to parse LoRA request: %s", e)
-            elif (
-                is_glm_image_multistage
-                and comprehension_idx is not None
-                and idx == comprehension_idx
-                and isinstance(default_stage_params, SamplingParams)
-                and height is not None
-                and width is not None
-            ):
-                from vllm_omni.model_executor.stage_input_processors.glm_image import compute_max_tokens
-
-                default_stage_params.max_tokens = compute_max_tokens(
-                    int(height),
-                    int(width),
-                    is_i2i=bool(reference_images),
-                )
-                extra_args = dict(getattr(default_stage_params, "extra_args", {}) or {})
-                extra_args["target_h"] = int(height)
-                extra_args["target_w"] = int(width)
-                default_stage_params.extra_args = extra_args
 
             sampling_params_list.append(default_stage_params)
 
@@ -2300,16 +2289,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         engine = self._diffusion_engine if self._diffusion_engine is not None else self.engine_client
 
-        height = extra_body.get("height")
-        width = extra_body.get("width")
-        if "size" in extra_body:
-            try:
-                size_str = extra_body["size"]
-                if isinstance(size_str, str) and "x" in size_str.lower():
-                    w, h = size_str.lower().split("x")
-                    width, height = int(w), int(h)
-            except ValueError:
-                logger.warning("Invalid size format: %s", extra_body.get("size"))
+        height, width = self._resolve_height_width_from_extra_body(extra_body)
 
         seed = extra_body.get("seed")
         generator_device = extra_body.get("generator_device")
@@ -2341,6 +2321,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             guidance_scale_2=extra_body.get("guidance_scale_2"),
             layers=extra_body.get("layers"),
             resolution=extra_body.get("resolution"),
+            strength=extra_body.get("strength"),
         )
 
         if lora_body and isinstance(lora_body, dict):
@@ -2461,16 +2442,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 extra_body = request.model_extra or {}
 
             # Parse size if provided (supports "1024x1024" format)
-            height = extra_body.get("height")
-            width = extra_body.get("width")
-            if "size" in extra_body:
-                try:
-                    size_str = extra_body["size"]
-                    if isinstance(size_str, str) and "x" in size_str.lower():
-                        w, h = size_str.lower().split("x")
-                        width, height = int(w), int(h)
-                except ValueError:
-                    logger.warning("Invalid size format: %s", extra_body.get("size"))
+            height, width = self._resolve_height_width_from_extra_body(extra_body)
 
             # Get request parameters from extra_body.
             # Avoid hardcoded defaults here — let each pipeline's forward()
@@ -2787,8 +2759,8 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 if isinstance(size_str, str) and "x" in size_str.lower():
                     w, h = size_str.lower().split("x")
                     width, height = int(w), int(h)
-            except Exception:
-                pass
+            except ValueError:
+                logger.warning("Invalid size format: %s", extra_body.get("size"))
 
         return height, width
 

@@ -114,6 +114,9 @@ class OrchestratorRequestState:
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
+    # Per-request pipeline timing accumulator (milliseconds)
+    pipeline_timings: dict[str, float] = field(default_factory=dict)
+
 
 @dataclass
 class StreamingInputState:
@@ -299,7 +302,12 @@ class Orchestrator:
                         req_state = self.request_states.get(output.request_id)
                         if req_state is not None:
                             if getattr(output, "error", None) is not None:
-                                parent_id = self._companion_to_parent.get(output.request_id, output.request_id)
+                                # Map companion id → parent id (if this was a CFG companion),
+                                # then report the error under the parent's request_id and
+                                # clean up both parent and companion bookkeeping via the tracker.
+                                parent_id = self._cfg_tracker._companion_to_parent.get(
+                                    output.request_id, output.request_id
+                                )
                                 await self.output_async_queue.put(
                                     {
                                         "type": "error",
@@ -308,10 +316,9 @@ class Orchestrator:
                                         "error": output.error,
                                     }
                                 )
-                                role_map = self._companion_map.get(parent_id, {})
-                                for cid in role_map.values():
+                                companion_ids = self._cfg_tracker.cleanup_parent(parent_id)
+                                for cid in companion_ids:
                                     self.request_states.pop(cid, None)
-                                self._cleanup_companion_state(parent_id)
                                 self.request_states.pop(parent_id, None)
                                 continue
 
@@ -406,9 +413,9 @@ class Orchestrator:
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         stage_client = self.stage_clients[stage_id]
 
-        # CFG companion handling: companions don't produce user-visible output
-        # and don't forward to the next stage directly.
+        # CFG companion: stash output for the parent to bundle at forward time.
         if finished and self._cfg_tracker.is_companion(req_id):
+            self._cfg_tracker.set_companion_output(req_id, output)
             await self._handle_cfg_companion_ready(req_id)
             self.request_states.pop(req_id, None)
             return
@@ -625,6 +632,7 @@ class Orchestrator:
                 total_token=self._agg_total_tokens[stage_id],
                 total_gen_time_ms=self._agg_total_gen_time_ms[stage_id],
             ),
+            pipeline_timings=dict(req_state.pipeline_timings),
         )
 
     def _build_kv_sender_info(self, sender_stage_ids: list[int]) -> dict[int, dict[str, Any]] | None:
@@ -672,7 +680,17 @@ class Orchestrator:
         next_stage_resumable = is_streaming_session and not is_final_update
 
         if next_client.stage_type == "diffusion":
-            self.stage_clients[stage_id].set_engine_outputs([output])
+            companion_outputs = self._cfg_tracker.pop_companion_outputs(req_id)
+            expected = len(self._cfg_tracker.get_companion_request_ids(req_id))
+            if expected > len(companion_outputs):
+                logger.warning(
+                    "[Orchestrator] req=%s: only %d/%d CFG companion outputs arrived; "
+                    "downstream CFG conditioning may degrade",
+                    req_id,
+                    len(companion_outputs),
+                    expected,
+                )
+            self.stage_clients[stage_id].set_engine_outputs([output, *companion_outputs])
             if next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
                 diffusion_prompt = next_client.custom_process_input_func(
@@ -682,6 +700,7 @@ class Orchestrator:
                     False,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
                 logger.info(
                     "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,
@@ -911,6 +930,15 @@ class Orchestrator:
         )
         req_state.streaming.enabled = is_streaming
         req_state.stage_submit_ts[stage_id] = _time.time()
+
+        # Per-request pipeline timings from caller thread
+        _enqueue_ts = msg.get("enqueue_ts", 0.0)
+        if _enqueue_ts > 0:
+            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - _enqueue_ts) * 1000.0
+        _preprocess_ms = msg.get("preprocess_ms", 0.0)
+        if _preprocess_ms > 0:
+            req_state.pipeline_timings["preprocess_ms"] = _preprocess_ms
+
         self.request_states[request_id] = req_state
 
         # Stage-0 prompt is already a fully-formed OmniEngineCoreRequest

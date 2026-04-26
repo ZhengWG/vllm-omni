@@ -34,7 +34,7 @@ DEFAULT_AUDIO_PATCH_TOKEN = "<audioPatch>"
 DEFAULT_AU_START_TOKEN = "<audio>"
 DEFAULT_AU_END_TOKEN = "</audio>"
 
-# High-level placeholders used in user prompts
+# High-level placeholders used in user prompts.
 PLACEHOLDER_IMAGE_TOKEN_IN_TEXT = "<IMAGE>"
 PLACEHOLDER_VIDEO_TOKEN_IN_TEXT = "<VIDEO>"
 PLACEHOLDER_AUDIO_TOKEN_IN_TEXT = "<AUDIO>"

@@ -2,14 +2,16 @@
 
 [Ming-flash-omni-2.0](https://github.com/inclusionAI/Ming) is an omni-modal model supporting text, image, video, and audio understanding, with text and speech outputs.
 
-vLLM-Omni supports two deployment modes:
+vLLM-Omni supports three deployment modes:
 
 | Mode | Stage config | Output |
 |------|-------------|--------|
 | Thinker only (multimodal understanding) | `ming_flash_omni_thinker.yaml` (default `--omni`) | Text |
 | Thinker + Talker (omni-speech) | `ming_flash_omni.yaml` | Text + Audio |
+| Thinker + Diffusion (image generation, text-to-image / image edit) | `ming_flash_omni_dual.yaml` | Image |
 
 For standalone TTS (talker only), see [`examples/offline_inference/ming_flash_omni_tts/`](../ming_flash_omni_tts/).
+For image generation, see the [Image generation](#image-generation-thinker--diffusion) section below.
 
 ## Setup
 
@@ -87,6 +89,61 @@ The stage config allocates thinker on GPUs 0–3 and talker on GPU 3 by default.
 Pass `--stage-configs-path /path/to/your_config.yaml` to any of the commands
 above to override the stage config.
 
+### Image generation (thinker + diffusion)
+
+Ming-flash-omni-2.0 also exposes an image-generation stage backed by the
+ZImage DiT and a Qwen2 connector. The diffusion stage is wired up via
+`ming_flash_omni_dual.yaml`, which runs the AR thinker on TP=4 across
+GPUs 0–3 and the diffusion stage on GPU 4. Adjust `devices` in the YAML
+to match your hardware.
+
+Online launch (OpenAI-compatible server):
+
+```bash
+vllm serve Jonathan1909/Ming-flash-omni-2.0 \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml \
+    --trust-remote-code \
+    --port 8188
+```
+
+Send a text-to-image request via curl:
+
+```bash
+curl http://127.0.0.1:8188/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Jonathan1909/Ming-flash-omni-2.0",
+        "messages": [{"role": "user", "content": "Please draw a cute cat."}],
+        "modalities": ["image"]
+    }' -o /tmp/ming_response.json
+
+python -c "
+import base64, json
+r = json.load(open('/tmp/ming_response.json'))
+url = r['choices'][0]['message']['content'][0]['image_url']['url']
+png = base64.b64decode(url.split(',')[1])
+open('/tmp/ming_cat.png', 'wb').write(png)
+print('PNG bytes:', len(png))
+"
+```
+
+Optional knobs accepted in `extra_body`:
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `height`, `width` | 1024×1024 | Target image resolution. |
+| `num_inference_steps` | 30 | DiT denoise step count. |
+| `negative_prompt` | None | Triggers the CFG companion via `expand_cfg_prompts`. |
+| `cfg_text_scale` | 2.0 | Classifier-free-guidance scale. |
+| `seed` | request seed | Deterministic generation. |
+
+Image edit (img2img): include a single reference `image_url` in the
+chat message; the chat endpoint will prepend `<IMAGE>` to the prompt
+so the thinker's ref-image placeholder substitution still fires when
+the multimodal cache is warm.
+
 ## Online serving
 
-For online serving via the OpenAI-compatible API, see [examples/online_serving/ming_flash_omni/README.md](../../online_serving/ming_flash_omni/README.md).
+For online serving via the OpenAI-compatible API, see
+[examples/online_serving/ming_flash_omni/README.md](../../online_serving/ming_flash_omni/README.md).

@@ -12,11 +12,14 @@ and image generation
 ## When to use this recipe
 
 Use this recipe when you want a known-good starting point for serving
-`Jonathan1909/Ming-flash-omni-2.0` with vLLM-Omni in one of three modes:
+`Jonathan1909/Ming-flash-omni-2.0` with vLLM-Omni in one of four modes:
 
 - **Thinker only** — multimodal understanding with text output.
 - **Thinker + Talker (omni-speech)** — multimodal understanding with text and spoken output.
 - **Talker only (TTS)** — standalone text-to-speech via the OpenAI `/v1/audio/speech` endpoint.
+- **Thinker + Diffusion (image generation)** — text-to-image and image
+  edit via the OpenAI `/v1/chat/completions` endpoint with
+  `modalities: ["image"]`.
 
 ## References
 
@@ -208,3 +211,96 @@ curl -X POST http://localhost:8091/v1/audio/speech \
 #### Notes
 
 - The OpenAI `instructions` field is forwarded to the talker as the caption JSON — pass a raw string for `风格` (style) only, or a JSON-encoded object for multiple entries such as `方言` (dialect) and `情感` (emotion).
+
+### 5x H100 80GB — image generation (thinker + diffusion)
+
+The bundled `ming_flash_omni_dual.yaml` runs the AR thinker with tensor
+parallel size 4 on GPUs 0–3 and the diffusion stage (`MingImagePipeline`)
+on GPU 4. Adjust `devices` in the YAML for your hardware. Image
+generation can be co-located with the thinker (e.g. `devices: "3"` on
+the diffusion stage) at the cost of higher peak memory.
+
+#### Environment
+
+- OS: Linux
+- Python: 3.10+
+- CUDA Driver Version: 590.48.01
+- CUDA 12.5
+- vLLM version: 0.19.0
+- vLLM-Omni version or commit: 0.19.0rc1
+
+#### Command
+
+```bash
+vllm serve Jonathan1909/Ming-flash-omni-2.0 \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml \
+    --trust-remote-code \
+    --port 8188 \
+    --log-stats
+```
+
+`--log-stats` is optional but recommended while validating the deployment.
+
+#### Verification
+
+Text-to-image:
+
+```bash
+curl http://127.0.0.1:8188/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Jonathan1909/Ming-flash-omni-2.0",
+        "messages": [{"role": "user", "content": "Please draw a cute cat."}],
+        "modalities": ["image"]
+    }' -o /tmp/ming_response.json
+
+python -c "
+import base64, json
+r = json.load(open('/tmp/ming_response.json'))
+url = r['choices'][0]['message']['content'][0]['image_url']['url']
+png = base64.b64decode(url.split(',')[1])
+open('/tmp/ming_cat.png', 'wb').write(png)
+print('PNG bytes:', len(png))
+"
+```
+
+Image edit (img2img) — include a reference image and an edit instruction:
+
+```bash
+curl http://127.0.0.1:8188/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Jonathan1909/Ming-flash-omni-2.0",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$(base64 -w0 ./input.jpg)"'"}},
+            {"type": "text", "text": "Turn this into a watercolour painting."}
+        ]}],
+        "modalities": ["image"]
+    }' -o /tmp/ming_edit.json
+```
+
+Optional generation knobs (passed via `extra_body`):
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `height`, `width` | 1024×1024 | Target image resolution. |
+| `num_inference_steps` | 30 | DiT denoise step count. |
+| `negative_prompt` | None | Triggers the CFG companion via `expand_cfg_prompts`. |
+| `cfg_text_scale` | 2.0 | Classifier-free-guidance scale. |
+| `seed` | request seed | Deterministic generation. |
+
+#### Notes
+
+- Image generation is requested by the chat client via
+  `"modalities": ["image"]`. The dual-stage server in this section
+  must be launched for any image-output request — the thinker-only or
+  omni-speech servers do not load the diffusion stage.
+- When a request carries a `negative_prompt`, the AR thinker spawns one
+  CFG companion in parallel (see
+  `vllm_omni/model_executor/stage_input_processors/ming_flash_omni.py::expand_cfg_prompts`).
+  Both the parent's and the companion's hidden states are forwarded to
+  `MingImagePipeline` for true CFG.
+- Image edit (img2img) requests prepend an `<IMAGE>` placeholder to the
+  text prompt so the thinker's ref-image substitution still fires when
+  the multimodal cache is warm.
