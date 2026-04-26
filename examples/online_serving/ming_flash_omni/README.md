@@ -10,8 +10,10 @@ Please refer to [README.md](../../../README.md)
 |------|---------------|--------|
 | Thinker only (multimodal understanding) | `vllm serve ... --omni` | Text |
 | Thinker + Talker (omni-speech) | `vllm serve ... --omni --stage-configs-path ming_flash_omni.yaml` | Text + Audio |
+| Thinker + Diffusion (image generation) | `vllm serve ... --omni --stage-configs-path ming_flash_omni_dual.yaml` | Image |
 
 For standalone TTS (talker only), see [`examples/online_serving/ming_flash_omni_tts/`](../ming_flash_omni_tts/).
+For image generation, see the [Image generation](#image-generation-thinker--diffusion) section below.
 
 ## Run examples (Ming-flash-omni 2.0)
 
@@ -67,6 +69,71 @@ bash run_curl_multimodal_generation.sh use_mixed_modalities
 For ready-to-copy curl examples (text / audio / multimodal input, SSE
 streaming, reasoning mode), see the recipe at
 [`recipes/inclusionAI/Ming-flash-omni-2.0.md`](../../../recipes/inclusionAI/Ming-flash-omni-2.0.md).
+
+## Image generation (thinker + diffusion)
+
+Launch the dual-stage image-generation server (AR thinker on TP=4 +
+diffusion stage; adjust `devices` inside the YAML to match your hardware):
+
+```bash
+vllm serve Jonathan1909/Ming-flash-omni-2.0 \
+    --omni \
+    --stage-configs-path vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml \
+    --trust-remote-code \
+    --port 8188
+```
+
+### Text-to-image
+
+```bash
+curl http://127.0.0.1:8188/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Jonathan1909/Ming-flash-omni-2.0",
+        "messages": [{"role": "user", "content": "Please draw a cute cat."}],
+        "modalities": ["image"]
+    }' -o /tmp/ming_response.json
+
+python -c "
+import base64, json
+r = json.load(open('/tmp/ming_response.json'))
+url = r['choices'][0]['message']['content'][0]['image_url']['url']
+png = base64.b64decode(url.split(',')[1])
+open('/tmp/ming_cat.png', 'wb').write(png)
+print('PNG bytes:', len(png))
+"
+```
+
+### Image edit (img2img)
+
+Include a reference image as the first content item; the chat endpoint
+detects the reference image and routes the request through
+`MingImagePipeline` in img2img mode (the `<IMAGE>` placeholder is
+prepended automatically so the thinker can still locate the
+ref-image position when its multimodal cache is warm).
+
+```bash
+curl http://127.0.0.1:8188/v1/chat/completions \
+    -H "Content-Type: application/json" \
+    -d '{
+        "model": "Jonathan1909/Ming-flash-omni-2.0",
+        "messages": [{"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,'"$(base64 -w0 ./input.jpg)"'"}},
+            {"type": "text", "text": "Turn this into a watercolour painting."}
+        ]}],
+        "modalities": ["image"]
+    }' -o /tmp/ming_edit.json
+```
+
+### Optional generation knobs (passed via `extra_body`)
+
+| Field | Default | Notes |
+|-------|---------|-------|
+| `height`, `width` | 1024×1024 | Target image resolution. |
+| `num_inference_steps` | 30 | DiT denoise step count. |
+| `negative_prompt` | None | Triggers the CFG companion via `expand_cfg_prompts`. |
+| `cfg_text_scale` | 2.0 | Classifier-free-guidance scale. |
+| `seed` | request seed | Deterministic generation. |
 
 ## OpenAI Python SDK — streaming
 

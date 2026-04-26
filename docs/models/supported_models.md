@@ -17,6 +17,7 @@ th {
 
 | Architecture | Models | Example HF Models | NVIDIA GPU | AMD GPU | Ascend NPU | Intel GPU |
 |--------------|--------|-------------------|------------|---------|-----|-----------|
+| `MingFlashOmniForConditionalGeneration`, `MingFlashOmniTalkerForConditionalGeneration`, `MingImagePipeline` | Ming-flash-omni-2.0 | `Jonathan1909/Ming-flash-omni-2.0`, `inclusionAI/Ming-flash-omni-2.0` | ✅︎ | | | |
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` | ✅︎ | ✅︎ | | ✅︎ |
