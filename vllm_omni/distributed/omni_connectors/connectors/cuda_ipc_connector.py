@@ -47,6 +47,12 @@ _GPU_TENSOR_MARKER = "__cuda_ipc_tensor__"
 # When exceeded, put() falls back to CPU serialization to avoid OOM.
 _DEFAULT_MAX_HELD_BYTES = 2 * 1024**3  # 2 GB
 
+# Sentinel returned by _try_get_ipc when, *under the file lock*, the SHM
+# segment turns out not to exist. The caller uses this signal to fall back
+# to the shm_compat read path. Using a sentinel object (rather than ``None``)
+# lets us distinguish "segment missing" from "transient I/O error".
+_IPC_SEGMENT_NOT_PRESENT = object()
+
 
 class _CudaIpcMemHandle(ctypes.Structure):
     """ctypes wrapper for ``cudaIpcMemHandle_t`` (64-byte opaque struct).
@@ -490,21 +496,22 @@ class CudaIPCConnector(OmniConnectorBase):
         composite_key = f"{get_key}@{from_stage}_{to_stage}"
         payload_name = self._payload_name(composite_key)
         lock_file = self._lock_file(payload_name)
-        # Normal path: IPC payload exists.
-        # Fallback to shm_compat ONLY when IPC segment is absent (typically
-        # sender-side CPU fallback). This avoids hiding real IPC failures:
-        # if IPC segment exists but decode/open fails, we should surface error
-        # instead of silently downgrading to shm_compat.
-        ipc_exists = False
-        try:
-            seg = shm_pkg.SharedMemory(name=payload_name)
-            seg.close()
-            ipc_exists = True
-        except FileNotFoundError:
-            ipc_exists = False
 
-        if ipc_exists:
-            return self._try_get_ipc(get_key, composite_key, payload_name, lock_file)
+        # Routing hint only: the lock file's presence suggests the sender used
+        # the IPC path. The authoritative existence check on the SHM segment
+        # is performed inside ``_try_get_ipc`` *under the file lock* to close
+        # the TOCTOU window where a sender might be mid-write between a
+        # lock-free probe and the locked read. If the IPC segment is absent
+        # under the lock, ``_try_get_ipc`` returns the
+        # ``_IPC_SEGMENT_NOT_PRESENT`` sentinel so we transparently fall back
+        # to the shm_compat path (e.g. CPU fallback writes).
+        if os.path.exists(lock_file):
+            result = self._try_get_ipc(get_key, composite_key, payload_name, lock_file)
+            if result is _IPC_SEGMENT_NOT_PRESENT:
+                # Lock file existed, but no SHM segment under lock: caller
+                # likely wrote via CPU fallback (different naming) — try compat.
+                return self._try_get_shm_compat(get_key)
+            return result
         return self._try_get_shm_compat(get_key)
 
     def _try_get_ipc(
@@ -513,20 +520,46 @@ class CudaIPCConnector(OmniConnectorBase):
         composite_key: str,
         payload_name: str,
         lock_file: str,
-    ) -> tuple[Any, int] | None:
-        try:
-            with open(lock_file, "rb+") as lockf:
-                fcntl.flock(lockf, fcntl.LOCK_EX)
-                seg = shm_pkg.SharedMemory(name=payload_name)
-                try:
-                    shm_handle = {"name": payload_name, "size": seg.size}
-                finally:
-                    seg.close()
-                data_bytes = shm_read_bytes(shm_handle)
-                fcntl.flock(lockf, fcntl.LOCK_UN)
+    ) -> tuple[Any, int] | None | object:
+        """Perform an IPC read while holding the per-payload file lock.
 
-            if os.path.exists(lock_file):
+        Returns:
+            * ``(obj, size)`` on success.
+            * ``None`` on a transient/io error (caller may retry).
+            * ``_IPC_SEGMENT_NOT_PRESENT`` if the SHM segment was missing
+              under the lock — caller should fall back to shm_compat.
+        """
+        try:
+            try:
+                lockf = open(lock_file, "rb+")
+            except FileNotFoundError:
+                return _IPC_SEGMENT_NOT_PRESENT
+
+            try:
+                fcntl.flock(lockf, fcntl.LOCK_EX)
+                try:
+                    # Authoritative existence check happens *inside* the
+                    # lock to avoid TOCTOU vs. the sender's locked write.
+                    try:
+                        seg = shm_pkg.SharedMemory(name=payload_name)
+                    except FileNotFoundError:
+                        return _IPC_SEGMENT_NOT_PRESENT
+
+                    try:
+                        shm_handle = {"name": payload_name, "size": seg.size}
+                    finally:
+                        seg.close()
+                    data_bytes = shm_read_bytes(shm_handle)
+                finally:
+                    fcntl.flock(lockf, fcntl.LOCK_UN)
+            finally:
+                lockf.close()
+
+            # Best-effort cleanup of the stale lock file; safe to leave behind.
+            try:
                 os.remove(lock_file)
+            except OSError:
+                pass
 
             raw_obj = OmniSerializer.deserialize(data_bytes)
             obj = self._walk_decode(raw_obj)
@@ -537,12 +570,10 @@ class CudaIPCConnector(OmniConnectorBase):
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
             return obj, size
-        except FileNotFoundError:
-            return None
         except Exception as e:
             self._metrics["errors"] += 1
-            # Do not auto-fallback here: caller already knows IPC segment
-            # exists, so this is a real IPC path issue that should be visible.
+            # Do not auto-fallback here: lock file existed, so this is a
+            # real IPC path issue that should be visible.
             logger.error("CudaIPCConnector IPC get failed for %s: %s", get_key, e, exc_info=True)
             return None
 
@@ -647,21 +678,69 @@ class CudaIPCConnector(OmniConnectorBase):
             return False
 
     def _drain_acks(self) -> None:
-        """Scan held tensors: release on ACK or TTL expiry."""
+        """Scan held tensors: release on ACK or TTL expiry.
+
+        The SHM probe in ``_has_ack`` performs blocking I/O. To prevent a
+        slow/stuck SHM open from blocking concurrent ``put()`` callers that
+        also need ``_held_lock``, we:
+
+        1. Snapshot ``(key, ts)`` pairs under the lock.
+        2. Probe SHM ACKs *outside* the lock.
+        3. Re-acquire the lock briefly only to mutate the dict and counter.
+
+        Step 3 also re-validates each entry (the timestamp must still match)
+        to avoid releasing an entry that has been replaced by a new ``put()``
+        with the same composite key in the gap between steps.
+        """
         now = _time_mod.time()
-        to_release: list[str] = []
+
         with self._held_lock:
-            for key, (ts, _holders, _nbytes) in self._held_tensors.items():
-                if self._has_ack(key):
-                    to_release.append(key)
-                    self._metrics["acks"] += 1
-                elif now - ts > self.tensor_lifetime_sec:
-                    to_release.append(key)
-                    self._metrics["ack_timeouts"] += 1
-            for key in to_release:
-                popped = self._held_tensors.pop(key, None)
-                if popped:
-                    self._held_bytes -= popped[2]
+            snapshot: dict[str, float] = {key: ts for key, (ts, _holders, _nbytes) in self._held_tensors.items()}
+
+        if not snapshot:
+            return
+
+        # Probe acks / TTL outside of the lock so blocking SHM I/O does not
+        # serialize against put() callers.
+        ack_keys: list[str] = []
+        timeout_keys: list[str] = []
+        for key, ts in snapshot.items():
+            if self._has_ack(key):
+                ack_keys.append(key)
+            elif now - ts > self.tensor_lifetime_sec:
+                timeout_keys.append(key)
+
+        if not ack_keys and not timeout_keys:
+            return
+
+        # Re-acquire the lock briefly to mutate state. Compare each entry's
+        # timestamp against the snapshot so we never drop a freshly-installed
+        # entry that happens to share a composite key with a recently-
+        # released one (a put() between steps replaces the tuple in place).
+        with self._held_lock:
+            for key in ack_keys:
+                cur = self._held_tensors.get(key)
+                if cur is None:
+                    continue
+                cur_ts, _holders, cur_nbytes = cur
+                if snapshot.get(key) != cur_ts:
+                    continue
+                self._held_tensors.pop(key, None)
+                self._held_bytes -= cur_nbytes
+                self._metrics["acks"] += 1
+            for key in timeout_keys:
+                cur = self._held_tensors.get(key)
+                if cur is None:
+                    continue
+                cur_ts, _holders, cur_nbytes = cur
+                if snapshot.get(key) != cur_ts:
+                    continue
+                if now - cur_ts <= self.tensor_lifetime_sec:
+                    # Entry was refreshed — don't time it out yet.
+                    continue
+                self._held_tensors.pop(key, None)
+                self._held_bytes -= cur_nbytes
+                self._metrics["ack_timeouts"] += 1
 
     def _ack_loop(self) -> None:
         """Background loop that periodically drains ACKs.
