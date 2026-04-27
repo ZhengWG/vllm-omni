@@ -113,7 +113,7 @@ class StageDiffusionClient:
         batch_size: int,
     ) -> None:
         self.stage_id = metadata.stage_id
-        self.replica_id = getattr(metadata, "replica_id", 0)
+        self.replica_id = metadata.replica_id
         self.final_output = metadata.final_output
         self.final_output_type = metadata.final_output_type
         self.default_sampling_params = metadata.default_sampling_params
