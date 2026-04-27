@@ -395,7 +395,6 @@ class TestLoadAndResolveStageConfigs:
             base_engine_args={},
             deploy_config_path=str(deploy_path),
             stage_overrides=None,
-            cli_explicit_keys=None,
         )
         assert config_path == str(deploy_path)
         assert len(stage_configs) == 2

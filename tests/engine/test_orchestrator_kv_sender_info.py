@@ -191,9 +191,10 @@ def test_forward_to_diffusion_uses_engine_input_source_for_kv_sender_info():
 
 def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     orchestrator = object.__new__(Orchestrator)
-    sender_stage = _DummySenderStage({"host": "10.0.0.2", "zmq_port": 50151})
     diffusion_stage = _DummyDiffusionStage(engine_input_source=[0])
     diffusion_stage.custom_process_input_func = lambda *_args, **_kwargs: []
+    sender_pool = _build_sender_pool(0, {"host": "10.0.0.2", "zmq_port": 50151})
+    diffusion_pool = StagePool(1, diffusion_stage)
 
     class _AsyncQueue:
         def __init__(self):
@@ -203,10 +204,8 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
             self.items.append(item)
 
     orchestrator.num_stages = 2
-    orchestrator.stage_clients = [sender_stage, diffusion_stage]
+    orchestrator.stage_pools = [sender_pool, diffusion_pool]
     orchestrator._cfg_tracker = CfgCompanionTracker()
-    orchestrator.stage_vllm_configs = [None, None]
-    orchestrator.output_processors = [None, None]
     orchestrator.output_async_queue = _AsyncQueue()
     orchestrator.request_states = {}
     orchestrator._pd_kv_params = {}
@@ -223,7 +222,6 @@ def test_forward_to_diffusion_returns_terminal_error_for_empty_custom_inputs():
     output = SimpleNamespace(request_id="req-empty", finished=True)
     asyncio.run(Orchestrator._forward_to_next_stage(orchestrator, "req-empty", 0, output, req_state))
 
-    assert sender_stage.engine_outputs == [output]
     assert diffusion_stage.calls == []
     assert len(orchestrator.output_async_queue.items) == 1
     terminal_msg = orchestrator.output_async_queue.items[0]

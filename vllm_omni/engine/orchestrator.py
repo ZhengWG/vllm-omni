@@ -26,6 +26,7 @@ from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.engine.cfg_companion_tracker import CfgCompanionTracker
 from vllm_omni.engine.serialization import serialize_additional_information
 from vllm_omni.engine.stage_pool import StagePool
+from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
 
@@ -800,9 +801,31 @@ class Orchestrator:
                 )
                 if isinstance(diffusion_prompt, list):
                     if not diffusion_prompt:
-                        raise ValueError(
-                            f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}"
+                        error_output = OmniRequestOutput.from_error(
+                            req_id,
+                            f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}",
                         )
+                        logger.warning(
+                            "[Orchestrator] req=%s stage=%d produced empty diffusion inputs for stage=%d; "
+                            "routing terminal error output",
+                            req_id,
+                            src_stage_id,
+                            next_logical,
+                        )
+                        await self.output_async_queue.put(
+                            {
+                                "type": "output",
+                                "request_id": req_id,
+                                "stage_id": next_logical,
+                                "engine_outputs": error_output,
+                                "metrics": None,
+                                "finished": True,
+                            }
+                        )
+                        await self._cleanup_request_ids(
+                            [req_id, *self._cfg_tracker.cleanup_parent(req_id)],
+                        )
+                        return
                     if already_submitted and len(diffusion_prompt) == 1:
                         diffusion_prompt = diffusion_prompt[0]
             else:
