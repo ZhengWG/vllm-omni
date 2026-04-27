@@ -449,6 +449,15 @@ class Orchestrator:
                                 stage_id,
                                 e,
                             )
+                            # TODO: Fault handling is intentionally fail-stop at
+                            # the orchestrator level today. If one replica in a
+                            # logical stage dies, we promote it to `_fatal_error`,
+                            # notify requests already admitted to that stage, and
+                            # re-raise so `run()` shuts down all stages. This is
+                            # conservative but means a single unhealthy replica in
+                            # a multi-replica deployment can take down otherwise
+                            # healthy replicas in other stages. Revisit this when
+                            # adding per-replica fault isolation / eviction.
                             self._fatal_error = str(e)
                             self._fatal_error_stage_id = stage_id
                             for req_id, req_state in list(self.request_states.items()):
