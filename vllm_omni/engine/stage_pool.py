@@ -234,6 +234,8 @@ class StagePool:
         request_id: str,
         req_state: OrchestratorRequestState,
         request: Any,
+        *,
+        prompt_text: Any = None,
     ) -> int:
         """Submit a streaming update to an already admitted request."""
         params = req_state.sampling_params_list[self.stage_id]
@@ -244,6 +246,16 @@ class StagePool:
         if self.stage_type == "diffusion":
             await self.clients[replica_id].add_request_async(request_id, request, params)
         else:
+            # Refresh the shared output-processor state before yielding to the
+            # stage client so streaming segments are merged against the latest
+            # prompt/token metadata.
+            self.output_processor.add_request(
+                request=request,
+                prompt=prompt_text,
+                parent_req=None,
+                request_index=0,
+                queue=None,
+            )
             await self.clients[replica_id].add_request_async(request)
         return replica_id
 

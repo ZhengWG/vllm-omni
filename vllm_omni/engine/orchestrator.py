@@ -286,7 +286,12 @@ class Orchestrator:
 
         req_state.streaming.enabled = True
         req_state.stage_submit_ts[stage_id] = _time.time()
-        await self.stage_pools[stage_id].submit_update(request_id, req_state, request)
+        await self.stage_pools[stage_id].submit_update(
+            request_id,
+            req_state,
+            request,
+            prompt_text=msg.get("output_prompt_text"),
+        )
 
     async def _handle_add_companion(self, msg: dict[str, Any]) -> None:
         """Handle an add_companion_request message: submit companion to stage 0."""

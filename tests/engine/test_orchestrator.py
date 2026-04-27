@@ -114,8 +114,10 @@ class FakeCollectiveRpcStageClient(FakeStageClient):
 class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
+        self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
 
-    def add_request(self, *_args, **_kwargs) -> None:
+    def add_request(self, *args, **kwargs) -> None:
+        self.add_request_calls.append((args, kwargs))
         return None
 
     def process_outputs(self, *_args, **_kwargs):
@@ -855,6 +857,81 @@ async def test_stage_pool_submit_update_reuses_existing_binding() -> None:
     assert stage0_r0.add_request_calls[1][0].request_id == "req-0"
     assert stage0_r1.add_request_calls[0][0].request_id == "req-1"
     assert stage0_r1.add_request_calls[1][0].request_id == "req-1"
+
+
+@pytest.mark.asyncio
+async def test_stage_pool_submit_update_refreshes_output_processor_state() -> None:
+    output_processor = FakeOutputProcessor()
+
+    class AssertingStageClient(FakeStageClient):
+        async def add_request_async(self, *args, **kwargs) -> None:
+            if len(self.add_request_calls) == 1:
+                prompts = [call_kwargs["prompt"] for _, call_kwargs in output_processor.add_request_calls]
+                assert prompts == ["seg-1", "seg-2"]
+            await super().add_request_async(*args, **kwargs)
+
+    stage0 = AssertingStageClient(stage_type="llm", final_output=False)
+    pool = StagePool(
+        0,
+        [stage0],
+        output_processor=output_processor,
+        stage_vllm_config=SimpleNamespace(model_config=SimpleNamespace(max_model_len=64)),
+    )
+    req_state = OrchestratorRequestState(
+        request_id="req-0",
+        sampling_params_list=[_sampling_params()],
+        final_stage_id=0,
+    )
+
+    await pool.submit_initial(
+        "req-0",
+        req_state,
+        SimpleNamespace(request_id="req-0", prompt_token_ids=[1, 2]),
+        prompt_text="seg-1",
+    )
+    await pool.submit_update(
+        "req-0",
+        req_state,
+        SimpleNamespace(request_id="req-0", prompt_token_ids=[3], resumable=True),
+        prompt_text="seg-2",
+    )
+
+    assert len(output_processor.add_request_calls) == 2
+    assert output_processor.add_request_calls[1][1]["prompt"] == "seg-2"
+
+
+@pytest.mark.asyncio
+async def test_handle_streaming_update_passes_prompt_text_to_stage_pool() -> None:
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, Any]] = []
+
+        async def submit_update(self, request_id, req_state, request, *, prompt_text=None) -> int:
+            self.calls.append((request_id, prompt_text))
+            return 0
+
+    pool = RecordingPool()
+    orchestrator = object.__new__(Orchestrator)
+    orchestrator.request_states = {
+        "req-stream": OrchestratorRequestState(
+            request_id="req-stream",
+            sampling_params_list=[_sampling_params()],
+            final_stage_id=0,
+        )
+    }
+    orchestrator.stage_pools = [pool]
+
+    await orchestrator._handle_streaming_update(
+        {
+            "request_id": "req-stream",
+            "prompt": SimpleNamespace(request_id="req-stream", prompt_token_ids=[1], resumable=True),
+            "sampling_params_list": [_sampling_params()],
+            "output_prompt_text": "segment-2",
+        }
+    )
+
+    assert pool.calls == [("req-stream", "segment-2")]
+    assert orchestrator.request_states["req-stream"].streaming.enabled is True
 
 
 @pytest.mark.asyncio
