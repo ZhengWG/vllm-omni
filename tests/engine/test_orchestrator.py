@@ -18,8 +18,8 @@ from vllm.sampling_params import SamplingParams
 from vllm.v1.engine.core_client import AsyncMPClient
 
 from vllm_omni.engine.orchestrator import Orchestrator, OrchestratorRequestState
-from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.engine.stage_engine_core_client import StageEngineCoreClient
+from vllm_omni.engine.stage_pool import StagePool
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
