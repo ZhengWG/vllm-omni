@@ -93,6 +93,9 @@ class OrchestratorRequestState:
 
     streaming: StreamingInputState = field(default_factory=lambda: StreamingInputState())
 
+    # Per-request pipeline timing accumulator (milliseconds)
+    pipeline_timings: dict[str, float] = field(default_factory=dict)
+
 
 @dataclass
 class StreamingInputState:
@@ -245,6 +248,12 @@ class Orchestrator:
         self.request_states[request_id] = req_state
         req_state.streaming.enabled = bool(getattr(prompt, "resumable", False))
         req_state.stage_submit_ts[stage_id] = _time.time()
+        enqueue_ts = msg.get("enqueue_ts", 0.0)
+        if enqueue_ts > 0:
+            req_state.pipeline_timings["queue_wait_ms"] = (_time.perf_counter() - enqueue_ts) * 1000.0
+        preprocess_ms = msg.get("preprocess_ms", 0.0)
+        if preprocess_ms > 0:
+            req_state.pipeline_timings["preprocess_ms"] = preprocess_ms
         await self.stage_pools[stage_id].submit_initial(
             request_id,
             req_state,
@@ -499,6 +508,7 @@ class Orchestrator:
                     submit_ts=req_state.stage_submit_ts.get(stage_id, _time.time()),
                     replica_id=replica_id,
                 )
+                stage_metrics.pipeline_timings = dict(req_state.pipeline_timings)
 
             await self._route_output(stage_id, output, req_state, stage_metrics)
 
@@ -766,6 +776,7 @@ class Orchestrator:
                     requires_multimodal_data,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
+                req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d
                 logger.info(
                     "[Orchestrator] ar2diffusion req=%s wall_time=%.3fms stage=%d->%d",
                     req_id,
@@ -773,8 +784,13 @@ class Orchestrator:
                     src_stage_id,
                     next_logical,
                 )
-                if already_submitted and isinstance(diffusion_prompt, list) and len(diffusion_prompt) == 1:
-                    diffusion_prompt = diffusion_prompt[0]
+                if isinstance(diffusion_prompt, list):
+                    if not diffusion_prompt:
+                        raise ValueError(
+                            f"Stage-{src_stage_id} produced no valid inputs for diffusion stage-{next_logical}"
+                        )
+                    if already_submitted and len(diffusion_prompt) == 1:
+                        diffusion_prompt = diffusion_prompt[0]
             else:
                 diffusion_prompt = req_state.prompt
 

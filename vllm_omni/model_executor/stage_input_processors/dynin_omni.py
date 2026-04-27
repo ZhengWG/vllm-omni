@@ -105,7 +105,7 @@ def _bridge_tokens(
         if not token_ids:
             token_ids = _to_token_id_list(mm_out.get("text_tokens"))
         if not token_ids:
-            token_ids = list(getattr(output, "token_ids", []) or [])
+            token_ids = list(output.cumulative_token_ids or [])
         if not token_ids:
             raise RuntimeError(f"Stage output for request {source_output.request_id} has no token_ids")
 

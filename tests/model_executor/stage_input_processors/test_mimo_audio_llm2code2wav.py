@@ -18,8 +18,8 @@ pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
 
 def _make_source_outputs(codec_codes: torch.Tensor, request_id: str = "req-0"):
-    """Build minimal source_outputs with one talker output carrying codec_codes."""
-    output = SimpleNamespace(multimodal_output={"code_predictor_codes": codec_codes})
+    output = SimpleNamespace(multimodal_output={"codes": {"audio": codec_codes}})
+    """Build minimal source_outputs with one talker output carrying codec codes."""
     talker_output = SimpleNamespace(outputs=[output], request_id=request_id)
     return [talker_output]
 

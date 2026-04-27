@@ -114,8 +114,8 @@ def test_flush_tail_when_finished():
     )
 
     assert payload is not None
-    assert payload["finished"].item() is True
-    codes = payload["code_predictor_codes"]
+    assert payload["meta"]["finished"].item() is True
+    codes = payload["codes"]["audio"]
     # Format: [ctx_frames, context_length, ...flat_codes]
     assert len(codes) >= 2  # At least ctx_frames + context_length header
     ctx_frames = codes[0]
@@ -137,10 +137,8 @@ def test_eof_marker_when_finished_with_no_frames():
         request=request,
     )
 
-    assert payload == {
-        "code_predictor_codes": [],
-        "finished": torch.tensor(True, dtype=torch.bool),
-    }
+    assert payload["codes"] == {"audio": []}
+    assert payload["meta"]["finished"].item() is True
 
 
 def test_normal_chunk_emission():
@@ -164,7 +162,7 @@ def test_normal_chunk_emission():
 
     # A chunk should be emitted
     assert payload is not None
-    codes = payload["code_predictor_codes"]
+    codes = payload["codes"]["audio"]
     ctx_frames = codes[0]
     context_length = codes[1]
     assert ctx_frames == 20  # 25 - 5(chunk_size_at_begin)
@@ -191,7 +189,7 @@ def test_small_initial_chunks():
         )
 
     assert payload is not None
-    codes = payload["code_predictor_codes"]
+    codes = payload["codes"]["audio"]
     ctx_frames = codes[0]
     context_length = codes[1]
     assert ctx_frames == 0
@@ -240,7 +238,7 @@ def test_context_handling_format():
         )
 
     assert payload is not None
-    codes = payload["code_predictor_codes"]
+    codes = payload["codes"]["audio"]
     # First two elements are ctx_frames and context_length
     ctx_frames = codes[0]
     context_length = codes[1]
