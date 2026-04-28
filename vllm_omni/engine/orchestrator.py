@@ -413,7 +413,8 @@ class Orchestrator:
         submit_ts = req_state.stage_submit_ts.get(stage_id)
         stage_client = self.stage_clients[stage_id]
 
-        # CFG companion: stash output for the parent to bundle at forward time.
+        # CFG companion: stash output so parent can bundle [parent, *companions]
+        # into set_engine_outputs for the bridge (e.g. thinker2imagegen).
         if finished and self._cfg_tracker.is_companion(req_id):
             self._cfg_tracker.set_companion_output(req_id, output)
             await self._handle_cfg_companion_ready(req_id)

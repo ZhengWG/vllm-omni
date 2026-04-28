@@ -399,22 +399,6 @@ def thinker2imagegen(
     return [{"prompt": "", "extra": extra}]
 
 
-def _validate_stage_inputs(stage_list, engine_input_source):
-    """Validate stage inputs and return the source engine outputs."""
-    if not engine_input_source:
-        raise ValueError("engine_input_source cannot be empty")
-
-    stage_id = engine_input_source[0]
-    if stage_id >= len(stage_list):
-        raise IndexError(f"Invalid stage_id: {stage_id}")
-
-    stage = stage_list[stage_id]
-    if stage.engine_outputs is None:
-        raise RuntimeError(f"Stage {stage_id} has no outputs yet")
-
-    return stage.engine_outputs
-
-
 def thinker2talker(
     stage_list: list[Any],
     engine_input_source: list[int],
@@ -427,7 +411,7 @@ def thinker2talker(
     a talker input prompt with the text and any speaker/instruction info
     from the original request.
     """
-    source_outputs = _validate_stage_inputs(stage_list, engine_input_source)
+    _, source_outputs = _validate_stage_inputs(stage_list, engine_input_source)
 
     if not isinstance(prompt, list):
         prompt = [prompt]

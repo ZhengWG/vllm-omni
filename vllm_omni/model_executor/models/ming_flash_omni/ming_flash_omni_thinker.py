@@ -467,20 +467,30 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         design splits the work into
         :meth:`_apply_hf_processor_text_only` (prompt, empty kwargs) and
         :meth:`_apply_hf_processor_mm_only` (dummy text, real kwargs), so a
-        per-request flag like ``is_image_gen`` cannot reach the real
+        per-request flag like ``modalities`` cannot reach the real
         tokenization from inside :meth:`_call_hf_processor`.
 
         For Ming-flash-omni-2.0, image-generation requests carry
-        ``mm_processor_kwargs["is_image_gen"] = True`` (set by
-        ``serving_chat.py``). We expand the prompt here with the
+        ``mm_processor_kwargs["modalities"]`` set to ``["image"]`` (t2i) or
+        ``["img2img"]`` (image edit). We expand the prompt here with the
         ``<image><imagePatch>*N</image>`` query-token block so the expanded
         form flows through both the tokenization and (eventual) MM paths.
+        For img2img, we also prepend ``<IMAGE>`` so the thinker-side prompt
+        replacement can locate the reference-image placeholder.
         """
-        if isinstance(prompt, str) and hf_processor_mm_kwargs.get("is_image_gen"):
+        modalities = hf_processor_mm_kwargs.get("modalities") or []
+        is_image_gen = "image" in modalities or "img2img" in modalities
+        if isinstance(prompt, str) and is_image_gen:
             from vllm_omni.model_executor.models.ming_flash_omni.prompt_utils import (
                 DEFAULT_NUM_QUERY_TOKENS,
                 maybe_expand_image_gen_prompt,
             )
+
+            # img2img: prepend ``<IMAGE>`` so the ref-image placeholder survives
+            # MM caching (when the ref image is cache-warm, the thinker sees 0
+            # missing items and cannot inject the placeholder itself).
+            if "img2img" in modalities:
+                prompt = "<IMAGE>" + prompt
 
             ig = getattr(self.info.ctx.model_config.hf_config, "image_gen_config", None)
             num_query_tokens = getattr(ig, "num_query_tokens", DEFAULT_NUM_QUERY_TOKENS)

@@ -351,13 +351,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 # Override the prompts produced by chat-template preprocessing.
                 is_img2img = engine_prompt_image is not None
-                # For img2img (Ming-flash-omni-2.0 image edit), prepend ``<IMAGE>``
-                # so the thinker-side prompt replacement can locate the
-                # ref-image placeholder — needs to survive MM caching (when the
-                # ref image is cache-warm, the thinker sees 0 missing items and
-                # cannot know to inject the placeholder itself).
-                effective_prompt = "<IMAGE>" + extracted_prompt if is_img2img else extracted_prompt
-                tprompt: OmniTextPrompt = {"prompt": effective_prompt}
+                tprompt: OmniTextPrompt = {"prompt": extracted_prompt}
                 if is_img2img:
                     tprompt["modalities"] = ["img2img"]
                 else:
@@ -370,12 +364,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     mm_processor_kwargs["target_h"] = height
                 if width is not None:
                     mm_processor_kwargs["target_w"] = width
-                # Image-gen models (Ming reads this flag) use it to trigger
-                # per-request query-token expansion in their MM processor.
-                # Both pure t2i and img2img (edit with reference image) are
-                # image-gen cases — the presence of a reference image does
-                # not disable image generation, it augments it.
-                mm_processor_kwargs["is_image_gen"] = True
+                # Pass output modalities so model-specific MM processors can
+                # detect image-generation requests and apply their own prompt
+                # rewrites (e.g. query-token expansion, placeholder injection).
+                mm_processor_kwargs["modalities"] = ["img2img"] if is_img2img else ["image"]
                 if mm_processor_kwargs:
                     tprompt["mm_processor_kwargs"] = mm_processor_kwargs
                 if engine_prompt_image is not None:

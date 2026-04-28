@@ -67,11 +67,11 @@ class CfgCompanionTracker:
         return sampling_params
 
     def set_companion_output(self, companion_id: str, output: Any) -> None:
-        """Store a companion's engine output so the parent can pick it up at forward time."""
+        """Stash companion engine output for the parent to bundle at forward time."""
         self._companion_outputs[companion_id] = output
 
     def pop_companion_outputs(self, parent_id: str) -> list[Any]:
-        """Return companion outputs for ``parent_id`` (in role-registration order)."""
+        """Pop companion outputs (role-registration order) for bundling into set_engine_outputs."""
         role_map = self._companion_map.get(parent_id, {})
         outputs = []
         for cid in role_map.values():
