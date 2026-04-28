@@ -69,6 +69,13 @@ class OpenAICreateSpeechRequest(BaseModel):
         default=None,
         description="Maximum tokens to generate",
     )
+    seed: int | None = Field(
+        default=None,
+        ge=0,
+        le=2**63 - 1,
+        description="Random seed for reproducible generation. When set, ensures "
+        "deterministic output for the same input text and seed value.",
+    )
     initial_codec_chunk_frames: int | None = Field(
         default=None,
         ge=0,
@@ -76,7 +83,12 @@ class OpenAICreateSpeechRequest(BaseModel):
     )
     extra_params: dict[str, Any] | None = Field(
         default=None,
-        description=("Optional model-specific parameters passed directly to the model's extra_args."),
+        description=(
+            "Optional model-specific parameters passed directly to the model's extra_args. "
+            "VoxCPM2 reads `cfg_value` (float in 0.1-10.0; default 2.0) from this dict to set "
+            "the classifier-free guidance scale per request; Voxtral TTS reads `cfg_alpha` here "
+            "the same way."
+        ),
     )
 
     @field_validator("stream_format")
