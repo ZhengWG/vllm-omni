@@ -274,7 +274,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         # vocab = tokenizer.get_vocab()
         thinker_config = self.info.get_hf_config()
 
-        # patch/delimiter token IDs (used in replacement sequences).
+        # patch/delimiter token IDs (used in replacement sequences)
         image_start_token_id = thinker_config.llm_config.image_start_token
         image_patch_token_id = thinker_config.llm_config.image_patch_token
         image_end_token_id = thinker_config.llm_config.image_end_token

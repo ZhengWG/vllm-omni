@@ -1,29 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 The vLLM-Omni team.
-"""Stage input processors for Ming-flash-omni-2.0 multi-stage pipelines.
-
-This module exposes the per-stage adapters wired from the various Ming
-stage YAMLs (``ming_flash_omni.yaml``, ``ming_flash_omni_tts.yaml``,
-``ming_flash_omni_dual.yaml``):
-
-Image-generation (thinker → diffusion):
-
-* ``expand_cfg_prompts`` (stage 0 ``prompt_expand_func``) — when the user
-  provides a ``negative_prompt``, expand into one CFG companion that runs
-  through the thinker in parallel.
-* ``thinker2imagegen`` (stage 1 ``custom_process_input_func``) — for each
-  thinker output, slice ``final_hidden_states`` at ``<imagePatch>``
-  positions and pack them into the diffusion prompt. When a CFG companion
-  output is present, its sliced hidden is packed under
-  ``extra[negative_thinker_hidden_states]`` alongside the parent's
-  ``extra[thinker_hidden_states]``.
-
-TTS / Omni-Speech (thinker → talker):
-
-* ``thinker2talker`` (talker stage ``custom_process_input_func``) — build
-  the talker input from thinker outputs, plumbing speaker / voice-clone
-  metadata from the original request through to the talker.
-"""
+"""Stage input processors for Ming-flash-omni-2.0 multi-stage pipeline."""
 
 from __future__ import annotations
 
