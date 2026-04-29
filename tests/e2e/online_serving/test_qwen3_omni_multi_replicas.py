@@ -27,6 +27,7 @@ test_params = [
     )
 ]
 
+
 def _system_prompt() -> dict[str, object]:
     return {
         "role": "system",
