@@ -170,12 +170,15 @@ def test_collect_initialized_clients_for_cleanup_deduplicates_clients():
     assert cleanup_clients == [shared, extra]
 
 
-def test_initialize_stages_rejects_replicas_in_single_stage_mode():
+def test_initialize_stages_rejects_non_diffusion_replicas_in_single_stage_mode():
     engine = object.__new__(AsyncOmniEngine)
     engine.single_stage_mode = True
     engine.stage_configs = [types.SimpleNamespace(stage_id=0, runtime={"num_replicas": 2})]
 
-    with pytest.raises(ValueError, match="single_stage_mode does not support num_replicas > 1 yet"):
+    with pytest.raises(
+        ValueError,
+        match="single_stage_mode only supports num_replicas > 1 for diffusion stages",
+    ):
         engine._validate_single_stage_mode_replica_constraints()
 
 
