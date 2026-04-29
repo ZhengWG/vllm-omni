@@ -811,7 +811,6 @@ def build_diffusion_config(
     metadata: StageMetadata,
 ) -> Any:
     """Build diffusion config for a stage."""
-    from vllm_omni.diffusion.data import OmniDiffusionConfig
 
     engine_args_dict = build_engine_args_dict(stage_cfg, model)
     od_config = OmniDiffusionConfig.from_kwargs(**engine_args_dict)

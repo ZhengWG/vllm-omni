@@ -206,7 +206,9 @@ class OmniMasterServer:
 
         if not self._stage_config_events[key].is_set():
             if not self._stage_config_events[key].wait(timeout=timeout_s):
-                raise TimeoutError(f"Timed out waiting for stage registration for stage {stage_id} replica {replica_id}.")
+                raise TimeoutError(
+                    f"Timed out waiting for stage registration for stage {stage_id} replica {replica_id}."
+                )
 
         return self._stage_coordinator_addresses[key]
 

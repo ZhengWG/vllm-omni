@@ -567,8 +567,7 @@ def run_headless(args: argparse.Namespace) -> None:
             break
     if stage_cfg is None:
         raise ValueError(
-            f"No stage config found for stage_id={stage_id}. "
-            f"Available stage ids: {[c.stage_id for c in stage_configs]}"
+            f"No stage config found for stage_id={stage_id}. Available stage ids: {[c.stage_id for c in stage_configs]}"
         )
 
     prepare_engine_environment()

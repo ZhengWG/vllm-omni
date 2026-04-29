@@ -155,7 +155,9 @@ def test_mixed_modal_stream_batch_generates_text_and_audio(omni_server, openai_c
 def test_multi_stage_diffusion_uses_multi_replica_dit_stage(omni_server, openai_client) -> None:
     request_config = {
         "model": omni_server.model,
-        "messages": dummy_messages_from_mix_data(content_text="<|im_start|>A small red cube on a white table.<|im_end|>"),
+        "messages": dummy_messages_from_mix_data(
+            content_text="<|im_start|>A small red cube on a white table.<|im_end|>"
+        ),
         "modalities": ["image"],
         "extra_body": {
             "height": 512,
