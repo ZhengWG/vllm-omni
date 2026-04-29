@@ -455,6 +455,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
                 "stage_id": 0,
                 "devices": "0",
                 "max_num_seqs": 6,
+                "max_num_batched_tokens": 16384,
                 "gpu_memory_utilization": 0.45,
                 "load_format": "dummy",
                 "default_sampling_params": {
