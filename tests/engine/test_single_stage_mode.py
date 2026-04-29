@@ -131,16 +131,42 @@ class TestOmniMasterServerAllocation:
 
     def test_allocations_created_for_each_stage_id(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15000, stage_ids=[0, 1, 2])
-        assert set(server._allocations.keys()) == {0, 1, 2}
+        assert set(server._stage_routes.keys()) == {(0, 0), (1, 0), (2, 0)}
 
     def test_each_allocation_is_stage_allocation(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15000, stage_ids=[0, 1])
         for sid in (0, 1):
-            assert isinstance(server._allocations[sid], StageAllocation)
+            assert isinstance(server.get_allocation(sid), StageAllocation)
+
+    def test_replica_allocations_are_distinct(self):
+        server = OmniMasterServer(
+            master_address="127.0.0.1",
+            master_port=15000,
+            stage_ids=[0],
+            stage_replica_counts={0: 3},
+        )
+
+        allocations = [server.get_allocation(0, replica_id) for replica_id in range(3)]
+        assert len({alloc.handshake_bind_address for alloc in allocations}) == 3
+        assert server.get_allocation(0) is allocations[0]
+
+    def test_replica_stage_configs_are_isolated(self):
+        server = OmniMasterServer(
+            master_address="127.0.0.1",
+            master_port=15000,
+            stage_ids=[0],
+            stage_replica_counts={0: 2},
+        )
+
+        server.register_stage_config(0, {"replica": 0}, replica_id=0)
+        server.register_stage_config(0, {"replica": 1}, replica_id=1)
+
+        assert server.get_stage_config(0, replica_id=0) == {"replica": 0}
+        assert server.get_stage_config(0, replica_id=1) == {"replica": 1}
 
     def test_allocation_addresses_reference_master_address(self):
         server = OmniMasterServer(master_address="192.168.1.10", master_port=20000, stage_ids=[0])
-        alloc = server._allocations[0]
+        alloc = server.get_allocation(0)
         for address in (
             alloc.handshake_bind_address,
             alloc.handshake_connect_address,
@@ -153,7 +179,7 @@ class TestOmniMasterServerAllocation:
 
     def test_port_uniqueness_within_single_allocation(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15001, stage_ids=[0])
-        alloc = server._allocations[0]
+        alloc = server.get_allocation(0)
         handshake_port = int(alloc.handshake_bind_address.split(":")[-1])
         input_port = int(alloc.input_bind_address.split(":")[-1])
         output_port = int(alloc.output_bind_address.split(":")[-1])
@@ -161,21 +187,21 @@ class TestOmniMasterServerAllocation:
 
     def test_get_zmq_addresses_returns_bind_addresses(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15002, stage_ids=[0])
-        alloc = server._allocations[0]
+        alloc = server.get_allocation(0)
         zmq_addrs = server.get_zmq_addresses(0)
         assert zmq_addrs.inputs == [alloc.input_bind_address]
         assert zmq_addrs.outputs == [alloc.output_bind_address]
 
     def test_get_engine_zmq_addresses_returns_connect_addresses(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15003, stage_ids=[0])
-        alloc = server._allocations[0]
+        alloc = server.get_allocation(0)
         zmq_addrs = server.get_engine_zmq_addresses(0)
         assert zmq_addrs.inputs == [alloc.input_connect_address]
         assert zmq_addrs.outputs == [alloc.output_connect_address]
 
     def test_get_allocation_returns_correct_object(self):
         server = OmniMasterServer(master_address="127.0.0.1", master_port=15004, stage_ids=[3])
-        assert server.get_allocation(3) is server._allocations[3]
+        assert server.get_allocation(3) is server._stage_routes[(3, 0)]
 
 
 # ---------------------------------------------------------------------------
@@ -192,7 +218,7 @@ class TestOmniMasterServerRegistration:
         master_port = get_open_port()
         server = OmniMasterServer(master_address="127.0.0.1", master_port=master_port, stage_ids=[0])
         server.start()
-        expected_hs = server._allocations[0].handshake_connect_address
+        expected_hs = server.get_allocation(0).handshake_connect_address
 
         ctx = zmq.Context()
         try:
@@ -498,6 +524,7 @@ class TestSingleStageInitialization:
             master_address="127.0.0.1",
             master_port=26000,
             stage_ids=[7, 11],
+            stage_replica_counts={7: 1, 11: 1},
         )
         mock_oms.start.assert_called_once()
 
@@ -548,6 +575,60 @@ class TestSingleStageInitialization:
             monkeypatch.undo()
 
         assert stage_plans[0].replicas[0].metadata.runtime_cfg is None
+
+    def test_validate_single_stage_mode_allows_diffusion_replicas(self):
+        stage_cfg = _make_stage_cfg(0, stage_type="diffusion")
+        stage_cfg.runtime.num_replicas = 2
+        engine = self._build_engine([stage_cfg], single_stage_mode=True, stage_id_filter=0)
+
+        engine._validate_single_stage_mode_replica_constraints()
+
+    def test_validate_single_stage_mode_rejects_llm_replicas(self):
+        stage_cfg = _make_stage_cfg(0, stage_type="llm")
+        stage_cfg.runtime.num_replicas = 2
+        engine = self._build_engine([stage_cfg], single_stage_mode=True, stage_id_filter=0)
+
+        with pytest.raises(ValueError, match="only supports num_replicas > 1 for diffusion"):
+            engine._validate_single_stage_mode_replica_constraints()
+
+    def test_build_logical_stage_init_plans_preserves_diffusion_runtime_cfg_in_single_stage_mode(
+        self, mocker: MockerFixture
+    ):
+        import vllm_omni.engine.async_omni_engine as engine_mod
+
+        stage_cfg = _make_stage_cfg(7, stage_type="diffusion")
+        stage_cfg.runtime.devices = "0,1"
+        engine = self._build_engine([stage_cfg], single_stage_mode=True, stage_id_filter=7)
+
+        monkeypatch = pytest.MonkeyPatch()
+        monkeypatch.setattr(
+            engine_mod,
+            "extract_stage_metadata",
+            lambda cfg: SimpleNamespace(
+                stage_id=cfg.stage_id,
+                stage_type="diffusion",
+                prompt_expand_func=None,
+                runtime_cfg={"devices": cfg.runtime.devices},
+                final_output=True,
+                final_output_type="image",
+                default_sampling_params=SimpleNamespace(),
+                custom_process_input_func=None,
+                engine_input_source=[],
+                cfg_kv_collect_func=None,
+                replica_id=0,
+            ),
+        )
+        monkeypatch.setattr(engine_mod, "get_stage_connector_spec", lambda **_: {})
+        monkeypatch.setattr(engine_mod, "resolve_omni_kv_config_for_stage", lambda *_: (None, None, None))
+        try:
+            stage_plans, _ = engine._build_logical_stage_init_plans(None, [2], {0: ["0", "1"]})
+        finally:
+            monkeypatch.undo()
+
+        replicas = stage_plans[0].replicas
+        assert [replica.replica_id for replica in replicas] == [0, 1]
+        assert [replica.stage_cfg.runtime.devices for replica in replicas] == ["0", "1"]
+        assert [replica.metadata.runtime_cfg for replica in replicas] == [{"devices": "0"}, {"devices": "1"}]
 
     def test_initialize_stages_calls_master_server_only_in_single_stage_mode(self, mocker: MockerFixture):
         import vllm_omni.engine.async_omni_engine as engine_mod
@@ -647,7 +728,12 @@ class TestSingleStageReplicaInitialization:
             finally:
                 events.append("exit")
 
-        plan = _make_llm_plan(0, configured_stage_id=7, launch_mode="remote", vllm_config=fake_vllm_config).replicas[0]
+        plan = _make_llm_plan(
+            0,
+            configured_stage_id=7,
+            launch_mode="remote",
+            vllm_config=fake_vllm_config,
+        ).replicas[0]
         sentinel_client = SimpleNamespace()
 
         mock_connect = mocker.patch.object(engine_mod, "connect_remote_engine_cores", side_effect=_fake_connect)
@@ -660,9 +746,10 @@ class TestSingleStageReplicaInitialization:
         result = engine._initialize_llm_replica(plan, stage_init_timeout=60, llm_stage_launch_lock=threading.Lock())
 
         assert result is sentinel_client
-        engine._omni_master_server.get_stage_config.assert_called_once_with(7, timeout_s=60)
+        engine._omni_master_server.get_stage_config.assert_called_once_with(7, timeout_s=60, replica_id=0)
         assert fake_vllm_config.parallel_config.data_parallel_size_local == 0
         assert mock_connect.call_args.kwargs["stage_id"] == 7
+        assert mock_connect.call_args.kwargs["replica_id"] == 0
         assert events == ["enter", "exit", "attach"]
 
     def test_initialize_llm_replica_remote_missing_registered_stage_config_raises(self, mocker: MockerFixture):
@@ -695,7 +782,12 @@ class TestSingleStageReplicaInitialization:
         def _fake_connect(**kwargs):
             yield fake_manager, fake_coordinator, fake_addresses
 
-        plan = _make_llm_plan(0, configured_stage_id=7, launch_mode="remote", vllm_config=fake_vllm_config).replicas[0]
+        plan = _make_llm_plan(
+            0,
+            configured_stage_id=7,
+            launch_mode="remote",
+            vllm_config=fake_vllm_config,
+        ).replicas[0]
         mocker.patch.object(engine_mod, "connect_remote_engine_cores", side_effect=_fake_connect)
         mocker.patch.object(
             StageEngineCoreClientBase,
@@ -728,7 +820,12 @@ class TestSingleStageReplicaInitialization:
         def _fake_launch(**kwargs):
             yield mocker.Mock(), None, fake_addresses
 
-        plan = _make_llm_plan(0, configured_stage_id=3, launch_mode="local", vllm_config=fake_vllm_config).replicas[0]
+        plan = _make_llm_plan(
+            0,
+            configured_stage_id=3,
+            launch_mode="local",
+            vllm_config=fake_vllm_config,
+        ).replicas[0]
         sentinel_client = SimpleNamespace()
 
         device_env_var = current_omni_platform.device_control_env_var
@@ -756,6 +853,7 @@ class TestSingleStageReplicaInitialization:
         assert result is sentinel_client
         assert mock_launch.call_args.kwargs["stage_id"] == 3
         assert mock_launch.call_args.kwargs["stage_config"] is plan.stage_cfg
+        assert mock_launch.call_args.kwargs["replica_id"] == 0
 
     def test_initialize_diffusion_replica_remote_uses_from_addresses(self, mocker: MockerFixture):
         import vllm_omni.engine.async_omni_engine as engine_mod
@@ -782,7 +880,8 @@ class TestSingleStageReplicaInitialization:
         result = engine._initialize_diffusion_replica(plan, stage_init_timeout=60, stage_launch_lock=threading.Lock())
 
         assert result is sentinel_client
-        engine._omni_master_server.get_stage_config.assert_called_once_with(11, timeout_s=60)
+        engine._omni_master_server.get_stage_config.assert_called_once_with(11, timeout_s=60, replica_id=0)
+        engine._omni_master_server.get_zmq_addresses.assert_called_once_with(11, replica_id=0)
         mock_from_addresses.assert_called_once()
 
     def test_initialize_diffusion_replica_single_stage_local_registers_with_master(self, mocker: MockerFixture):
@@ -843,6 +942,7 @@ class TestSingleStageReplicaInitialization:
             omni_stage_id=5,
             omni_stage_config=plan.stage_cfg,
             return_addresses=True,
+            replica_id=0,
         )
         mock_spawn.assert_called_once_with(
             "fake-model",
@@ -851,7 +951,7 @@ class TestSingleStageReplicaInitialization:
             request_address="tcp://req",
             response_address="tcp://resp",
         )
-        mock_handshake.assert_called_once_with(proc, "tcp://hs")
+        mock_handshake.assert_called_once_with(proc, "tcp://hs", 60)
         mock_from_addresses.assert_called_once_with(
             plan.metadata,
             request_address="tcp://req",
@@ -955,13 +1055,16 @@ class TestConnectRemoteEngineCoresCoordinator:
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
             stage_id=7,
+            replica_id=2,
         ) as (_, yielded_coordinator, yielded_addresses):
             assert yielded_coordinator is None
             assert yielded_addresses.coordinator_input == "tcp://coord-in"
             assert yielded_addresses.coordinator_output == "tcp://coord-out"
             assert yielded_addresses.frontend_stats_publish_address == "tcp://stats"
 
-        omni_master_server.get_stage_coordinator_addresses.assert_called_once_with(7)
+        omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
+        omni_master_server.get_stage_coordinator_addresses.assert_called_once_with(7, replica_id=2)
+        omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
         mock_wait.assert_called_once()
 
     def test_defaults_to_no_coordinator_addresses_when_none_registered(self, mocker: MockerFixture):
@@ -1030,6 +1133,7 @@ class TestLaunchOmniCoreEngines:
             omni_master_server=omni_master_server,
             stage_id=7,
             stage_config=stage_config,
+            replica_id=2,
         ) as (yielded_manager, yielded_coordinator, yielded_addresses):
             assert yielded_manager is local_engine_manager
             assert yielded_coordinator is None
@@ -1041,7 +1145,10 @@ class TestLaunchOmniCoreEngines:
             omni_stage_id=7,
             omni_stage_config=stage_config,
             coordinator=None,
+            replica_id=2,
         )
+        omni_master_server.get_zmq_addresses.assert_called_once_with(7, replica_id=2)
+        omni_master_server.get_allocation.assert_called_once_with(7, replica_id=2)
         manager_kwargs = mock_manager_cls.call_args.kwargs
         assert manager_kwargs["local_engine_count"] == 2
         assert manager_kwargs["start_index"] == 3
@@ -1097,6 +1204,7 @@ class TestLaunchOmniCoreEngines:
             omni_master_server=omni_master_server,
             stage_id=7,
             stage_config={"stage_id": 7},
+            replica_id=3,
         ) as (_, yielded_coordinator, yielded_addresses):
             assert yielded_coordinator is coordinator
             assert yielded_addresses.coordinator_input == "tcp://coord-in"
@@ -1109,5 +1217,6 @@ class TestLaunchOmniCoreEngines:
             omni_stage_id=7,
             omni_stage_config={"stage_id": 7},
             coordinator=coordinator,
+            replica_id=3,
         )
         mock_wait.assert_called_once()

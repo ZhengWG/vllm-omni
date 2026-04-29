@@ -447,6 +447,42 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
             },
         ],
     },
+    "bagel_multi_replicas_4gpu": {
+        "base_config": "bagel.yaml",
+        "async_chunk": False,
+        "stages": [
+            {
+                "stage_id": 0,
+                "devices": "0",
+                "max_num_seqs": 6,
+                "gpu_memory_utilization": 0.45,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "temperature": 0.4,
+                    "top_p": 0.9,
+                    "top_k": 1,
+                    "max_tokens": 256,
+                    "detokenize": False,
+                },
+            },
+            {
+                "stage_id": 1,
+                "devices": "1,2,3",
+                "num_replicas": 3,
+                "max_num_seqs": 1,
+                "enforce_eager": True,
+                "gpu_memory_utilization": 0.7,
+                "load_format": "dummy",
+                "default_sampling_params": {
+                    "seed": 42,
+                    "num_inference_steps": 2,
+                    "guidance_scale": 0.0,
+                    "height": 512,
+                    "width": 512,
+                },
+            },
+        ],
+    },
     "bagel": {
         "base_config": "bagel.yaml",
         "stages": [

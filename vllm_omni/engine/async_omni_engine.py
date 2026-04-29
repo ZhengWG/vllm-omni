@@ -411,7 +411,7 @@ class AsyncOmniEngine:
                 )
 
     def _validate_single_stage_mode_replica_constraints(self) -> None:
-        """Reject replica fan-out in single-stage mode until startup is replica-aware."""
+        """Reject unsupported replica fan-out in single-stage mode."""
         if not self.single_stage_mode:
             return
 
@@ -425,15 +425,16 @@ class AsyncOmniEngine:
             )
             if num_replicas <= 1:
                 continue
+            if getattr(stage_cfg, "stage_type", "llm") == "diffusion":
+                continue
             stage_id = int(getattr(stage_cfg, "stage_id", idx))
             unsupported.append((stage_id, num_replicas))
 
         if unsupported:
-            # TODO(Peiqi): single_stage_mode / headless launch still assumes one
-            # OmniMasterServer endpoint allocation per logical stage. Support
-            # per-replica startup only after remote/local startup paths are made
-            # replica-aware end-to-end.
-            raise ValueError(f"single_stage_mode does not support num_replicas > 1 yet; found {unsupported}")
+            raise ValueError(
+                "single_stage_mode only supports num_replicas > 1 for diffusion stages; "
+                f"found non-diffusion stages {unsupported}"
+            )
 
     def _build_logical_stage_init_plans(
         self,
@@ -507,7 +508,8 @@ class AsyncOmniEngine:
                 replica_metadata = extract_stage_metadata(replica_cfg)
                 replica_metadata.replica_id = replica_id
                 if self.single_stage_mode:
-                    replica_metadata.runtime_cfg = None
+                    if replica_metadata.stage_type != "diffusion":
+                        replica_metadata.runtime_cfg = None
 
                 replicas.append(
                     ReplicaInitPlan(
@@ -542,6 +544,7 @@ class AsyncOmniEngine:
             )
 
         all_stage_ids: list[int] = []
+        stage_replica_counts: dict[int, int] = {}
         seen_stage_ids: set[int] = set()
         for plan in stage_plans:
             stage_id = plan.configured_stage_id
@@ -551,11 +554,13 @@ class AsyncOmniEngine:
                 )
             seen_stage_ids.add(stage_id)
             all_stage_ids.append(stage_id)
+            stage_replica_counts[stage_id] = len(plan.replicas)
 
         self._omni_master_server = OmniMasterServer(
             master_address=self._omni_master_address,
             master_port=self._omni_master_port,
             stage_ids=all_stage_ids,
+            stage_replica_counts=stage_replica_counts,
         )
         self._omni_master_server.start()
         logger.info(
@@ -585,6 +590,7 @@ class AsyncOmniEngine:
                 raw_stage_cfg = self._omni_master_server.get_stage_config(
                     plan.metadata.stage_id,
                     timeout_s=stage_init_timeout,
+                    replica_id=plan.replica_id,
                 )
                 if raw_stage_cfg is None:
                     raise ValueError(f"Remote stage {plan.metadata.stage_id} registered without stage config")
@@ -597,6 +603,7 @@ class AsyncOmniEngine:
                     vllm_config=vllm_config,
                     omni_master_server=self._omni_master_server,
                     stage_id=plan.metadata.stage_id,
+                    replica_id=plan.replica_id,
                 )
                 logger.info(
                     "[AsyncOmniEngine] Stage %s remote engine handshake started",
@@ -653,6 +660,7 @@ class AsyncOmniEngine:
                                         omni_master_server=self._omni_master_server,
                                         stage_id=plan.metadata.stage_id,
                                         stage_config=stage_cfg,
+                                        replica_id=plan.replica_id,
                                     )
                                 )
                             else:
@@ -739,10 +747,14 @@ class AsyncOmniEngine:
                     self._omni_master_server.get_stage_config(
                         plan.metadata.stage_id,
                         timeout_s=stage_init_timeout,
+                        replica_id=plan.replica_id,
                     )
                 )
                 remote_metadata = extract_stage_metadata(remote_stage_cfg)
-                addresses = self._omni_master_server.get_zmq_addresses(plan.metadata.stage_id)
+                addresses = self._omni_master_server.get_zmq_addresses(
+                    plan.metadata.stage_id,
+                    replica_id=plan.replica_id,
+                )
                 logger.info(
                     "[AsyncOmniEngine] Stage %s remote diffusion startup completed",
                     plan.metadata.stage_id,
@@ -772,6 +784,7 @@ class AsyncOmniEngine:
                                 omni_stage_id=plan.metadata.stage_id,
                                 omni_stage_config=plan.stage_cfg,
                                 return_addresses=True,
+                                replica_id=plan.replica_id,
                             )
                             logger.info(
                                 "[AsyncOmniEngine] Stage %s diffusion registration completed",
@@ -784,7 +797,7 @@ class AsyncOmniEngine:
                                 request_address=request_address,
                                 response_address=response_address,
                             )
-                            complete_diffusion_handshake(proc, handshake_address)
+                            complete_diffusion_handshake(proc, handshake_address, stage_init_timeout)
                             logger.info(
                                 "[AsyncOmniEngine] Stage %s diffusion startup completed",
                                 plan.metadata.stage_id,
