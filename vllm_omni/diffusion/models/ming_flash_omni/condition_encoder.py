@@ -41,21 +41,6 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenCon
 logger = logging.getLogger(__name__)
 
 
-def _tstats(name: str, t: torch.Tensor) -> str:
-    """Compact one-line tensor statistics for debug logging."""
-    try:
-        f = t.detach().float()
-        norm_per_feat = f.norm(dim=-1).mean().item() if f.dim() >= 1 else float("nan")
-        return (
-            f"{name}: shape={tuple(t.shape)} dtype={t.dtype} "
-            f"mean={f.mean().item():+.4f} std={f.std().item():.4f} "
-            f"min={f.min().item():+.3f} max={f.max().item():+.3f} "
-            f"|x|/feat={norm_per_feat:.3f}"
-        )
-    except Exception as e:  # noqa: BLE001
-        return f"{name}: <stats failed: {e}>"
-
-
 class MingConditionEncoder(nn.Module):
     """Wraps a Qwen2 connector + norm/projection, producing DiT condition embeds.
 
@@ -324,22 +309,13 @@ class MingConditionEncoder(nn.Module):
             raise ValueError(f"expected [B, N, H], got shape {tuple(thinker_hidden_states.shape)}")
 
         b, n, _ = thinker_hidden_states.shape
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[MingCondEnc] %s", _tstats("STEP0 thinker_hidden_states", thinker_hidden_states))
-            logger.debug(
-                "[MingCondEnc] proj_in  weight %s bias %s",
-                _tstats("", self.proj_in.weight),
-                _tstats("", self.proj_in.bias) if self.proj_in.bias is not None else "None",
-            )
+        logger.debug("[MingCondEnc] input shape=%s dtype=%s", tuple(thinker_hidden_states.shape), thinker_hidden_states.dtype)
 
         x = self.proj_in(thinker_hidden_states)  # [B, N, conn_hidden]
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[MingCondEnc] %s", _tstats("STEP1 after proj_in", x))
 
         # Ming's ``get_condition_embeds_for_image_gen`` passes a 4D full-ones
         # attention mask of shape [B, 1, N, N] to the Qwen2 connector,
-        # forcing full bidirectional self-attention over all query positions
-        # (as opposed to the default causal mask). Match that here.
+        # forcing full bidirectional self-attention over all query positions.
         if attention_mask is None:
             attention_mask = torch.ones(
                 (b, 1, n, n),
@@ -347,7 +323,6 @@ class MingConditionEncoder(nn.Module):
                 device=x.device,
             )
         elif attention_mask.dim() == 2:
-            # Caller passed a 2D [B, N] mask — broadcast it into [B, 1, N, N]
             mask_2d = attention_mask.to(x.dtype)
             attention_mask = mask_2d[:, None, None, :].expand(b, 1, n, n)
 
@@ -358,34 +333,18 @@ class MingConditionEncoder(nn.Module):
             output_hidden_states=True,
             return_dict=True,
         )
-        # Ming uses hidden_states[-1] (last layer).
         hidden = out.hidden_states[-1]  # [B, N, conn_hidden]
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[MingCondEnc] %s", _tstats("STEP2 after connector", hidden))
 
         cap_feats = self.proj_out(hidden)  # [B, N, diffusion_c_input_dim]
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[MingCondEnc] %s", _tstats("STEP3 after proj_out", cap_feats))
 
-        # Final L2 normalization along the feature dim — matches the tail
-        # of Ming's ``get_condition_embeds_for_image_gen``.
+        # L2 normalize + ×1000 rescale.  Ming's ``get_condition_embeds_for_image_gen``
+        # applies F.normalize; ``ZImageModel_withMLP`` then rescales by 1000
+        # when ``text_encoder_norm=True``.  We fold both into one place.
         cap_feats = torch.nn.functional.normalize(cap_feats, dim=-1)
-        if logger.isEnabledFor(logging.DEBUG):
-            logger.debug("[MingCondEnc] %s", _tstats("STEP4 after F.normalize", cap_feats))
-
-        # Ming wraps the DiT in ``ZImageModel_withMLP`` which, when
-        # ``text_encoder_norm=True`` (set on Ming-flash-omni-2.0), applies
-        # ``F.normalize(x, dim=-1) * 1000.0`` to encoder_hidden_states before
-        # feeding the transformer — the ×1000 restores the magnitude of the
-        # original Z-image text encoder output (see zimage_loss.py
-        # ::ZImageModel_withMLP.forward lines 88-91). Our pipeline does not
-        # include that wrapper, so we fold the same rescale into the
-        # condition encoder output directly.
         if self.config.text_encoder_norm:
             cap_feats = cap_feats * 1000.0
-            if logger.isEnabledFor(logging.DEBUG):
-                logger.debug("[MingCondEnc] %s", _tstats("STEP5 after *1000", cap_feats))
 
+        logger.debug("[MingCondEnc] output shape=%s dtype=%s", tuple(cap_feats.shape), cap_feats.dtype)
         return cap_feats
 
     # ------------------------------------------------------------------

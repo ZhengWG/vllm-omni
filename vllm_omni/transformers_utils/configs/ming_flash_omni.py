@@ -279,6 +279,7 @@ class MingImageGenConfig(PretrainedConfig):
         scheduler_subfolder: str = "scheduler",
         mlp_subfolder: str = "mlp",
         diffusion_c_input_dim: int = 2560,
+        thinker_hidden_size: int = 4096,
         img_gen_scales: list[int] | None = None,
         text_encoder_norm: bool = True,
         # Default sampling parameters — match Ming's defaults in
@@ -297,6 +298,7 @@ class MingImageGenConfig(PretrainedConfig):
         self.scheduler_subfolder = scheduler_subfolder
         self.mlp_subfolder = mlp_subfolder
         self.diffusion_c_input_dim = diffusion_c_input_dim
+        self.thinker_hidden_size = thinker_hidden_size
         self.img_gen_scales = img_gen_scales if img_gen_scales is not None else [16]
         self.text_encoder_norm = text_encoder_norm
         self.num_inference_steps = num_inference_steps

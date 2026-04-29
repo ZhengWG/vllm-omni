@@ -305,9 +305,7 @@ class Orchestrator:
                                 # Map companion id → parent id (if this was a CFG companion),
                                 # then report the error under the parent's request_id and
                                 # clean up both parent and companion bookkeeping via the tracker.
-                                parent_id = self._cfg_tracker._companion_to_parent.get(
-                                    output.request_id, output.request_id
-                                )
+                                parent_id = self._cfg_tracker.get_parent_id(output.request_id) or output.request_id
                                 await self.output_async_queue.put(
                                     {
                                         "type": "error",

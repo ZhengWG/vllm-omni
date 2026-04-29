@@ -204,6 +204,45 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
 
         self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
 
+    @classmethod
+    def from_components(
+        cls,
+        *,
+        od_config: Any,
+        scheduler: FlowMatchEulerDiscreteScheduler,
+        vae: nn.Module,
+        transformer: nn.Module,
+        text_encoder: nn.Module | None = None,
+        tokenizer: Any | None = None,
+    ) -> "ZImagePipeline":
+        """Create a pipeline from pre-built components without loading from pretrained.
+
+        Downstream pipelines (e.g. MingImagePipeline) that manage their own
+        component loading use this factory instead of ``__init__`` to avoid
+        redundant ``from_pretrained`` calls for text_encoder / tokenizer they
+        do not need.
+        """
+        instance = cls.__new__(cls)
+        nn.Module.__init__(instance)
+        instance.od_config = od_config
+        instance.weights_sources = []
+        instance._execution_device = get_local_device()
+        instance.scheduler = scheduler
+        instance.text_encoder = text_encoder
+        instance.tokenizer = tokenizer
+        instance.vae = vae
+        instance.transformer = transformer
+        instance.vae_scale_factor = (
+            2 ** (len(vae.config.block_out_channels) - 1) if vae is not None else 8
+        )
+        instance.image_processor = VaeImageProcessor(
+            vae_scale_factor=instance.vae_scale_factor * 2, do_convert_rgb=True,
+        )
+        instance.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False),
+        )
+        return instance
+
     def encode_prompt(
         self,
         prompt: str | list[str],

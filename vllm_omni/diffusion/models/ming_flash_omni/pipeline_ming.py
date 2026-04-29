@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import logging
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -55,7 +56,37 @@ from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenCon
 logger = logging.getLogger(__name__)
 
 
+@dataclass
+class _ZPipelineSamplingParams:
+    """Typed shim satisfying the attributes ZImagePipeline.forward reads
+    from ``req.sampling_params``.  Unlike SimpleNamespace this fails loudly
+    at construction if a required field is missing."""
+
+    height: int
+    width: int
+    num_inference_steps: int
+    guidance_scale: float
+    generator: torch.Generator | None = None
+    strength: float | None = None
+    sigmas: list[float] | None = None
+    max_sequence_length: int = 512
+    guidance_rescale: float | None = None
+    num_outputs_per_prompt: int = 1
+
+
+@dataclass
+class _ZPipelineRequest:
+    """Typed shim satisfying the attributes ZImagePipeline.forward reads
+    from ``req``."""
+
+    request_id: str
+    sampling_params: _ZPipelineSamplingParams
+    prompts: list[dict[str, Any]] = field(default_factory=lambda: [{"prompt": "", "negative_prompt": ""}])
+
+
 class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+    _DUMMY_REQUEST_IDS = frozenset({"dummy_req_id"})
+
     """Ming-flash-omni-2.0 text-to-image diffusion pipeline.
 
     Composed of:
@@ -102,10 +133,9 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         )
 
         # ----- Condition encoder (Qwen2 connector + proj_in/out + norm×1000)
-        thinker_hidden_size = 4096  # BailingMoeV2 LLM hidden size for Ming 2.0
         self.condition_encoder = MingConditionEncoder(
             self.image_gen_config,
-            thinker_hidden_size=thinker_hidden_size,
+            thinker_hidden_size=self.image_gen_config.thinker_hidden_size,
             device=self.device,
             dtype=dtype,
         )
@@ -173,33 +203,21 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # __init__ above.
         self.weights_sources = []
 
-        # Expose the underlying ZImagePipeline's main forward body by
-        # building a lightweight wrapper. Rather than re-implementing the
-        # 30-step denoise + CFG + VAE decode here, we borrow ZImagePipeline.
-        # We cannot instantiate ZImagePipeline directly (its __init__ loads
-        # text_encoder/tokenizer which Ming lacks), so we do ``object.__new__``
-        # and copy the components we already built.
-        self._z_pipeline = object.__new__(ZImagePipeline)
-        nn.Module.__init__(self._z_pipeline)
-        self._z_pipeline.od_config = SimpleNamespace(
-            model=model_path,
-            quantization_config=None,
-            enable_diffusion_pipeline_profiler=False,
-            dtype=dtype,
+        # Reuse ZImagePipeline's denoise + CFG + VAE decode loop by creating
+        # an instance from our pre-built components.  Ming does not use
+        # ZImagePipeline's text_encoder / tokenizer (condition embeddings are
+        # computed by our own MingConditionEncoder), so we pass None for both.
+        self._z_pipeline = ZImagePipeline.from_components(
+            od_config=SimpleNamespace(
+                model=model_path,
+                quantization_config=None,
+                enable_diffusion_pipeline_profiler=False,
+                dtype=dtype,
+            ),
+            scheduler=self.scheduler,
+            vae=self.vae,
+            transformer=self.transformer,
         )
-        self._z_pipeline._execution_device = self.device
-        self._z_pipeline.weights_sources = []
-        self._z_pipeline.scheduler = self.scheduler
-        self._z_pipeline.vae = self.vae
-        self._z_pipeline.transformer = self.transformer
-        self._z_pipeline.text_encoder = None
-        self._z_pipeline.tokenizer = None
-        self._z_pipeline.vae_scale_factor = self.vae_scale_factor
-        self._z_pipeline.image_processor = self.image_processor
-        try:
-            self._z_pipeline.setup_diffusion_pipeline_profiler(enable_diffusion_pipeline_profiler=False)
-        except Exception:
-            logger.debug("[MingImagePipeline] z_pipeline profiler setup skipped")
 
         self.setup_diffusion_pipeline_profiler(
             enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False)
@@ -242,24 +260,16 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             total,
         )
 
-    def load_weights(self, weights):
-        """Mark all sub-module parameters as loaded.
+    # This pipeline loads all its own weights from checkpoint subfolders
+    # during ``__init__`` (condition_encoder, DiT, VAE, ByT5).  The
+    # diffusion loader still calls ``load_weights`` — we drain the iterator
+    # (backed by file-handle-owning generators) and report all parameters
+    # as loaded so the post-load completeness check passes.
+    _self_loading = True
 
-        The ZImagePipeline + condition_encoder components load their own
-        weights from checkpoint subfolders inside ``__init__``. vllm-omni's
-        diffusion loader still calls ``load_weights`` on the pipeline — we
-        return a set that covers every named parameter so the completeness
-        check passes, and we ignore whatever the caller streams in.
-        """
-        # drain the iterator (it may be backed by a generator that owns
-        # file handles; consuming it avoids resource leaks).
-        consumed = 0
-        for _ in weights:
-            consumed += 1
-        logger.info(
-            "[MingImagePipeline.load_weights] pipeline owns its own weights (%d external tensors ignored)",
-            consumed,
-        )
+    def load_weights(self, weights):
+        for _ in weights:  # drain to release file handles
+            pass
         return {name for name, _ in self.named_parameters()}
 
     # ------------------------------------------------------------------
@@ -345,8 +355,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # Detect vllm-omni's ``_dummy_run`` warmup pass and short-circuit to
         # avoid spending 30 seconds of DiT on a meaningless request. See
         # vllm_omni/diffusion/diffusion_engine.py::_dummy_run.
-        dummy_ids = {"dummy_req_id"}
-        if (req.request_ids and set(req.request_ids).issubset(dummy_ids)) or req.request_id == "dummy_req_id":
+        if (req.request_ids and set(req.request_ids).issubset(self._DUMMY_REQUEST_IDS)) or req.request_id == "dummy_req_id":
             logger.info("[MingImagePipeline.forward] dummy warmup run — returning blank output")
             dummy_h = int(req.sampling_params.height or 512)
             dummy_w = int(req.sampling_params.width or 512)
@@ -391,7 +400,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             scale = self.image_gen_config.img_gen_scales[-1]
             num_query_tokens = scale * scale
             hidden = torch.zeros(
-                (num_query_tokens, 4096),
+                (num_query_tokens, self.image_gen_config.thinker_hidden_size),
                 dtype=self._dtype,
                 device=self.device,
             )
@@ -491,25 +500,15 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         else:
             negative_prompt_embeds = [self.condition_encoder.zero_negative(e) for e in prompt_embeds]
 
-        # ZImagePipeline.forward reads a number of fields from req /
-        # req.sampling_params. The real ``req`` already has most of them;
-        # we only need to supply things ZImagePipeline expects that are
-        # Ming-specific. Wrap with a shim namespace if fields are missing.
-        z_sp = SimpleNamespace(
-            strength=None,
+        z_sp = _ZPipelineSamplingParams(
             height=height,
             width=width,
             num_inference_steps=num_inference_steps,
-            generator=generator,
-            sigmas=None,
-            max_sequence_length=512,
             guidance_scale=guidance_scale,
-            guidance_rescale=None,
-            num_outputs_per_prompt=1,
+            generator=generator,
         )
-        z_req = SimpleNamespace(
+        z_req = _ZPipelineRequest(
             request_id=req.request_id or "ming-imagegen",
-            prompts=[{"prompt": "", "negative_prompt": ""}],
             sampling_params=z_sp,
         )
 
