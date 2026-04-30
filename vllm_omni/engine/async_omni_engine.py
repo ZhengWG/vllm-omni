@@ -65,6 +65,7 @@ from vllm_omni.engine.stage_init_utils import (
     ReplicaInitPlan,
     _inject_inferred_kv_tp_topology,
     acquire_device_locks,
+    acquire_diffusion_device_locks,
     build_diffusion_config,
     build_engine_args_dict,
     build_llm_stage_output_processor,
@@ -610,7 +611,7 @@ class AsyncOmniEngine:
                     plan.metadata.stage_id,
                 )
                 with launch_cm as remote_resources:
-                    engine_manager, coordinator, addresses = remote_resources
+                    engine_manager, coordinator, addresses, _tensor_queue = remote_resources
 
                 logger.info(
                     "[AsyncOmniEngine] Stage %s remote engine startup completed",
@@ -740,6 +741,7 @@ class AsyncOmniEngine:
 
         client = None
         proc = None
+        lock_fds: list[int] = []
         try:
             if plan.launch_mode == "remote":
                 assert self._omni_master_server is not None
@@ -778,6 +780,11 @@ class AsyncOmniEngine:
                         if self.single_stage_mode:
                             assert self._omni_master_server is not None
                             od_config = build_diffusion_config(self.model, plan.stage_cfg, plan.metadata)
+                            lock_fds = acquire_diffusion_device_locks(
+                                plan.metadata.stage_id,
+                                od_config,
+                                stage_init_timeout,
+                            )
                             handshake_address, request_address, response_address = register_stage_with_omni_master(
                                 omni_master_address=self._omni_master_server.address,
                                 omni_master_port=self._omni_master_server.port,
@@ -837,6 +844,9 @@ class AsyncOmniEngine:
             if proc is not None:
                 terminate_alive_proc(proc)
             raise
+        finally:
+            if lock_fds:
+                release_device_locks(lock_fds)
 
     def _initialize_replica(
         self,

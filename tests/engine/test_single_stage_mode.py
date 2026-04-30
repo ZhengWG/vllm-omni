@@ -724,7 +724,7 @@ class TestSingleStageReplicaInitialization:
         def _fake_connect(**kwargs):
             events.append("enter")
             try:
-                yield fake_manager, fake_coordinator, fake_addresses
+                yield fake_manager, fake_coordinator, fake_addresses, None
             finally:
                 events.append("exit")
 
@@ -780,7 +780,7 @@ class TestSingleStageReplicaInitialization:
 
         @contextmanager
         def _fake_connect(**kwargs):
-            yield fake_manager, fake_coordinator, fake_addresses
+            yield fake_manager, fake_coordinator, fake_addresses, None
 
         plan = _make_llm_plan(
             0,
@@ -1056,7 +1056,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             omni_master_server=omni_master_server,
             stage_id=7,
             replica_id=2,
-        ) as (_, yielded_coordinator, yielded_addresses):
+        ) as (_, yielded_coordinator, yielded_addresses, _tensor_queue):
             assert yielded_coordinator is None
             assert yielded_addresses.coordinator_input == "tcp://coord-in"
             assert yielded_addresses.coordinator_output == "tcp://coord-out"
@@ -1088,7 +1088,7 @@ class TestConnectRemoteEngineCoresCoordinator:
             vllm_config=vllm_config,
             omni_master_server=omni_master_server,
             stage_id=7,
-        ) as (_, yielded_coordinator, yielded_addresses):
+        ) as (_, yielded_coordinator, yielded_addresses, _tensor_queue):
             assert yielded_coordinator is None
             assert yielded_addresses.coordinator_input is None
             assert yielded_addresses.coordinator_output is None
