@@ -549,6 +549,13 @@ def build_engine_args_dict(
     if stage_type != "diffusion":
         resolve_worker_cls(engine_args_dict)
 
+    if engine_args_dict.get("worker_type") == "generation":
+        # Non-AR generation stages (e.g. code2wav) do not benefit from
+        # prefix caching and can expose hybrid KV-cache layouts that vLLM's
+        # prefix-cache coordinator does not handle.
+        engine_args_dict.setdefault("disable_hybrid_kv_cache_manager", True)
+        engine_args_dict.setdefault("enable_prefix_caching", False)
+
     # Check whether the stage's default_sampling_params defines extra_args.
     default_sp = _to_dict(getattr(stage_config, "default_sampling_params", {}))
     engine_args_dict["has_sampling_extra_args"] = bool(default_sp.get("extra_args"))
