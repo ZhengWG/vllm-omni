@@ -115,6 +115,7 @@ class FakeOutputProcessor:
     def __init__(self, *, request_outputs: list[object] | None = None) -> None:
         self.request_outputs = list(request_outputs or [])
         self.add_request_calls: list[tuple[tuple[Any, ...], dict[str, Any]]] = []
+        self.abort_calls: list[list[str]] = []
 
     def add_request(self, *args, **kwargs) -> None:
         self.add_request_calls.append((args, kwargs))
@@ -125,6 +126,10 @@ class FakeOutputProcessor:
             request_outputs=list(self.request_outputs),
             reqs_to_abort=[],
         )
+
+    def abort_requests(self, request_ids, internal: bool = False):
+        self.abort_calls.append(request_ids)
+        return request_ids
 
     def update_scheduler_stats(self, _scheduler_stats) -> None:
         return None

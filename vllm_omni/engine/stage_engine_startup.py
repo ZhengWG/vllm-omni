@@ -14,7 +14,7 @@ import zmq
 from omegaconf import OmegaConf
 from vllm.config import CacheConfig, VllmConfig
 from vllm.logger import init_logger
-from vllm.utils.network_utils import get_open_port, zmq_socket_ctx
+from vllm.utils.network_utils import get_open_ports_list, zmq_socket_ctx
 from vllm.v1.engine.coordinator import DPCoordinator
 from vllm.v1.engine.utils import (
     STARTUP_POLL_PERIOD_MS,
