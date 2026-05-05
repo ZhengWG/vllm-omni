@@ -127,9 +127,7 @@ class OmniMasterServer:
                 route = (sid, replica_id)
                 self._stage_config_events[route] = threading.Event()
                 self._stage_coordinator_addresses[route] = StageCoordinatorAddresses()
-                hs_port = get_open_port()
-                inp_port = get_open_port()
-                out_port = get_open_port()
+                hs_port, inp_port, out_port = get_open_ports_list(count=3)
                 self._stage_routes[route] = StageAllocation(
                     handshake_bind_address=f"tcp://{master_address}:{hs_port}",
                     handshake_connect_address=f"tcp://{master_address}:{hs_port}",

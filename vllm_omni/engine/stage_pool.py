@@ -341,6 +341,13 @@ class StagePool:
         for replica_id, replica_request_ids in request_ids_by_replica.items():
             await self.clients[replica_id].abort_requests_async(replica_request_ids)
 
+        # Clean up OutputProcessor state (e.g. mm_accumulated tensors) that
+        # would otherwise leak — aborted requests never produce a final
+        # EngineCoreOutput, so process_outputs() never fires its cleanup path.
+        all_aborted = [rid for ids in request_ids_by_replica.values() for rid in ids]
+        if all_aborted and self._output_processor is not None:
+            self._output_processor.abort_requests(all_aborted, internal=True)
+
     async def collective_rpc(
         self,
         replica_id: int,
