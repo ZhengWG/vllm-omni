@@ -11,10 +11,9 @@ import torch.nn as nn
 from diffusers.schedulers.scheduling_flow_match_euler_discrete import FlowMatchEulerDiscreteScheduler
 from transformers.generation.configuration_utils import GenerationConfig
 from transformers.generation.utils import ALL_CACHE_NAMES, GenerationMixin
-from transformers.models.siglip2 import Siglip2VisionConfig, Siglip2VisionModel
 from transformers.utils.generic import ModelOutput
 from vllm.config.vllm import get_current_vllm_config
-from vllm.model_executor.models.utils import AutoWeightsLoader
+from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.transformers_utils.config import get_config
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -22,6 +21,7 @@ from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import DiffusionPipelineProfilerMixin
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.model_executor.models.hunyuan_image3.siglip2 import Siglip2VisionTransformer
 
 from .autoencoder import AutoencoderKLConv3D
 from .hunyuan_image3_tokenizer import TokenizerWrapper
@@ -64,6 +64,15 @@ def to_device(data, device):
 
 
 class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, DiffusionPipelineProfilerMixin):
+    hf_to_vllm_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.": "",
+        },
+        orig_to_new_substr={
+            "mlp.gate.wg.": "mlp.gate.",
+            "gate_and_up_proj.": "gate_up_proj.",
+        },
+    )
     _PROFILER_TARGETS = [
         "model.forward",
         "model.layers[0].forward",
@@ -71,6 +80,8 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         "model.layers[0].mlp.forward",
         "vae.encode",
         "vae.decode",
+        "patch_embed.forward",
+        "final_layer.forward",
     ]
 
     def __init__(self, od_config: OmniDiffusionConfig) -> None:
@@ -100,9 +111,7 @@ class HunyuanImage3Pipeline(HunyuanImage3PreTrainedModel, GenerationMixin, Diffu
         self._pipeline = None
         self._tkwrapper = TokenizerWrapper(od_config.model)
         self.image_processor = HunyuanImage3ImageProcessor(self.hf_config)
-        self.hf_config.vit.pop("use_return_dict", None)
-        vision_config = Siglip2VisionConfig(**self.hf_config.vit)
-        self.vision_model = Siglip2VisionModel(vision_config).vision_model
+        self.vision_model = Siglip2VisionTransformer(self.hf_config.vit)
         # self.vision_model = vision_model.vision_model
         self.vision_aligner = LightProjector(self.hf_config.vit_aligner)
         self.timestep_emb = TimestepEmbedder(hidden_size=self.hf_config.hidden_size)

@@ -45,8 +45,7 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
-        # TODO: Enable this when torch compile bugs are resolved
-        return False
+        return True
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
@@ -75,3 +74,8 @@ class XPUOmniPlatform(OmniPlatform, XPUPlatform):
     def get_free_memory(cls, device: torch.device | None = None) -> int:
         free, _ = torch.xpu.mem_get_info(device)
         return free
+
+    @classmethod
+    def get_profiler_cls(cls) -> str:
+        """Return XPU-specific profiler that handles XPU events."""
+        return "vllm_omni.platforms.xpu.profiler.XPUTorchProfilerWrapper"
