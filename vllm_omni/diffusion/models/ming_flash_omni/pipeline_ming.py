@@ -187,7 +187,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # Optional ByT5 glyph/text encoder. Only loaded when the checkpoint
         # ships ``byt5/``; otherwise the feature silently stays off and
         # ``extra_args.image_gen.byte5_text`` requests will be ignored.
-        byte5_dir = Path(model_path) / "byte5"
+        byte5_dir = Path(model_path) / "byt5"
         if byte5_dir.exists():
             self.byte5 = MingByT5Encoder.from_checkpoint(byte5_dir, device=self.device, dtype=dtype)
         else:

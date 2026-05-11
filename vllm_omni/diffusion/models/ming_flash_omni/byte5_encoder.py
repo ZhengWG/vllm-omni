@@ -102,15 +102,19 @@ class MingByT5Encoder(nn.Module):
         dtype: torch.dtype,
     ) -> MingByT5Encoder:
         byte5_dir = Path(byte5_dir)
-        # Filesystem layout + JSON keys use Ming's original ``byte5`` spelling.
-        cfg_raw = json.loads((byte5_dir / "byte5.json").read_text())
+        # Ming checkpoint uses ``byt5`` prefix in filenames and JSON keys;
+        # normalize to ``byt5`` naming consistently.
+        cfg_path = byte5_dir / "byt5.json"
+        cfg_raw = json.loads(cfg_path.read_text())
         cfg = SimpleNamespace(**cfg_raw)
-        byte5_config = cfg.byte5_config
-        mapper_config = cfg.byte5_mapper_config
-        max_length = int(cfg.byte5_max_length)
+        # Support both ``byt5_*`` (checkpoint) and ``byte5_*`` (legacy) keys.
+        byte5_config = getattr(cfg, "byt5_config", None) or cfg.byte5_config
+        mapper_config = getattr(cfg, "byt5_mapper_config", None) or cfg.byte5_mapper_config
+        max_length = int(getattr(cfg, "byt5_max_length", None) or cfg.byte5_max_length)
 
         # ---- Tokenizer + T5 encoder (base).
-        byte5_ckpt_path = byte5_dir / byte5_config["byte5_ckpt_path"].lstrip("./")
+        ckpt_key = byte5_config.get("byt5_ckpt_path") or byte5_config.get("byte5_ckpt_path")
+        byte5_ckpt_path = byte5_dir / ckpt_key.lstrip("./")
         tokenizer = AutoTokenizer.from_pretrained(byte5_ckpt_path, local_files_only=True)
         text_encoder = T5ForConditionalGeneration.from_pretrained(byte5_ckpt_path, local_files_only=True).get_encoder()
 
@@ -133,7 +137,7 @@ class MingByT5Encoder(nn.Module):
         # ---- Load byte5 text-encoder weights (base.pt wraps the backbone in a
         # trainable-module container; byte5_model.pt has the top-level encoder
         # state). Follow Ming's two-step load.
-        base_state = torch.load(byte5_dir / "byte5_model" / "base.pt", map_location="cpu", weights_only=False)
+        base_state = torch.load(byte5_dir / "byt5_model" / "base.pt", map_location="cpu", weights_only=False)
         prefix = "module.text_tower.encoder."
         base_filtered = {
             name[len(prefix) :]: state for name, state in base_state["state_dict"].items() if name.startswith(prefix)
@@ -141,7 +145,7 @@ class MingByT5Encoder(nn.Module):
         text_encoder.load_state_dict(base_filtered, strict=True)
         del base_state, base_filtered
 
-        encoder_state = torch.load(byte5_dir / "byte5_model" / "byte5_model.pt", map_location="cpu", weights_only=False)
+        encoder_state = torch.load(byte5_dir / "byt5_model" / "byt5_model.pt", map_location="cpu", weights_only=False)
         text_encoder.load_state_dict(encoder_state)
         del encoder_state
 
@@ -154,7 +158,7 @@ class MingByT5Encoder(nn.Module):
             sdxl_channels=int(mapper_config["sdxl_channels"]),
         )
         mapper_state = torch.load(
-            byte5_dir / "byte5_mapper" / "byte5_mapper.pt", map_location="cpu", weights_only=False
+            byte5_dir / "byt5_mapper" / "byt5_mapper.pt", map_location="cpu", weights_only=False
         )
         mapper.load_state_dict(mapper_state, strict=True)
         del mapper_state

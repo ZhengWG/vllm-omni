@@ -238,6 +238,8 @@ class MingFlashOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MingFlashOmn
 
         audio_length = int(audio_duration * sample_rate)
 
+        num_img2img = mm_counts.get("img2img", 0)
+
         mm_data: MultiModalDataDict = {
             "image": self._get_dummy_images(
                 width=image_width,
@@ -252,6 +254,13 @@ class MingFlashOmniThinkerDummyInputsBuilder(BaseDummyInputsBuilder[MingFlashOmn
             ),
             "audio": [(np.random.randn(audio_length).astype(np.float32), sample_rate) for _ in range(num_audios)],
         }
+
+        if num_img2img > 0:
+            mm_data["img2img"] = self._get_dummy_images(
+                width=image_width,
+                height=image_height,
+                num_images=num_img2img,
+            )
 
         return mm_data
 
@@ -531,7 +540,6 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         if images is not None:
             image_outputs = hf_processor.image_processor(
                 images=images,
-                videos=None,
                 return_tensors="pt",
             )
             data.update(image_outputs)
@@ -539,7 +547,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         videos = mm_data.get("videos", None)
         if videos is not None:
             video_outputs = hf_processor.image_processor(
-                images=None,
+                images=videos,
                 videos=videos,
                 return_tensors="pt",
             )

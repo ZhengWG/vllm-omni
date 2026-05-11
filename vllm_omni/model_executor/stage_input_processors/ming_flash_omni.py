@@ -317,24 +317,44 @@ def _slice_patch_hidden(
     return hidden
 
 
+def _resolve_token_ids_from_stage_or_defaults(
+    stage: Any | None,
+) -> tuple[int, int | None, int | None]:
+    """Return (image_patch_token_id, image_end_token_id, num_query_tokens).
+
+    Tries to read from the stage's HF config when available (old API).
+    Falls back to Ming-flash-omni-2.0 defaults when stage is None (new API).
+    """
+    if stage is not None:
+        return (
+            _resolve_image_patch_token_id(stage),
+            _resolve_image_end_token_id(stage),
+            _resolve_num_query_tokens(stage),
+        )
+    # Defaults from Ming-flash-omni-2.0:
+    #   llm_config.image_patch_token = 157157
+    #   llm_config.image_end_token   = 157159
+    #   img_gen_scales=[16] -> 16*16 = 256 query tokens
+    return (_DEFAULT_IMAGE_PATCH_TOKEN_ID, 157159, 256)
+
+
 def thinker2imagegen(
-    stage_list: list[Any],
-    engine_input_source: list[int],
+    source_outputs: list[Any],
     prompt: Any | None = None,
     requires_multimodal_data: bool = False,  # noqa: ARG001
 ) -> list[dict[str, Any]]:
     """Bridge thinker AR outputs into image-generation DiT inputs.
 
-    ``stage.engine_outputs`` holds ``[parent_output, *companion_outputs]``
-    (bundled by the orchestrator). Parent outputs feed
+    The orchestrator passes ``source_outputs`` as
+    ``[parent_output, *companion_outputs]``. Parent outputs feed
     ``extra[thinker_hidden_states]``; the cfg_text companion feeds
     ``extra[negative_thinker_hidden_states]`` used by MingImagePipeline as real
     CFG negative conditioning. Unknown-suffix outputs are skipped.
     """
-    source_stage, thinker_outputs = _validate_stage_inputs(stage_list, engine_input_source)
-    image_patch_token_id = _resolve_image_patch_token_id(source_stage)
-    image_end_token_id = _resolve_image_end_token_id(source_stage)
-    num_query_tokens = _resolve_num_query_tokens(source_stage)
+    thinker_outputs = source_outputs
+    image_patch_token_id, image_end_token_id, num_query_tokens = (
+        _resolve_token_ids_from_stage_or_defaults(stage=None)
+    )
 
     parent_output = None
     negative_output = None
@@ -372,12 +392,6 @@ def thinker2imagegen(
             extra["negative_thinker_hidden_states"] = neg_hidden
 
     # img2img: forward the reference image PIL/tensor to the diffusion stage.
-    # serving_chat's img2img branch originally writes the PIL to
-    # ``multi_modal_data["img2img"]``; ``_MingMultiModalDataParser`` then
-    # rewrites that key to ``multi_modal_data["image"]`` in-place so the
-    # thinker can embed it as a regular vision input. Read from whichever
-    # key the PIL ends up at — prefer ``image`` (the post-parser location)
-    # and fall back to ``img2img`` in case the parser didn't run (e.g. tests).
     if isinstance(prompt, dict):
         mm_data = prompt.get("multi_modal_data") or {}
         ref_image = mm_data.get("image")
@@ -390,11 +404,21 @@ def thinker2imagegen(
         if ref_image is not None:
             extra["reference_image"] = ref_image
 
-        # Ming-style auto-extraction of quoted glyph text for ByT5 (no API change
-        # needed on the caller side — writing the text inside quotes is enough).
-        glyph = _extract_byte5_glyph_text(prompt.get("prompt", ""))
-        if glyph:
-            extra["byte5_text"] = [glyph]
+        # ByT5 glyph text: check explicit API (image_gen_extra_args forwarded
+        # from serving_chat) first, then auto-extract from quoted prompt text.
+        prompt_text = prompt.get("prompt", "")
+        ig_extra = prompt.get("image_gen_extra_args") or {}
+        byte5_texts = ig_extra.get("byte5_text")
+        if isinstance(byte5_texts, list) and byte5_texts:
+            # Wrap raw strings in Ming's expected format if needed.
+            extra["byte5_text"] = [
+                t if t.startswith("Text ") else f'Text "{t}". '
+                for t in byte5_texts if isinstance(t, str)
+            ]
+        else:
+            glyph = _extract_byte5_glyph_text(prompt_text)
+            if glyph:
+                extra["byte5_text"] = [glyph]
 
     return [{"prompt": "", "extra": extra}]
 
