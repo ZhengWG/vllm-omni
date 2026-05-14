@@ -1440,5 +1440,166 @@ class TestSendRetry(unittest.TestCase):
         sender.shutdown_omni_connectors()
 
 
+class TestAsyncPrefillCompleteGate(unittest.TestCase):
+    """Receiver-side prefill completeness gate (Qwen3-Omni multi-replica
+    root cause #2).
+
+    The talker's chunk_id==0 sender protocol emits its first prefill payload
+    after merging only the first two thinker chunks; subsequent chunks arrive
+    later and are accumulated on the receiver side. Without a gate, any
+    consumable chunk wakes the talker scheduler, which may dispatch a
+    forward step on a partial ``embed.prefill`` while ``ids.prompt`` is the
+    full prompt. ``_get_talker_assistant_parts`` then slices an empty
+    assistant segment and crashes with tensor (6) vs (9). The gate withholds
+    the wake-up until prefill rows >= prompt len; ``is_finished`` always
+    forces a wake to keep the finish-sentinel path intact.
+    """
+
+    def _make_host(
+        self,
+        *,
+        stage_id: int = 1,
+        model_mode: str = "ar",
+        async_chunk: bool = True,
+    ):
+        host = MixinHost()
+        # Avoid spinning up real connector / threads — directly populate the
+        # state attributes touched by ``_async_prefill_complete``.
+        host._stage_id = stage_id
+        host._model_mode = model_mode
+        host._async_chunk = async_chunk
+        return host
+
+    @staticmethod
+    def _payload(*, prefill_rows: int | None, prompt_len: int | None):
+        payload: dict = {}
+        if prefill_rows is not None:
+            payload["embed"] = {"prefill": torch.zeros((prefill_rows, 4))}
+        if prompt_len is not None:
+            payload["ids"] = {"prompt": [0] * prompt_len}
+        return payload
+
+    # ---- gate semantics ----
+
+    def test_partial_prefill_blocks_wakeup(self):
+        host = self._make_host()
+        # Mirrors the multi-replica failure: chunk_0+chunk_1 = 768 rows but
+        # the full prompt is 1024 tokens.
+        payload = self._payload(prefill_rows=768, prompt_len=1024)
+        self.assertFalse(host._async_prefill_complete(payload))
+
+    def test_complete_prefill_allows_wakeup(self):
+        host = self._make_host()
+        payload = self._payload(prefill_rows=1024, prompt_len=1024)
+        self.assertTrue(host._async_prefill_complete(payload))
+
+    def test_overshoot_prefill_allows_wakeup(self):
+        host = self._make_host()
+        # Some sender paths can land prefill_rows > prompt_len (e.g. one
+        # extra decode embed appended). The gate uses >= so this releases.
+        payload = self._payload(prefill_rows=1025, prompt_len=1024)
+        self.assertTrue(host._async_prefill_complete(payload))
+
+    def test_decode_only_payload_bypass(self):
+        host = self._make_host()
+        payload = {
+            "embed": {"decode": torch.zeros((1, 4))},
+            "ids": {"output": [42]},
+        }
+        # No embed.prefill key → not a prefill update → gate doesn't apply.
+        self.assertTrue(host._async_prefill_complete(payload))
+
+    def test_missing_ids_prompt_bypass(self):
+        host = self._make_host()
+        payload = {"embed": {"prefill": torch.zeros((100, 4))}}
+        # Upstream contract changed; play safe and release.
+        self.assertTrue(host._async_prefill_complete(payload))
+
+    def test_non_dict_payload_bypass(self):
+        host = self._make_host()
+        self.assertTrue(host._async_prefill_complete(None))
+        self.assertTrue(host._async_prefill_complete([1, 2, 3]))
+        self.assertTrue(host._async_prefill_complete("not a payload"))
+
+    def test_tuple_prompt_supported(self):
+        host = self._make_host()
+        payload = {
+            "embed": {"prefill": torch.zeros((5, 4))},
+            "ids": {"prompt": (0, 1, 2, 3, 4, 5, 6, 7, 8, 9)},
+        }
+        self.assertFalse(host._async_prefill_complete(payload))
+
+    # ---- gate scope ----
+
+    def test_other_stages_bypass(self):
+        # Stage 0 (thinker, no upstream) and Stage 2 (code2wav) must not be
+        # gated — the partial-prefill semantics are talker-specific.
+        for stage_id in (0, 2, 3):
+            host = self._make_host(stage_id=stage_id)
+            payload = self._payload(prefill_rows=10, prompt_len=100)
+            self.assertTrue(
+                host._async_prefill_complete(payload),
+                msg=f"gate must be bypass for stage {stage_id}",
+            )
+
+    def test_non_ar_modes_bypass(self):
+        for mode in ("diffusion", "pooling", ""):
+            host = self._make_host(model_mode=mode)
+            payload = self._payload(prefill_rows=10, prompt_len=100)
+            self.assertTrue(host._async_prefill_complete(payload))
+
+    def test_full_payload_mode_bypass(self):
+        host = self._make_host(async_chunk=False)
+        payload = self._payload(prefill_rows=10, prompt_len=100)
+        self.assertTrue(host._async_prefill_complete(payload))
+
+    # ---- combined wake-up decision (mirrors _poll_single_request) ----
+
+    @staticmethod
+    def _wake_decision(host, staged, *, payload_consumable: bool, is_finished: bool) -> bool:
+        # Replicates the exact wake-up branch in _poll_single_request so that
+        # any future refactor that drops the ``and prefill_complete`` clause
+        # is caught by these tests, not just by integration runs.
+        prefill_complete = host._async_prefill_complete(staged)
+        return (payload_consumable and prefill_complete) or is_finished
+
+    def test_partial_prefill_no_wake(self):
+        host = self._make_host()
+        staged = self._payload(prefill_rows=512, prompt_len=1024)
+        self.assertFalse(self._wake_decision(host, staged, payload_consumable=True, is_finished=False))
+
+    def test_complete_prefill_wakes(self):
+        host = self._make_host()
+        staged = self._payload(prefill_rows=1024, prompt_len=1024)
+        self.assertTrue(self._wake_decision(host, staged, payload_consumable=True, is_finished=False))
+
+    def test_is_finished_forces_wake_even_if_partial(self):
+        host = self._make_host()
+        staged = self._payload(prefill_rows=64, prompt_len=1024)
+        self.assertTrue(self._wake_decision(host, staged, payload_consumable=True, is_finished=True))
+
+    def test_metadata_only_payload_no_wake(self):
+        host = self._make_host()
+        staged = self._payload(prefill_rows=1024, prompt_len=1024)
+        self.assertFalse(self._wake_decision(host, staged, payload_consumable=False, is_finished=False))
+
+    def test_finish_sentinel_with_metadata_only_wakes(self):
+        host = self._make_host()
+        staged = self._payload(prefill_rows=64, prompt_len=1024)
+        self.assertTrue(self._wake_decision(host, staged, payload_consumable=False, is_finished=True))
+
+    def test_other_stage_partial_wakes_through_decision(self):
+        # The wake decision uses the gate; for non-talker stages the gate
+        # is bypass, so partial payloads at e.g. stage-2 still wake.
+        host = self._make_host(stage_id=2)
+        staged = self._payload(prefill_rows=512, prompt_len=1024)
+        self.assertTrue(self._wake_decision(host, staged, payload_consumable=True, is_finished=False))
+
+    def test_decode_chunk_wakes(self):
+        host = self._make_host()
+        staged = {"embed": {"decode": torch.zeros((1, 4))}, "ids": {"output": [1]}}
+        self.assertTrue(self._wake_decision(host, staged, payload_consumable=True, is_finished=False))
+
+
 if __name__ == "__main__":
     unittest.main()

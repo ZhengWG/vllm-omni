@@ -479,6 +479,62 @@ class OmniConnectorModelRunnerMixin:
                 return True
         return False
 
+    def _async_prefill_complete(self, staged_payload: Any) -> bool:
+        """Return True when an async-chunk talker payload may wake the scheduler.
+
+        Background — Qwen3-Omni multi-replica root cause #2: the sender side
+        ``thinker2talker_async_chunk`` emits its first prefill payload after
+        merging only the first two chunked-prefill chunks. ``ids.prompt`` is
+        always the *full* prompt token id list, so any prompt that
+        chunked-prefill splits into N>=3 chunks ends up with
+        ``embed.prefill.shape[0] < len(ids.prompt)`` on the first emitted
+        payload. Receiver-side ``_payload_is_consumable`` does not check
+        prefill completeness, so multi-replica (where talker is no longer the
+        bottleneck) wakes the talker scheduler on a partial payload. The
+        downstream ``_get_talker_assistant_parts`` then slices an empty
+        assistant segment (using the full ``ids.prompt`` to compute boundaries
+        against a too-short ``thinker_embed``) and crashes with
+        ``RuntimeError: tensor a (6) vs b (9)``.
+
+        This gate, applied only on stage-1 AR async-chunk talkers, withholds
+        the scheduler wake-up until the cumulative ``embed.prefill`` rows
+        cover the full ``ids.prompt``. Decode-only updates (no ``embed.prefill``
+        tensor) and other stages bypass the gate. ``is_finished`` paths are
+        forced through by the caller to avoid any deadlock risk and let the
+        existing length-tolerant fallbacks (RF-1 / RF-2) handle edge cases.
+
+        Returns:
+            True if the gate does not apply or the payload is complete enough
+            to be consumed; False if the talker scheduler must wait for more
+            chunks.
+        """
+        # Gate scope: only async-chunk AR talker stage. Other stages /
+        # full-payload mode keep their existing behavior.
+        if self._stage_id != 1 or self._model_mode != "ar" or not self._async_chunk:
+            return True
+        if not isinstance(staged_payload, dict):
+            return True
+        embed = staged_payload.get("embed")
+        if not isinstance(embed, dict):
+            return True
+        prefill = embed.get("prefill")
+        if not isinstance(prefill, torch.Tensor):
+            # Decode chunk: payload carries embed.decode (or audio codes), not
+            # prefill. The gate doesn't apply — the talker has already moved
+            # past prefill admission for this req.
+            return True
+        ids = staged_payload.get("ids")
+        if not isinstance(ids, dict):
+            return True
+        prompt = ids.get("prompt")
+        # ``ids.prompt`` is built as a Python list in
+        # ``thinker2talker_async_chunk`` (see _ensure_list at request build
+        # time). Anything else means the upstream contract changed; play
+        # safe and let the wake-up through.
+        if not isinstance(prompt, (list, tuple)):
+            return True
+        return int(prefill.shape[0]) >= len(prompt)
+
     @staticmethod
     def _get_local_tp_group() -> Any | None:
         """Return the local TP group when tensor parallelism is initialized."""
@@ -1627,17 +1683,40 @@ class OmniConnectorModelRunnerMixin:
                 staged_payload = self._local_stage_payload_cache[req_id]
                 self._async_chunk_updated_req_ids.add(req_id)
                 self.put_local_request_metadata(req_id, self._extract_scheduling_metadata(staged_payload))
-                # A finish-only sentinel still needs one terminal wake-up so
-                # the downstream stage can sync the merged local payload and
-                # flush/finish even when the last recv carries no new
-                # consumable chunk bytes.
-                if payload_consumable or is_finished:
+                # Receiver-side prefill completeness gating
+                # (Qwen3-Omni multi-replica root cause #2). Withhold the
+                # scheduler wake-up while ``embed.prefill`` rows are still
+                # short of ``ids.prompt`` so the talker never sees a partial
+                # prefill. ``is_finished`` is a hard release to keep the
+                # finish-sentinel path identical to before (no deadlock risk
+                # if the protocol invariant ever doesn't hold — RF-1 / RF-2
+                # length-tolerant paths still defend the talker).
+                prefill_complete = self._async_prefill_complete(staged_payload)
+                should_wake = (payload_consumable and prefill_complete) or is_finished
+                if should_wake:
                     self._finished_load_reqs.add(req_id)
                 if is_finished and not payload_consumable:
                     logger.debug(
                         "[Stage-%s] finish sentinel arrived for req=%s without new consumable payload",
                         self._stage_id,
                         req_id,
+                    )
+                elif payload_consumable and not prefill_complete:
+                    embed_dict = staged_payload.get("embed", {}) if isinstance(staged_payload, dict) else {}
+                    prefill_t = embed_dict.get("prefill") if isinstance(embed_dict, dict) else None
+                    prefill_rows = (
+                        int(prefill_t.shape[0]) if isinstance(prefill_t, torch.Tensor) else -1
+                    )
+                    ids_dict = staged_payload.get("ids", {}) if isinstance(staged_payload, dict) else {}
+                    prompt = ids_dict.get("prompt") if isinstance(ids_dict, dict) else None
+                    prompt_len = len(prompt) if isinstance(prompt, (list, tuple)) else -1
+                    logger.debug(
+                        "[Stage-%s] gating talker wake-up for req=%s: "
+                        "prefill_rows=%d < prompt_len=%d (waiting for more chunks)",
+                        self._stage_id,
+                        req_id,
+                        prefill_rows,
+                        prompt_len,
                     )
                 elif not payload_consumable:
                     logger.debug(
