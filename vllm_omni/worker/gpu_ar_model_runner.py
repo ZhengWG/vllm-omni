@@ -42,6 +42,7 @@ from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.worker.dfinal_utils import recompute_sampling_logits_indices
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
 from vllm_omni.worker.omni_connector_model_runner_mixin import OmniConnectorModelRunnerMixin
 
@@ -598,7 +599,21 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         kv_connector_output,
                     )
 
-                sample_hidden_states = hidden_states[logits_indices]
+                # D-final: recompute sampler gather indices against the talker
+                # view (which may be shorter than the scheduler view because
+                # talker_preprocess_prefill drops segments such as the ChatML
+                # ``system`` block). Helper returns None for non-omni models or
+                # if anything looks inconsistent → fall back to the scheduler
+                # view (unchanged behavior + RF-3 clamp safety net).
+                _talker_li = recompute_sampling_logits_indices(
+                    seg_lens=getattr(self, "_omni_talker_seg_lens", None),
+                    num_reqs=self.input_batch.num_reqs,
+                    hidden_states_rows=int(hidden_states.shape[0]),
+                    scheduler_logits_indices=logits_indices,
+                )
+                sampling_logits_indices = _talker_li if _talker_li is not None else logits_indices
+
+                sample_hidden_states = hidden_states[sampling_logits_indices]
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
                     logits = self.model.compute_logits(
@@ -610,7 +625,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Rare case.
                 assert not self.is_pooling_model
 
-                sample_hidden_states = hidden_states[logits_indices]
+                # D-final: same recompute as the common branch above. Done
+                # locally so attention metadata / spec-decode keep the
+                # scheduler-view ``logits_indices``.
+                _talker_li = recompute_sampling_logits_indices(
+                    seg_lens=getattr(self, "_omni_talker_seg_lens", None),
+                    num_reqs=self.input_batch.num_reqs,
+                    hidden_states_rows=int(hidden_states.shape[0]),
+                    scheduler_logits_indices=logits_indices,
+                )
+                sampling_logits_indices = _talker_li if _talker_li is not None else logits_indices
+                sample_hidden_states = hidden_states[sampling_logits_indices]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {
                         "residual": not is_residual_scattered_for_sp(self.vllm_config, num_tokens_padded)

@@ -44,6 +44,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         super().__init__(*args, **kwargs)
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
+        # D-final: per-request actual talker segment lengths (after talker
+        # preprocess, e.g. system-segment skip). Published by ``_preprocess``
+        # for AR runners to recompute the sampler ``logits_indices`` against
+        # the talker view (vs. the scheduler / thinker view). ``None`` when
+        # the model has no custom ``has_preprocess`` hook (non-omni / pooling).
+        self._omni_talker_seg_lens: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
@@ -1304,6 +1310,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
+            # D-final: collect per-request talker seg_len for the AR runner to
+            # rebuild ``logits_indices`` against the talker view rather than
+            # the scheduler view. We append in ``input_batch.req_ids`` order so
+            # downstream cumsum stays aligned with ``query_start_loc``.
+            seg_lens_list: list[int] = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1343,13 +1354,25 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
+                seg_lens_list.append(int(seg_len))
                 inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
                     input_ids[s : s + seg_len] = req_input_ids
 
+            # D-final: publish the per-req talker seg_lens for AR runners to
+            # consume right before ``hidden_states[logits_indices]``. Empty
+            # list (no preprocess executed for this batch) → leave as None.
+            self._omni_talker_seg_lens = (
+                np.array(seg_lens_list, dtype=np.int32) if seg_lens_list else None
+            )
+
             # run talker mtp decode
             if self.has_talker_mtp:
                 self._talker_mtp_forward(decode_req_ids, inputs_embeds)
+        else:
+            # No custom preprocess hook → make sure stale seg_lens from a
+            # previous step do not leak into the AR runner's recompute path.
+            self._omni_talker_seg_lens = None
 
         return (
             input_ids,

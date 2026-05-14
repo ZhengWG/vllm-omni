@@ -46,6 +46,7 @@ from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTran
 from vllm_omni.outputs import OmniModelRunnerOutput
 from vllm_omni.platforms.npu.worker.npu_model_runner import OmniNPUModelRunner
 from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+from vllm_omni.worker.dfinal_utils import recompute_sampling_logits_indices
 
 
 class ExecuteModelState(NamedTuple):
@@ -654,7 +655,17 @@ class NPUARModelRunner(OmniNPUModelRunner):
                         self.debugger.step()
                     return output
 
-                sample_hidden_states = hidden_states[logits_indices]
+                # D-final: see vllm_omni/worker/gpu_ar_model_runner.py for the
+                # rationale. Recompute against the talker view; keep the
+                # original ``logits_indices`` for attention/spec-decode paths.
+                _talker_li = recompute_sampling_logits_indices(
+                    seg_lens=getattr(self, "_omni_talker_seg_lens", None),
+                    num_reqs=self.input_batch.num_reqs,
+                    hidden_states_rows=int(hidden_states.shape[0]),
+                    scheduler_logits_indices=logits_indices,
+                )
+                sampling_logits_indices = _talker_li if _talker_li is not None else logits_indices
+                sample_hidden_states = hidden_states[sampling_logits_indices]
                 #  -------------------------------------- Omni-new -------------------------------------------------
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
@@ -668,12 +679,21 @@ class NPUARModelRunner(OmniNPUModelRunner):
                 # Rare case.
                 assert not self.is_pooling_model
 
+                # D-final: same recompute as the common branch above.
+                _talker_li = recompute_sampling_logits_indices(
+                    seg_lens=getattr(self, "_omni_talker_seg_lens", None),
+                    num_reqs=self.input_batch.num_reqs,
+                    hidden_states_rows=int(hidden_states.shape[0]),
+                    scheduler_logits_indices=logits_indices,
+                )
+                sampling_logits_indices = _talker_li if _talker_li is not None else logits_indices
+
                 if not get_pp_group().is_last_rank:
-                    sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states = hidden_states[sampling_logits_indices]
                     get_pp_group().send_tensor_dict(hidden_states.tensors, all_gather_group=get_tp_group())
                     logits = None
                 else:
-                    sample_hidden_states = hidden_states[logits_indices]
+                    sample_hidden_states = hidden_states[sampling_logits_indices]
                     #  -------------------------------------- Omni-new -------------------------------------------------
                     # Try with sampling_metadata first; fall back to without for models that don't support it
                     try:
