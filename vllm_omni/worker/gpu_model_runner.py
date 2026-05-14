@@ -1362,9 +1362,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # D-final: publish the per-req talker seg_lens for AR runners to
             # consume right before ``hidden_states[logits_indices]``. Empty
             # list (no preprocess executed for this batch) → leave as None.
-            self._omni_talker_seg_lens = (
-                np.array(seg_lens_list, dtype=np.int32) if seg_lens_list else None
-            )
+            self._omni_talker_seg_lens = np.array(seg_lens_list, dtype=np.int32) if seg_lens_list else None
 
             # run talker mtp decode
             if self.has_talker_mtp:

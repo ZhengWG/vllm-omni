@@ -86,9 +86,7 @@ class TestRecomputeArithmetic:
         )
         assert result is None
 
-    def test_returns_none_when_seg_lens_sum_mismatches_hidden_states(
-        self, caplog: pytest.LogCaptureFixture
-    ):
+    def test_returns_none_when_seg_lens_sum_mismatches_hidden_states(self, caplog: pytest.LogCaptureFixture):
         """Belt-and-suspenders fallback: if seg_lens.sum() doesn't match
         hidden_states.shape[0], skip recompute and let the original
         scheduler-view indexing happen (RF-3 clamp can still catch it).
@@ -103,9 +101,9 @@ class TestRecomputeArithmetic:
                 scheduler_logits_indices=scheduler_li,
             )
         assert result is None
-        assert any(
-            "sum=2036" in rec.message and "9999" in rec.message for rec in caplog.records
-        ), "expected sum-mismatch warning"
+        assert any("sum=2036" in rec.message and "9999" in rec.message for rec in caplog.records), (
+            "expected sum-mismatch warning"
+        )
 
     def test_recomputes_indices_for_qwen3_omni_doc_dump125(self):
         """Reproduce DUMP-125 from the post-mortem and validate the fix output.

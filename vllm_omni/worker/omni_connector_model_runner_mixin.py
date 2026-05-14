@@ -1704,9 +1704,7 @@ class OmniConnectorModelRunnerMixin:
                 elif payload_consumable and not prefill_complete:
                     embed_dict = staged_payload.get("embed", {}) if isinstance(staged_payload, dict) else {}
                     prefill_t = embed_dict.get("prefill") if isinstance(embed_dict, dict) else None
-                    prefill_rows = (
-                        int(prefill_t.shape[0]) if isinstance(prefill_t, torch.Tensor) else -1
-                    )
+                    prefill_rows = int(prefill_t.shape[0]) if isinstance(prefill_t, torch.Tensor) else -1
                     ids_dict = staged_payload.get("ids", {}) if isinstance(staged_payload, dict) else {}
                     prompt = ids_dict.get("prompt") if isinstance(ids_dict, dict) else None
                     prompt_len = len(prompt) if isinstance(prompt, (list, tuple)) else -1
