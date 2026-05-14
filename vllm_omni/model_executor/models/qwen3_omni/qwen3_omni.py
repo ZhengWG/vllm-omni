@@ -72,6 +72,16 @@ TALKER_CODEC_THINK_EOS_ID = 4205  # Think mode end
 logger = init_logger(__name__)
 
 
+def _slice_or_zero_pad(tensor: torch.Tensor, start: int, end: int, hidden_dim: int) -> torch.Tensor:
+    """Return ``tensor[start:end]``, zero-padded along dim 0 to ``end - start`` rows."""
+    sliced = tensor[start:end]
+    missing = (end - start) - sliced.shape[0]
+    if missing <= 0:
+        return sliced
+    padding = torch.zeros((missing, hidden_dim), device=tensor.device, dtype=tensor.dtype)
+    return torch.cat((sliced, padding), dim=0)
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3OmniMoeThinkerMultiModalProcessor,
     info=Qwen3OmniMoeThinkerProcessingInfo,
@@ -647,7 +657,17 @@ class Qwen3OmniMoeForConditionalGeneration(
         """
         Postprocess the talker hidden states.
         """
-        return {"hidden_states": {"last": hidden_states[-1, :].detach()}}
+        # hidden_states can be empty under multi-replica chunked-prefill; fall
+        # back to a zero "last" sentinel instead of indexing into an empty tensor.
+        if hidden_states.shape[0] == 0:
+            last = torch.zeros(
+                hidden_states.shape[1:],
+                device=hidden_states.device,
+                dtype=hidden_states.dtype,
+            )
+        else:
+            last = hidden_states[-1, :].detach()
+        return {"hidden_states": {"last": last}}
 
     def talker_preprocess(self, input_ids: torch.Tensor, input_embeds: torch.Tensor, **info_dict: dict):
         """
@@ -1101,19 +1121,18 @@ class Qwen3OmniMoeForConditionalGeneration(
             tts_pad_embed.device
         )  # [t, d]
 
-        # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
+        # Fixed layout: [3 prefix] + [4 pad] + [1 BOS] + [1 first text] = 9 rows.
+        # assistant_hidden may be shorter than expected under multi-replica
+        # chunked-prefill, so zero-pad both slices to keep the layout at [9, d].
+        hidden_dim = self.config.talker_config.text_config.hidden_size
+        prefix = _slice_or_zero_pad(assistant_hidden, 0, 3, hidden_dim)
+        first_text = _slice_or_zero_pad(assistant_hidden, 3, 4, hidden_dim)
         assistant_text_hidden = torch.cat(
             (
-                assistant_hidden[:3],
+                prefix,
                 tts_pad_embed.expand(4, -1),
                 tts_bos_embed,
-                assistant_hidden[3:4]
-                if assistant_hidden.shape[0] > 3
-                else torch.zeros(
-                    (1, assistant_hidden.shape[1]),
-                    device=assistant_hidden.device,
-                    dtype=assistant_hidden.dtype,
-                ),  # First text
+                first_text,
             ),
             dim=0,
         )

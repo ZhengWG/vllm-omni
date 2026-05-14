@@ -294,6 +294,27 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
         return combined_hidden_states, combined_multimodal_outputs
 
+    def _maybe_recompute_talker_logits_indices(
+        self, logits_indices: torch.Tensor, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """Rebuild ``logits_indices`` from per-req talker output lengths.
+
+        ``logits_indices`` is derived from thinker-side ``num_scheduled_tokens``,
+        but ``talker_preprocess`` may skip segments (e.g. the ChatML system
+        block), leaving ``hidden_states`` with fewer rows. Only applies when the
+        captured seg_lens match both the request count and the row count, so it
+        is a no-op for non-talker stages.
+        """
+        seg_lens = getattr(self, "_omni_talker_seg_lens", None)
+        if (
+            seg_lens is None
+            or len(seg_lens) != logits_indices.numel()
+            or sum(seg_lens) != hidden_states.shape[0]
+        ):
+            return logits_indices
+        seg_lens_t = torch.tensor(seg_lens, device=logits_indices.device, dtype=logits_indices.dtype)
+        return seg_lens_t.cumsum(0) - 1
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -598,6 +619,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         kv_connector_output,
                     )
 
+                logits_indices = self._maybe_recompute_talker_logits_indices(logits_indices, hidden_states)
                 sample_hidden_states = hidden_states[logits_indices]
                 # Try with sampling_metadata first; fall back to without for models that don't support it
                 try:
@@ -610,6 +632,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 # Rare case.
                 assert not self.is_pooling_model
 
+                logits_indices = self._maybe_recompute_talker_logits_indices(logits_indices, hidden_states)
                 sample_hidden_states = hidden_states[logits_indices]
                 if not get_pp_group().is_last_rank:
                     all_gather_tensors = {

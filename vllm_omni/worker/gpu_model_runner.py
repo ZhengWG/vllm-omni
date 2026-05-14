@@ -45,6 +45,9 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
+        # Per-req talker output lengths captured in _preprocess; used by the AR
+        # runner to rebuild logits_indices. None for non-talker stages.
+        self._omni_talker_seg_lens: list[int] | None = None
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
@@ -1285,6 +1288,8 @@ class OmniGPUModelRunner(GPUModelRunner):
             dtype=np.int32,
         )
         self._omni_num_scheduled_tokens_np = num_scheduled_tokens_np
+        # reset; only the talker has_preprocess branch below repopulates it
+        self._omni_talker_seg_lens = None
 
         # Note: only prefill need collect additional_information for now.
         # Decode don't need per_req_additional_information anymore.
@@ -1304,6 +1309,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Overlay custom prompt_embeds per request for the prompt portion;
             # collect additional_information (tensor/list) for prefill portion only
             decode_req_ids = []
+            talker_seg_lens: list[int] = []
             for req_index, req_id in enumerate(self.input_batch.req_ids):
                 req_infos = self.model_intermediate_buffer.get(req_id, {})
 
@@ -1343,9 +1349,15 @@ class OmniGPUModelRunner(GPUModelRunner):
 
                 # update the inputs_embeds and input_ids
                 seg_len = min(span_len, req_embeds.shape[0])
+                talker_seg_lens.append(int(seg_len))
                 inputs_embeds[s : s + seg_len] = req_embeds[:seg_len]
                 if isinstance(req_input_ids, torch.Tensor) and req_input_ids.numel() == seg_len:
                     input_ids[s : s + seg_len] = req_input_ids
+
+            # Expose per-req talker output lengths so the AR runner can rebuild
+            # logits_indices (talker_preprocess skips segments, so thinker-side
+            # num_scheduled_tokens over-counts).
+            self._omni_talker_seg_lens = talker_seg_lens
 
             # run talker mtp decode
             if self.has_talker_mtp:
