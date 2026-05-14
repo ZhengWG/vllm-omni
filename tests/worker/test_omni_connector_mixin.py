@@ -1600,6 +1600,139 @@ class TestAsyncPrefillCompleteGate(unittest.TestCase):
         staged = {"embed": {"decode": torch.zeros((1, 4))}, "ids": {"output": [1]}}
         self.assertTrue(self._wake_decision(host, staged, payload_consumable=True, is_finished=False))
 
+    # ---- end-to-end through _poll_single_request ----
+
+    def _make_talker_host_with_mock_connector(self):
+        host = MixinHost()
+        host.init_omni_connectors(
+            vllm_config=None,
+            model_config=_make_model_config(stage_id=1, async_chunk=True, worker_type="ar"),
+        )
+        host._omni_connector = MagicMock()
+        host._stage_id = 1
+        host._async_chunk = True
+        host._model_mode = "ar"
+        host._request_ids_mapping["r1"] = "ext-r1"
+        host._get_req_chunk["r1"] = 0
+        return host
+
+    def test_poll_single_request_partial_prefill_does_not_wake(self):
+        """Receiver gets first prefill payload that is shorter than ids.prompt
+        (e.g. chunk_0+chunk_1 merged = 768 rows when prompt = 1024 tokens).
+        Talker scheduler must NOT be woken; chunk_ready_req_ids stays empty.
+        """
+        host = self._make_talker_host_with_mock_connector()
+        host._omni_connector.get.return_value = (
+            {
+                "embed": {"prefill": torch.zeros((768, 4))},
+                "ids": {"prompt": list(range(1024))},
+                "meta": {"finished": torch.tensor(False)},
+            },
+            1,
+        )
+
+        made_progress = host._poll_single_request("r1")
+        self.assertTrue(made_progress)  # the chunk itself was received
+        self.assertNotIn("r1", host._finished_load_reqs)  # but no wake
+
+        output = host.get_omni_connector_output()
+        self.assertEqual(output.chunk_ready_req_ids, set())
+
+        host.shutdown_omni_connectors()
+
+    def test_poll_single_request_completes_after_followup_chunks(self):
+        """First chunk arrives partial (768/1024) → no wake. Follow-up chunk
+        of 256 rows brings cumulative prefill to 1024 → wake.
+        """
+        host = self._make_talker_host_with_mock_connector()
+        host._omni_connector.get.side_effect = [
+            (
+                {
+                    "embed": {"prefill": torch.zeros((768, 4))},
+                    "ids": {"prompt": list(range(1024))},
+                    "meta": {"finished": torch.tensor(False)},
+                },
+                1,
+            ),
+            (
+                {
+                    "embed": {"prefill": torch.zeros((256, 4))},
+                    "meta": {"finished": torch.tensor(False)},
+                },
+                1,
+            ),
+        ]
+
+        host._poll_single_request("r1")
+        self.assertNotIn("r1", host._finished_load_reqs)
+        first_output = host.get_omni_connector_output()
+        self.assertEqual(first_output.chunk_ready_req_ids, set())
+
+        host._poll_single_request("r1")
+        self.assertIn("r1", host._finished_load_reqs)
+        second_output = host.get_omni_connector_output()
+        self.assertEqual(second_output.chunk_ready_req_ids, {"r1"})
+
+        host.shutdown_omni_connectors()
+
+    def test_poll_single_request_is_finished_sentinel_forces_wake_on_partial(self):
+        """If sender ever emits is_finished=True with a still-partial prefill
+        (protocol corner / buggy upstream), the gate must NOT block — RF-1 /
+        RF-2 length-tolerant fallbacks then handle the talker forward.
+        """
+        host = self._make_talker_host_with_mock_connector()
+        host._omni_connector.get.return_value = (
+            {
+                "embed": {"prefill": torch.zeros((64, 4))},
+                "ids": {"prompt": list(range(1024))},
+                "meta": {"finished": torch.tensor(True)},
+            },
+            1,
+        )
+
+        host._poll_single_request("r1")
+        self.assertIn("r1", host._finished_load_reqs)
+        self.assertIn("r1", host._chunk_finished_req_ids)
+
+        output = host.get_omni_connector_output()
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+        self.assertEqual(output.chunk_finished_req_ids, {"r1"})
+
+        host.shutdown_omni_connectors()
+
+    def test_poll_single_request_decode_chunk_wakes_normally(self):
+        """After prefill is complete, decode chunks (no embed.prefill) must
+        wake the scheduler unconditionally — the gate must not regress this.
+        """
+        host = self._make_talker_host_with_mock_connector()
+        # Pre-stage a complete prefill so the gate's earlier-chunk path is past.
+        host._local_stage_payload_cache["r1"] = {
+            "embed": {"prefill": torch.zeros((1024, 4))},
+            "ids": {"prompt": list(range(1024)), "output": []},
+        }
+        host._send_side_request_payload["ext-r1"] = dict(host._local_stage_payload_cache["r1"])
+        host._get_req_chunk["r1"] = 5  # arbitrary later chunk index
+
+        host._omni_connector.get.return_value = (
+            {
+                "embed": {"decode": torch.zeros((1, 4))},
+                "ids": {"output": [42]},
+                "meta": {
+                    "finished": torch.tensor(False),
+                    "override_keys": [["embed", "decode"], ["ids", "output"]],
+                },
+            },
+            1,
+        )
+
+        host._poll_single_request("r1")
+        self.assertIn("r1", host._finished_load_reqs)
+
+        output = host.get_omni_connector_output()
+        self.assertEqual(output.chunk_ready_req_ids, {"r1"})
+
+        host.shutdown_omni_connectors()
+
 
 if __name__ == "__main__":
     unittest.main()
