@@ -17,6 +17,13 @@ MODEL = "Qwen/Qwen3-Omni-30B-A3B-Instruct"
 MULTI_REPLICA_DEPLOY = get_deploy_config_path("ci/qwen3_omni_moe_multi_replicas_4gpu.yaml")
 ROUTE_STRESS_REQUESTS = 6
 MIXED_MODAL_REQUESTS = 4
+# Regression guard for the conc>=24 crash from the post-mortem: under
+# multi-replica the talker stops being the bottleneck so the receiver wakes
+# the talker scheduler on a partial embed.prefill payload (root cause #2),
+# and the per-batch concurrent prefill count crosses the logits_indices
+# OOB threshold (root cause #1). 24 concurrent prefills was the smallest
+# bench point that crashed; we use it here as the smoke threshold.
+HIGH_CONCURRENCY_REQUESTS = 24
 
 test_params = [
     OmniServerParams(
@@ -134,3 +141,36 @@ def test_mixed_modal_stream_batch_generates_text_and_audio(omni_server, openai_c
     responses = openai_client.send_omni_request(request_config, request_num=MIXED_MODAL_REQUESTS)
     _assert_batch_size(responses, MIXED_MODAL_REQUESTS)
     _assert_audio_outputs(responses, expect_text=True)
+
+
+@pytest.mark.full_model
+@pytest.mark.omni
+@hardware_test(res={"cuda": "H100"}, num_cards=4)
+@pytest.mark.parametrize("omni_server", test_params, indirect=True)
+def test_high_concurrency_text_to_audio_stream_does_not_crash(omni_server, openai_client) -> None:
+    """Regression guard for the multi-replica conc>=24 crash.
+
+    Pre-fix symptoms (see commits ec8d3b0a / 70de2098 / 665c9c37):
+      * ``RuntimeError: tensor a (6) vs b (9)`` from
+        ``_get_talker_assistant_parts`` slicing an empty assistant segment
+        out of a partial ``embed.prefill`` (root cause #2).
+      * ``device-side assert`` from ``hidden_states[logits_indices]`` once
+        the per-batch ``num_prefill * 21`` system-segment skip drift exceeded
+        the talker view of hidden_states (root cause #1).
+
+    Both surface only under multi-replica because single-replica's "talker is
+    bottleneck" timing accidentally serialized the offending paths. This test
+    drives 24 concurrent text→audio streaming prefills against the
+    multi-replica deploy so any future regression that re-opens either gap
+    crashes the engine and trips the assertion below.
+    """
+    request_config = {
+        "model": omni_server.model,
+        "messages": _text_messages(),
+        "stream": True,
+        "modalities": ["audio"],
+    }
+
+    responses = openai_client.send_omni_request(request_config, request_num=HIGH_CONCURRENCY_REQUESTS)
+    _assert_batch_size(responses, HIGH_CONCURRENCY_REQUESTS)
+    _assert_audio_outputs(responses, expect_text=False)
