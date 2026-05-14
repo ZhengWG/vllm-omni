@@ -11,8 +11,8 @@
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [128, 128, 128, 128],
                 "max_concurrency": [8, 16, 24, 32],
-                "random_input_len": 1024,
-                "random_output_len": 512,
+                "random_input_len": 2500,
+                "random_output_len": 900,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
@@ -40,8 +40,8 @@
                 "endpoint": "/v1/chat/completions",
                 "num_prompts": [128, 128, 128, 128],
                 "max_concurrency": [8, 16, 24, 32],
-                "random_input_len": 1024,
-                "random_output_len": 512,
+                "random_input_len": 2500,
+                "random_output_len": 900,
                 "ignore_eos": true,
                 "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
                 "baseline": {
