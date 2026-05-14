@@ -1,0 +1,56 @@
+[
+    {
+        "test_name": "test_qwen3_omni_2gpu_base",
+        "server_params": {
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct"
+        },
+        "benchmark_params": [
+            {
+                "dataset_name": "random",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [128, 128, 128, 128],
+                "max_concurrency": [8, 16, 24, 32],
+                "random_input_len": 1024,
+                "random_output_len": 512,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": [1000, 2000, 3000, 4000],
+                    "mean_tpot_ms": [200, 200, 200, 200],
+                    "mean_audio_ttfp_ms": [10000, 15000, 20000, 25000],
+                    "mean_audio_rtf": [1.5, 1.5, 1.5, 1.5]
+                }
+            }
+        ]
+    },
+    {
+        "test_name": "test_qwen3_omni_3gpu_replica2",
+        "server_params": {
+            "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "extra_cli_args": [
+                "--deploy-config",
+                "vllm_omni/deploy/qwen3_omni_moe_multi_replicas.yaml"
+            ]
+        },
+        "benchmark_params": [
+            {
+                "dataset_name": "random",
+                "backend": "openai-chat-omni",
+                "endpoint": "/v1/chat/completions",
+                "num_prompts": [128, 128, 128, 128],
+                "max_concurrency": [8, 16, 24, 32],
+                "random_input_len": 1024,
+                "random_output_len": 512,
+                "ignore_eos": true,
+                "percentile-metrics": "ttft,tpot,itl,e2el,audio_rtf,audio_ttfp,audio_duration",
+                "baseline": {
+                    "mean_ttft_ms": [1000, 2000, 3000, 4000],
+                    "mean_tpot_ms": [200, 200, 200, 200],
+                    "mean_audio_ttfp_ms": [10000, 15000, 20000, 25000],
+                    "mean_audio_rtf": [1.5, 1.5, 1.5, 1.5]
+                }
+            }
+        ]
+    }
+]
