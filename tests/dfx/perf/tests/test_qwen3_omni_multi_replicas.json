@@ -3,9 +3,12 @@
         "test_name": "test_qwen3_omni_3gpu_replica2",
         "server_params": {
             "model": "Qwen/Qwen3-Omni-30B-A3B-Instruct",
+            "stage_overrides": {
+                "1": {"num_replicas": 2, "devices": "1,2"},
+                "2": {"num_replicas": 2, "devices": "1,2"}
+            },
             "extra_cli_args": [
-                "--deploy-config",
-                "vllm_omni/deploy/qwen3_omni_moe_multi_replicas.yaml"
+                "--async-chunk"
             ]
         },
         "benchmark_params": [
