@@ -19,6 +19,7 @@ th {
 |--------------|--------|-------------------|------------|---------|-----|-----------|
 | `Qwen3OmniMoeForConditionalGeneration` | Qwen3-Omni | `Qwen/Qwen3-Omni-30B-A3B-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
 | `Qwen2_5OmniForConditionalGeneration` | Qwen2.5-Omni | `Qwen/Qwen2.5-Omni-7B`, `Qwen/Qwen2.5-Omni-3B` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
+| `MingFlashOmniForConditionalGeneration` + `MingImagePipeline` | Ming-flash-omni-2.0 (omni-speech + imagegen<sup>1</sup>) | `Jonathan1909/Ming-flash-omni-2.0` | ✅︎ |   |   |   |
 | `BagelForConditionalGeneration` | BAGEL (DiT-only) | `ByteDance-Seed/BAGEL-7B-MoT` | ✅︎ | ✅︎ | | ✅︎ |
 | `InternVLAA1Pipeline` | InternVLA-A1 | `InternRobotics/InternVLA-A1-3B` | ✅︎ | ✅︎ | | |
 | `HunyuanImage3ForCausalMM` | HunyuanImage3.0 (DiT-only) | `tencent/HunyuanImage-3.0`, `tencent/HunyuanImage-3.0-Instruct` | ✅︎ | ✅︎ | ✅︎ | ✅︎ |
@@ -68,3 +69,5 @@ th {
 |`DyninOmniForConditionalGeneration` | Dynin-Omni | `snu-aidas/Dynin-Omni` | ✅︎ | | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
+
+<sup>1</sup> Ming-flash-omni-2.0 ships text-in, image/audio-in, text+audio-out (`Thinker + Talker` via [`ming_flash_omni.yaml`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/ming_flash_omni.yaml)) and **image-out** (text-to-image / img2img via the dual-stage [`ming_flash_omni_dual.yaml`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml)). See [`examples/online_serving/ming_flash_omni`](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/ming_flash_omni/README.md) for image-gen usage and knobs.
