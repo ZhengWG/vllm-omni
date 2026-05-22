@@ -85,8 +85,6 @@ class _ZPipelineRequest:
 
 
 class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
-    _DUMMY_REQUEST_IDS = frozenset({"dummy_req_id"})
-
     """Ming-flash-omni-2.0 text-to-image diffusion pipeline.
 
     Composed of:
@@ -352,20 +350,6 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             image tensor in ``[-1, 1]``. The vllm-omni diffusion engine's
             output adapter converts this to PIL/base64 downstream.
         """
-        # Detect vllm-omni's ``_dummy_run`` warmup pass and short-circuit to
-        # avoid spending 30 seconds of DiT on a meaningless request. See
-        # vllm_omni/diffusion/diffusion_engine.py::_dummy_run.
-        if (req.request_ids and set(req.request_ids).issubset(self._DUMMY_REQUEST_IDS)) or req.request_id == "dummy_req_id":
-            logger.info("[MingImagePipeline.forward] dummy warmup run — returning blank output")
-            dummy_h = int(req.sampling_params.height or 512)
-            dummy_w = int(req.sampling_params.width or 512)
-            blank = torch.zeros(
-                (1, 3, dummy_h, dummy_w),
-                device=self.device,
-                dtype=self._dtype,
-            )
-            return DiffusionOutput(output=blank)
-
         first_prompt = req.prompts[0] if req.prompts else None
         if isinstance(first_prompt, str):
             prompt_dict: dict[str, Any] = {}
@@ -385,18 +369,16 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             # ``sampling_params.extra_args``.
             hidden = (req.sampling_params.extra_args or {}).get("thinker_hidden_states")
         if hidden is None:
-            # No thinker hidden states found on the request. Two legitimate
-            # causes:
-            #   1. vllm-omni's warmup / profile_run path (see
-            #      ``diffusion_engine.py::_dummy_run``) fabricates a
-            #      minimal dummy request to exercise the pipeline once.
-            #   2. User misconfiguration — the stage YAML is missing
-            #      ``custom_process_input_func: thinker2imagegen`` or the
-            #      upstream thinker did not export ``final_hidden_states``.
-            # In both cases we fall back to a zero-conditioning tensor of
-            # the expected shape so the DiT kernels still run (warmup
-            # case) and real requests produce a diagnosable all-noise
-            # image instead of a hard crash.
+            # No thinker hidden states on the request. This is the single
+            # entry point for vllm-omni's warmup ``_dummy_run`` (see
+            # ``diffusion_engine.py::_dummy_run``) and also catches the
+            # user-misconfiguration case where the stage YAML is missing
+            # ``custom_process_input_func: thinker2imagegen`` (or the upstream
+            # thinker did not export ``final_hidden_states``). Either way we
+            # fall back to a zero-conditioning tensor of the expected shape
+            # so the DiT kernels still run end-to-end (warmup case) and real
+            # requests produce a diagnosable all-noise image rather than a
+            # hard crash.
             scale = self.image_gen_config.img_gen_scales[-1]
             num_query_tokens = scale * scale
             hidden = torch.zeros(
