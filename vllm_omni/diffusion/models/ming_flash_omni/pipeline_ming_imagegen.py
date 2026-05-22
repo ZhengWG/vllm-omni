@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2025 The vLLM-Omni team.
 
-"""Ming-flash-omni-2.0 image generation pipeline for vllm-omni diffusion engine.
+"""Ming-flash-omni-2.0 imagegen (text-to-image / img2img) diffusion pipeline.
 
 Cross-stage data flow:
 

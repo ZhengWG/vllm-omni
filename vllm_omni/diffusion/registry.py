@@ -137,7 +137,7 @@ _DIFFUSION_MODELS = {
     ),
     "MingImagePipeline": (
         "ming_flash_omni",
-        "pipeline_ming",
+        "pipeline_ming_imagegen",
         "MingImagePipeline",
     ),
     "InternVLAA1Pipeline": (

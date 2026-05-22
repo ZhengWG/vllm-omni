@@ -744,7 +744,7 @@ class OmniDiffusionConfig:
                 ):
                     # Ming-flash-omni-2.0 — imagegen stage uses the custom
                     # ``MingImagePipeline`` (ZImage DiT + Qwen2 connector). See
-                    # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming.py.
+                    # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py.
                     self.model_class_name = "MingImagePipeline"
                     self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
