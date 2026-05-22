@@ -692,11 +692,20 @@ class Orchestrator:
             self.stage_clients[stage_id].set_engine_outputs([output, *companion_outputs])
             if next_client.custom_process_input_func is not None:
                 _t_ar2d = _time.perf_counter()
-                diffusion_prompt = next_client.custom_process_input_func(
+                _fn = next_client.custom_process_input_func
+                _extra_kwargs: dict[str, Any] = {}
+                try:
+                    import inspect as _inspect
+                    if "sampling_params" in _inspect.signature(_fn).parameters:
+                        _extra_kwargs["sampling_params"] = params
+                except (TypeError, ValueError):
+                    pass
+                diffusion_prompt = _fn(
                     self.stage_clients,
                     next_client.engine_input_source,
                     req_state.prompt,
                     False,
+                    **_extra_kwargs,
                 )
                 _dt_ar2d = (_time.perf_counter() - _t_ar2d) * 1000
                 req_state.pipeline_timings["ar2diffusion_ms"] = _dt_ar2d

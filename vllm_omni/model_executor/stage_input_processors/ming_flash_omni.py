@@ -338,10 +338,32 @@ def _resolve_token_ids_from_stage_or_defaults(
     return (_DEFAULT_IMAGE_PATCH_TOKEN_ID, 157159, 256)
 
 
+def _extract_byte5_from_sampling_params(sampling_params: Any) -> list[str] | None:
+    """Read ``byte5_text`` from the diffusion-stage sampling_params.
+
+    Looks up ``sampling_params.extra_args["image_gen"]["byte5_text"]`` (the
+    explicit API surface for ByT5 glyph text). Returns ``None`` if absent or
+    malformed, so callers can fall back to other sources.
+    """
+    if sampling_params is None:
+        return None
+    extra = getattr(sampling_params, "extra_args", None)
+    if not isinstance(extra, dict):
+        return None
+    image_gen = extra.get("image_gen")
+    if not isinstance(image_gen, dict):
+        return None
+    texts = image_gen.get("byte5_text")
+    if isinstance(texts, list) and texts:
+        return [t for t in texts if isinstance(t, str)]
+    return None
+
+
 def thinker2imagegen(
     source_outputs: list[Any],
     prompt: Any | None = None,
     requires_multimodal_data: bool = False,  # noqa: ARG001
+    sampling_params: Any | None = None,
 ) -> list[dict[str, Any]]:
     """Bridge thinker AR outputs into image-generation DiT inputs.
 
@@ -350,6 +372,12 @@ def thinker2imagegen(
     ``extra[thinker_hidden_states]``; the cfg_text companion feeds
     ``extra[negative_thinker_hidden_states]`` used by MingImagePipeline as real
     CFG negative conditioning. Unknown-suffix outputs are skipped.
+
+    ``sampling_params`` is the diffusion stage's own SamplingParams, supplied
+    by the orchestrator. ByT5 explicit ``byte5_text`` is read from
+    ``sampling_params.extra_args.image_gen.byte5_text`` (preferred); falls
+    back to ``prompt.image_gen_extra_args.byte5_text``, then to auto-extraction
+    from quoted prompt text.
     """
     thinker_outputs = source_outputs
     image_patch_token_id, image_end_token_id, num_query_tokens = (
@@ -404,13 +432,19 @@ def thinker2imagegen(
         if ref_image is not None:
             extra["reference_image"] = ref_image
 
-        # ByT5 glyph text: check explicit API (image_gen_extra_args forwarded
-        # from serving_chat) first, then auto-extract from quoted prompt text.
+        # ByT5 glyph text: prefer sampling_params (stage-1 explicit API), then
+        # prompt.image_gen_extra_args (serving_chat path), then auto-extract
+        # from quoted prompt text.
         prompt_text = prompt.get("prompt", "")
-        ig_extra = prompt.get("image_gen_extra_args") or {}
-        byte5_texts = ig_extra.get("byte5_text")
-        if isinstance(byte5_texts, list) and byte5_texts:
-            # Wrap raw strings in Ming's expected format if needed.
+        sp_byte5 = _extract_byte5_from_sampling_params(sampling_params)
+        if sp_byte5:
+            byte5_texts: list[str] | None = sp_byte5
+        else:
+            ig_extra = prompt.get("image_gen_extra_args") or {}
+            cand = ig_extra.get("byte5_text")
+            byte5_texts = cand if isinstance(cand, list) and cand else None
+
+        if byte5_texts:
             extra["byte5_text"] = [
                 t if t.startswith("Text ") else f'Text "{t}". '
                 for t in byte5_texts if isinstance(t, str)
@@ -419,6 +453,14 @@ def thinker2imagegen(
             glyph = _extract_byte5_glyph_text(prompt_text)
             if glyph:
                 extra["byte5_text"] = [glyph]
+    else:
+        # prompt is not a dict — still honor explicit byte5_text from sampling_params.
+        sp_byte5 = _extract_byte5_from_sampling_params(sampling_params)
+        if sp_byte5:
+            extra["byte5_text"] = [
+                t if t.startswith("Text ") else f'Text "{t}". '
+                for t in sp_byte5
+            ]
 
     return [{"prompt": "", "extra": extra}]
 

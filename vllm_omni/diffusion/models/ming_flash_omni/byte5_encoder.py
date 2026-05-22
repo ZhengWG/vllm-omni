@@ -101,6 +101,23 @@ class MingByT5Encoder(nn.Module):
         device: torch.device,
         dtype: torch.dtype,
     ) -> MingByT5Encoder:
+        # Wrap the whole load in fork_rng so any nn.init.normal_ inside
+        # T5ForConditionalGeneration.from_pretrained / vocab-resize cannot
+        # advance the default CPU/CUDA generator state. Without this, the
+        # diffusion pipeline's seeded noise becomes order-dependent across
+        # requests (same-seed replays diverge).
+        cuda_devs = list(range(torch.cuda.device_count())) if torch.cuda.is_available() else []
+        with torch.random.fork_rng(devices=cuda_devs, enabled=True):
+            return cls._from_checkpoint_impl(byte5_dir, device=device, dtype=dtype)
+
+    @classmethod
+    def _from_checkpoint_impl(
+        cls,
+        byte5_dir: Path,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> MingByT5Encoder:
         byte5_dir = Path(byte5_dir)
         # Ming checkpoint uses ``byt5`` prefix in filenames and JSON keys;
         # normalize to ``byt5`` naming consistently.
