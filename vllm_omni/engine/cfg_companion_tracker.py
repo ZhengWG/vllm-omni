@@ -29,9 +29,9 @@ class CfgCompanionTracker:
     def is_companion(self, req_id: str) -> bool:
         return req_id in self._companion_ids
 
-    def get_parent_id(self, companion_id: str) -> str | None:
-        """Return the parent request ID for a companion, or None."""
-        return self._companion_to_parent.get(companion_id)
+    def get_parent_id(self, req_id: str) -> str | None:
+        """Return the parent request id for a companion, or None."""
+        return self._companion_to_parent.get(req_id)
 
     def has_companions(self, parent_id: str) -> bool:
         return parent_id in self._companion_map
