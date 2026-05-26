@@ -37,6 +37,7 @@ from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
+from vllm_omni.diffusion.forward_context import set_forward_context_ref_latent
 from vllm_omni.diffusion.models.ming_flash_omni.byte5_encoder import (
     MingByT5Encoder,
 )
@@ -369,16 +370,6 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             # ``sampling_params.extra_args``.
             hidden = (req.sampling_params.extra_args or {}).get("thinker_hidden_states")
         if hidden is None:
-            # No thinker hidden states on the request. This is the single
-            # entry point for vllm-omni's warmup ``_dummy_run`` (see
-            # ``diffusion_engine.py::_dummy_run``) and also catches the
-            # user-misconfiguration case where the stage YAML is missing
-            # ``custom_process_input_func: thinker2imagegen`` (or the upstream
-            # thinker did not export ``final_hidden_states``). Either way we
-            # fall back to a zero-conditioning tensor of the expected shape
-            # so the DiT kernels still run end-to-end (warmup case) and real
-            # requests produce a diagnosable all-noise image rather than a
-            # hard crash.
             scale = self.image_gen_config.img_gen_scales[-1]
             num_query_tokens = scale * scale
             hidden = torch.zeros(
@@ -494,11 +485,11 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             sampling_params=z_sp,
         )
 
-        # Reference image (img2img) → VAE-encoded latent stashed on transformer.
-        # Every request (re)sets this unconditionally, so there's no cleanup in
-        # between — the next request always overwrites before reading.
+        # Reference image (img2img) → VAE-encoded latent published on the
+        # active ForwardContext so MingZImageTransformer2DModel can read it
+        # from request scope inside its forward(). 
         ref_latent = self._encode_reference_image(extra.get("reference_image"), height, width)
-        self.transformer.set_ref_latent(ref_latent)
+        set_forward_context_ref_latent(ref_latent)
 
         logger.debug(
             "[MingImagePipeline.forward] running z_pipeline hw=(%d,%d) steps=%d cfg=%.2f seed=%s overrides=%s ref=%s",
@@ -510,19 +501,22 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             ig,
             None if ref_latent is None else tuple(ref_latent.shape),
         )
-        output = self._z_pipeline.forward(
-            z_req,
-            prompt=None,
-            height=height,
-            width=width,
-            num_inference_steps=num_inference_steps,
-            guidance_scale=guidance_scale,
-            prompt_embeds=prompt_embeds,
-            negative_prompt_embeds=negative_prompt_embeds,
-            generator=generator,
-            output_type="pt",
-            return_dict=True,
-        )
+        try:
+            output = self._z_pipeline.forward(
+                z_req,
+                prompt=None,
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                guidance_scale=guidance_scale,
+                prompt_embeds=prompt_embeds,
+                negative_prompt_embeds=negative_prompt_embeds,
+                generator=generator,
+                output_type="pt",
+                return_dict=True,
+            )
+        finally:
+            set_forward_context_ref_latent(None)
 
         if hasattr(output, "output") and output.output is not None:
             raw = output.output
