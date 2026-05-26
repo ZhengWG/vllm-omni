@@ -3,78 +3,19 @@
 
 """T5EncoderBlockByT5Mapper — Ming's per-block T5 stack mapping byte5 features
 onto the DiT condition space.
-
-Ported from Ming's ``bizgen/custom_diffusers/models/byt5_block_byt5_mapper.py``.
-Uses HF transformers' T5 internals (``T5LayerSelfAttention`` / ``T5LayerFF`` /
-``T5LayerNorm``) instead of Ming's vendored ``modeling_t5`` copy — semantically
-equivalent, no extra vendored code.
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 import torch
 import torch.nn as nn
 from diffusers.models.modeling_utils import ModelMixin
-from transformers.models.t5.modeling_t5 import T5LayerFF, T5LayerNorm, T5LayerSelfAttention
+from vllm.model_executor.layers.layernorm import RMSNorm
+from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
-
-class _T5EncoderBlock(nn.Module):
-    def __init__(self, config, has_relative_attention_bias: bool = False) -> None:
-        super().__init__()
-        self.layer = nn.ModuleList()
-        self.layer.append(T5LayerSelfAttention(config, has_relative_attention_bias=has_relative_attention_bias))
-        self.layer.append(T5LayerFF(config))
-
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: torch.Tensor | None = None,
-        position_bias: torch.Tensor | None = None,
-        query_length: int | None = None,
-        layer_head_mask: torch.Tensor | None = None,
-        output_attentions: bool = False,
-    ):
-        # HF ``T5LayerSelfAttention.forward`` signature varies across transformers
-        # versions; ``query_length`` was dropped in favour of ``cache_position``.
-        # For pure-encoder usage we pass a plain 0..N-1 range so the inner
-        # ``T5Attention`` can compute the relative attention bias without a KV
-        # cache.
-        cache_position = torch.arange(hidden_states.shape[1], device=hidden_states.device)
-        self_attention_outputs = self.layer[0](
-            hidden_states,
-            attention_mask=attention_mask,
-            position_bias=position_bias,
-            layer_head_mask=layer_head_mask,
-            past_key_value=None,
-            use_cache=False,
-            output_attentions=output_attentions,
-            cache_position=cache_position,
-        )
-        hidden_states = self_attention_outputs[0]
-        # In modern HF (transformers>=4.x), ``T5LayerSelfAttention.forward``
-        # returns ``(hidden_states, position_bias, ?attn_weights)`` — keep
-        # everything after index 0 so position_bias propagates to the next layer.
-        attn_extra = self_attention_outputs[1:]
-
-        if hidden_states.dtype == torch.float16:
-            clamp_value = torch.where(
-                torch.isinf(hidden_states).any(),
-                torch.finfo(hidden_states.dtype).max - 1000,
-                torch.finfo(hidden_states.dtype).max,
-            )
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-
-        hidden_states = self.layer[-1](hidden_states)
-
-        if hidden_states.dtype == torch.float16:
-            clamp_value = torch.where(
-                torch.isinf(hidden_states).any(),
-                torch.finfo(hidden_states.dtype).max - 1000,
-                torch.finfo(hidden_states.dtype).max,
-            )
-            hidden_states = torch.clamp(hidden_states, min=-clamp_value, max=clamp_value)
-
-        return (hidden_states,) + attn_extra
+from vllm_omni.diffusion.models.t5_encoder.t5_encoder import T5Block
 
 
 class T5EncoderBlockByT5Mapper(ModelMixin):
@@ -86,14 +27,21 @@ class T5EncoderBlockByT5Mapper(ModelMixin):
         super().__init__()
         if num_layers > 0:
             self.blocks = nn.ModuleList(
-                [_T5EncoderBlock(byte5_config, has_relative_attention_bias=(i == 0)) for i in range(num_layers)]
+                [
+                    T5Block(
+                        byte5_config,
+                        has_relative_attention_bias=(i == 0),
+                        prefix=f"blocks.{i}",
+                    )
+                    for i in range(num_layers)
+                ]
             )
         else:
             self.blocks = None
-        self.layer_norm = T5LayerNorm(byte5_config.d_model, eps=byte5_config.layer_norm_epsilon)
+        self.layer_norm = RMSNorm(byte5_config.d_model, eps=byte5_config.layer_norm_epsilon)
         if sdxl_channels is not None:
             self.channel_mapper = nn.Linear(byte5_config.d_model, sdxl_channels)
-            self.final_layer_norm = T5LayerNorm(sdxl_channels, eps=byte5_config.layer_norm_epsilon)
+            self.final_layer_norm = RMSNorm(sdxl_channels, eps=byte5_config.layer_norm_epsilon)
         else:
             self.channel_mapper = None
             self.final_layer_norm = None
@@ -116,18 +64,66 @@ class T5EncoderBlockByT5Mapper(ModelMixin):
 
         if self.blocks is not None:
             for block in self.blocks:
-                layer_outputs = block(
+                hidden_states, position_bias = block(
                     hidden_states,
-                    attention_mask=extended_mask,
+                    mask=extended_mask,
                     position_bias=position_bias,
                 )
-                hidden_states, position_bias = layer_outputs[0], layer_outputs[1]
 
         hidden_states = self.layer_norm(hidden_states)
         if self.channel_mapper is not None:
             hidden_states = self.channel_mapper(hidden_states)
             hidden_states = self.final_layer_norm(hidden_states)
         return hidden_states
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        """Load Ming's HF-format byt5_mapper checkpoint into the fused
+        TP-aware layers.
+
+        Source format (from ``byt5_mapper.pt``):
+            blocks.{i}.layer.0.SelfAttention.{q,k,v,o}.weight
+            blocks.{i}.layer.1.DenseReluDense.{wi_0,wi_1,wo}.weight
+            blocks.{i}.layer.{0,1}.layer_norm.weight
+            {layer_norm, channel_mapper, final_layer_norm}.{weight,bias}
+
+        Target format (after ``T5Block`` from t5_encoder.py):
+            blocks.{i}.layer.0.SelfAttention.qkv_proj.weight  (fused q+k+v)
+            blocks.{i}.layer.1.DenseReluDense.wi.weight       (fused wi_0+wi_1)
+            (others identical)
+        """
+        stacked_params_mapping = [
+            (".qkv_proj.", ".q.", "q"),
+            (".qkv_proj.", ".k.", "k"),
+            (".qkv_proj.", ".v.", "v"),
+            (".DenseReluDense.wi.", ".DenseReluDense.wi_0.", 0),
+            (".DenseReluDense.wi.", ".DenseReluDense.wi_1.", 1),
+        ]
+        params_dict = dict(self.named_parameters())
+        loaded_params: set[str] = set()
+
+        for name, loaded_weight in weights:
+            matched = False
+            for target_substr, source_substr, shard_id in stacked_params_mapping:
+                if source_substr not in name:
+                    continue
+                target_name = name.replace(source_substr, target_substr, 1)
+                if target_name in params_dict:
+                    param = params_dict[target_name]
+                    param.weight_loader(param, loaded_weight, shard_id)
+                    loaded_params.add(target_name)
+                    matched = True
+                    break
+
+            if matched:
+                continue
+
+            if name in params_dict:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+
+        return loaded_params
 
 
 __all__ = ["T5EncoderBlockByT5Mapper"]

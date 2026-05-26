@@ -177,7 +177,8 @@ class MingByT5Encoder(nn.Module):
         mapper_state = torch.load(
             byte5_dir / "byt5_mapper" / "byt5_mapper.pt", map_location="cpu", weights_only=False
         )
-        mapper.load_state_dict(mapper_state, strict=True)
+        # mapper now uses vllm-omni TP-aware T5 layers (fused qkv_proj / wi);
+        mapper.load_weights(mapper_state.items())
         del mapper_state
         mapper.to(device=device, dtype=dtype).eval()
 
