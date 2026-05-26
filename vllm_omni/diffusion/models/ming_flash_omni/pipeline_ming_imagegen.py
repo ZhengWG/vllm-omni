@@ -26,18 +26,19 @@ import logging
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.nn as nn
 from diffusers.image_processor import VaeImageProcessor
-from diffusers.models import AutoencoderKL
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl import DistributedAutoencoderKL
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.forward_context import set_forward_context_ref_latent
+from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
+from vllm_omni.diffusion.model_loader.hub_prefetch import prefetch_subfolders
 from vllm_omni.diffusion.models.ming_flash_omni.byte5_encoder import (
     MingByT5Encoder,
 )
@@ -48,9 +49,6 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
     MingZImageTransformer2DModel,
 )
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
-from vllm_omni.diffusion.profiler.diffusion_pipeline_profiler import (
-    DiffusionPipelineProfilerMixin,
-)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenConfig
 
@@ -85,20 +83,13 @@ class _ZPipelineRequest:
     prompts: list[dict[str, Any]] = field(default_factory=lambda: [{"prompt": "", "negative_prompt": ""}])
 
 
-class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
+class MingImagePipeline(ZImagePipeline):
     """Ming-flash-omni-2.0 text-to-image diffusion pipeline.
 
-    Composed of:
+    Ming-specific components added on top of the inherited contract:
       * ``condition_encoder`` — Qwen2 connector + proj_in/out + F.normalize×1000
-      * ``scheduler``         — FlowMatchEulerDiscreteScheduler (use_dynamic_shifting=True)
-      * ``transformer``       — ZImageTransformer2DModel (from in-tree z_image)
-      * ``vae``               — AutoencoderKL (Flux format, latent=16)
-
-    The pipeline's ``forward(req)`` reads the thinker-side hidden states from
-    ``req.prompts[0]["extra"]["thinker_hidden_states"]`` (placed there by the
-    ``thinker2imagegen`` custom_process_input_func), runs the full Ming
-    condition encoder + ZImage diffusion loop, and returns a
-    ``DiffusionOutput`` with a raw image tensor under ``.output``.
+      * ``byte5``             — Optional ByT5 glyph encoder (loaded if checkpoint
+                                ships ``byt5/``)
     """
 
     def __init__(
@@ -107,15 +98,20 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         od_config: OmniDiffusionConfig,
         prefix: str = "",  # noqa: ARG002
     ) -> None:
-        super().__init__()
-        self.od_config = od_config
-        self.device = get_local_device()
+        # Skip ZImagePipeline.__init__ (it would eagerly load the Z-Image text
+        # encoder/tokenizer that Ming replaces with its own condition_encoder).
+        nn.Module.__init__(self)
 
         model_path = od_config.model
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"Ming checkpoint path does not exist: {model_path}")
 
         dtype = getattr(od_config, "dtype", torch.bfloat16)
+        local_files_only = os.path.exists(model_path)
+
+        self.od_config = od_config
+        self._execution_device = get_local_device()
+        self.device = self._execution_device  # Ming convention alias
         self._dtype = dtype
 
         # Ming's per-checkpoint image-gen configuration. We cannot rely on
@@ -131,7 +127,65 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             self.image_gen_config,
         )
 
-        # ----- Condition encoder (Qwen2 connector + proj_in/out + norm×1000)
+        # ----- weights_sources: DiT transformer + VAE. 
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder=self.image_gen_config.transformer_subfolder,
+                revision=od_config.revision,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            ),
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model_path,
+                subfolder=self.image_gen_config.vae_subfolder,
+                revision=od_config.revision,
+                prefix="vae.",
+            ),
+        ]
+
+        prefetch_subfolders(
+            model_path,
+            [self.image_gen_config.scheduler_subfolder, self.image_gen_config.vae_subfolder],
+            local_files_only=local_files_only,
+        )
+
+        # ----- Scheduler: load config-only from disk + Ming-specific override.
+        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
+            model_path,
+            subfolder=self.image_gen_config.scheduler_subfolder,
+            local_files_only=local_files_only,
+        )
+        # Ming forces use_dynamic_shifting=True at runtime regardless of what
+        # the checkpoint scheduler_config.json ships. 
+        self.scheduler.config["use_dynamic_shifting"] = True
+        logger.info(
+            "[MingImagePipeline] scheduler: %s (use_dynamic_shifting=True)",
+            type(self.scheduler).__name__,
+        )
+
+        # ----- VAE: DistributedAutoencoderKL. 
+        vae_config = DistributedAutoencoderKL.load_config(
+            model_path, subfolder=self.image_gen_config.vae_subfolder, local_files_only=local_files_only
+        )
+        self.vae = DistributedAutoencoderKL.from_config(vae_config).to(self._execution_device, dtype=dtype)
+        self.vae.eval()
+
+        # ----- DiT transformer.
+        self.transformer = MingZImageTransformer2DModel(quant_config=None)
+
+        # Ming brings its own conditioning path — no Z-Image text_encoder /
+        # tokenizer.
+        self.text_encoder = None
+        self.tokenizer = None
+
+        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
+        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
+        self.setup_diffusion_pipeline_profiler(
+            enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False)
+        )
+
+        # ----- Condition encoder (Qwen2 connector + proj_in/out + norm×1000).
         self.condition_encoder = MingConditionEncoder(
             self.image_gen_config,
             thinker_hidden_size=self.image_gen_config.thinker_hidden_size,
@@ -139,49 +193,6 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             dtype=dtype,
         )
         self.condition_encoder.load_from_checkpoint(model_path)
-
-        # ----- Scheduler: force use_dynamic_shifting=True regardless of what
-        # the checkpoint's scheduler_config.json ships (Ming overrides it at
-        # runtime in ZImageLoss.__init__, zimage_loss.py:154).
-        self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-            model_path,
-            subfolder=self.image_gen_config.scheduler_subfolder,
-            local_files_only=True,
-        )
-        self.scheduler.config["use_dynamic_shifting"] = True
-        logger.info(
-            "[MingImagePipeline] scheduler: %s (use_dynamic_shifting=True)",
-            type(self.scheduler).__name__,
-        )
-
-        # ----- VAE (Flux-format AutoencoderKL).
-        logger.info("[MingImagePipeline] loading VAE ...")
-        self.vae = AutoencoderKL.from_pretrained(
-            model_path,
-            subfolder=self.image_gen_config.vae_subfolder,
-            local_files_only=True,
-            torch_dtype=dtype,
-        ).to(device=self.device, dtype=dtype)
-        self.vae.eval()
-
-        # ----- DiT transformer. The diffusers-format checkpoint ships
-        # split ``.to_{q,k,v}.`` / ``.w{1,3}.`` tensors, while our in-tree
-        # ``ZImageTransformer2DModel`` uses fused ``.to_qkv.`` / ``.w13.``
-        # layers — the mapping is handled automatically by the transformer's
-        # own ``load_weights`` via its ``stacked_params_mapping``, so we
-        # just stream the raw safetensors shards through it.
-        logger.info("[MingImagePipeline] loading DiT transformer ...")
-        self.transformer = MingZImageTransformer2DModel(quant_config=None)
-        self._load_transformer_weights(
-            self.transformer,
-            Path(model_path) / self.image_gen_config.transformer_subfolder,
-        )
-        self.transformer = self.transformer.to(device=self.device, dtype=dtype)
-        self.transformer.eval()
-
-        # Drop text_encoder/tokenizer — Ming uses our own condition_encoder.
-        self.text_encoder = None
-        self.tokenizer = None
 
         # Optional ByT5 glyph/text encoder. Only loaded when the checkpoint
         # ships ``byt5/``; otherwise the feature silently stays off and
@@ -193,83 +204,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             self.byte5 = None
             logger.info("[MingImagePipeline] no byt5/ subfolder at %s; ByT5 enhancement disabled", byte5_dir)
 
-        self.vae_scale_factor = 2 ** (len(self.vae.config.block_out_channels) - 1)
-        self.image_processor = VaeImageProcessor(vae_scale_factor=self.vae_scale_factor * 2, do_convert_rgb=True)
-
-        # weights_sources is consulted by the vllm-omni diffusion loader.
-        # Empty means "this pipeline manages its own weight loading", which
-        # is true for us: condition encoder + DiT + VAE all load during
-        # __init__ above.
-        self.weights_sources = []
-
-        # Reuse ZImagePipeline's denoise + CFG + VAE decode loop by creating
-        # an instance from our pre-built components.  Ming does not use
-        # ZImagePipeline's text_encoder / tokenizer (condition embeddings are
-        # computed by our own MingConditionEncoder), so we pass None for both.
-        self._z_pipeline = ZImagePipeline.from_components(
-            od_config=SimpleNamespace(
-                model=model_path,
-                quantization_config=None,
-                enable_diffusion_pipeline_profiler=False,
-                dtype=dtype,
-            ),
-            scheduler=self.scheduler,
-            vae=self.vae,
-            transformer=self.transformer,
-        )
-
-        self.setup_diffusion_pipeline_profiler(
-            enable_diffusion_pipeline_profiler=getattr(od_config, "enable_diffusion_pipeline_profiler", False)
-        )
         logger.info("[MingImagePipeline] ready — vae_scale_factor=%d", self.vae_scale_factor)
-
-    # ------------------------------------------------------------------
-    # Weight loading helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _load_transformer_weights(
-        transformer: nn.Module,
-        transformer_dir: Path,
-    ) -> None:
-        from safetensors.torch import load_file
-
-        if not transformer_dir.exists():
-            raise FileNotFoundError(f"transformer dir missing: {transformer_dir}")
-        candidates = sorted(transformer_dir.glob("*.safetensors"))
-        if not candidates:
-            candidates = sorted(transformer_dir.glob("*.bin"))
-        if not candidates:
-            raise FileNotFoundError(f"no weight files in {transformer_dir}")
-
-        def _weight_iter():
-            for p in candidates:
-                logger.info("[MingImagePipeline] reading transformer weights: %s", p)
-                if p.suffix == ".safetensors":
-                    shard = load_file(str(p))
-                else:
-                    shard = torch.load(str(p), map_location="cpu")
-                yield from shard.items()
-
-        loaded = transformer.load_weights(_weight_iter())
-        total = len(list(transformer.named_parameters()))
-        logger.info(
-            "[MingImagePipeline] transformer load summary: loaded=%d / %d params",
-            len(loaded),
-            total,
-        )
-
-    # This pipeline loads all its own weights from checkpoint subfolders
-    # during ``__init__`` (condition_encoder, DiT, VAE, ByT5).  The
-    # diffusion loader still calls ``load_weights`` — we drain the iterator
-    # (backed by file-handle-owning generators) and report all parameters
-    # as loaded so the post-load completeness check passes.
-    _self_loading = True
-
-    def load_weights(self, weights):
-        for _ in weights:  # drain to release file handles
-            pass
-        return {name for name, _ in self.named_parameters()}
 
     # ------------------------------------------------------------------
     # Helpers
@@ -502,7 +437,7 @@ class MingImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
             None if ref_latent is None else tuple(ref_latent.shape),
         )
         try:
-            output = self._z_pipeline.forward(
+            output = super().forward(
                 z_req,
                 prompt=None,
                 height=height,
