@@ -833,7 +833,7 @@ class ZImagePipeline(nn.Module, DiffusionPipelineProfilerMixin):
         # Record components loaded by diffusers submodules to satisfy strict checks.
         loaded_weights |= {f"vae.{name}" for name, _ in self.vae.named_parameters()}
         # downstream pipelines (e.g. MingImagePipeline) may set ``self.text_encoder = None`` when they
-        # bring their own conditioning path. 
+        # bring their own conditioning path.
         if self.text_encoder is not None:
             loaded_weights |= {f"text_encoder.{name}" for name, _ in self.text_encoder.named_parameters()}
         return loaded_weights

@@ -309,7 +309,9 @@ class MingConditionEncoder(nn.Module):
             raise ValueError(f"expected [B, N, H], got shape {tuple(thinker_hidden_states.shape)}")
 
         b, n, _ = thinker_hidden_states.shape
-        logger.debug("[MingCondEnc] input shape=%s dtype=%s", tuple(thinker_hidden_states.shape), thinker_hidden_states.dtype)
+        logger.debug(
+            "[MingCondEnc] input shape=%s dtype=%s", tuple(thinker_hidden_states.shape), thinker_hidden_states.dtype
+        )
 
         x = self.proj_in(thinker_hidden_states)  # [B, N, conn_hidden]
 

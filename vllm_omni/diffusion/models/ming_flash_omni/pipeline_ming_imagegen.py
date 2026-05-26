@@ -127,7 +127,7 @@ class MingImagePipeline(ZImagePipeline):
             self.image_gen_config,
         )
 
-        # ----- weights_sources: DiT transformer + VAE. 
+        # ----- weights_sources: DiT transformer + VAE.
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model_path,
@@ -157,14 +157,14 @@ class MingImagePipeline(ZImagePipeline):
             local_files_only=local_files_only,
         )
         # Ming forces use_dynamic_shifting=True at runtime regardless of what
-        # the checkpoint scheduler_config.json ships. 
+        # the checkpoint scheduler_config.json ships.
         self.scheduler.config["use_dynamic_shifting"] = True
         logger.info(
             "[MingImagePipeline] scheduler: %s (use_dynamic_shifting=True)",
             type(self.scheduler).__name__,
         )
 
-        # ----- VAE: DistributedAutoencoderKL. 
+        # ----- VAE: DistributedAutoencoderKL.
         vae_config = DistributedAutoencoderKL.load_config(
             model_path, subfolder=self.image_gen_config.vae_subfolder, local_files_only=local_files_only
         )
@@ -197,7 +197,7 @@ class MingImagePipeline(ZImagePipeline):
         # Optional ByT5 glyph/text encoder. Only loaded when the checkpoint
         # ships ``byt5/``; otherwise the feature silently stays off and
         # ``extra_args.image_gen.byte5_text`` requests will be ignored.
-        byte5_dir = Path(model_path) / "byt5"
+        byte5_dir = Path(model_path) / "byte5"
         if byte5_dir.exists():
             self.byte5 = MingByT5Encoder.from_checkpoint(byte5_dir, device=self.device, dtype=dtype)
         else:
@@ -422,7 +422,7 @@ class MingImagePipeline(ZImagePipeline):
 
         # Reference image (img2img) → VAE-encoded latent published on the
         # active ForwardContext so MingZImageTransformer2DModel can read it
-        # from request scope inside its forward(). 
+        # from request scope inside its forward().
         ref_latent = self._encode_reference_image(extra.get("reference_image"), height, width)
         set_forward_context_ref_latent(ref_latent)
 

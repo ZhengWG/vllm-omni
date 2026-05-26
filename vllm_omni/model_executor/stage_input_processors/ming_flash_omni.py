@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from typing import Any
 
 import torch
-
 from vllm.inputs import TextPrompt
 
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -380,9 +379,7 @@ def thinker2imagegen(
     from quoted prompt text.
     """
     thinker_outputs = source_outputs
-    image_patch_token_id, image_end_token_id, num_query_tokens = (
-        _resolve_token_ids_from_stage_or_defaults(stage=None)
-    )
+    image_patch_token_id, image_end_token_id, num_query_tokens = _resolve_token_ids_from_stage_or_defaults(stage=None)
 
     parent_output = None
     negative_output = None
@@ -446,8 +443,7 @@ def thinker2imagegen(
 
         if byte5_texts:
             extra["byte5_text"] = [
-                t if t.startswith("Text ") else f'Text "{t}". '
-                for t in byte5_texts if isinstance(t, str)
+                t if t.startswith("Text ") else f'Text "{t}". ' for t in byte5_texts if isinstance(t, str)
             ]
         else:
             glyph = _extract_byte5_glyph_text(prompt_text)
@@ -457,10 +453,7 @@ def thinker2imagegen(
         # prompt is not a dict — still honor explicit byte5_text from sampling_params.
         sp_byte5 = _extract_byte5_from_sampling_params(sampling_params)
         if sp_byte5:
-            extra["byte5_text"] = [
-                t if t.startswith("Text ") else f'Text "{t}". '
-                for t in sp_byte5
-            ]
+            extra["byte5_text"] = [t if t.startswith("Text ") else f'Text "{t}". ' for t in sp_byte5]
 
     return [{"prompt": "", "extra": extra}]
 

@@ -447,7 +447,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                 # access them (e.g. byte5_text for ByT5 glyph rendering).
                 if hasattr(request, "sampling_params_list") and request.sampling_params_list:
                     for sp_raw in request.sampling_params_list:
-                        ea = (sp_raw.get("extra_args") or {}) if isinstance(sp_raw, dict) else (getattr(sp_raw, "extra_args", None) or {})
+                        ea = (
+                            (sp_raw.get("extra_args") or {})
+                            if isinstance(sp_raw, dict)
+                            else (getattr(sp_raw, "extra_args", None) or {})
+                        )
                         ig = ea.get("image_gen") or {}
                         if ig:
                             tprompt["image_gen_extra_args"] = ig

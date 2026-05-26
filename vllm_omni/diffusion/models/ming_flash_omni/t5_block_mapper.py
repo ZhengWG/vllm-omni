@@ -77,10 +77,10 @@ class T5EncoderBlockByT5Mapper(ModelMixin):
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        """Load Ming's HF-format byt5_mapper checkpoint into the fused
+        """Load Ming's HF-format byte5_mapper checkpoint into the fused
         TP-aware layers.
 
-        Source format (from ``byt5_mapper.pt``):
+        Source format (from ``byte5_mapper.pt``):
             blocks.{i}.layer.0.SelfAttention.{q,k,v,o}.weight
             blocks.{i}.layer.1.DenseReluDense.{wi_0,wi_1,wo}.weight
             blocks.{i}.layer.{0,1}.layer_norm.weight

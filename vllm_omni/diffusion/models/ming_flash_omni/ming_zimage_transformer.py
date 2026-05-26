@@ -19,8 +19,7 @@ from vllm_omni.diffusion.models.z_image.z_image_transformer import ZImageTransfo
 
 
 class MingZImageTransformer2DModel(ZImageTransformer2DModel):
-    """ZImage DiT with Ming's reference-latent support.
-    """
+    """ZImage DiT with Ming's reference-latent support."""
 
     def forward(
         self,
