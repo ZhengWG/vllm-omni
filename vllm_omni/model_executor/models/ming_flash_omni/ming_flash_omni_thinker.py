@@ -707,6 +707,16 @@ class MingFlashOmniThinkerForConditionalGeneration(
         from pathlib import Path
 
         p = Path(model_path) / "mlp" / "model.safetensors"
+        if not p.exists() and not os.path.exists(model_path):
+            from vllm_omni.model_executor.model_loader.weight_utils import (
+                download_weights_from_hf_specific,
+            )
+
+            try:
+                local_path = download_weights_from_hf_specific(model_path, None, ["mlp/*"])
+                p = Path(local_path) / "mlp" / "model.safetensors"
+            except Exception:
+                logger.exception("[MingFlashOmniThinker] failed to download mlp/ from %s", model_path)
         if not p.exists():
             logger.warning(
                 "[MingFlashOmniThinker] mlp/model.safetensors not found at %s; "
