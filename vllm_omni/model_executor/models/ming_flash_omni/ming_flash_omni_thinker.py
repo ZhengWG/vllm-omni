@@ -540,6 +540,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         if images is not None:
             image_outputs = hf_processor.image_processor(
                 images=images,
+                videos=None,
                 return_tensors="pt",
             )
             data.update(image_outputs)
@@ -547,7 +548,7 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
         videos = mm_data.get("videos", None)
         if videos is not None:
             video_outputs = hf_processor.image_processor(
-                images=videos,
+                images=None,
                 videos=videos,
                 return_tensors="pt",
             )
