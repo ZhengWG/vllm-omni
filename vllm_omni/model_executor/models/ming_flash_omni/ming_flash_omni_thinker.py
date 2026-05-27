@@ -6,7 +6,7 @@
 
 """Ming-flash-omni-2.0 Thinker stage implementation (multimodal understanding)."""
 
-import logging
+import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Annotated, Any
 
@@ -1032,28 +1032,6 @@ class MingFlashOmniThinkerForConditionalGeneration(
         multimodal_outputs = {
             "final_hidden_states": hidden_states,
         }
-
-        # Image-gen: if <imagePatch> tokens were present in the input, export
-        # their final hidden states for the downstream imagegen stage. This
-        # fires for BOTH comprehension and generation requests — the imagegen
-        # stage is only invoked for generation by the stage router, so the
-        # extra payload on comprehension requests is harmless.
-        patch_token_id = self.config.image_patch_token
-        patch_mask = input_ids == patch_token_id
-        if patch_mask.any():
-            gen_hidden = hidden_states[patch_mask]  # [num_patch, hidden]
-            multimodal_outputs["ming_imagegen_hidden_states"] = gen_hidden
-            if logger.isEnabledFor(logging.DEBUG):
-                g = gen_hidden.detach().float()
-                logger.debug(
-                    "[MingFlashOmniThinker] exported patch-token hidden_states "
-                    "shape=%s dtype=%s mean=%+.4f std=%.4f |x|/tok=%.3f",
-                    tuple(gen_hidden.shape),
-                    gen_hidden.dtype,
-                    g.mean().item(),
-                    g.std().item(),
-                    g.norm(dim=-1).mean().item(),
-                )
 
         return OmniOutput(
             text_hidden_states=hidden_states,
