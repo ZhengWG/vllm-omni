@@ -21,6 +21,9 @@
 # (custom_process_input_func) slices it and produces a list[dict] with the
 # conditioning tensor under ``extra[thinker_hidden_states]``. Msgpack
 # (``OmniMsgpackEncoder``) handles bf16/fp16 tensors natively.
+#
+# TODO(ming-flash-omni-2.0): stage 0 `thinker_config` / stage 1 `image_gen_config` target the
+# future unified MingFlashOmniConfig; today's BailingMM2Config checkpoint silently falls back.
 
 stage_args:
   - stage_id: 0
@@ -29,6 +32,7 @@ stage_args:
     # companion is spawned so both positive and negative hidden states reach
     # the diffusion stage (consumed by MingImagePipeline as real CFG negatives).
     prompt_expand_func: vllm_omni.model_executor.stage_input_processors.ming_flash_omni.expand_cfg_prompts
+    hf_config_name: thinker_config
     runtime:
       devices: "0,1,2,3"
     engine_args:
@@ -43,7 +47,6 @@ stage_args:
       engine_output_type: latent
       distributed_executor_backend: "mp"
       enable_prefix_caching: false
-      hf_config_name: thinker_config
       tensor_parallel_size: 4
     is_comprehension: true
     default_sampling_params:
@@ -58,6 +61,7 @@ stage_args:
 
   - stage_id: 1
     stage_type: diffusion
+    hf_config_name: image_gen_config
     runtime:
       devices: "4"
     engine_args:
@@ -66,7 +70,6 @@ stage_args:
       enforce_eager: true
       trust_remote_code: true
       distributed_executor_backend: "mp"
-      hf_config_name: thinker_config
     engine_input_source: [0]
     custom_process_input_func: vllm_omni.model_executor.stage_input_processors.ming_flash_omni.thinker2imagegen
     final_output: true
