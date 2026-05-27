@@ -50,6 +50,9 @@ from vllm_omni.diffusion.models.ming_flash_omni.ming_zimage_transformer import (
 )
 from vllm_omni.diffusion.models.z_image.pipeline_z_image import ZImagePipeline
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.model_executor.model_loader.weight_utils import (
+    download_weights_from_hf_specific,
+)
 from vllm_omni.transformers_utils.configs.ming_flash_omni import MingImageGenConfig
 
 logger = logging.getLogger(__name__)
@@ -104,7 +107,7 @@ class MingImagePipeline(ZImagePipeline):
 
         model_path = od_config.model
         if not os.path.exists(model_path):
-            raise FileNotFoundError(f"Ming checkpoint path does not exist: {model_path}")
+            model_path = download_weights_from_hf_specific(model_path, od_config.revision, ["*"])
 
         dtype = getattr(od_config, "dtype", torch.bfloat16)
         local_files_only = os.path.exists(model_path)
