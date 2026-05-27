@@ -76,5 +76,3 @@ th {
 |`HiDreamImagePipeline` | HiDream-I1-Full | `HiDream-ai/HiDream-I1-Full` | ✅︎ | ✅︎ | | |
 
 ✅︎ indicates the model is supported on that backend. Empty cells mean not listed as supported on that backend.
-
-<sup>1</sup> Ming-flash-omni-2.0 ships text-in, image/audio-in, text+audio-out (`Thinker + Talker` via [`ming_flash_omni.yaml`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/deploy/ming_flash_omni.yaml)) and **image-out** (text-to-image / img2img via the dual-stage [`ming_flash_omni_dual.yaml`](https://github.com/vllm-project/vllm-omni/blob/main/vllm_omni/model_executor/stage_configs/ming_flash_omni_dual.yaml)). See [`examples/online_serving/ming_flash_omni`](https://github.com/vllm-project/vllm-omni/blob/main/examples/online_serving/ming_flash_omni/README.md) for image-gen usage and knobs.
