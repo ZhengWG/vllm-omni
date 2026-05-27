@@ -951,6 +951,7 @@ class Orchestrator:
                 _t_ar2d = _time.perf_counter()
                 _fn = next_client.custom_process_input_func
                 _extra_kwargs: dict[str, Any] = {}
+                # TODO: replace signature probe with explicit kwarg contract.
                 try:
                     import inspect as _inspect
 

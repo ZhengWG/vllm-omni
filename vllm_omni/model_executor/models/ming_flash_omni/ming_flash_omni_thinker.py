@@ -547,6 +547,8 @@ class MingFlashOmniThinkerMultiModalProcessor(BaseMultiModalProcessor[MingFlashO
 
         videos = mm_data.get("videos", None)
         if videos is not None:
+            # TODO: ``videos=`` on image_processor is deprecated since
+            # transformers v4.57 (removed in v5); migrate to Qwen2VLVideoProcessor.
             video_outputs = hf_processor.image_processor(
                 images=None,
                 videos=videos,
