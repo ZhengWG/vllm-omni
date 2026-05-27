@@ -119,18 +119,16 @@ class MingByT5Encoder(nn.Module):
         dtype: torch.dtype,
     ) -> MingByT5Encoder:
         byte5_dir = Path(byte5_dir)
-        # Ming checkpoint uses ``byte5`` prefix in filenames and JSON keys;
-        # normalize to ``byte5`` naming consistently.
+        # Ming checkpoint uses ``byte5`` (no 'e') in filenames and JSON keys
         cfg_path = byte5_dir / "byte5.json"
         cfg_raw = json.loads(cfg_path.read_text())
         cfg = SimpleNamespace(**cfg_raw)
-        # Support both ``byte5_*`` (checkpoint) and ``byte5_*`` (legacy) keys.
-        byte5_config = getattr(cfg, "byte5_config", None) or cfg.byte5_config
-        mapper_config = getattr(cfg, "byte5_mapper_config", None) or cfg.byte5_mapper_config
-        max_length = int(getattr(cfg, "byte5_max_length", None) or cfg.byte5_max_length)
+        byte5_config = cfg.byte5_config
+        mapper_config = cfg.byte5_mapper_config
+        max_length = int(cfg.byte5_max_length)
 
         # ---- Tokenizer + T5 encoder (base).
-        ckpt_key = byte5_config.get("byte5_ckpt_path") or byte5_config.get("byte5_ckpt_path")
+        ckpt_key = byte5_config.get("byte5_ckpt_path")
         byte5_ckpt_path = byte5_dir / ckpt_key.lstrip("./")
         tokenizer = AutoTokenizer.from_pretrained(byte5_ckpt_path, local_files_only=True)
         text_encoder = T5ForConditionalGeneration.from_pretrained(byte5_ckpt_path, local_files_only=True).get_encoder()
