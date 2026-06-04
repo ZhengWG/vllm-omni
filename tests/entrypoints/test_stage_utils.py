@@ -137,16 +137,16 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_map_device_list_idempotency():
-    """Device IDs already in the visible set are returned as-is (idempotency)."""
+def test_map_device_list_zero_based_visible():
+    """Logical indices into a 0-based visible list map correctly."""
     result = _map_device_list(0, ["0", "1"], ["0", "1", "2", "3"])
     assert result == ["0", "1"]
 
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_map_device_list_idempotency_single():
-    """Single device ID in visible set passes through."""
+def test_map_device_list_single_index():
+    """Single logical index maps via the visible list."""
     result = _map_device_list(1, ["1"], ["0", "1"])
     assert result == ["1"]
 
@@ -195,10 +195,8 @@ def test_map_device_list_index_with_gaps():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_map_device_list_index_mapping_no_idempotency():
-    """Device IDs < num_visible not in visible set map via index even when no ID matches literally."""
-    # "0","1" with visible ["2","3"]: idempotency check fails (none in set),
-    # but index mapping succeeds: visible[0]="2", visible[1]="3"
+def test_map_device_list_index_mapping_offset_visible():
+    """Device IDs map via index even when the visible set starts at a higher offset."""
     result = _map_device_list(0, ["0", "1"], ["2", "3"])
     assert result == ["2", "3"]
 
@@ -209,6 +207,33 @@ def test_map_device_list_partial_mapping():
     """When only a subset can map, returns the mapped subset (no error)."""
     result = _map_device_list(0, ["0", "1", "2"], ["5", "6"])
     assert result == ["5", "6"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_multi_replica_offset_cvd():
+    """Logical indices from split_devices_for_replicas correctly map through
+    an offset CUDA_VISIBLE_DEVICES (the bug from issue #4071).
+
+    With CVD=2,3,4,5 and 2 replicas for a stage using devices "1,2":
+      - Replica 0 gets device '1' -> should map to visible[1] = '3'
+      - Replica 1 gets device '2' -> should map to visible[2] = '4'
+    Previously the idempotency check would see '2' in {2,3,4,5} and
+    return it as-is, mapping to physical GPU 2 instead of GPU 4.
+    """
+    visible = ["2", "3", "4", "5"]
+    assert _map_device_list(1, ["1"], visible) == ["3"]
+    assert _map_device_list(1, ["2"], visible) == ["4"]
+    assert _map_device_list(1, ["3"], visible) == ["5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_multi_replica_tp2_offset_cvd():
+    """Multi-replica with TP=2 and offset CVD maps all logical indices correctly."""
+    visible = ["2", "3", "4", "5"]
+    assert _map_device_list(1, ["0", "1"], visible) == ["2", "3"]
+    assert _map_device_list(1, ["2", "3"], visible) == ["4", "5"]
 
 
 @pytest.mark.core_model

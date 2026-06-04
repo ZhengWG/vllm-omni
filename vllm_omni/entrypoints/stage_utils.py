@@ -88,39 +88,15 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
     """
     num_visible = len(visible_device_list)
 
-    # Ensure that the logical IDs are actually in range to avoid index errors;
-    # if some requested ids exceed the available pool, we will fall back to the
-    # subset that can be mapped and leave the final capacity check to the later
-    # parallel-config validation path.
     if not all(device.isdigit() for device in device_list):
         raise ValueError("Logical devices must be non-negative integers")
-
-    # Idempotency: if every requested id already names an entry in the visible
-    # pool (by value, not by index), treat the YAML field as physical and skip
-    # the remap. This avoids a double-mapping crash when a parent harness has
-    # already narrowed CUDA_VISIBLE_DEVICES to specific physical ids before
-    # spawning the subprocess (the test runtime's OmniServerStageCli does this
-    # — it sets each stage subprocess's env via ``_set_stage_device_env``).
-    # Without this guard, a YAML ``devices: "1"`` against a narrowed visible
-    # list ``["1"]`` would try ``visible[1]`` (out of range) and raise.
-    visible_set = set(visible_device_list)
-    if all(device in visible_set for device in device_list):
-        logger.info(
-            "Stage %s requested devices %s are already in the visible set %s; using as-is (no remap).",
-            stage_id,
-            device_list,
-            visible_device_list,
-        )
-        return list(device_list)
 
     logical_ids = [int(device) for device in device_list]
 
     # If ALL logical device IDs are >= num_visible, none can be 0-based indices
-    # into the visible list — they must be physical device IDs.  This happens
-    # during multi-replica stage initialization where split_devices_for_replicas
-    # assigns physical device IDs (e.g. "2") that are not part of the current
-    # process's CUDA_VISIBLE_DEVICES but are valid physical GPUs.  Pass them
-    # through directly so the replica subprocess inherits the correct device.
+    # into the visible list.  Pass them through as physical device IDs so that
+    # out-of-range configurations surface as a CUDA/device error rather than an
+    # IndexError here.
     if logical_ids and all(d >= num_visible for d in logical_ids):
         logger.warning(
             "Stage %s has device IDs %s, none of which are < the visible device count %d "
