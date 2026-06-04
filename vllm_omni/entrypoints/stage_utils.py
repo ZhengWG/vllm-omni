@@ -97,6 +97,10 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
     # into the visible list.  Pass them through as physical device IDs so that
     # out-of-range configurations surface as a CUDA/device error rather than an
     # IndexError here.
+    # NOTE: multi-replica stage initialization uses split_devices_for_replicas
+    # which always produces logical indices within the visible range; this
+    # fallback should NOT be triggered by that path.  If it is, the stage
+    # config likely declares more replicas than available GPUs.
     if logical_ids and all(d >= num_visible for d in logical_ids):
         logger.warning(
             "Stage %s has device IDs %s, none of which are < the visible device count %d "
