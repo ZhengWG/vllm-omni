@@ -145,42 +145,10 @@ def test_map_device_list_index_mapping():
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_map_device_list_physical_fallback():
-    """Device IDs >= num_visible are treated as physical IDs and passed through."""
-    result = _map_device_list(1, ["2"], ["0", "1"])
-    assert result == ["2"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_map_device_list_physical_fallback_multi():
-    """Multiple device IDs >= num_visible all pass through as physical IDs."""
-    result = _map_device_list(1, ["2", "3"], ["0", "1"])
-    assert result == ["2", "3"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_map_device_list_physical_fallback_mixed():
-    """When some devices are >= num_visible but some < num_visible, index mapping applies for the subset."""
-    result = _map_device_list(1, ["1", "2"], ["0", "5"])
-    assert result == ["5"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_map_device_list_index_with_gaps():
     """Index-based mapping works with non-contiguous visible device lists."""
     result = _map_device_list(0, ["0", "1"], ["4", "5", "7"])
     assert result == ["4", "5"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_map_device_list_partial_mapping():
-    """When only a subset can map, returns the mapped subset (no error)."""
-    result = _map_device_list(0, ["0", "1", "2"], ["5", "6"])
-    assert result == ["5", "6"]
 
 
 @pytest.mark.core_model
@@ -208,6 +176,14 @@ def test_map_device_list_multi_replica_tp2_offset_cvd():
     visible = ["2", "3", "4", "5"]
     assert _map_device_list(1, ["0", "1"], visible) == ["2", "3"]
     assert _map_device_list(1, ["2", "3"], visible) == ["4", "5"]
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_map_device_list_raises_on_out_of_range():
+    """Logical IDs exceeding visible device count raise ValueError."""
+    with pytest.raises(ValueError, match="exceed the number of visible devices"):
+        _map_device_list(1, ["2"], ["0", "1"])
 
 
 @pytest.mark.core_model

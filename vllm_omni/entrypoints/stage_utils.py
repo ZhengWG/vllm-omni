@@ -93,51 +93,20 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
 
     logical_ids = [int(device) for device in device_list]
 
-    # If ALL logical device IDs are >= num_visible, none can be 0-based indices
-    # into the visible list.  Pass them through as physical device IDs so that
-    # out-of-range configurations surface as a CUDA/device error rather than an
-    # IndexError here.
-    # NOTE: multi-replica stage initialization uses split_devices_for_replicas
-    # which always produces logical indices within the visible range; this
-    # fallback should NOT be triggered by that path.  If it is, the stage
-    # config likely declares more replicas than available GPUs.
-    if logical_ids and all(d >= num_visible for d in logical_ids):
-        logger.warning(
-            "Stage %s has device IDs %s, none of which are < the visible device count %d "
-            "(visible=%s). Treating them as physical device IDs and passing through.",
-            stage_id,
-            device_list,
-            num_visible,
-            visible_device_list,
-        )
-        return list(device_list)
-
-    mapped_devices = [visible_device_list[idx] for idx in logical_ids if idx < num_visible]
-    mapping_pairs = [
-        f"{logical_id}->{visible_device_list[logical_id]}" for logical_id in logical_ids if logical_id < num_visible
-    ]
-    if not mapped_devices:
+    out_of_range = [d for d in logical_ids if d >= num_visible]
+    if out_of_range:
         raise ValueError(
-            f"Stage {stage_id} has logical IDs {device_list}, none of which map to the visible devices "
-            f"{visible_device_list}"
+            f"Stage {stage_id} has logical device IDs {out_of_range} that exceed the "
+            f"number of visible devices ({num_visible}): {visible_device_list}"
         )
-    if len(mapped_devices) < len(logical_ids):
-        logger.warning(
-            "Stage %s requested logical devices %s, but only %d device(s) are currently available: %s. "
-            "Resolved logical-to-physical mapping: %s. Falling back to mapped subset %s",
-            stage_id,
-            device_list,
-            num_visible,
-            visible_device_list,
-            ", ".join(mapping_pairs) if mapping_pairs else "(none)",
-            mapped_devices,
-        )
-    else:
-        logger.info(
-            "Stage %s logical-to-physical device mapping: %s",
-            stage_id,
-            ", ".join(mapping_pairs),
-        )
+
+    mapped_devices = [visible_device_list[idx] for idx in logical_ids]
+    mapping_pairs = [f"{lid}->{visible_device_list[lid]}" for lid in logical_ids]
+    logger.info(
+        "Stage %s logical-to-physical device mapping: %s",
+        stage_id,
+        ", ".join(mapping_pairs),
+    )
     return mapped_devices
 
 
