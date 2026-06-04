@@ -649,9 +649,8 @@ def setup_stage_devices(stage_id: int, runtime_cfg: Any) -> None:
         stage_id,
         runtime_cfg.get("devices") if hasattr(runtime_cfg, "get") else None,
     )
-    # Only log if we actually set the env vars in the stage
     if physical_devices:
-        logger.info(
+        logger.debug(
             "[stage_init] Stage-%s set runtime devices: %s",
             stage_id,
             physical_devices,

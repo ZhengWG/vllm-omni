@@ -119,17 +119,16 @@ def _map_device_list(stage_id: int, device_list: list[str], visible_device_list:
         )
     if len(mapped_devices) < len(logical_ids):
         logger.warning(
-            "Stage %s requested logical devices %s, but only %d device(s) are currently available: %s. "
-            "Resolved logical-to-physical mapping: %s. Falling back to mapped subset %s",
+            "Stage %s requested %d logical device(s) %s but only %d visible; "
+            "using mapped subset: %s",
             stage_id,
+            len(logical_ids),
             device_list,
             num_visible,
-            visible_device_list,
-            ", ".join(mapping_pairs) if mapping_pairs else "(none)",
-            mapped_devices,
+            ", ".join(mapping_pairs),
         )
     else:
-        logger.info(
+        logger.debug(
             "Stage %s logical-to-physical device mapping: %s",
             stage_id,
             ", ".join(mapping_pairs),
