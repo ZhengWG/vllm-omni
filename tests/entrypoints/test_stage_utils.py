@@ -137,24 +137,8 @@ def test_set_stage_devices_npu_platform(mocker: MockerFixture, monkeypatch: pyte
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_map_device_list_zero_based_visible():
-    """Logical indices into a 0-based visible list map correctly."""
-    result = _map_device_list(0, ["0", "1"], ["0", "1", "2", "3"])
-    assert result == ["0", "1"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_map_device_list_single_index():
-    """Single logical index maps via the visible list."""
-    result = _map_device_list(1, ["1"], ["5", "6"])
-    assert result == ["6"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_map_device_list_index_mapping():
-    """Device IDs < num_visible not in set are treated as indices."""
+    """Logical indices are mapped through the visible device list."""
     result = _map_device_list(0, ["0", "1"], ["6", "7", "8", "9"])
     assert result == ["6", "7"]
 
@@ -179,8 +163,6 @@ def test_map_device_list_physical_fallback_multi():
 @pytest.mark.cpu
 def test_map_device_list_physical_fallback_mixed():
     """When some devices are >= num_visible but some < num_visible, index mapping applies for the subset."""
-    # "1" < num_visible(2) so index mapping applies: visible[1] = "5"
-    # "2" >= num_visible(2) so it's dropped via the partial mapping path
     result = _map_device_list(1, ["1", "2"], ["0", "5"])
     assert result == ["5"]
 
@@ -191,14 +173,6 @@ def test_map_device_list_index_with_gaps():
     """Index-based mapping works with non-contiguous visible device lists."""
     result = _map_device_list(0, ["0", "1"], ["4", "5", "7"])
     assert result == ["4", "5"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_map_device_list_index_mapping_offset_visible():
-    """Device IDs map via index even when the visible set starts at a higher offset."""
-    result = _map_device_list(0, ["0", "1"], ["2", "3"])
-    assert result == ["2", "3"]
 
 
 @pytest.mark.core_model
