@@ -147,8 +147,8 @@ def test_map_device_list_zero_based_visible():
 @pytest.mark.cpu
 def test_map_device_list_single_index():
     """Single logical index maps via the visible list."""
-    result = _map_device_list(1, ["1"], ["0", "1"])
-    assert result == ["1"]
+    result = _map_device_list(1, ["1"], ["5", "6"])
+    assert result == ["6"]
 
 
 @pytest.mark.core_model
