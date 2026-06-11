@@ -26,13 +26,13 @@ from typing import Any, Literal, cast
 import janus
 import torch
 from omegaconf import OmegaConf
-from vllm import envs as vllm_envs
 from vllm.engine.arg_utils import EngineArgs
 from vllm.inputs import PromptType
 from vllm.logger import init_logger
 from vllm.v1.engine import EngineCoreRequest
 from vllm.v1.engine.input_processor import InputProcessor
 
+from vllm import envs as vllm_envs
 from vllm_omni.config.stage_config import strip_parent_engine_args
 from vllm_omni.diffusion.data import DiffusionParallelConfig, parse_attention_config
 from vllm_omni.diffusion.diffusion_engine import supports_audio_output
@@ -921,6 +921,8 @@ class AsyncOmniEngine:
                                         vllm_config=vllm_config,
                                         executor_class=executor_class,
                                         log_stats=self._log_stats,
+                                        omni_stage_id=plan.metadata.stage_id,
+                                        omni_replica_id=plan.replica_id,
                                     )
                                 logger.info(
                                     "[AsyncOmniEngine] Stage %s engine launch started",
