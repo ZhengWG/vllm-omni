@@ -69,8 +69,8 @@ class StageEngineCoreProc(EngineCoreProc):
         dp_rank: int = 0,
         local_dp_rank: int = 0,
         omni_coordinator_address: str | None = None,
-        stage_id: int | None = None,
-        replica_id: int = 0,
+        omni_stage_id: int | None = None,
+        omni_replica_id: int = 0,
         **kwargs: Any,
     ) -> None:
         """Launch StageEngineCoreProc busy loop in background process.
@@ -82,9 +82,9 @@ class StageEngineCoreProc(EngineCoreProc):
             HELLO/INIT/READY handshake completes and reports its status +
             queue length via heartbeats. The hook is wired so each
             heartbeat refreshes ``queue_length`` from the live scheduler.
-          - ``stage_id``: logical stage id this replica belongs to.
+          - ``omni_stage_id``: logical stage id this replica belongs to.
             Required when ``omni_coordinator_address`` is provided.
-          - ``replica_id``: cluster-unique replica id within the
+          - ``omni_replica_id``: cluster-unique replica id within the
             stage (assigned by :class:`OmniMasterServer`). Used for
             logging / metrics only.
         """
@@ -113,16 +113,16 @@ class StageEngineCoreProc(EngineCoreProc):
             # so the DP fields propagate through from the caller exactly
             # like upstream vLLM.
 
-            stage_label = f"stage{stage_id}" if stage_id is not None else "noid"
+            stage_label = f"stage{omni_stage_id}" if omni_stage_id is not None else "noid"
             set_death_signal(signal.SIGTERM)
-            set_process_title(f"StageEngineCoreProc_{stage_label}_replica{replica_id}_DP{dp_rank}")
+            set_process_title(f"StageEngineCoreProc_{stage_label}_replica{omni_replica_id}_DP{dp_rank}")
             decorate_logs()
             # Workaround for flashinfer/jit-cache version mismatch in CI.
             # The parent process handles this gracefully via ring_globals.py,
             # but the subprocess hits an unprotected import in TopKTopPSampler.
             # Setting this env var allows the same graceful fallback to work.
             os.environ.setdefault("FLASHINFER_DISABLE_VERSION_CHECK", "1")
-            os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(replica_id), 0))
+            os.environ["VLLM_OMNI_REPLICA_ID"] = str(max(int(omni_replica_id), 0))
 
             # Patch the decoder type so process_input_sockets (started
             # during __init__) decodes OmniEngineCoreRequest (which
@@ -146,8 +146,8 @@ class StageEngineCoreProc(EngineCoreProc):
             # its own OmniMasterServer allocation, so the heartbeat client
             # runs unconditionally — there is no dp_rank-based gating.
             if omni_coordinator_address is not None:
-                if stage_id is None:
-                    raise ValueError("stage_id must be provided when omni_coordinator_address is set")
+                if omni_stage_id is None:
+                    raise ValueError("omni_stage_id must be provided when omni_coordinator_address is set")
                 addresses: EngineZmqAddresses = engine_core.addresses
                 if not addresses.inputs or not addresses.outputs:
                     raise RuntimeError(
@@ -158,7 +158,7 @@ class StageEngineCoreProc(EngineCoreProc):
                     coord_zmq_addr=omni_coordinator_address,
                     input_addr=addresses.inputs[0],
                     output_addr=addresses.outputs[0],
-                    stage_id=int(stage_id),
+                    stage_id=int(omni_stage_id),
                 )
 
                 def _refresh_queue_length() -> None:
@@ -218,8 +218,8 @@ def spawn_stage_core(
     vllm_config: VllmConfig,
     executor_class: type[Executor],
     log_stats: bool = False,
-    stage_id: int | None = None,
-    replica_id: int = 0,
+    omni_stage_id: int | None = None,
+    omni_replica_id: int = 0,
 ) -> tuple[EngineZmqAddresses, BaseProcess, str]:
     """Spawn a *StageEngineCoreProc* subprocess without performing the handshake.
 
@@ -243,8 +243,8 @@ def spawn_stage_core(
             "log_stats": log_stats,
             "dp_rank": 0,
             "local_dp_rank": 0,
-            "stage_id": stage_id,
-            "replica_id": replica_id,
+            "omni_stage_id": omni_stage_id,
+            "omni_replica_id": omni_replica_id,
         },
     )
     proc.start()
