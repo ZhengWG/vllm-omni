@@ -134,20 +134,17 @@ def test_ring_ttl_zero_never_reclaims(ring):
         ring.publish(key_hash16("y"), 0, b"n", ts=999999, ttl_sec=0)
 
 
-def test_ring_name_isolates_deployment_and_replica():
-    """Ring shm name must be deterministic, unique per (deployment_id, edge, replica_id), and
-    a valid POSIX shm name (hashed) even when deployment_id carries unsafe/long chars."""
+def test_ring_name_isolates_edge_and_replica():
+    """Ring shm name is deterministic, unique per (edge, replica_id), and a valid POSIX shm name."""
 
-    def name(dep, rid, a, b):
-        return ring_shm_name(dep, a, b, rid)
+    def name(rid, a, b):
+        return ring_shm_name(a, b, rid)
 
-    base = name("dep7", 0, "0", "1")
-    assert name("dep7", 0, 0, 1) == base  # int (sender) / str (receiver) stage agree
-    assert name("dep7", 3, "0", "1") != base  # replica-unique
-    assert name("depZ", 0, "0", "1") != base  # deployment-unique
-    assert name("dep7", 0, "1", "2") != base  # edge-unique
-    nasty = name("a/b c:δ" * 40, 0, "0", "1")  # unsafe + long deployment_id
-    assert "/" not in nasty and " " not in nasty and len(nasty) < 40
+    base = name(0, "0", "1")
+    assert name(0, 0, 1) == base  # int (sender) / str (receiver) stage agree
+    assert name(3, "0", "1") != base  # replica-unique
+    assert name(0, "1", "2") != base  # edge-unique
+    assert "/" not in base and " " not in base and len(base) < 40
 
 
 # ════════════════════════════════════════════════════════════════════

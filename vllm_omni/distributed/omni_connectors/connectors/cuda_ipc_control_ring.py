@@ -45,13 +45,13 @@ def key_hash16(composite_key: str) -> bytes:
     return hashlib.sha1(composite_key.encode("utf-8")).digest()[:16]
 
 
-def ring_shm_name(deployment_id: str, from_stage, to_stage, replica_id) -> str:
+def ring_shm_name(from_stage, to_stage, replica_id) -> str:
     """Deterministic POSIX shm name for a directed edge.
 
-    Hashes deployment_id + stages + replica_id — deployment_id may carry chars
-    invalid/unsafe for a raw shm name. Aligned 1:1 replicas (from_replica == to_replica).
+    Hashes stage ids + replica_id. Pod/process IPC isolation is assumed for
+    co-located deployments; replica_id distinguishes parallel pipelines.
     """
-    raw = f"{deployment_id}:{from_stage}:{to_stage}:{replica_id}"
+    raw = f"{from_stage}:{to_stage}:{replica_id}"
     return f"cudaipc_{hashlib.sha1(raw.encode()).hexdigest()[:20]}"
 
 

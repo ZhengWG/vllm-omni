@@ -135,11 +135,10 @@ class CudaIPCConnector(OmniConnectorBase):
         if self._is_sender_owner:
             self._start_release_thread()
         logger.info(
-            "CudaIPCConnector initialized: role=%s, local_device=%s, deployment_id=%s, "
+            "CudaIPCConnector initialized: role=%s, local_device=%s, "
             "replica_id=%s, pool=%dMB (%d credits x %dMB slots)",
             self.role,
             self.local_device,
-            self._deployment_id,
             self._replica_id,
             self._pool_size // (1024 * 1024),
             self._pool_credits,
@@ -159,16 +158,6 @@ class CudaIPCConnector(OmniConnectorBase):
         if self.role not in {"sender", "receiver"}:
             raise ValueError(f"Invalid role={self.role!r}. Expected 'sender' or 'receiver'.")
         self.tensor_lifetime_sec = float(config.get("tensor_lifetime_sec", 30.0))
-        # deployment_id isolates co-located services on one host (launcher-set, never
-        # connector-generated — both ends must agree). "default" = tests/dev only.
-        self._deployment_id = str(config.get("deployment_id", "default"))
-        if self._deployment_id == "default":
-            logger.warning(
-                "CudaIPCConnector deployment_id='default' — co-located deployments will collide "
-                "on /dev/shm ring names. Set VLLM_OMNI_DEPLOYMENT_ID (the launcher does this; "
-                "'default' is only safe for single-run tests/dev)."
-            )
-        self._num_replicas = int(config.get("num_replicas", 1))
         # replica_id (per same-host replica) from VLLM_OMNI_REPLICA_ID, set by the engine-core
         # process. Aligned 1:1 edges: sender and receiver resolve the same value.
         _rid = config.get("replica_id")
@@ -276,7 +265,7 @@ class CudaIPCConnector(OmniConnectorBase):
         n_slots = self._ring_entries_cfg or max(64, self._pool_credits * 4)
         body_max = max(self._ring_body_max, self._inline_threshold)
         self._ring = CudaIpcControlRing.create(
-            ring_shm_name(self._deployment_id, self.stage_id, self.stage_id + 1, self._replica_id),
+            ring_shm_name(self.stage_id, self.stage_id + 1, self._replica_id),
             n_slots,
             body_max,
             header_bytes=RING_HEADER_BYTES,
@@ -407,9 +396,7 @@ class CudaIPCConnector(OmniConnectorBase):
         ring = self._opened_rings.get(edge)
         if ring is None:
             try:
-                ring = CudaIpcControlRing.open(
-                    ring_shm_name(self._deployment_id, from_stage, to_stage, self._replica_id)
-                )
+                ring = CudaIpcControlRing.open(ring_shm_name(from_stage, to_stage, self._replica_id))
             except FileNotFoundError:
                 return None  # sender not up yet; poll loop tolerates None
             self._opened_rings[edge] = ring
@@ -906,9 +893,7 @@ class CudaIPCConnector(OmniConnectorBase):
             "status": "healthy" if not self._closed else "closed",
             "role": self.role,
             "local_device": str(self.local_device),
-            "deployment_id": self._deployment_id,
             "replica_id": self._replica_id,
-            "num_replicas": self._num_replicas,
             "pool_size_mb": self._pool_size // (1024 * 1024),
             "pool_credits": self._pool_credits,
             "held_credits": len(self._held_credits),
