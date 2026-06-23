@@ -4,12 +4,22 @@
 """Per-edge SPSC keyed mailbox ring — the CudaIPC connector's control plane.
 
 One pre-allocated ring per directed edge (opened once) replaces the per-transfer /dev/shm
-round-trip. Sender publishes a fixed-stride entry; receiver looks it up by key — fenceless,
-correct on x86 TSO (ARM/POWER would need a store fence).
+round-trip. Sender publishes a fixed-stride entry; receiver looks it up by key.
 
 Lock-free SPSC correctness: body-first / seq-LAST publish (seq is the release marker); a
 seq==0 in-progress sentinel written first on (re)claim; a seqlock re-read guarding the body;
 a per-slot consumed byte for bounded backpressure; open addressing by key hash.
+
+**Memory model (important — read before porting off x86)**
+The seqlock relies on the publisher's ``body``/``seq`` writes being observed by the
+poller in program order. Pure-Python ``struct.pack_into`` calls do NOT issue
+release/acquire fences; this is only safe on TSO architectures (x86/x86_64), where
+stores to different addresses are observed in program order. On weakly-ordered hosts
+(ARM, POWER) the consumer can observe ``seq`` updated before the body is fully
+written, producing a torn read that ``seq_a == seq_b`` cannot detect. To prevent
+silent corruption, ``CudaIpcControlRing`` refuses to start on non-TSO archs by
+default — set ``VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY=1`` to override (only do
+this with a separate fence or a C-extension memory barrier in place).
 
 Pure-Python (struct + POSIX shm), no CUDA — testable on CPU.
 
@@ -19,6 +29,8 @@ seq u64@0 | consumed u8@8 | pclass u8@9 | ts u32@10 | keyhash 16B@14 | blen u32@
 """
 
 import hashlib
+import os
+import platform
 import struct
 from dataclasses import dataclass
 from multiprocessing import shared_memory as shm_pkg
@@ -103,6 +115,45 @@ class RingFullError(Exception):
     """Raised by publish() when no free slot exists in the probe window (backpressure)."""
 
 
+# Architectures whose memory model is compatible with the fenceless seqlock above.
+# x86 (TSO) preserves store-store and store-load order strongly enough that
+# ``body``-then-``seq`` writes are observed in program order without explicit
+# release fences. Weakly-ordered hosts (ARM, POWER) do not, and this Python
+# code path has no portable way to issue a release fence between the body
+# writes and the final seq publish.
+_TSO_MACHINES: frozenset[str] = frozenset({"x86_64", "amd64", "i386", "i686", "x86"})
+
+
+def _memory_model_supports_fenceless_seqlock() -> bool:
+    """True iff the current host's CPU memory model is strong enough.
+
+    Override with ``VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY=1`` only when an
+    explicit fence (e.g. via a C extension) has been wired in.
+    """
+    if os.environ.get("VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY", "0") in ("1", "true", "yes", "on"):
+        return True
+    return platform.machine().lower() in _TSO_MACHINES
+
+
+def _check_memory_model_or_raise(action: str) -> None:
+    """Refuse to ``create``/``open`` a ring on a weakly-ordered host.
+
+    Surfaced at construction time rather than as a torn-read symptom later;
+    the silent-corruption alternative is far worse than a clear startup
+    failure on day-one ARM/POWER deploys.
+    """
+    if _memory_model_supports_fenceless_seqlock():
+        return
+    raise RuntimeError(
+        f"CudaIpcControlRing.{action} refused: this seqlock implementation has no explicit "
+        f"release/acquire fences and is only correct on TSO hosts (x86/x86_64). The current "
+        f"machine is {platform.machine()!r}, which is weakly ordered (ARM, POWER, RISC-V, ...) "
+        f"— ``seq_a == seq_b`` in poll() cannot detect a torn body read here. "
+        f"To explicitly opt in (e.g. after wiring up a memory-barrier extension), set "
+        f"VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY=1."
+    )
+
+
 class CudaIpcControlRing:
     """One directed-edge SPSC keyed mailbox. Sender side calls create()+publish();
     receiver side calls open()+poll(). A fixed header region carries edge-constant
@@ -129,6 +180,7 @@ class CudaIpcControlRing:
     # ---- construction -------------------------------------------------
     @classmethod
     def create(cls, name, n_slots, body_max, header_bytes=0):
+        _check_memory_model_or_raise("create")
         size = 8 + header_bytes + n_slots * (_OFF_BODY + body_max)
         try:
             old = shm_pkg.SharedMemory(name=name)
@@ -162,6 +214,7 @@ class CudaIpcControlRing:
 
     @classmethod
     def open(cls, name):
+        _check_memory_model_or_raise("open")
         shm = shm_pkg.SharedMemory(name=name)
         untrack_shm(name)  # non-owner: never unlink the sender's ring at exit
         n_slots, body_max = struct.unpack_from("<II", shm.buf, 0)

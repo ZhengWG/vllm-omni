@@ -51,6 +51,48 @@ def test_ring_header_round_trip(ring):
     assert ring.read_header(len(blob)) == blob
 
 
+def test_ring_refuses_to_create_on_weakly_ordered_host(monkeypatch):
+    """CudaIpcControlRing's seqlock is fenceless and only safe on TSO hosts.
+    On ARM/POWER the consumer can observe ``seq`` updated before the body is
+    fully written, producing a torn read that ``seq_a == seq_b`` cannot detect.
+    Refusing to construct on weakly-ordered hosts (rather than running and
+    silently corrupting prefill handoffs) is the documented contract."""
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_control_ring as ring_mod
+
+    monkeypatch.setattr(ring_mod.platform, "machine", lambda: "aarch64")
+    monkeypatch.delenv("VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY", raising=False)
+    name = f"test_ipc_ring_arm_{uuid.uuid4().hex[:12]}"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ring_mod.CudaIpcControlRing.create(name, n_slots=8, body_max=64, header_bytes=32)
+
+    msg = str(excinfo.value)
+    assert "TSO" in msg or "weakly ordered" in msg
+    assert "VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY" in msg, "the override env var must be discoverable from the error"
+
+
+def test_ring_weak_memory_override_allows_construction(monkeypatch):
+    """Operators that have wired up an explicit memory barrier (e.g. via a
+    C extension) must be able to opt out of the refusal — otherwise we
+    would block legitimate non-x86 deployments forever."""
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_control_ring as ring_mod
+
+    monkeypatch.setattr(ring_mod.platform, "machine", lambda: "ppc64le")
+    monkeypatch.setenv("VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY", "1")
+    name = f"test_ipc_ring_ppc_override_{uuid.uuid4().hex[:12]}"
+
+    r = ring_mod.CudaIpcControlRing.create(name, n_slots=4, body_max=32, header_bytes=8)
+    try:
+        # Sanity: the ring still works as expected once we opt in (the
+        # override does not disable any other invariants).
+        kh = ring_mod.key_hash16("ppc-override")
+        r.publish(kh, pclass=0, body=b"ok")
+        got = r.poll(kh)
+        assert got is not None and got[1] == b"ok"
+    finally:
+        r.close()
+
+
 def test_ring_create_translates_shm_oserror_to_actionable_message(monkeypatch):
     """When /dev/shm is too small (the most common deploy gotcha), CudaIpcControlRing.create
     must raise an OSError whose message names the requested size and tells the operator how
