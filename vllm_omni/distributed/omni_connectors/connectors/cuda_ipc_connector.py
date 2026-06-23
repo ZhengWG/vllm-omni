@@ -22,7 +22,6 @@ import queue as _queue_mod
 import threading
 import time as _time_mod
 import uuid
-from dataclasses import dataclass
 from multiprocessing import shared_memory as shm_pkg
 from multiprocessing.resource_tracker import unregister
 from typing import Any
@@ -34,7 +33,18 @@ from vllm_omni.entrypoints.stage_utils import shm_write_bytes
 from ..utils.logging import get_connector_logger
 from ..utils.serialization import OmniSerializer
 from .base import OmniConnectorBase
-from .cuda_ipc_control_ring import CudaIpcControlRing, RingFullError, untrack_shm
+from .cuda_ipc_control_ring import (
+    RING_HEADER_BYTES,
+    RING_PCLASS_INLINE,
+    RING_PCLASS_POOL,
+    CudaIpcControlRing,
+    RingFullError,
+    RingHeader,
+    key_hash16,
+    make_composite_key,
+    ring_shm_name,
+    untrack_shm,
+)
 from .cuda_ipc_runtime import (
     _CUDA_EVENT_DISABLE_TIMING,
     _CUDA_EVENT_INTERPROCESS,
@@ -52,9 +62,10 @@ _POOL_MARKER = "__cuda_ipc_pool__"
 
 _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 
-# Auto-size when pool_size_mb / pool_credits are omitted: credits = max(64, max_num_seqs*4),
-# size = credits * 2 MB. Explicit config overrides.
-_DEFAULT_POOL_SIZE_MB = 128
+# Auto-size when pool_size_mb / pool_credits are omitted: credits = max(64, max_num_seqs*2),
+# pool_size_mb = credits * slot_size_mb (default 64 MB/slot — fits Qwen3-Omni ~33 MB prefill
+# handoff @ input 4000). Explicit pool_size_mb / pool_credits / slot_size_mb override.
+_DEFAULT_SLOT_SIZE_MB = 64
 _DEFAULT_POOL_CREDITS = 64
 _DEFAULT_RECV_STREAMS = 8  # receiver D2D copy streams (round-robined per get)
 
@@ -64,45 +75,6 @@ _CREDIT_WAIT_SEC = 0.05  # put() inline reclaim window before CPU fallback
 _CREDIT_POLL_SEC = 0.0005  # poll interval within the reclaim window
 _RELEASE_FAST_INTERVAL_SEC = 0.001  # board-reclaim thread fast tick
 _RELEASE_TTL_EVERY_N_TICKS = 20  # TTL sweep runs every N fast ticks
-
-# Ring header: edge-constant pool/event/board handles, written once after create().
-# The magic+version prefix lets a receiver reject a not-yet-written / incompatible header.
-_RING_HEADER_BYTES = 256
-_RING_MAGIC = b"CIPC"
-_RING_VERSION = 1
-_RING_PCLASS_INLINE = 0
-_RING_PCLASS_POOL = 1
-
-
-@dataclass
-class RingHeader:
-    """Typed view of the ring header. Wire layout (little-endian):
-    magic(4) | version(1) | pool_handle(64) | event_handle(64) | board_name_len(1) | board_name.
-    """
-
-    pool_handle: bytes
-    event_handle: bytes
-    board_name: str
-
-    _PREFIX = 4 + 1 + 64 + 64 + 1  # magic + version + two handles + name_len
-
-    def pack(self) -> bytes:
-        bn = self.board_name.encode("utf-8")
-        if self._PREFIX + len(bn) > _RING_HEADER_BYTES:
-            raise ValueError(f"board_name {len(bn)}B overflows ring header ({_RING_HEADER_BYTES}B)")
-        return _RING_MAGIC + bytes([_RING_VERSION]) + self.pool_handle + self.event_handle + bytes([len(bn)]) + bn
-
-    @classmethod
-    def try_unpack(cls, blob: bytes) -> "RingHeader | None":
-        """Return a RingHeader, or None if the header is not yet written / version-mismatched
-        (all-zero blob fails the magic check)."""
-        if len(blob) < cls._PREFIX or blob[0:4] != _RING_MAGIC or blob[4] != _RING_VERSION:
-            return None
-        pool_handle = bytes(blob[5:69])
-        event_handle = bytes(blob[69:133])
-        bn_len = blob[133]
-        board_name = bytes(blob[134 : 134 + bn_len]).decode("utf-8")
-        return cls(pool_handle, event_handle, board_name)
 
 
 class _SlotOverflowError(Exception):
@@ -148,6 +120,8 @@ class CudaIPCConnector(OmniConnectorBase):
     """
 
     supports_gpu_tensor: bool = True
+
+    # --- Init ---
 
     def __init__(self, config: dict[str, Any]):
         self.config = config
@@ -208,16 +182,23 @@ class CudaIPCConnector(OmniConnectorBase):
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         self._ring_body_max = int(config.get("ring_body_max", 524288))
         self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
-        # Pool sizing: auto from max_num_seqs unless overridden.
+        # Pool sizing: credits (concurrency) and slot_size_mb (max single pool put) are independent;
+        # pool_size_mb defaults to credits * slot_size_mb unless explicitly set.
         max_num_seqs = int(config.get("max_num_seqs", 0))
-        if max_num_seqs > 0 and "pool_credits" not in config:
-            auto_credits = max(64, max_num_seqs * 4)
-            auto_size_mb = auto_credits * 2
+        if "pool_credits" in config:
+            auto_credits = int(config["pool_credits"])
+        elif max_num_seqs > 0:
+            # ~1 pool credit per req (chunk-0 prefill); x2 headroom for board-reclaim lag.
+            auto_credits = max(_DEFAULT_POOL_CREDITS, max_num_seqs * 2)
         else:
             auto_credits = _DEFAULT_POOL_CREDITS
-            auto_size_mb = _DEFAULT_POOL_SIZE_MB
+        slot_size_mb = int(config.get("slot_size_mb", _DEFAULT_SLOT_SIZE_MB))
         self._pool_credits = int(config.get("pool_credits", auto_credits))
-        self._pool_size = int(config.get("pool_size_mb", auto_size_mb)) * 1024 * 1024
+        if "pool_size_mb" in config:
+            auto_size_mb = int(config["pool_size_mb"])
+        else:
+            auto_size_mb = self._pool_credits * slot_size_mb
+        self._pool_size = auto_size_mb * 1024 * 1024
         self._slot_size = self._pool_size // self._pool_credits
         # Timing overrides via extra config.
         self._credit_wait_sec = float(config.get("credit_wait_sec", _CREDIT_WAIT_SEC))
@@ -295,10 +276,10 @@ class CudaIPCConnector(OmniConnectorBase):
         n_slots = self._ring_entries_cfg or max(64, self._pool_credits * 4)
         body_max = max(self._ring_body_max, self._inline_threshold)
         self._ring = CudaIpcControlRing.create(
-            self._ring_name(self.stage_id, self.stage_id + 1),
+            ring_shm_name(self._deployment_id, self.stage_id, self.stage_id + 1, self._replica_id),
             n_slots,
             body_max,
-            header_bytes=_RING_HEADER_BYTES,
+            header_bytes=RING_HEADER_BYTES,
         )
         self._ring.write_header(self._ring_header_blob())
 
@@ -326,7 +307,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
         self._release_thread.start()
 
-    # --- Device & naming helpers ---
+    # --- Device & SHM helpers ---
 
     @staticmethod
     def _resolve_local_device(local_device_cfg: str | int) -> torch.device:
@@ -372,7 +353,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 f"D2D copy will fall back to PCIe staging (slower than NVLink)."
             )
 
-    # --- Low-level CUDA IPC via ctypes (bindings in cuda_ipc_runtime.load_cudart) ---
+    # --- CUDA IPC handles (ctypes bindings in cuda_ipc_runtime.load_cudart) ---
 
     def _get_ipc_handle(self, ptr: int) -> bytes:
         """Obtain a 64-byte CUDA IPC memory handle for a device pointer."""
@@ -416,7 +397,46 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._opened_events[handle_bytes] = event
             return self._opened_events[handle_bytes]
 
-    # --- Pool-based encode / decode ---
+    # --- Control plane: ring wiring ---
+
+    def _ring_header_blob(self) -> bytes:
+        return RingHeader(self._pool_handle, self._ipc_event_handle_bytes, self._board_name).pack()
+
+    def _open_ring_receiver(self, from_stage, to_stage):
+        edge = (from_stage, to_stage)
+        ring = self._opened_rings.get(edge)
+        if ring is None:
+            try:
+                ring = CudaIpcControlRing.open(
+                    ring_shm_name(self._deployment_id, from_stage, to_stage, self._replica_id)
+                )
+            except FileNotFoundError:
+                return None  # sender not up yet; poll loop tolerates None
+            self._opened_rings[edge] = ring
+        # Cache the parsed header only once a valid (magic+version) one is present — never
+        # cache zero handles from a ring whose sender hasn't written the header yet.
+        if edge not in self._ring_edge_handles:
+            hdr = RingHeader.try_unpack(ring.read_header(RING_HEADER_BYTES))
+            if hdr is not None:
+                self._ring_edge_handles[edge] = (hdr.pool_handle, hdr.event_handle, hdr.board_name)
+        return ring
+
+    def _estimate_nbytes(self, obj: Any) -> int:
+        """Sum GPU-tensor bytes (the part that would go to the pool) WITHOUT a
+        serialize/D2H — used to route inline vs pool."""
+        if isinstance(obj, torch.Tensor):
+            return obj.nbytes if obj.is_cuda else 0
+        if isinstance(obj, dict):
+            return sum(self._estimate_nbytes(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return sum(self._estimate_nbytes(v) for v in obj)
+        if hasattr(obj, "__struct_fields__"):
+            return sum(
+                self._estimate_nbytes(getattr(obj, f)) for f in obj.__struct_fields__ if getattr(obj, f) is not None
+            )
+        return 0
+
+    # --- Pool slot codec ---
 
     def _walk_encode_pool(self, obj: Any, slot: _PoolSlot) -> Any:
         """Recursively replace CUDA tensors with pool offset metadata."""
@@ -500,7 +520,89 @@ class CudaIPCConnector(OmniConnectorBase):
             return tuple(self._walk_decode_pool(v, pool_ptr, slot_offset, stream=stream) for v in obj)
         return obj
 
-    # --- put() — Sender side ---
+    # --- Credit pool (sender) ---
+
+    def _acquire_credit(self) -> int | None:
+        """Get a free slot offset, reclaiming board credits inline.
+
+        Bounded wait (``credit_wait_sec``) before giving up; returns None to
+        trigger the CPU fallback.
+        """
+        try:
+            return self._credit_queue.get_nowait()
+        except _queue_mod.Empty:
+            pass
+        deadline = _time_mod.monotonic() + self._credit_wait_sec
+        while _time_mod.monotonic() < deadline:
+            self._reclaim_board_credits()
+            try:
+                return self._credit_queue.get_nowait()
+            except _queue_mod.Empty:
+                _time_mod.sleep(self._credit_poll_sec)
+        return None
+
+    def _reclaim_board_credits(self) -> None:
+        """Sender: reclaim credits whose board byte was set by the receiver."""
+        if self._board is None:
+            return
+        buf = self._board.buf
+        with self._held_lock:
+            released = [
+                (key, slot_offset)
+                for key, (_ts, slot_offset) in self._held_credits.items()
+                if buf[slot_offset // self._slot_size] == 1
+            ]
+            for key, slot_offset in released:
+                self._held_credits.pop(key, None)
+                buf[slot_offset // self._slot_size] = 0
+                self._credit_queue.put_nowait(slot_offset)
+                self._metrics["board_releases"] += 1
+
+    def _release_expired_credits(self) -> None:
+        """TTL sweep: reclaim slots whose receiver never marked the board
+        (e.g. the request was aborted or the receiver died)."""
+        now = _time_mod.time()
+        with self._held_lock:
+            expired = [
+                (key, slot_offset)
+                for key, (ts, slot_offset) in self._held_credits.items()
+                if now - ts > self.tensor_lifetime_sec
+            ]
+            for key, slot_offset in expired:
+                self._held_credits.pop(key, None)
+                self._board.buf[slot_offset // self._slot_size] = 0
+                self._credit_queue.put_nowait(slot_offset)
+                self._metrics["ttl_releases"] += 1
+        # also TTL-sweep orphaned CPU-fallback /dev/shm segments (receiver aborted before
+        # reading; normally the receiver unlinks on read so these are already gone).
+        segs = getattr(self, "_fallback_segs", None)
+        if segs:
+            stale = [name for name, ts in segs.items() if now - ts > self.tensor_lifetime_sec]
+            for name in stale:
+                segs.pop(name, None)
+                try:
+                    seg = shm_pkg.SharedMemory(name=name)
+                    seg.close()
+                    seg.unlink()
+                    self._metrics["fallback_seg_reclaims"] = self._metrics.get("fallback_seg_reclaims", 0) + 1
+                except FileNotFoundError:
+                    pass  # receiver already consumed + unlinked it (the common case)
+                except Exception as e:
+                    logger.debug("fallback seg unlink %s: %s", name, e)
+
+    def _release_loop(self) -> None:
+        tick = 0
+        while not self._stop_event.is_set():
+            try:
+                self._reclaim_board_credits()
+                tick += 1
+                if tick % self._release_ttl_every == 0:
+                    self._release_expired_credits()
+            except Exception as e:
+                logger.warning("Release loop error: %s", e, exc_info=True)
+            self._stop_event.wait(timeout=self._release_interval_sec)
+
+    # --- put() ---
 
     def put(
         self,
@@ -515,85 +617,19 @@ class CudaIPCConnector(OmniConnectorBase):
             # Inert non-transfer-rank sender: no ring/pool. Guard against a stray call.
             return False, 0, None
 
-        composite_key = self._make_composite_key(put_key, from_stage, to_stage)
-        return self._put_ring(from_stage, to_stage, put_key, composite_key, data)
+        composite_key = make_composite_key(put_key, from_stage, to_stage)
+        return self._put_control_plane(from_stage, to_stage, put_key, composite_key, data)
 
-    def _put_cpu_fallback(
-        self,
-        from_stage: str,
-        to_stage: str,
-        put_key: str,
-        composite_key: str,
-        data: Any,
-        reason: str = "",
-    ) -> tuple[bool, int, dict[str, Any] | None]:
-        logger.warning(
-            "CudaIPCConnector CPU fallback for %s (from_stage=%s to_stage=%s): %s",
-            put_key,
-            from_stage,
-            to_stage,
-            reason or "pool credits exhausted or slot overflow",
-        )
-        self._metrics["cpu_fallbacks"] += 1
-        # Categorize by the reason's leading token (ring_full / credits_exhausted / ...).
-        cat = f"fallback_{reason.split(maxsplit=1)[0]}" if reason else "fallback_other"
-        self._metrics[cat] = self._metrics.get(cat, 0) + 1
-        payload = self.serialize_obj(data)
-        size = len(payload)
-
-        meta = self._atomic_shm_write(payload, name=put_key)
-        # Track for TTL cleanup in case the receiver aborts and never reads/unlinks it.
-        if getattr(self, "_fallback_segs", None) is not None:
-            self._fallback_segs[put_key] = _time_mod.time()
-
-        self._metrics["puts"] += 1
-        self._metrics["bytes_transferred"] += size
-        return True, size, {"shm": meta, "size": size, "cpu_fallback": True}
-
-    # --- Ring control plane: put/get over the per-edge SPSC mailbox ---
-
-    def _ring_name(self, from_stage, to_stage) -> str:
-        # Hash the edge identity — deployment_id may carry chars invalid/unsafe for a POSIX
-        # shm name. Aligned 1:1 replicas (from_replica == to_replica == replica_id).
-        raw = f"{self._deployment_id}:{from_stage}:{to_stage}:{self._replica_id}"
-        return f"cudaipc_{hashlib.sha1(raw.encode()).hexdigest()[:20]}"
-
-    @staticmethod
-    def _make_composite_key(key: str, from_stage: str, to_stage: str) -> str:
-        """Per-edge composite key. Change here once if the wire format ever changes."""
-        return f"{key}@{from_stage}_{to_stage}"
-
-    @staticmethod
-    def _key_hash16(composite_key: str) -> bytes:
-        return hashlib.sha1(composite_key.encode("utf-8")).digest()[:16]
-
-    def _ring_header_blob(self) -> bytes:
-        return RingHeader(self._pool_handle, self._ipc_event_handle_bytes, self._board_name).pack()
-
-    def _estimate_nbytes(self, obj: Any) -> int:
-        """Sum GPU-tensor bytes (the part that would go to the pool) WITHOUT a
-        serialize/D2H — used to route inline vs pool."""
-        if isinstance(obj, torch.Tensor):
-            return obj.nbytes if obj.is_cuda else 0
-        if isinstance(obj, dict):
-            return sum(self._estimate_nbytes(v) for v in obj.values())
-        if isinstance(obj, (list, tuple)):
-            return sum(self._estimate_nbytes(v) for v in obj)
-        if hasattr(obj, "__struct_fields__"):
-            return sum(
-                self._estimate_nbytes(getattr(obj, f)) for f in obj.__struct_fields__ if getattr(obj, f) is not None
-            )
-        return 0
-
-    def _put_ring(self, from_stage, to_stage, put_key, composite_key, data):
+    def _put_control_plane(self, from_stage, to_stage, put_key, composite_key, data):
+        """Primary send path: route small payloads inline vs large via GPU pool (both publish to ring)."""
         try:
-            kh = self._key_hash16(composite_key)
+            kh = key_hash16(composite_key)
             if self._estimate_nbytes(data) < self._inline_threshold:
                 return self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
             return self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh)
         except Exception as e:
             self._metrics["errors"] += 1
-            logger.error("CudaIPCConnector ring put failed for %s: %s", put_key, e, exc_info=True)
+            logger.error("CudaIPCConnector control-plane put failed for %s: %s", put_key, e, exc_info=True)
             return False, 0, None
 
     def _put_inline(self, from_stage, to_stage, put_key, composite_key, data, kh):
@@ -605,7 +641,7 @@ class CudaIPCConnector(OmniConnectorBase):
             )
         try:
             self._ring.publish(
-                kh, _RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
             )
         except RingFullError:
             return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
@@ -616,6 +652,8 @@ class CudaIPCConnector(OmniConnectorBase):
     def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh):
         # Acquire a credit, D2D-pack into the slot, then publish a small descriptor
         # (slot_offset/slot_index + tensor layout) to the ring.
+        # TODO: support acquiring multiple contiguous credits/slots when a single payload
+        # exceeds _slot_size (currently: _SlotOverflowError → CPU fallback).
         slot_offset = self._acquire_credit()
         if slot_offset is None:
             return self._put_cpu_fallback(
@@ -679,7 +717,7 @@ class CudaIPCConnector(OmniConnectorBase):
             self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
         try:
             self._ring.publish(
-                kh, _RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
             )
         except RingFullError:
             with self._held_lock:
@@ -690,24 +728,55 @@ class CudaIPCConnector(OmniConnectorBase):
         self._metrics["bytes_transferred"] += len(descriptor)
         return True, len(descriptor), {"ring": True, "size": len(descriptor)}
 
-    def _open_ring_receiver(self, from_stage, to_stage):
-        edge = (from_stage, to_stage)
-        ring = self._opened_rings.get(edge)
-        if ring is None:
-            try:
-                ring = CudaIpcControlRing.open(self._ring_name(from_stage, to_stage))
-            except FileNotFoundError:
-                return None  # sender not up yet; poll loop tolerates None
-            self._opened_rings[edge] = ring
-        # Cache the parsed header only once a valid (magic+version) one is present — never
-        # cache zero handles from a ring whose sender hasn't written the header yet.
-        if edge not in self._ring_edge_handles:
-            hdr = RingHeader.try_unpack(ring.read_header(_RING_HEADER_BYTES))
-            if hdr is not None:
-                self._ring_edge_handles[edge] = (hdr.pool_handle, hdr.event_handle, hdr.board_name)
-        return ring
+    def _put_cpu_fallback(
+        self,
+        from_stage: str,
+        to_stage: str,
+        put_key: str,
+        composite_key: str,
+        data: Any,
+        reason: str = "",
+    ) -> tuple[bool, int, dict[str, Any] | None]:
+        logger.warning(
+            "CudaIPCConnector CPU fallback for %s (from_stage=%s to_stage=%s): %s",
+            put_key,
+            from_stage,
+            to_stage,
+            reason or "pool credits exhausted or slot overflow",
+        )
+        self._metrics["cpu_fallbacks"] += 1
+        # Categorize by the reason's leading token (ring_full / credits_exhausted / ...).
+        cat = f"fallback_{reason.split(maxsplit=1)[0]}" if reason else "fallback_other"
+        self._metrics[cat] = self._metrics.get(cat, 0) + 1
+        payload = self.serialize_obj(data)
+        size = len(payload)
 
-    def _get_ring(self, from_stage, to_stage, get_key, composite_key):
+        meta = self._atomic_shm_write(payload, name=put_key)
+        # Track for TTL cleanup in case the receiver aborts and never reads/unlinks it.
+        if getattr(self, "_fallback_segs", None) is not None:
+            self._fallback_segs[put_key] = _time_mod.time()
+
+        self._metrics["puts"] += 1
+        self._metrics["bytes_transferred"] += size
+        return True, size, {"shm": meta, "size": size, "cpu_fallback": True}
+
+    # --- get() ---
+
+    def get(
+        self,
+        from_stage: str,
+        to_stage: str,
+        get_key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> tuple[Any, int] | None:
+        if self._closed:
+            return None
+
+        composite_key = make_composite_key(get_key, from_stage, to_stage)
+        return self._get_control_plane(from_stage, to_stage, get_key, composite_key)
+
+    def _get_control_plane(self, from_stage, to_stage, get_key, composite_key):
+        """Primary recv path: poll ring (inline or pool); on miss try CPU-fallback /dev/shm."""
         try:
             ring = self._open_ring_receiver(from_stage, to_stage)
             if ring is None:
@@ -715,13 +784,13 @@ class CudaIPCConnector(OmniConnectorBase):
             if (from_stage, to_stage) not in self._ring_edge_handles:
                 # Header not ready — don't poll (poll consumes; a pool entry would be lost). Retry.
                 return None
-            r = ring.poll(self._key_hash16(composite_key))
+            r = ring.poll(key_hash16(composite_key))
             if r is None:
                 # Ring miss: chunk not published yet (poll retry), or the sender took the CPU
                 # fallback (/dev/shm by put_key) — read that so the consumer never hangs.
                 return self._try_get_shm_compat(get_key)
             pclass, body = r
-            if pclass == _RING_PCLASS_INLINE:
+            if pclass == RING_PCLASS_INLINE:
                 # Return CPU tensors; the downstream model does the H2D (parity with SHM).
                 # Doing it here was a redundant device-wide sync on the talker forward.
                 obj = self.deserialize_obj(body)
@@ -753,23 +822,24 @@ class CudaIPCConnector(OmniConnectorBase):
             return obj, len(body)
         except Exception as e:
             self._metrics["errors"] += 1
-            logger.error("CudaIPCConnector ring get failed for %s: %s", get_key, e, exc_info=True)
+            logger.error("CudaIPCConnector control-plane get failed for %s: %s", get_key, e, exc_info=True)
             return None
 
-    # --- get() — Receiver side ---
-
-    def get(
-        self,
-        from_stage: str,
-        to_stage: str,
-        get_key: str,
-        metadata: dict[str, Any] | None = None,
-    ) -> tuple[Any, int] | None:
-        if self._closed:
-            return None
-
-        composite_key = self._make_composite_key(get_key, from_stage, to_stage)
-        return self._get_ring(from_stage, to_stage, get_key, composite_key)
+    def _mark_board_release(self, board_name: str, slot_index: int) -> None:
+        """Receiver: flip the slot byte on the sender's release board."""
+        board = self._opened_boards.get(board_name)
+        if board is None:
+            try:
+                board = shm_pkg.SharedMemory(name=board_name)
+            except FileNotFoundError:
+                logger.warning("Release board %s not found; sender will rely on TTL.", board_name)
+                return
+            untrack_shm(board_name)  # non-owner: never unlink the sender's board at exit
+            self._opened_boards[board_name] = board
+        if not 0 <= slot_index < board.size:
+            logger.warning("Release board %s: slot_index %d out of range.", board_name, slot_index)
+            return
+        board.buf[slot_index] = 1
 
     def _try_get_shm_compat(self, get_key: str) -> tuple[Any, int] | None:
         try:
@@ -823,104 +893,6 @@ class CudaIPCConnector(OmniConnectorBase):
         if isinstance(obj, tuple):
             return tuple(self._move_to_device(v, non_blocking) for v in obj)
         return obj
-
-    # --- Credit release: shared-memory board (fast path) + TTL sweep ---
-
-    def _mark_board_release(self, board_name: str, slot_index: int) -> None:
-        """Receiver: flip the slot byte on the sender's release board."""
-        board = self._opened_boards.get(board_name)
-        if board is None:
-            try:
-                board = shm_pkg.SharedMemory(name=board_name)
-            except FileNotFoundError:
-                logger.warning("Release board %s not found; sender will rely on TTL.", board_name)
-                return
-            untrack_shm(board_name)  # non-owner: never unlink the sender's board at exit
-            self._opened_boards[board_name] = board
-        if not 0 <= slot_index < board.size:
-            logger.warning("Release board %s: slot_index %d out of range.", board_name, slot_index)
-            return
-        board.buf[slot_index] = 1
-
-    def _reclaim_board_credits(self) -> None:
-        """Sender: reclaim credits whose board byte was set by the receiver."""
-        if self._board is None:
-            return
-        buf = self._board.buf
-        with self._held_lock:
-            released = [
-                (key, slot_offset)
-                for key, (_ts, slot_offset) in self._held_credits.items()
-                if buf[slot_offset // self._slot_size] == 1
-            ]
-            for key, slot_offset in released:
-                self._held_credits.pop(key, None)
-                buf[slot_offset // self._slot_size] = 0
-                self._credit_queue.put_nowait(slot_offset)
-                self._metrics["board_releases"] += 1
-
-    def _acquire_credit(self) -> int | None:
-        """Get a free slot offset, reclaiming board credits inline.
-
-        Bounded wait (``credit_wait_sec``) before giving up; returns None to
-        trigger the CPU fallback.
-        """
-        try:
-            return self._credit_queue.get_nowait()
-        except _queue_mod.Empty:
-            pass
-        deadline = _time_mod.monotonic() + self._credit_wait_sec
-        while _time_mod.monotonic() < deadline:
-            self._reclaim_board_credits()
-            try:
-                return self._credit_queue.get_nowait()
-            except _queue_mod.Empty:
-                _time_mod.sleep(self._credit_poll_sec)
-        return None
-
-    def _release_expired_credits(self) -> None:
-        """TTL sweep: reclaim slots whose receiver never marked the board
-        (e.g. the request was aborted or the receiver died)."""
-        now = _time_mod.time()
-        with self._held_lock:
-            expired = [
-                (key, slot_offset)
-                for key, (ts, slot_offset) in self._held_credits.items()
-                if now - ts > self.tensor_lifetime_sec
-            ]
-            for key, slot_offset in expired:
-                self._held_credits.pop(key, None)
-                self._board.buf[slot_offset // self._slot_size] = 0
-                self._credit_queue.put_nowait(slot_offset)
-                self._metrics["ttl_releases"] += 1
-        # also TTL-sweep orphaned CPU-fallback /dev/shm segments (receiver aborted before
-        # reading; normally the receiver unlinks on read so these are already gone).
-        segs = getattr(self, "_fallback_segs", None)
-        if segs:
-            stale = [name for name, ts in segs.items() if now - ts > self.tensor_lifetime_sec]
-            for name in stale:
-                segs.pop(name, None)
-                try:
-                    seg = shm_pkg.SharedMemory(name=name)
-                    seg.close()
-                    seg.unlink()
-                    self._metrics["fallback_seg_reclaims"] = self._metrics.get("fallback_seg_reclaims", 0) + 1
-                except FileNotFoundError:
-                    pass  # receiver already consumed + unlinked it (the common case)
-                except Exception as e:
-                    logger.debug("fallback seg unlink %s: %s", name, e)
-
-    def _release_loop(self) -> None:
-        tick = 0
-        while not self._stop_event.is_set():
-            try:
-                self._reclaim_board_credits()
-                tick += 1
-                if tick % self._release_ttl_every == 0:
-                    self._release_expired_credits()
-            except Exception as e:
-                logger.warning("Release loop error: %s", e, exc_info=True)
-            self._stop_event.wait(timeout=self._release_interval_sec)
 
     # --- Lifecycle ---
 

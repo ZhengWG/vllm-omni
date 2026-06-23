@@ -11,15 +11,81 @@ Lock-free SPSC correctness: body-first / seq-LAST publish (seq is the release ma
 seq==0 in-progress sentinel written first on (re)claim; a seqlock re-read guarding the body;
 a per-slot consumed byte for bounded backpressure; open addressing by key hash.
 
-Pure-Python (struct + POSIX shm), no CUDA — testable on CPU. Per-slot layout (little-endian):
+Pure-Python (struct + POSIX shm), no CUDA — testable on CPU.
+
+Fixed header region (``RING_HEADER_BYTES``, written once): see ``RingHeader``.
+Per-slot layout (little-endian):
 seq u64@0 | consumed u8@8 | pclass u8@9 | ts u32@10 | keyhash 16B@14 | blen u32@30 | body@34.
 """
 
+import hashlib
 import struct
+from dataclasses import dataclass
 from multiprocessing import shared_memory as shm_pkg
 
 _OFF_SEQ, _OFF_CONSUMED, _OFF_PCLASS, _OFF_TS, _OFF_KEY, _OFF_LEN, _OFF_BODY = 0, 8, 9, 10, 14, 30, 34
 _KEY_BYTES = 16
+
+# Edge-constant header blob (pool/event IPC handles + release-board shm name).
+RING_HEADER_BYTES = 256  # reserved shm bytes before slots
+_RING_MAGIC = b"CIPC"  # rejects uninitialized (all-zero) shm
+_RING_VERSION = 1  # bump on incompatible wire layout changes
+
+# Per-entry payload-class tags (ring slot pclass byte).
+RING_PCLASS_INLINE = 0  # ring body: serialized payload (small, < inline_threshold)
+RING_PCLASS_POOL = 1  # ring body: pool descriptor (big GPU tensor, D2D path)
+
+
+def make_composite_key(key: str, from_stage: str, to_stage: str) -> str:
+    """Per-edge composite key. Change here once if the wire format ever changes."""
+    return f"{key}@{from_stage}_{to_stage}"
+
+
+def key_hash16(composite_key: str) -> bytes:
+    return hashlib.sha1(composite_key.encode("utf-8")).digest()[:16]
+
+
+def ring_shm_name(deployment_id: str, from_stage, to_stage, replica_id) -> str:
+    """Deterministic POSIX shm name for a directed edge.
+
+    Hashes deployment_id + stages + replica_id — deployment_id may carry chars
+    invalid/unsafe for a raw shm name. Aligned 1:1 replicas (from_replica == to_replica).
+    """
+    raw = f"{deployment_id}:{from_stage}:{to_stage}:{replica_id}"
+    return f"cudaipc_{hashlib.sha1(raw.encode()).hexdigest()[:20]}"
+
+
+@dataclass
+class RingHeader:
+    """Typed view of the ring header. Wire layout (little-endian):
+    magic(4) | version(1) | pool_handle(64) | event_handle(64) | board_name_len(1) | board_name.
+    """
+
+    pool_handle: bytes
+    event_handle: bytes
+    board_name: str
+
+    _PREFIX = 4 + 1 + 64 + 64 + 1  # magic + version + two handles + name_len
+
+    def pack(self) -> bytes:
+        bn = self.board_name.encode("utf-8")
+        if self._PREFIX + len(bn) > RING_HEADER_BYTES:
+            raise ValueError(f"board_name {len(bn)}B overflows ring header ({RING_HEADER_BYTES}B)")
+        return _RING_MAGIC + bytes([_RING_VERSION]) + self.pool_handle + self.event_handle + bytes([len(bn)]) + bn
+
+    @classmethod
+    def try_unpack(cls, blob: bytes) -> "RingHeader | None":
+        """Return a RingHeader, or None if not yet written / version-mismatched."""
+        # Wire offsets (must match ``pack()`` / class docstring):
+        # [0:4) magic | [4:5) version | [5:69) pool_handle | [69:133) event_handle
+        # | [133:134) board_name_len | [134:134+len) board_name
+        if len(blob) < cls._PREFIX or blob[0:4] != _RING_MAGIC or blob[4] != _RING_VERSION:
+            return None
+        pool_handle = bytes(blob[5:69])  # cudaIpcMemHandle_t, 64 B
+        event_handle = bytes(blob[69:133])  # cudaIpcEventHandle_t, 64 B
+        bn_len = blob[133]  # u8 length prefix for board_name UTF-8
+        board_name = bytes(blob[134 : 134 + bn_len]).decode("utf-8")
+        return cls(pool_handle, event_handle, board_name)
 
 
 def untrack_shm(name: str) -> None:
@@ -105,13 +171,10 @@ class CudaIpcControlRing:
 
     # ---- sender -------------------------------------------------------
     def publish(self, key_hash: bytes, pclass: int, body: bytes, ts: int = 0, ttl_sec: int = 0) -> None:
-        """Claim a free slot (open-addressed by key_hash) and publish. Raises RingFullError
-        when the probe window has no free slot (caller falls back, never blocks).
+        """Claim a free slot (open addressing) and publish. RingFullError if full.
 
-        C4 (abort reclaim): when ttl_sec>0, an occupied-but-unconsumed slot whose entry
-        is older than ttl_sec (an aborted / never-polled request) is treated as free and
-        reclaimed in place. This is race-free: it runs only here, on the single producer
-        thread; the SPSC consumer would never poll an aborted key, so reusing it is safe."""
+        ttl_sec>0 reclaims stale unconsumed slots (aborted / never-polled).
+        SPSC — one sender thread only; inline publish is sub-ms and not an E2E bottleneck."""
         if len(body) > self._body_max:
             raise ValueError(f"body {len(body)}B exceeds slot body_max {self._body_max}B")
         buf = self._buf

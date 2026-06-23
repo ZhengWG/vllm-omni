@@ -27,16 +27,13 @@ import torch
 #
 # Single-mapping publish/poll protocol tests.
 from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_control_ring import (
+    RING_PCLASS_INLINE,
+    RING_PCLASS_POOL,
     CudaIpcControlRing,
     RingFullError,
+    key_hash16,
+    ring_shm_name,
 )
-
-
-def _kh(s: str) -> bytes:
-    """16-byte key hash, as the connector derives via sha1(key)[:16]."""
-    import hashlib
-
-    return hashlib.sha1(s.encode()).digest()[:16]
 
 
 @pytest.fixture()
@@ -60,7 +57,7 @@ def test_ring_header_overflow_rejected(ring):
 
 
 def test_ring_publish_then_poll(ring):
-    kh = _kh("req-A_0_1")
+    kh = key_hash16("req-A_0_1")
     ring.publish(kh, pclass=0, body=b"hello")
     got = ring.poll(kh)
     assert got is not None
@@ -69,18 +66,18 @@ def test_ring_publish_then_poll(ring):
 
 
 def test_ring_poll_miss_returns_none(ring):
-    assert ring.poll(_kh("never-published")) is None
+    assert ring.poll(key_hash16("never-published")) is None
 
 
 def test_ring_pclass_is_carried(ring):
-    ring.publish(_kh("k-inline"), pclass=0, body=b"a")
-    ring.publish(_kh("k-pool"), pclass=1, body=b"bb")
-    assert ring.poll(_kh("k-inline"))[0] == 0
-    assert ring.poll(_kh("k-pool"))[0] == 1
+    ring.publish(key_hash16("k-inline"), pclass=RING_PCLASS_INLINE, body=b"a")
+    ring.publish(key_hash16("k-pool"), pclass=RING_PCLASS_POOL, body=b"bb")
+    assert ring.poll(key_hash16("k-inline"))[0] == RING_PCLASS_INLINE
+    assert ring.poll(key_hash16("k-pool"))[0] == RING_PCLASS_POOL
 
 
 def test_ring_poll_marks_consumed_once(ring):
-    kh = _kh("once")
+    kh = key_hash16("once")
     ring.publish(kh, 0, b"x")
     assert ring.poll(kh) is not None  # first poll consumes
     assert ring.poll(kh) is None  # second poll: already consumed
@@ -90,7 +87,7 @@ def test_ring_consumed_slot_is_reused(ring):
     """Producer must reuse a slot the consumer has taken — else the ring wedges after
     n_slots publishes. Round-trips far more entries than slots."""
     for i in range(8 * 20):  # 160 entries through 8 slots
-        kh = _kh(f"seq-{i}")
+        kh = key_hash16(f"seq-{i}")
         ring.publish(kh, 0, b"%d" % i)
         got = ring.poll(kh)
         assert got is not None and got[1] == b"%d" % i
@@ -98,7 +95,7 @@ def test_ring_consumed_slot_is_reused(ring):
 
 def test_ring_open_addressed_collision(ring):
     """Distinct keys that may land on the same home slot must each be retrievable."""
-    keys = [_kh(f"collide-{i}") for i in range(6)]  # < n_slots, all live at once
+    keys = [key_hash16(f"collide-{i}") for i in range(6)]  # < n_slots, all live at once
     for i, k in enumerate(keys):
         ring.publish(k, 0, b"v%d" % i)
     for i, k in enumerate(keys):
@@ -108,44 +105,41 @@ def test_ring_open_addressed_collision(ring):
 
 def test_ring_full_raises(ring):
     for i in range(8):  # fill all 8 slots without consuming
-        ring.publish(_kh(f"fill-{i}"), 0, b"z")
+        ring.publish(key_hash16(f"fill-{i}"), 0, b"z")
     with pytest.raises(RingFullError):
-        ring.publish(_kh("one-too-many"), 0, b"z")
+        ring.publish(key_hash16("one-too-many"), 0, b"z")
 
 
 def test_ring_body_too_big_raises(ring):
     with pytest.raises(ValueError):
-        ring.publish(_kh("big"), 0, b"x" * 65)  # body_max=64
+        ring.publish(key_hash16("big"), 0, b"x" * 65)  # body_max=64
 
 
 def test_ring_ttl_reclaims_stale_entry(ring):
     """An occupied-but-unconsumed slot older than ttl_sec is reclaimed in place so an
     aborted/never-polled request cannot wedge the ring. Fresh entries are NOT reclaimed."""
     for i in range(8):  # fill at t=100, never consumed
-        ring.publish(_kh(f"stale-{i}"), 0, b"old", ts=100, ttl_sec=30)
+        ring.publish(key_hash16(f"stale-{i}"), 0, b"old", ts=100, ttl_sec=30)
     with pytest.raises(RingFullError):  # t=110 within ttl -> still full
-        ring.publish(_kh("fresh"), 0, b"new", ts=110, ttl_sec=30)
+        ring.publish(key_hash16("fresh"), 0, b"new", ts=110, ttl_sec=30)
     # t=200: the t=100 entries are stale (>30s) -> reclaimed in place, publish succeeds
-    ring.publish(_kh("after-ttl"), 0, b"new", ts=200, ttl_sec=30)
+    ring.publish(key_hash16("after-ttl"), 0, b"new", ts=200, ttl_sec=30)
 
 
 def test_ring_ttl_zero_never_reclaims(ring):
     """ttl_sec=0 disables reclaim — full ring stays full regardless of ts."""
     for i in range(8):
-        ring.publish(_kh(f"x-{i}"), 0, b"o", ts=100, ttl_sec=0)
+        ring.publish(key_hash16(f"x-{i}"), 0, b"o", ts=100, ttl_sec=0)
     with pytest.raises(RingFullError):
-        ring.publish(_kh("y"), 0, b"n", ts=999999, ttl_sec=0)
+        ring.publish(key_hash16("y"), 0, b"n", ts=999999, ttl_sec=0)
 
 
 def test_ring_name_isolates_deployment_and_replica():
     """Ring shm name must be deterministic, unique per (deployment_id, edge, replica_id), and
     a valid POSIX shm name (hashed) even when deployment_id carries unsafe/long chars."""
-    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
 
     def name(dep, rid, a, b):
-        c = object.__new__(CudaIPCConnector)
-        c._deployment_id, c._replica_id = dep, rid
-        return c._ring_name(a, b)
+        return ring_shm_name(dep, a, b, rid)
 
     base = name("dep7", 0, "0", "1")
     assert name("dep7", 0, 0, 1) == base  # int (sender) / str (receiver) stage agree

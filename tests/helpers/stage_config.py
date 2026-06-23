@@ -386,7 +386,7 @@ _CI_OVERLAYS: dict[str, dict[str, Any]] = {
     },
     "qwen3_omni_moe_cuda_ipc": {
         "base_config": "qwen3_omni_moe_cuda_ipc.yaml",
-        "async_chunk": False,
+        "async_chunk": True,
         "stages": [
             {
                 "stage_id": 0,
