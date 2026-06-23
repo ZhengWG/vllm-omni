@@ -210,6 +210,14 @@ class CudaIPCConnector(OmniConnectorBase):
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
+        # Optional producer-side stream registered by the model runner. When set,
+        # ``_put_pool`` orders its pool D2D after operations queued on this stream
+        # (typically ``_omni_payload_copy_stream`` from the AR model runner).
+        # When ``None``, ``_put_pool`` falls back to recording an event on the
+        # save thread's ambient stream — only correct when PTDS is off and the
+        # producer wrote on the legacy default stream. See ``register_producer_stream``.
+        self._producer_stream: torch.cuda.Stream | None = None
+        self._producer_fallback_warned: bool = False
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -295,6 +303,62 @@ class CudaIPCConnector(OmniConnectorBase):
     def _start_release_thread(self) -> None:
         self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
         self._release_thread.start()
+
+    # --- Producer stream registration ---
+
+    def _maybe_warn_ambient_fallback(self) -> None:
+        """One-shot warning when ``_put_pool`` falls back to ambient-stream ordering.
+
+        The fallback is only correct when PTDS is off and the producer wrote
+        on the legacy default stream. We don't raise — older code paths still
+        rely on this — but we surface a warning on the first put() so a
+        silently-broken assumption (e.g. a future PTDS rollout) is at least
+        observable in logs.
+        """
+        if self._producer_fallback_warned:
+            return
+        self._producer_fallback_warned = True
+        # Detect PTDS heuristically: when enabled, ``current_stream()`` on a
+        # newly-spawned thread returns a per-thread default stream whose
+        # ``cuda_stream`` pointer is non-zero (legacy default has 0). We
+        # cannot reliably probe from this thread, so we just warn that the
+        # caller did not register a producer stream and explain the
+        # consequences. Callers using the keep_on_gpu snapshot path should
+        # call ``register_producer_stream`` to opt into the correct path.
+        logger.warning(
+            "CudaIPCConnector: _put_pool taking ambient-stream fallback "
+            "ordering. Correct only when PTDS is off and the producer "
+            "wrote on the legacy default stream. Call "
+            "register_producer_stream(_omni_payload_copy_stream) from the "
+            "model runner to use safe stream-based ordering."
+        )
+
+    def register_producer_stream(self, producer_stream: torch.cuda.Stream | None) -> None:
+        """Register the stream the producer uses to write payload tensors.
+
+        When set, ``_put_pool`` orders its pool D2D after operations queued on
+        this stream via ``copy_stream.wait_stream(producer_stream)``. This is
+        the correct ordering primitive when ``put()`` runs on a thread other
+        than the producer (e.g. the chunk_transfer save thread) and the
+        producer writes on a non-default stream — for example the AR model
+        runner's ``_omni_payload_copy_stream`` used by the keep_on_gpu
+        snapshot path.
+
+        Without this registration, ``_put_pool`` falls back to recording an
+        event on the save thread's ambient stream, which is only correct
+        when PTDS is off and the producer also wrote on the legacy default
+        stream. We log a warning on the first put() in that mode so the
+        fragile assumption can't break silently.
+
+        Args:
+            producer_stream: A ``torch.cuda.Stream`` instance, or ``None`` to
+                clear a previous registration and revert to the legacy
+                fallback.
+        """
+        self._producer_stream = producer_stream
+        # Reset the warn-once latch so a re-registration after clear can
+        # surface a new warning if the fallback path is triggered later.
+        self._producer_fallback_warned = False
 
     # --- Device & SHM helpers ---
 
@@ -650,10 +714,27 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
-            # Order the pack after the producer's writes. record() captures the AMBIENT stream
-            # (default — no PTDS in current wheels); correct only while the producer writes there.
-            self._compute_event.record()
-            self._copy_stream.wait_event(self._compute_event)
+            # Order the pack after the producer's writes. Two paths:
+            #
+            # 1. Preferred: ``register_producer_stream`` was called by the model
+            #    runner with the actual producer stream (e.g. the AR runner's
+            #    ``_omni_payload_copy_stream`` used by keep_on_gpu snapshots).
+            #    ``copy_stream.wait_stream(producer_stream)`` is the correct
+            #    primitive on any host: it fences the pool D2D past every op
+            #    currently queued on ``producer_stream``, including the snapshot
+            #    clone, regardless of which thread queued it.
+            # 2. Fallback (legacy): record an event on the save thread's
+            #    ambient stream and wait on it. Only correct when PTDS is off
+            #    AND the producer wrote on the legacy default stream — e.g.
+            #    the synchronous, non-async-output path. Warn once when this
+            #    path is taken with PTDS enabled, so the silent-corruption
+            #    assumption can't break unnoticed.
+            if self._producer_stream is not None:
+                self._copy_stream.wait_stream(self._producer_stream)
+            else:
+                self._maybe_warn_ambient_fallback()
+                self._compute_event.record()
+                self._copy_stream.wait_event(self._compute_event)
             try:
                 with torch.cuda.stream(self._copy_stream):
                     encoded_obj = self._walk_encode_pool(data, slot)
