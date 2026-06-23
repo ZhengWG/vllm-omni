@@ -276,6 +276,65 @@ def test_register_producer_stream_sets_field_and_resets_warn_latch():
     )
 
 
+def test_get_refuses_on_non_transfer_rank_and_warns_once(caplog):
+    """Defence-in-depth for the SPSC ring: a non-transfer rank that ends up
+    calling ``get()`` (e.g. a future caller bypassing the mixin's
+    ``is_data_transfer_rank`` gate) must be refused returning ``None``, and
+    must surface a single warning per process so the bug is observable."""
+    import logging
+
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_connector as conn_mod
+    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
+
+    conn = _bare_connector()
+    conn._closed = False
+    conn._is_transfer_rank = False
+    conn.role = "receiver"
+    conn.stage_id = 1
+    conn._replica_id = 0
+
+    with caplog.at_level(logging.WARNING, logger=conn_mod.logger.name):
+        for _ in range(5):
+            result = CudaIPCConnector.get(conn, "0", "1", "any-key", metadata=None)
+            assert result is None, "non-transfer rank must not consume from the SPSC ring"
+
+    refusal_warnings = [r for r in caplog.records if "non-transfer rank refused" in r.getMessage()]
+    assert len(refusal_warnings) == 1, (
+        f"Expected exactly one SPSC refusal warning, got {len(refusal_warnings)}; "
+        "must be one-shot or steady-state recv loops would spam the log."
+    )
+
+
+def test_get_passes_through_on_transfer_rank():
+    """Sanity counterpart to the gate test: when ``_is_transfer_rank`` is set,
+    ``get()`` must dispatch to ``_get_control_plane`` (we capture the call
+    rather than exercise the real ring/pool, which need CUDA + a peer process)."""
+    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
+
+    conn = _bare_connector()
+    conn._closed = False
+    conn._is_transfer_rank = True
+    captured: dict = {}
+
+    def fake_get_control_plane(from_stage, to_stage, get_key, composite_key):
+        captured.update(
+            from_stage=from_stage,
+            to_stage=to_stage,
+            get_key=get_key,
+            composite_key=composite_key,
+        )
+        return ({"hello": "world"}, 16)
+
+    conn._get_control_plane = fake_get_control_plane
+
+    result = CudaIPCConnector.get(conn, "0", "1", "k1", metadata=None)
+    assert result == ({"hello": "world"}, 16)
+    assert captured["from_stage"] == "0"
+    assert captured["to_stage"] == "1"
+    assert captured["get_key"] == "k1"
+    assert "k1" in captured["composite_key"]
+
+
 def test_maybe_warn_ambient_fallback_is_one_shot(caplog):
     import logging
 

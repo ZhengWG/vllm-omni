@@ -219,6 +219,8 @@ class CudaIPCConnector(OmniConnectorBase):
         # producer wrote on the legacy default stream. See ``register_producer_stream``.
         self._producer_stream: torch.cuda.Stream | None = None
         self._producer_fallback_warned: bool = False
+        # One-shot latch for the SPSC defence-in-depth gate in ``get()``.
+        self._recv_non_transfer_rank_warned: bool = False
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -850,6 +852,28 @@ class CudaIPCConnector(OmniConnectorBase):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         if self._closed:
+            return None
+        if not self._is_transfer_rank:
+            # Defense-in-depth gate, symmetric to put(): the per-edge control
+            # ring is single-producer / single-consumer. ``poll()`` is a
+            # destructive read (it sets ``consumed=1``), so if multiple TP
+            # receiver ranks poll the same ring they would all consume the
+            # same entry, all D2D-copy the prefill out of the pool, and all
+            # mark the release board — wasting bandwidth and breaking the
+            # SPSC invariant. The mixin's ``_recv_ordinary_stage_result``
+            # already gates on ``is_data_transfer_rank``; this guards
+            # against any future caller bypassing that gate.
+            if not getattr(self, "_recv_non_transfer_rank_warned", False):
+                self._recv_non_transfer_rank_warned = True
+                logger.warning(
+                    "CudaIPCConnector.get on non-transfer rank refused "
+                    "(stage=%s, role=%s, replica=%s); the per-edge ring is "
+                    "SPSC and only the data-transfer rank may poll it. "
+                    "This warning is one-shot per process.",
+                    self.stage_id,
+                    self.role,
+                    self._replica_id,
+                )
             return None
 
         composite_key = make_composite_key(get_key, from_stage, to_stage)
