@@ -1560,6 +1560,24 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if stream is None:
             stream = torch.cuda.Stream()
             self._omni_payload_copy_stream = stream
+            # Tell the output connector (if it supports GPU tensors) which
+            # stream the keep_on_gpu snapshot path writes on. Connectors that
+            # need it (CudaIPCConnector) override register_producer_stream to
+            # use stream-based ordering for their pool D2D, instead of
+            # recording an event on the save thread's ambient stream — which
+            # is only correct when PTDS is off and the producer wrote on the
+            # legacy default stream.
+            output_connector = getattr(self, "_output_connector", None)
+            register = getattr(output_connector, "register_producer_stream", None)
+            if callable(register):
+                try:
+                    register(stream)
+                except Exception:
+                    logger.warning(
+                        "Failed to register producer stream on output connector %s",
+                        type(output_connector).__name__,
+                        exc_info=True,
+                    )
         return stream
 
     def _to_connector_payload_tensor(
