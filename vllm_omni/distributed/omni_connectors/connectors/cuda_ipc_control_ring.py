@@ -138,7 +138,22 @@ class CudaIpcControlRing:
                 old.close()
         except FileNotFoundError:
             pass
-        shm = shm_pkg.SharedMemory(create=True, size=size, name=name)
+        try:
+            shm = shm_pkg.SharedMemory(create=True, size=size, name=name)
+        except OSError as e:
+            # /dev/shm too small (default 64 MB in many containers) is by far the most
+            # common cause here — translate the bare OSError into something an operator
+            # can act on without grepping the source.
+            size_mb = size / (1024 * 1024)
+            raise OSError(
+                f"CudaIpcControlRing.create: failed to allocate {size_mb:.0f} MB "
+                f"of POSIX shared memory for '{name}' ({e}). The control ring needs "
+                f"~ n_slots * (header + body_max) bytes per edge, with the default "
+                f"sender configuration around 1 GB per direction. If this is a "
+                f"container, raise --shm-size (or /dev/shm tmpfs limit) above the "
+                f"required size, or lower 'ring_entries' / 'ring_body_max' in the "
+                f"connector's `extra:` block."
+            ) from e
         # POSIX shm_open + ftruncate zero-fills the new segment, so every slot already
         # reads seq==0 (empty). No explicit memset — avoids a transient bytes(size) heap
         # spike (a 2048 x 128KB ring = 256MB) on the hot init path.

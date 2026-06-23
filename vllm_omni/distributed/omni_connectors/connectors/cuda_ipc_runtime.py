@@ -27,6 +27,10 @@ class _CudaIpcEventHandle(ctypes.Structure):
 _CUDA_MEMCPY_D2D = 3  # cudaMemcpyDeviceToDevice
 _CUDA_EVENT_INTERPROCESS = 0x04
 _CUDA_EVENT_DISABLE_TIMING = 0x02
+# cudaIpcOpenMemHandle ``flags`` argument. Only valid value per the CUDA spec
+# is ``cudaIpcMemLazyEnablePeerAccess`` (1); using a named constant at the
+# call site keeps the intent grep-able.
+_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 1
 
 
 def load_cudart():

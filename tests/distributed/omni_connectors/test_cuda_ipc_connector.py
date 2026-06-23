@@ -51,6 +51,32 @@ def test_ring_header_round_trip(ring):
     assert ring.read_header(len(blob)) == blob
 
 
+def test_ring_create_translates_shm_oserror_to_actionable_message(monkeypatch):
+    """When /dev/shm is too small (the most common deploy gotcha), CudaIpcControlRing.create
+    must raise an OSError whose message names the requested size and tells the operator how
+    to fix it. The default 64 MB tmpfs limit in many containers would otherwise surface as a
+    bare ENOSPC out of multiprocessing.shared_memory with no actionable context."""
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_control_ring as ring_mod
+
+    def _fake_shm_init(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ring_mod.shm_pkg, "SharedMemory", _fake_shm_init)
+    name = f"test_ipc_ring_oserr_{uuid.uuid4().hex[:12]}"
+    with pytest.raises(OSError) as excinfo:
+        ring_mod.CudaIpcControlRing.create(name, n_slots=2048, body_max=524288, header_bytes=32)
+    msg = str(excinfo.value)
+    assert "shared memory" in msg
+    assert "shm-size" in msg or "ring_entries" in msg, "operator-actionable hint must be present"
+    # Size should be reported in MB — round-trip the math here so a future refactor that
+    # silently changes the layout fails this assertion explicitly.
+    expected_size_mb_lo = (8 + 32 + 2048 * 524288) // (1024 * 1024) - 1
+    assert any(
+        token in msg
+        for token in (f"{expected_size_mb_lo} MB", f"{expected_size_mb_lo + 1} MB", f"{expected_size_mb_lo + 2} MB")
+    ), f"expected size ~{expected_size_mb_lo} MB to appear in: {msg}"
+
+
 def test_ring_header_overflow_rejected(ring):
     with pytest.raises(ValueError):
         ring.write_header(b"x" * 33)  # header_bytes=32

@@ -48,6 +48,7 @@ from .cuda_ipc_control_ring import (
 from .cuda_ipc_runtime import (
     _CUDA_EVENT_DISABLE_TIMING,
     _CUDA_EVENT_INTERPROCESS,
+    _CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
     _CudaIpcEventHandle,
     _CudaIpcMemHandle,
     load_cudart,
@@ -420,7 +421,9 @@ class CudaIPCConnector(OmniConnectorBase):
         """Open a CUDA IPC handle and return the mapped device pointer."""
         handle = _CudaIpcMemHandle.from_buffer_copy(handle_bytes)
         dev_ptr = ctypes.c_void_p()
-        ret = self._cudart.cudaIpcOpenMemHandle(ctypes.byref(dev_ptr), handle, ctypes.c_uint(1))
+        ret = self._cudart.cudaIpcOpenMemHandle(
+            ctypes.byref(dev_ptr), handle, ctypes.c_uint(_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS)
+        )
         if ret != 0:
             raise RuntimeError(f"cudaIpcOpenMemHandle failed with code {ret}")
         return dev_ptr
@@ -611,8 +614,15 @@ class CudaIPCConnector(OmniConnectorBase):
 
     def _release_expired_credits(self) -> None:
         """TTL sweep: reclaim slots whose receiver never marked the board
-        (e.g. the request was aborted or the receiver died)."""
-        now = _time_mod.time()
+        (e.g. the request was aborted or the receiver died).
+
+        Uses ``time.monotonic`` consistently with both the put-time stamp on
+        ``_held_credits`` / ``_fallback_segs`` and the reclaim deadline in
+        ``_acquire_credit``. ``time.time`` would be wall-clock, so an NTP
+        step backward could make ``now - ts`` negative and leak credits
+        until the clock catches up.
+        """
+        now = _time_mod.monotonic()
         with self._held_lock:
             expired = [
                 (key, slot_offset)
@@ -692,7 +702,7 @@ class CudaIPCConnector(OmniConnectorBase):
             )
         try:
             self._ring.publish(
-                kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.monotonic()), ttl_sec=int(self.tensor_lifetime_sec)
             )
         except RingFullError:
             return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
@@ -782,10 +792,10 @@ class CudaIPCConnector(OmniConnectorBase):
                 reason=f"descriptor_too_big {len(descriptor)}>{self._ring.body_max}",
             )
         with self._held_lock:
-            self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
+            self._held_credits[composite_key] = (_time_mod.monotonic(), slot_offset)
         try:
             self._ring.publish(
-                kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.monotonic()), ttl_sec=int(self.tensor_lifetime_sec)
             )
         except RingFullError:
             with self._held_lock:
@@ -821,8 +831,10 @@ class CudaIPCConnector(OmniConnectorBase):
 
         meta = self._atomic_shm_write(payload, name=put_key)
         # Track for TTL cleanup in case the receiver aborts and never reads/unlinks it.
+        # Uses monotonic to match the TTL sweep in _release_expired_credits — a
+        # wall-clock NTP step backward would otherwise leak segments.
         if getattr(self, "_fallback_segs", None) is not None:
-            self._fallback_segs[put_key] = _time_mod.time()
+            self._fallback_segs[put_key] = _time_mod.monotonic()
 
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += size
