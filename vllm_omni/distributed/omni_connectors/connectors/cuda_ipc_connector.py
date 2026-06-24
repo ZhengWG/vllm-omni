@@ -48,6 +48,7 @@ from .cuda_ipc_control_ring import (
 from .cuda_ipc_runtime import (
     _CUDA_EVENT_DISABLE_TIMING,
     _CUDA_EVENT_INTERPROCESS,
+    _CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
     _CudaIpcEventHandle,
     _CudaIpcMemHandle,
     load_cudart,
@@ -210,6 +211,16 @@ class CudaIPCConnector(OmniConnectorBase):
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
+        # Optional producer-side stream registered by the model runner. When set,
+        # ``_put_pool`` orders its pool D2D after operations queued on this stream
+        # (typically ``_omni_payload_copy_stream`` from the AR model runner).
+        # When ``None``, ``_put_pool`` falls back to recording an event on the
+        # save thread's ambient stream — only correct when PTDS is off and the
+        # producer wrote on the legacy default stream. See ``register_producer_stream``.
+        self._producer_stream: torch.cuda.Stream | None = None
+        self._producer_fallback_warned: bool = False
+        # One-shot latch for the SPSC defence-in-depth gate in ``get()``.
+        self._recv_non_transfer_rank_warned: bool = False
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -296,6 +307,62 @@ class CudaIPCConnector(OmniConnectorBase):
         self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
         self._release_thread.start()
 
+    # --- Producer stream registration ---
+
+    def _maybe_warn_ambient_fallback(self) -> None:
+        """One-shot warning when ``_put_pool`` falls back to ambient-stream ordering.
+
+        The fallback is only correct when PTDS is off and the producer wrote
+        on the legacy default stream. We don't raise — older code paths still
+        rely on this — but we surface a warning on the first put() so a
+        silently-broken assumption (e.g. a future PTDS rollout) is at least
+        observable in logs.
+        """
+        if self._producer_fallback_warned:
+            return
+        self._producer_fallback_warned = True
+        # Detect PTDS heuristically: when enabled, ``current_stream()`` on a
+        # newly-spawned thread returns a per-thread default stream whose
+        # ``cuda_stream`` pointer is non-zero (legacy default has 0). We
+        # cannot reliably probe from this thread, so we just warn that the
+        # caller did not register a producer stream and explain the
+        # consequences. Callers using the keep_on_gpu snapshot path should
+        # call ``register_producer_stream`` to opt into the correct path.
+        logger.warning(
+            "CudaIPCConnector: _put_pool taking ambient-stream fallback "
+            "ordering. Correct only when PTDS is off and the producer "
+            "wrote on the legacy default stream. Call "
+            "register_producer_stream(_omni_payload_copy_stream) from the "
+            "model runner to use safe stream-based ordering."
+        )
+
+    def register_producer_stream(self, producer_stream: torch.cuda.Stream | None) -> None:
+        """Register the stream the producer uses to write payload tensors.
+
+        When set, ``_put_pool`` orders its pool D2D after operations queued on
+        this stream via ``copy_stream.wait_stream(producer_stream)``. This is
+        the correct ordering primitive when ``put()`` runs on a thread other
+        than the producer (e.g. the chunk_transfer save thread) and the
+        producer writes on a non-default stream — for example the AR model
+        runner's ``_omni_payload_copy_stream`` used by the keep_on_gpu
+        snapshot path.
+
+        Without this registration, ``_put_pool`` falls back to recording an
+        event on the save thread's ambient stream, which is only correct
+        when PTDS is off and the producer also wrote on the legacy default
+        stream. We log a warning on the first put() in that mode so the
+        fragile assumption can't break silently.
+
+        Args:
+            producer_stream: A ``torch.cuda.Stream`` instance, or ``None`` to
+                clear a previous registration and revert to the legacy
+                fallback.
+        """
+        self._producer_stream = producer_stream
+        # Reset the warn-once latch so a re-registration after clear can
+        # surface a new warning if the fallback path is triggered later.
+        self._producer_fallback_warned = False
+
     # --- Device & SHM helpers ---
 
     @staticmethod
@@ -356,7 +423,9 @@ class CudaIPCConnector(OmniConnectorBase):
         """Open a CUDA IPC handle and return the mapped device pointer."""
         handle = _CudaIpcMemHandle.from_buffer_copy(handle_bytes)
         dev_ptr = ctypes.c_void_p()
-        ret = self._cudart.cudaIpcOpenMemHandle(ctypes.byref(dev_ptr), handle, ctypes.c_uint(1))
+        ret = self._cudart.cudaIpcOpenMemHandle(
+            ctypes.byref(dev_ptr), handle, ctypes.c_uint(_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS)
+        )
         if ret != 0:
             raise RuntimeError(f"cudaIpcOpenMemHandle failed with code {ret}")
         return dev_ptr
@@ -547,8 +616,15 @@ class CudaIPCConnector(OmniConnectorBase):
 
     def _release_expired_credits(self) -> None:
         """TTL sweep: reclaim slots whose receiver never marked the board
-        (e.g. the request was aborted or the receiver died)."""
-        now = _time_mod.time()
+        (e.g. the request was aborted or the receiver died).
+
+        Uses ``time.monotonic`` consistently with both the put-time stamp on
+        ``_held_credits`` / ``_fallback_segs`` and the reclaim deadline in
+        ``_acquire_credit``. ``time.time`` would be wall-clock, so an NTP
+        step backward could make ``now - ts`` negative and leak credits
+        until the clock catches up.
+        """
+        now = _time_mod.monotonic()
         with self._held_lock:
             expired = [
                 (key, slot_offset)
@@ -628,7 +704,7 @@ class CudaIPCConnector(OmniConnectorBase):
             )
         try:
             self._ring.publish(
-                kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.monotonic()), ttl_sec=int(self.tensor_lifetime_sec)
             )
         except RingFullError:
             return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
@@ -650,10 +726,29 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
-            # Order the pack after the producer's writes. record() captures the AMBIENT stream
-            # (default — no PTDS in current wheels); correct only while the producer writes there.
-            self._compute_event.record()
-            self._copy_stream.wait_event(self._compute_event)
+            # Order the pack after the producer's writes. Two paths:
+            #
+            # 1. Preferred: ``register_producer_stream`` was called by the model
+            #    runner with the actual producer stream — for the AR runner's
+            #    keep_on_gpu snapshot path that's the model's compute stream
+            #    (the snapshot clone has to live there to be CUDA-graph safe;
+            #    see _snapshot_omni_output_tensors_for_async_output).
+            #    ``copy_stream.wait_stream(producer_stream)`` is the correct
+            #    primitive on any host: it fences the pool D2D past every op
+            #    currently queued on ``producer_stream``, including the
+            #    snapshot clone, regardless of which thread queued it.
+            # 2. Fallback (legacy): record an event on the save thread's
+            #    ambient stream and wait on it. Only correct when PTDS is off
+            #    AND the producer wrote on the legacy default stream — e.g.
+            #    the synchronous, non-async-output path. Warn once when this
+            #    path is taken with PTDS enabled, so the silent-corruption
+            #    assumption can't break unnoticed.
+            if self._producer_stream is not None:
+                self._copy_stream.wait_stream(self._producer_stream)
+            else:
+                self._maybe_warn_ambient_fallback()
+                self._compute_event.record()
+                self._copy_stream.wait_event(self._compute_event)
             try:
                 with torch.cuda.stream(self._copy_stream):
                     encoded_obj = self._walk_encode_pool(data, slot)
@@ -701,10 +796,10 @@ class CudaIPCConnector(OmniConnectorBase):
                 reason=f"descriptor_too_big {len(descriptor)}>{self._ring.body_max}",
             )
         with self._held_lock:
-            self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
+            self._held_credits[composite_key] = (_time_mod.monotonic(), slot_offset)
         try:
             self._ring.publish(
-                kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.monotonic()), ttl_sec=int(self.tensor_lifetime_sec)
             )
         except RingFullError:
             with self._held_lock:
@@ -740,8 +835,10 @@ class CudaIPCConnector(OmniConnectorBase):
 
         meta = self._atomic_shm_write(payload, name=put_key)
         # Track for TTL cleanup in case the receiver aborts and never reads/unlinks it.
+        # Uses monotonic to match the TTL sweep in _release_expired_credits — a
+        # wall-clock NTP step backward would otherwise leak segments.
         if getattr(self, "_fallback_segs", None) is not None:
-            self._fallback_segs[put_key] = _time_mod.time()
+            self._fallback_segs[put_key] = _time_mod.monotonic()
 
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += size
@@ -757,6 +854,28 @@ class CudaIPCConnector(OmniConnectorBase):
         metadata: dict[str, Any] | None = None,
     ) -> tuple[Any, int] | None:
         if self._closed:
+            return None
+        if not self._is_transfer_rank:
+            # Defense-in-depth gate, symmetric to put(): the per-edge control
+            # ring is single-producer / single-consumer. ``poll()`` is a
+            # destructive read (it sets ``consumed=1``), so if multiple TP
+            # receiver ranks poll the same ring they would all consume the
+            # same entry, all D2D-copy the prefill out of the pool, and all
+            # mark the release board — wasting bandwidth and breaking the
+            # SPSC invariant. The mixin's ``_recv_ordinary_stage_result``
+            # already gates on ``is_data_transfer_rank``; this guards
+            # against any future caller bypassing that gate.
+            if not getattr(self, "_recv_non_transfer_rank_warned", False):
+                self._recv_non_transfer_rank_warned = True
+                logger.warning(
+                    "CudaIPCConnector.get on non-transfer rank refused "
+                    "(stage=%s, role=%s, replica=%s); the per-edge ring is "
+                    "SPSC and only the data-transfer rank may poll it. "
+                    "This warning is one-shot per process.",
+                    self.stage_id,
+                    self.role,
+                    self._replica_id,
+                )
             return None
 
         composite_key = make_composite_key(get_key, from_stage, to_stage)

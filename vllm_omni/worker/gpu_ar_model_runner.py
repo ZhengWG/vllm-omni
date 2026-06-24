@@ -140,6 +140,12 @@ class _OmniOutputTensorSnapshot(NamedTuple):
     staged_hidden_states_cpu: torch.Tensor | None
     multimodal_outputs: Any
     async_payload: _AsyncCPUPayloadSnapshot | None = None
+    # Whether ``hidden_states`` and ``multimodal_outputs`` are already
+    # snapshot copies, i.e. independent of the model's CUDA-graph reuse
+    # buffers. When True the downstream output builder can skip its
+    # defensive clones in ``_to_connector_payload_tensor`` and
+    # ``build_mm_cpu(keep_on_gpu=True)``.
+    payload_is_cloned: bool = False
 
 
 class OmniAsyncGPUModelRunnerOutput(AsyncGPUModelRunnerOutput):
@@ -753,6 +759,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
         seq_len: int,
+        payload_already_cloned: bool = False,
     ) -> dict[str, object]:
         if combined_multimodal_outputs:
             return self._build_combined_prefix_cache_mm_payload(
@@ -781,7 +788,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                     continue
                 sparse_val = mm_val[sparse_idx]
-                mm_payload[mm_key] = sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
+                # Defensive ``.clone()`` here protects against cross-request
+                # aliasing when the snapshot stage has not already cloned
+                # (e.g. the synchronous, non-async-output path). Under the
+                # async-output path with keep_on_gpu, the snapshot's
+                # ``_clone_cuda_tensor_payload`` already walks the list and
+                # returns independent clones — re-cloning here would issue
+                # another GPU D2D on the background-thread's compute
+                # stream, the very thing this commit is trying to avoid.
+                if isinstance(sparse_val, torch.Tensor) and not payload_already_cloned:
+                    sparse_val = sparse_val.clone()
+                mm_payload[mm_key] = sparse_val
                 continue
             mm_payload[mm_key] = to_payload_element(
                 element=mm_val,
@@ -790,6 +807,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 end=end,
                 pass_lists_through=False,
                 seq_len=seq_len,
+                payload_already_cloned=payload_already_cloned,
             )
         return mm_payload
 
@@ -808,6 +826,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
         seq_len: int,
+        payload_already_cloned: bool = False,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         if not audio_sparse_output:
@@ -834,6 +853,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             audio_sparse_output=audio_sparse_output,
             sparse_mm_index=sparse_mm_index,
             seq_len=seq_len,
+            payload_already_cloned=payload_already_cloned,
         )
         payload.update(mm_payload)
         return payload
@@ -1454,12 +1474,42 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             multimodal_outputs=multimodal_outputs,
         )
         if self._payload_keep_on_gpu:
+            # SAFETY (CUDA-graph): keep_on_gpu reads ``hidden_states`` and the
+            # tensors in ``multimodal_outputs`` directly out of the producer's
+            # output buffers. Under ``CUDAGraphMode.FULL`` those are *static*
+            # output buffers reused across replays — the next forward writes
+            # the same addresses. The clone here MUST run on the producer's
+            # stream (the model thread's current/compute stream) so that it
+            # serialises before the next replay's writes.
+            #
+            # An earlier revision moved this clone onto a dedicated
+            # ``_omni_payload_copy_stream`` to overlap with the next forward.
+            # That introduced a cross-stream race because
+            # ``copy_stream.wait_stream(source_stream)`` is a one-way fence:
+            # it makes copy_stream wait for compute_stream's queued work, but
+            # does NOT make compute_stream wait for the clone. The next graph
+            # replay could then overwrite the static output buffer
+            # concurrently with the in-flight cross-stream clone — a torn
+            # read that ``seq``-style detection cannot catch, materialising
+            # as silent NaNs only at high transfer counts (the
+            # ~8400-iteration soak signature). See the discussion on
+            # PR #2507's review for the failure mode.
+            #
+            # Keeping the clone on the compute stream costs ~55µs of
+            # serialised compute critical path per chunk (the same overhead
+            # the SHM async-output path takes for its own on-compute clone).
+            # The off-compute overlap that path enjoys for the subsequent
+            # D2H is achieved on the IPC side by the connector's pool D2D
+            # running on its own ``_copy_stream`` and ordered after this
+            # clone via ``register_producer_stream`` — see
+            # ``_maybe_register_keep_on_gpu_producer_stream`` below.
+            self._maybe_register_keep_on_gpu_producer_stream()
             with record_function_or_nullcontext("omni_async_output:snapshot_gpu_payload"):
-                hidden_states_snapshot = payload.get("hidden_states")
-                if hidden_states_snapshot is None:
+                hidden_src = payload.get("hidden_states")
+                if hidden_src is None:
                     hidden_states_snapshot = hidden_states[:0]
                 else:
-                    hidden_states_snapshot = hidden_states_snapshot.detach().clone()
+                    hidden_states_snapshot = hidden_src.detach().clone()
                 cuda_sources: list[torch.Tensor] = []
                 mm_snapshot = _clone_cuda_tensor_payload(payload["multimodal_outputs"], cuda_sources)
             return _OmniOutputTensorSnapshot(
@@ -1467,6 +1517,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 staged_hidden_states_cpu=payload.get("staged_hidden_states_cpu"),
                 multimodal_outputs=mm_snapshot,
                 async_payload=None,
+                payload_is_cloned=True,
             )
 
         with record_function_or_nullcontext("omni_async_output:snapshot_cpu_payload"):
@@ -1488,6 +1539,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             staged_hidden_states_cpu=payload.get("staged_hidden_states_cpu"),
             multimodal_outputs=payload["multimodal_outputs"],
             async_payload=async_payload_snapshot,
+            payload_is_cloned=True,
         )
 
     def _maybe_run_eager_omni_postprocess_before_async_output(
@@ -1526,16 +1578,74 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return True
 
     def _get_or_create_omni_payload_copy_stream(self) -> torch.cuda.Stream:
+        """Lazy side stream used by the CPU async-output snapshot for D2H.
+
+        Only the CPU path uses this stream: it stages the device→host copy
+        of the snapshot off the compute stream so the next forward can
+        proceed immediately. The keep_on_gpu (GPU) path no longer uses
+        this stream — see ``_snapshot_omni_output_tensors_for_async_output``
+        for why the GPU snapshot clone has to live on the compute stream.
+        """
         stream = getattr(self, "_omni_payload_copy_stream", None)
         if stream is None:
             stream = torch.cuda.Stream()
             self._omni_payload_copy_stream = stream
         return stream
 
-    def _to_connector_payload_tensor(self, tensor: torch.Tensor) -> torch.Tensor:
-        """Detached tensor staged for the downstream connector (GPU or CPU)."""
+    def _maybe_register_keep_on_gpu_producer_stream(self) -> None:
+        """Register the model's compute stream on the output connector.
+
+        The keep_on_gpu snapshot clone runs on the producer (compute)
+        stream. The connector's pool D2D in the save thread therefore needs
+        to fence its private ``_copy_stream`` past the compute stream's
+        queued work to read the snapshot safely. ``register_producer_stream``
+        wires that up via ``copy_stream.wait_stream(producer_stream)``,
+        which is a portable two-way ordering primitive (TSO or weak-memory
+        host, PTDS on or off, any thread).
+
+        Idempotent and lazy: only the first invocation actually wires the
+        registration, so this is safe to call from the hot snapshot path.
+        Connectors without ``register_producer_stream`` (e.g. SHM) have
+        no equivalent need; we silently skip and latch to avoid retrying
+        the ``getattr`` on every snapshot.
+        """
+        if getattr(self, "_keep_on_gpu_producer_registered", False):
+            return
+        output_connector = getattr(self, "_output_connector", None)
+        register = getattr(output_connector, "register_producer_stream", None)
+        if not callable(register):
+            self._keep_on_gpu_producer_registered = True
+            return
+        try:
+            register(torch.cuda.current_stream())
+            self._keep_on_gpu_producer_registered = True
+        except Exception:
+            logger.warning(
+                "Failed to register compute stream as producer on output "
+                "connector %s; pool D2D will fall back to ambient-stream "
+                "ordering with a one-shot warning per process.",
+                type(output_connector).__name__,
+                exc_info=True,
+            )
+
+    def _to_connector_payload_tensor(
+        self,
+        tensor: torch.Tensor,
+        *,
+        payload_already_cloned: bool = False,
+    ) -> torch.Tensor:
+        """Detached tensor staged for the downstream connector (GPU or CPU).
+
+        When ``payload_already_cloned`` is True the input tensor is already a
+        snapshot copy (taken on the omni payload copy stream); the GPU branch
+        therefore skips the redundant ``.clone()`` and only ensures
+        contiguity. The CPU branch is unaffected because ``_to_cpu_contiguous``
+        is already a no-op for already-CPU tensors.
+        """
         detached = tensor.detach()
         if self._payload_keep_on_gpu:
+            if payload_already_cloned:
+                return detached.contiguous()
             return detached.clone()
         return _to_cpu_contiguous(detached)
 
@@ -1560,6 +1670,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
         postprocess_already_applied: bool = False,
+        payload_is_cloned: bool = False,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
@@ -1595,7 +1706,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             )
             if len(downstream_req_ids) == len(req_ids_output_copy):
                 with record_function_or_nullcontext("omni_output_builder:hidden_d2h/scheduled"):
-                    hidden_states_cpu = self._to_connector_payload_tensor(hidden_states[:num_valid_tokens])
+                    hidden_states_cpu = self._to_connector_payload_tensor(
+                        hidden_states[:num_valid_tokens],
+                        payload_already_cloned=payload_is_cloned,
+                    )
             else:
                 req_hidden_states_cpu = {}
                 with record_function_or_nullcontext("omni_output_builder:hidden_d2h/per_request"):
@@ -1604,7 +1718,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         start = int(query_start_loc_cpu[idx])
                         sched = int(num_scheduled_tokens_np[idx])
                         end = start + sched
-                        req_hidden_states_cpu[rid] = self._to_connector_payload_tensor(hidden_states[start:end])
+                        req_hidden_states_cpu[rid] = self._to_connector_payload_tensor(
+                            hidden_states[start:end],
+                            payload_already_cloned=payload_is_cloned,
+                        )
 
         # NOTE: pooler_output here is used only for the full-payload accumulation
         # path (accumulate_full_payload_output) and is NOT passed on the wire via
@@ -1630,6 +1747,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     mm_cpu = build_mm_cpu(
                         flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                         keep_on_gpu=self._payload_keep_on_gpu,
+                        payload_already_cloned=payload_is_cloned,
                     )
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):
@@ -1669,6 +1787,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         audio_sparse_output=audio_sparse_output,
                         sparse_mm_index=sparse_mm_index,
                         seq_len=seq_len,
+                        payload_already_cloned=payload_is_cloned,
                     )
                     pooler_output.append(flatten_payload(payload))
 
@@ -1890,7 +2009,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         def output_builder() -> OmniModelRunnerOutput:
             if output_tensor_snapshot.async_payload is not None:
-                with record_function_or_nullcontext("omni_async_output:wait_cpu_payload"):
+                with record_function_or_nullcontext("omni_async_output:wait_payload"):
                     output_tensor_snapshot.async_payload.wait()
             with record_function_or_nullcontext("omni_output_builder:total"):
                 return self._build_omni_model_runner_output_from_snapshot(
@@ -1912,6 +2031,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
                     postprocess_already_applied=omni_postprocess_already_applied,
+                    payload_is_cloned=output_tensor_snapshot.payload_is_cloned,
                 )
 
         if not use_async_omni_output:

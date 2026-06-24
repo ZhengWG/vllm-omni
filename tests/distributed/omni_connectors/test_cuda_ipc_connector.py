@@ -51,6 +51,74 @@ def test_ring_header_round_trip(ring):
     assert ring.read_header(len(blob)) == blob
 
 
+def test_ring_refuses_to_create_on_weakly_ordered_host(monkeypatch):
+    """CudaIpcControlRing's seqlock is fenceless and only safe on TSO hosts.
+    On ARM/POWER the consumer can observe ``seq`` updated before the body is
+    fully written, producing a torn read that ``seq_a == seq_b`` cannot detect.
+    Refusing to construct on weakly-ordered hosts (rather than running and
+    silently corrupting prefill handoffs) is the documented contract."""
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_control_ring as ring_mod
+
+    monkeypatch.setattr(ring_mod.platform, "machine", lambda: "aarch64")
+    monkeypatch.delenv("VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY", raising=False)
+    name = f"test_ipc_ring_arm_{uuid.uuid4().hex[:12]}"
+
+    with pytest.raises(RuntimeError) as excinfo:
+        ring_mod.CudaIpcControlRing.create(name, n_slots=8, body_max=64, header_bytes=32)
+
+    msg = str(excinfo.value)
+    assert "TSO" in msg or "weakly ordered" in msg
+    assert "VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY" in msg, "the override env var must be discoverable from the error"
+
+
+def test_ring_weak_memory_override_allows_construction(monkeypatch):
+    """Operators that have wired up an explicit memory barrier (e.g. via a
+    C extension) must be able to opt out of the refusal — otherwise we
+    would block legitimate non-x86 deployments forever."""
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_control_ring as ring_mod
+
+    monkeypatch.setattr(ring_mod.platform, "machine", lambda: "ppc64le")
+    monkeypatch.setenv("VLLM_OMNI_CUDA_IPC_RING_ALLOW_WEAK_MEMORY", "1")
+    name = f"test_ipc_ring_ppc_override_{uuid.uuid4().hex[:12]}"
+
+    r = ring_mod.CudaIpcControlRing.create(name, n_slots=4, body_max=32, header_bytes=8)
+    try:
+        # Sanity: the ring still works as expected once we opt in (the
+        # override does not disable any other invariants).
+        kh = ring_mod.key_hash16("ppc-override")
+        r.publish(kh, pclass=0, body=b"ok")
+        got = r.poll(kh)
+        assert got is not None and got[1] == b"ok"
+    finally:
+        r.close()
+
+
+def test_ring_create_translates_shm_oserror_to_actionable_message(monkeypatch):
+    """When /dev/shm is too small (the most common deploy gotcha), CudaIpcControlRing.create
+    must raise an OSError whose message names the requested size and tells the operator how
+    to fix it. The default 64 MB tmpfs limit in many containers would otherwise surface as a
+    bare ENOSPC out of multiprocessing.shared_memory with no actionable context."""
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_control_ring as ring_mod
+
+    def _fake_shm_init(*args, **kwargs):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ring_mod.shm_pkg, "SharedMemory", _fake_shm_init)
+    name = f"test_ipc_ring_oserr_{uuid.uuid4().hex[:12]}"
+    with pytest.raises(OSError) as excinfo:
+        ring_mod.CudaIpcControlRing.create(name, n_slots=2048, body_max=524288, header_bytes=32)
+    msg = str(excinfo.value)
+    assert "shared memory" in msg
+    assert "shm-size" in msg or "ring_entries" in msg, "operator-actionable hint must be present"
+    # Size should be reported in MB — round-trip the math here so a future refactor that
+    # silently changes the layout fails this assertion explicitly.
+    expected_size_mb_lo = (8 + 32 + 2048 * 524288) // (1024 * 1024) - 1
+    assert any(
+        token in msg
+        for token in (f"{expected_size_mb_lo} MB", f"{expected_size_mb_lo + 1} MB", f"{expected_size_mb_lo + 2} MB")
+    ), f"expected size ~{expected_size_mb_lo} MB to appear in: {msg}"
+
+
 def test_ring_header_overflow_rejected(ring):
     with pytest.raises(ValueError):
         ring.write_header(b"x" * 33)  # header_bytes=32
@@ -201,6 +269,131 @@ def _receiver_proc(cmd_q: mp.Queue, res_q: mp.Queue, cfg: dict):
                 break
     finally:
         receiver.close()
+
+
+# ════════════════════════════════════════════════════════════════════
+# Layer 1.5 — register_producer_stream wiring (CPU-only, no real GPU work)
+# ════════════════════════════════════════════════════════════════════
+#
+# These tests exercise the producer-stream registration plumbing on a
+# bare CudaIPCConnector instance built via ``object.__new__`` so we can
+# call _init_runtime_state without booting CUDA. They lock in the
+# contract that:
+#
+# 1. ``register_producer_stream`` stashes the stream on the connector and
+#    resets the warn-once latch.
+# 2. ``_maybe_warn_ambient_fallback`` warns exactly once per registration
+#    cycle, so a future PTDS rollout can't silently corrupt put() data
+#    without surfacing in the logs.
+
+
+def _bare_connector():
+    """Skeleton CudaIPCConnector with only the runtime-state slots populated.
+
+    Avoids ``__init__`` (which would try to load cudart and allocate a pool).
+    """
+    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
+
+    conn = object.__new__(CudaIPCConnector)
+    CudaIPCConnector._init_runtime_state(conn)
+    return conn
+
+
+def test_register_producer_stream_sets_field_and_resets_warn_latch():
+    conn = _bare_connector()
+    assert conn._producer_stream is None
+    assert conn._producer_fallback_warned is False
+
+    sentinel = object()  # opaque placeholder; the connector never inspects it
+    conn.register_producer_stream(sentinel)
+    assert conn._producer_stream is sentinel
+    assert conn._producer_fallback_warned is False
+
+    conn._producer_fallback_warned = True
+    conn.register_producer_stream(None)
+    assert conn._producer_stream is None
+    assert conn._producer_fallback_warned is False, (
+        "Re-registration must reset the warn-once latch so the next ambient "
+        "fallback (e.g. after clearing the producer stream) is observable."
+    )
+
+
+def test_get_refuses_on_non_transfer_rank_and_warns_once(caplog):
+    """Defence-in-depth for the SPSC ring: a non-transfer rank that ends up
+    calling ``get()`` (e.g. a future caller bypassing the mixin's
+    ``is_data_transfer_rank`` gate) must be refused returning ``None``, and
+    must surface a single warning per process so the bug is observable."""
+    import logging
+
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_connector as conn_mod
+    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
+
+    conn = _bare_connector()
+    conn._closed = False
+    conn._is_transfer_rank = False
+    conn.role = "receiver"
+    conn.stage_id = 1
+    conn._replica_id = 0
+
+    with caplog.at_level(logging.WARNING, logger=conn_mod.logger.name):
+        for _ in range(5):
+            result = CudaIPCConnector.get(conn, "0", "1", "any-key", metadata=None)
+            assert result is None, "non-transfer rank must not consume from the SPSC ring"
+
+    refusal_warnings = [r for r in caplog.records if "non-transfer rank refused" in r.getMessage()]
+    assert len(refusal_warnings) == 1, (
+        f"Expected exactly one SPSC refusal warning, got {len(refusal_warnings)}; "
+        "must be one-shot or steady-state recv loops would spam the log."
+    )
+
+
+def test_get_passes_through_on_transfer_rank():
+    """Sanity counterpart to the gate test: when ``_is_transfer_rank`` is set,
+    ``get()`` must dispatch to ``_get_control_plane`` (we capture the call
+    rather than exercise the real ring/pool, which need CUDA + a peer process)."""
+    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
+
+    conn = _bare_connector()
+    conn._closed = False
+    conn._is_transfer_rank = True
+    captured: dict = {}
+
+    def fake_get_control_plane(from_stage, to_stage, get_key, composite_key):
+        captured.update(
+            from_stage=from_stage,
+            to_stage=to_stage,
+            get_key=get_key,
+            composite_key=composite_key,
+        )
+        return ({"hello": "world"}, 16)
+
+    conn._get_control_plane = fake_get_control_plane
+
+    result = CudaIPCConnector.get(conn, "0", "1", "k1", metadata=None)
+    assert result == ({"hello": "world"}, 16)
+    assert captured["from_stage"] == "0"
+    assert captured["to_stage"] == "1"
+    assert captured["get_key"] == "k1"
+    assert "k1" in captured["composite_key"]
+
+
+def test_maybe_warn_ambient_fallback_is_one_shot(caplog):
+    import logging
+
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_connector as conn_mod
+
+    conn = _bare_connector()
+
+    with caplog.at_level(logging.WARNING, logger=conn_mod.logger.name):
+        conn._maybe_warn_ambient_fallback()
+        conn._maybe_warn_ambient_fallback()
+        conn._maybe_warn_ambient_fallback()
+
+    fallback_warnings = [r for r in caplog.records if "ambient-stream fallback" in r.getMessage()]
+    assert len(fallback_warnings) == 1, (
+        f"Expected exactly one ambient-fallback warning, got {len(fallback_warnings)}; "
+        "the warning must be one-shot or the log will spam under steady-state put() traffic."
+    )
 
 
 def _materialize(spec: dict, device: str) -> dict:

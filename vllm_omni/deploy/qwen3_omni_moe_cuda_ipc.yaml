@@ -1,9 +1,26 @@
 # Qwen3-Omni-MoE — CudaIPCConnector (one stage per GPU, all cross-GPU CudaIPC).
 #
-# The connector routes put()/get() through the per-edge SPSC mailbox (_ipc_ring.IpcRing)
-# instead of a per-transfer /dev/shm round-trip. Small payloads (< inline_threshold_bytes)
-# ride inline in the ring; big ones use the pool + D2D (descriptor in the ring); overflow /
-# ring-full / abort fall back to /dev/shm (read via _try_get_shm_compat).
+# The connector routes put()/get() through a per-edge SPSC mailbox
+# (CudaIpcControlRing in cuda_ipc_control_ring.py) instead of a per-transfer
+# /dev/shm round-trip. Small payloads (< inline_threshold_bytes) ride inline
+# in the ring; big ones use the pool + D2D (descriptor in the ring);
+# overflow / ring-full / abort fall back to /dev/shm (read via
+# _try_get_shm_compat).
+#
+# Memory & host-shm requirements (read before tweaking the values below):
+#   * The connector's GPU pool (`pool_size_mb`) is allocated *outside*
+#     vLLM's `gpu_memory_utilization` budget, so effective per-GPU usage on
+#     the sender stage is `gpu_memory_utilization + pool_size_mb`. With the
+#     defaults below (gmu=0.9 on stage 0 + a 4 GB pool) you need 4 GB of
+#     headroom on top of vLLM's allocation. Lower `pool_size_mb` /
+#     `pool_credits` if you are tight on memory.
+#   * Each ring needs ~ ring_entries * ring_body_max bytes of POSIX shared
+#     memory (i.e. /dev/shm). With the defaults below that is ~ 1 GB per
+#     direction (~ 2 GB total for the 3-stage pipeline). Many containers
+#     cap /dev/shm at 64 MB by default; raise --shm-size (or the tmpfs
+#     limit) accordingly, or lower `ring_entries` / `ring_body_max`.
+#     CudaIpcControlRing.create surfaces a clear error message when the
+#     allocation fails for this reason.
 #
 # Usage:
 #   CUDA_VISIBLE_DEVICES=0,1,2 vllm serve <model> --omni \
@@ -18,11 +35,14 @@ connectors:
       tensor_lifetime_sec: 30.0
       # Pool holds the big prefill handoff (emb+hidden ~33MB/req @ in4000, packed into one
       # slot). slot = pool_size/credits must exceed the handoff; credits >= max_num_seqs.
+      # Allocated outside `gpu_memory_utilization` — see header comment.
       pool_size_mb: 4096
       pool_credits: 64               # slot = 4096/64 = 64MB
       inline_threshold_bytes: 16384   # < 16KB -> inline
       ring_body_max: 524288           # 512KB: pool descriptors (ids ~40KB@in4000) + headroom
       # 2048 slots x 512KB ~ 1GB host shm per ring (~2GB for s0->s1 + s1->s2).
+      # Containers usually cap /dev/shm at 64 MB by default — raise --shm-size
+      # or lower this value (omit to auto-size from pool_credits).
       ring_entries: 2048
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
