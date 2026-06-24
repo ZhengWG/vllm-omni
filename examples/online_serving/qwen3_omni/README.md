@@ -357,6 +357,15 @@ Disable if needed:
 ENABLE_PROFILE_LOGS=0 bash run_server_connector_perf.sh ipc
 ```
 
+For dedicated IPC benchmarks where fallback is known to be absent, the server
+script defaults `VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS=0` to avoid extra
+`/dev/shm` probe overhead on ring misses. Re-enable if needed:
+
+```bash
+VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS=1 \
+bash run_server_connector_perf.sh ipc
+```
+
 Run benchmark against the running server (default `c=1,4`):
 
 ```bash

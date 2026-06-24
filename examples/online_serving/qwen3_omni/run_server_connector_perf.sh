@@ -50,6 +50,13 @@ if [[ "${ENABLE_PROFILE_LOGS}" == "1" ]]; then
   export VLLM_OMNI_MSGPACK_PROFILE_TENSORS_EVERY_N="${VLLM_OMNI_MSGPACK_PROFILE_TENSORS_EVERY_N:-32}"
 fi
 
+if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
+  # Benchmark-oriented default: disable shm-compat probe on ring miss to
+  # remove extra /dev/shm miss overhead in dedicated IPC deployments.
+  # Set to 1 if you still want receiver-side fallback probing.
+  export VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS="${VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS:-0}"
+fi
+
 cmd=(
   vllm
   serve
@@ -77,6 +84,7 @@ echo "  model          : ${MODEL}"
 echo "  host:port      : ${HOST}:${PORT}"
 echo "  deploy_config  : ${DEPLOY_CONFIG}"
 echo "  profile_logs   : ${ENABLE_PROFILE_LOGS}"
+echo "  shm_compat_on_miss : ${VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS:-<default>}"
 echo "  common_args    : ${COMMON_SERVER_ARGS:-<none>}"
 echo "============================================================"
 echo "Command: ${cmd[*]} $*"

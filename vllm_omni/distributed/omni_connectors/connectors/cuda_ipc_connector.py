@@ -223,6 +223,15 @@ class CudaIPCConnector(OmniConnectorBase):
         self._credit_poll_sec = float(config.get("credit_poll_sec", _CREDIT_POLL_SEC))
         self._release_interval_sec = float(config.get("release_fast_interval_sec", _RELEASE_FAST_INTERVAL_SEC))
         self._release_ttl_every = int(config.get("release_ttl_every_n_ticks", _RELEASE_TTL_EVERY_N_TICKS))
+        # On ring miss, legacy behavior probes /dev/shm compatibility path on every poll.
+        # In dedicated IPC deployments where sender fallback is guaranteed absent, disable
+        # this probe to avoid repeated SharedMemory open/miss syscalls and exceptions.
+        self._enable_shm_compat_on_ring_miss = bool(
+            config.get(
+                "enable_shm_compat_on_ring_miss",
+                _env_bool("VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS", default=True),
+            )
+        )
         # Optional profiling logs for critical put/get path bottlenecks.
         # Enable with config ``profile_log=true`` or env
         # ``VLLM_OMNI_CUDA_IPC_PROFILE_LOG=1``.
@@ -284,6 +293,8 @@ class CudaIPCConnector(OmniConnectorBase):
             "fallback_slot_overflow": 0,
             "fallback_descriptor_too_big": 0,
             "fallback_inline_too_big": 0,
+            "ring_misses": 0,
+            "shm_compat_checks": 0,
         }
 
     def _init_cuda(self) -> None:
@@ -1037,8 +1048,18 @@ class CudaIPCConnector(OmniConnectorBase):
                 return None
             r = ring.poll(key_hash16(composite_key))
             if r is None:
+                self._metrics["ring_misses"] += 1
+                if not self._enable_shm_compat_on_ring_miss:
+                    self._profile_log(
+                        "get_control_plane",
+                        (_time_mod.perf_counter() - t0) * 1000.0,
+                        key=get_key,
+                        pclass="ring_miss_no_shm_compat",
+                    )
+                    return None
                 # Ring miss: chunk not published yet (poll retry), or the sender took the CPU
                 # fallback (/dev/shm by put_key) — read that so the consumer never hangs.
+                self._metrics["shm_compat_checks"] += 1
                 shm_result = self._try_get_shm_compat(get_key)
                 if shm_result is not None:
                     self._profile_log(
