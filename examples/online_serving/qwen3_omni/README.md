@@ -321,6 +321,51 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 bash run_curl_multimodal_generation.sh use_image
 ```
 
+### Connector perf scripts (IPC vs SHM)
+
+Use the helper scripts below to compare connector performance with consistent
+server/bench settings.
+
+```bash
+cd examples/online_serving/qwen3_omni
+```
+
+Start server with shared-memory connector:
+
+```bash
+bash run_server_connector_perf.sh shm
+```
+
+Start server with CUDA IPC connector:
+
+```bash
+bash run_server_connector_perf.sh ipc
+```
+
+By default, `run_server_connector_perf.sh` enables critical-path profiling logs.
+Disable if needed:
+
+```bash
+ENABLE_PROFILE_LOGS=0 bash run_server_connector_perf.sh ipc
+```
+
+Run benchmark against the running server (default `c=1,4`):
+
+```bash
+bash run_bench_connector_perf.sh ipc
+```
+
+Customize sweep/output:
+
+```bash
+CONCURRENCY_LIST="1 4 8" \
+NUM_PROMPTS=64 \
+RANDOM_INPUT_LEN=4000 \
+RANDOM_OUTPUT_LEN=900 \
+RESULT_DIR=bench_results/ipc_vs_shm \
+bash run_bench_connector_perf.sh shm
+```
+
 
 ### FAQ
 
