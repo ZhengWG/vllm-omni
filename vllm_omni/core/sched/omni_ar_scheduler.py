@@ -31,6 +31,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.utils.mm_outputs import strip_gpu_tensors_for_engine_output
 
 logger = init_logger(__name__)
 
@@ -466,6 +467,29 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                # Build the wire-side mm payload for the engine-core → API
+                # msgspec hop. When this stage has a downstream connector
+                # actively taking the tensor data via its pool path, the
+                # engine-core only needs to forward token / metadata
+                # fields downstream. Stripping GPU tensors *before*
+                # OmniEngineCoreOutput is constructed removes the
+                # dominant TTFT/E2EL tax under c≥4 IPC keep_on_gpu:
+                # ``OmniMsgpackEncoder._encode_tensor`` calls
+                # ``tensor.detach().cpu()`` synchronously on the
+                # ``process_output_sockets`` thread, blocking on the
+                # GPU compute stream's drain (~145 ms / 57 MB chunk
+                # mean, multi-second p99 in profiling). The connector
+                # ``save_async`` call below still receives the original
+                # ``mm_output`` reference, so the downstream stage
+                # rebuilds tensors from the connector pool as before;
+                # only the redundant msgspec hop is short-circuited.
+                wire_mm_output = mm_output
+                if (
+                    mm_output is not None
+                    and self.chunk_transfer_adapter is not None
+                    and self.chunk_transfer_adapter.output_connector is not None
+                ):
+                    wire_mm_output = strip_gpu_tensors_for_engine_output(mm_output)
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
@@ -475,7 +499,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
-                        multimodal_output=mm_output,
+                        multimodal_output=wire_mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),

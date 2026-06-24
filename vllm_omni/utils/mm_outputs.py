@@ -3,11 +3,70 @@ payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
 from collections.abc import Mapping
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# Marker on a dict value indicating "this slot held a GPU tensor that was
+# stripped before crossing the engine-core → API msgspec boundary; the
+# real payload travelled via the connector pool". Downstream consumers
+# of ``OmniEngineCoreOutput.multimodal_output`` for non-terminal stages
+# should treat such values as opaque metadata and never call tensor
+# methods on them.
+_STRIPPED_GPU_TENSOR_MARKER = "_omni_stripped_gpu_tensor"
+
+
+def strip_gpu_tensors_for_engine_output(value: Any) -> Any:
+    """Replace CUDA tensors with msgspec-safe descriptors recursively.
+
+    Why: the engine-core ``process_output_sockets`` thread serialises
+    ``OmniEngineCoreOutput`` via ``OmniMsgpackEncoder``, which calls
+    ``tensor.detach().cpu()`` on each ``torch.Tensor`` it encounters.
+    For an IPC keep_on_gpu wire mm payload (≈ 57 MB / chunk for
+    Qwen3-Omni prefill) that single call blocks waiting for the GPU
+    compute stream to drain — profiling showed ~145 ms / call mean,
+    multi-second p99, scaling with concurrency (72 calls × 145 ms in a
+    c=4 / in=16k bench == ~10 s of wall time blocked on D2H). This is
+    the dominant +TTFT/+E2EL regression flagged on the PR review for
+    c≥4 IPC vs SHM.
+
+    The fix is structural: when the actual tensor data is already
+    travelling downstream via the connector pool path, the engine-core
+    msgspec hop does not need to forward the tensor at all. Strip it
+    here and let the receiver rebuild from the pool. Caller is
+    responsible for gating this on "non-terminal stage with output
+    connector active" — see the call site in ``omni_ar_scheduler``.
+
+    Walks dict / list / tuple containers; CPU tensors and non-tensor
+    values pass through unchanged. Returns a new container; the input
+    is never mutated, so the connector's ``save_async`` callsite still
+    sees the original GPU tensor refs.
+
+    Each stripped GPU tensor is replaced by a small descriptor dict
+    carrying ``shape`` and ``dtype`` (rather than ``None``) so any
+    downstream metric/trace path that reads the value can still tell
+    "this was a tensor of shape X, stripped because it's on the
+    connector path" without crashing on a missing attribute.
+    """
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "cuda":
+            return {
+                _STRIPPED_GPU_TENSOR_MARKER: True,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype).removeprefix("torch."),
+            }
+        return value
+    if isinstance(value, Mapping):
+        return {k: strip_gpu_tensors_for_engine_output(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [strip_gpu_tensors_for_engine_output(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(strip_gpu_tensors_for_engine_output(v) for v in value)
+    return value
 
 
 def build_mm_cpu(
