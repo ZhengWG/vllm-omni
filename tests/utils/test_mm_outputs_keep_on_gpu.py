@@ -17,7 +17,13 @@ forward — erasing the ``OmniAsyncGPUModelRunnerOutput`` overlap that
 import pytest
 import torch
 
-from vllm_omni.utils.mm_outputs import _detach_tensor, build_mm_cpu, to_payload_element
+from vllm_omni.utils.mm_outputs import (
+    _STRIPPED_GPU_TENSOR_MARKER,
+    _detach_tensor,
+    build_mm_cpu,
+    strip_gpu_tensors_for_engine_output,
+    to_payload_element,
+)
 
 pytestmark = [pytest.mark.cpu]
 
@@ -166,3 +172,117 @@ def test_to_payload_element_pass_lists_through_already_cloned_skips_per_element_
     assert len(out) == len(elements)
     for a, b in zip(out, elements):
         assert _shares_storage(a, b)
+
+
+# ────────────────────────────────────────────────────────────────────
+# ``strip_gpu_tensors_for_engine_output`` — Route A structural fix
+# ────────────────────────────────────────────────────────────────────
+
+
+class _CudaLikeTensor(torch.Tensor):
+    """Lightweight stand-in: a real CPU tensor that *reports* itself as a
+    CUDA tensor via ``device.type``. The strip helper only inspects
+    ``device.type``, ``shape``, and ``dtype`` so this is enough to
+    exercise its branches without a real GPU."""
+
+    @staticmethod
+    def __new__(cls, data: torch.Tensor) -> "_CudaLikeTensor":
+        return torch.Tensor._make_subclass(cls, data)
+
+    @property
+    def device(self) -> torch.device:  # type: ignore[override]
+        return torch.device("cuda", 0)
+
+
+def _gpu_like(*shape: int, dtype: torch.dtype = torch.float32) -> _CudaLikeTensor:
+    return _CudaLikeTensor(torch.zeros(*shape, dtype=dtype))
+
+
+def test_strip_replaces_cuda_tensor_with_descriptor_dict():
+    src = _gpu_like(128, 256, dtype=torch.bfloat16)
+
+    out = strip_gpu_tensors_for_engine_output(src)
+
+    assert isinstance(out, dict)
+    assert out[_STRIPPED_GPU_TENSOR_MARKER] is True
+    assert out["shape"] == [128, 256]
+    assert out["dtype"] == "bfloat16"
+
+
+def test_strip_passes_cpu_tensor_through_unchanged():
+    """Stripping must be a no-op for CPU tensors so terminal stages
+    (whose ``mm_output`` is already on CPU) are unaffected when the
+    same helper is applied unconditionally."""
+    src = torch.tensor([1.0, 2.0, 3.0])
+
+    out = strip_gpu_tensors_for_engine_output(src)
+
+    assert out is src
+
+
+def test_strip_walks_dict_and_list_recursively():
+    """The qwen3-omni wire mm payload is a flat dict mostly, but the
+    helper must still walk nested dict/list/tuple containers because
+    other models (talker code lists, sparse audio per-request lists)
+    use them."""
+    cpu_meta = {"req_id": "r0", "finished": False}
+    payload = {
+        "embed": _gpu_like(4, 8),
+        "tts_bos": _gpu_like(1, 8),
+        "meta": cpu_meta,
+        "code_list": [_gpu_like(2), _gpu_like(2), torch.tensor([1, 2, 3])],
+        "nested_tuple": (_gpu_like(3), "label"),
+    }
+
+    out = strip_gpu_tensors_for_engine_output(payload)
+
+    assert isinstance(out["embed"], dict) and out["embed"][_STRIPPED_GPU_TENSOR_MARKER] is True
+    assert isinstance(out["tts_bos"], dict) and out["tts_bos"]["shape"] == [1, 8]
+    # CPU meta dict passes through unchanged content (new dict object due to recursion).
+    assert out["meta"] == cpu_meta
+    assert isinstance(out["code_list"], list) and len(out["code_list"]) == 3
+    assert out["code_list"][0][_STRIPPED_GPU_TENSOR_MARKER] is True
+    assert out["code_list"][1][_STRIPPED_GPU_TENSOR_MARKER] is True
+    # CPU tensor inside the list passes through.
+    assert isinstance(out["code_list"][2], torch.Tensor)
+    assert out["code_list"][2].device.type == "cpu"
+    assert isinstance(out["nested_tuple"], tuple)
+    assert out["nested_tuple"][0][_STRIPPED_GPU_TENSOR_MARKER] is True
+    assert out["nested_tuple"][1] == "label"
+
+
+def test_strip_does_not_mutate_input():
+    """Critical: ``save_async`` is called with the *original*
+    ``mm_output`` reference and the strip happens in-line for
+    ``OmniEngineCoreOutput``. If the helper mutated the input dict,
+    the connector save thread would see a corrupted payload."""
+    src_tensor = _gpu_like(2, 2)
+    payload = {"embed": src_tensor, "meta": {"finished": False}}
+
+    out = strip_gpu_tensors_for_engine_output(payload)
+
+    assert payload["embed"] is src_tensor, "input dict's tensor ref must survive"
+    assert isinstance(payload["embed"], torch.Tensor)
+    assert payload["embed"].device.type == "cuda"
+    assert payload["meta"] == {"finished": False}
+    # Output is a new dict.
+    assert out is not payload
+    assert out["embed"] is not src_tensor
+
+
+def test_strip_handles_non_tensor_scalars_and_none():
+    """Defensive: any scalar / bool / None / bytes that already passes
+    msgpack should fall through unchanged so the helper is safe to
+    apply unconditionally."""
+    payload = {
+        "is_seg_finished": True,
+        "ttl_sec": 30,
+        "rate": 1.5,
+        "tag": "text",
+        "raw": b"bytes",
+        "missing": None,
+    }
+
+    out = strip_gpu_tensors_for_engine_output(payload)
+
+    assert out == payload
