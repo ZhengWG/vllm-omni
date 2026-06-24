@@ -3,6 +3,8 @@
 
 from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
+import os
+import time
 from typing import Any
 
 import msgspec
@@ -10,12 +12,14 @@ import numpy as np
 import torch
 from msgspec import msgpack
 from PIL import Image
+from vllm.logger import init_logger
 from vllm.outputs import CompletionOutput, RequestOutput
 
 # Type markers for custom serialization
 _TENSOR_MARKER = "__tensor__"
 _NDARRAY_MARKER = "__ndarray__"
 _PIL_IMAGE_MARKER = "__pil_image__"
+logger = init_logger(__name__)
 
 # Keys that identify a RequestOutput dict (for reconstruction)
 _REQUEST_OUTPUT_KEYS = frozenset({"request_id", "prompt", "prompt_token_ids", "outputs", "finished"})
@@ -29,6 +33,35 @@ _COMPLETION_OUTPUT_KEYS = frozenset({"index", "text", "token_ids", "finish_reaso
 _OMNI_REQUEST_OUTPUT_KEYS = frozenset({"finished", "final_output_type"})
 
 
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; fallback to %d", name, raw, default)
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; fallback to %.3f", name, raw, default)
+        return default
+
+
 class OmniMsgpackEncoder:
     """
     This implementation is adapted from vLLM’s MsgpackEncoder.
@@ -40,6 +73,17 @@ class OmniMsgpackEncoder:
 
     def __init__(self):
         self.encoder = msgpack.Encoder(enc_hook=self._enc_hook)
+        self._profile_tensor_encode = _env_bool("VLLM_OMNI_MSGPACK_PROFILE_TENSORS", default=False)
+        self._profile_tensor_encode_every_n = max(1, _env_int("VLLM_OMNI_MSGPACK_PROFILE_TENSORS_EVERY_N", default=16))
+        self._profile_tensor_encode_threshold_ms = _env_float(
+            "VLLM_OMNI_MSGPACK_PROFILE_TENSORS_THRESHOLD_MS",
+            default=3.0,
+        )
+        self._profile_tensor_encode_threshold_bytes = _env_int(
+            "VLLM_OMNI_MSGPACK_PROFILE_TENSORS_THRESHOLD_BYTES",
+            default=1 << 20,  # 1MB
+        )
+        self._profile_tensor_encode_counter = 0
 
     def encode(self, obj: Any) -> bytes:
         """Encode an object to bytes."""
@@ -83,12 +127,25 @@ class OmniMsgpackEncoder:
 
     def _encode_tensor(self, tensor: torch.Tensor) -> dict[str, Any]:
         """Encode torch.Tensor to dict."""
+        start = time.perf_counter()
         t = tensor.detach().cpu()
         # Handle 0-dimensional (scalar) tensors by reshaping to 1D first
         if t.dim() == 0:
             t = t.reshape(1)
         if not t.is_contiguous():
             t = t.contiguous()
+        elapsed_ms = (time.perf_counter() - start) * 1000.0
+        tensor_nbytes = int(tensor.numel() * tensor.element_size())
+        if self._should_profile_tensor_encode(elapsed_ms, tensor_nbytes):
+            logger.info(
+                "OmniMsgpackEncoder tensor_encode_profile elapsed_ms=%.3f bytes=%d "
+                "src_device=%s dtype=%s shape=%s",
+                elapsed_ms,
+                tensor_nbytes,
+                tensor.device,
+                tensor.dtype,
+                tuple(tensor.shape),
+            )
         t = t.view(torch.uint8)
         return {
             _TENSOR_MARKER: True,
@@ -96,6 +153,14 @@ class OmniMsgpackEncoder:
             "shape": list(tensor.shape),
             "data": t.numpy().tobytes(),
         }
+
+    def _should_profile_tensor_encode(self, elapsed_ms: float, tensor_nbytes: int) -> bool:
+        if elapsed_ms >= self._profile_tensor_encode_threshold_ms and tensor_nbytes >= self._profile_tensor_encode_threshold_bytes:
+            return True
+        if not self._profile_tensor_encode:
+            return False
+        self._profile_tensor_encode_counter += 1
+        return (self._profile_tensor_encode_counter % self._profile_tensor_encode_every_n) == 0
 
     def _encode_ndarray(self, arr: np.ndarray) -> dict[str, Any]:
         """Encode numpy.ndarray to dict."""
