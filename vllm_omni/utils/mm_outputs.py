@@ -71,7 +71,13 @@ def _detach_tensor(value, keep_on_gpu: bool = False, payload_already_cloned: boo
 
 
 def to_payload_element(
-    element: object, idx: int, start: int, end: int, pass_lists_through: bool = False, seq_len: int | None = None
+    element: object,
+    idx: int,
+    start: int,
+    end: int,
+    pass_lists_through: bool = False,
+    seq_len: int | None = None,
+    payload_already_cloned: bool = False,
 ):
     """Build an mm payload element corresponding to one request index
     from an element containing 0 or more CPU tensors.
@@ -90,28 +96,61 @@ def to_payload_element(
             sliced per request. The prefix cache passthrough also passes
             the total scheduled token count here so 1D (seq_len,) metadata
             that is intentionally not cached is still split per request.
+        payload_already_cloned: When True, the input ``element`` is part of
+            an already-snapshotted payload (independent of CUDA-graph reuse
+            buffers). Skip the defensive ``.clone()`` calls in this
+            function — they would otherwise re-issue a GPU D2D in the
+            async-output background thread on the *compute* stream
+            (background thread's ``current_stream()`` is the legacy
+            default = main thread's compute stream when PTDS is off),
+            serialising with the next forward and erasing the
+            ``OmniAsyncGPUModelRunnerOutput`` overlap. Cross-request
+            aliasing protection is preserved by the snapshot stage's
+            initial clone.
     """
     # Cached per-token tensors are merged elsewhere; here a first dim
     # equal to seq_len means a per-request slice is required.
     if seq_len is not None and isinstance(element, torch.Tensor) and element.shape[0] == seq_len:
-        return element[start:end].contiguous()
+        sliced = element[start:end]
+        # ``contiguous()`` is a no-op when the slice is already contiguous
+        # (the common case for a contiguous-dim-0 snapshot tensor); when it
+        # isn't, this is a small D2D on the caller's stream — same cost
+        # whether the snapshot has been cloned or not.
+        return sliced.contiguous()
     # Every other case is shared between prefix cache (passthrough data)
     # and running a model without prefix caching.
     elif isinstance(element, dict):
         return {
-            sk: to_payload_element(sv, idx, start, end, pass_lists_through=pass_lists_through, seq_len=seq_len)
+            sk: to_payload_element(
+                sv,
+                idx,
+                start,
+                end,
+                pass_lists_through=pass_lists_through,
+                seq_len=seq_len,
+                payload_already_cloned=payload_already_cloned,
+            )
             for sk, sv in element.items()
         }
     elif isinstance(element, list):
-        # For lists, clone tensors to avoid cross-request aliasing
+        # For lists, clone tensors to avoid cross-request aliasing — the
+        # snapshot stage's ``_clone_cuda_tensor_payload`` walks dict/list/
+        # tuple containers, so when ``payload_already_cloned`` is True the
+        # list elements are already independent clones and the
+        # cross-request aliasing protection is satisfied without another
+        # clone per element.
         if pass_lists_through:
+            if payload_already_cloned:
+                return list(element)
             return [elem.clone() if isinstance(elem, torch.Tensor) else elem for elem in element]
         element = element[idx] if idx < len(element) else element[0]
-        if isinstance(element, torch.Tensor):
+        if isinstance(element, torch.Tensor) and not payload_already_cloned:
             element = element.clone()
         return element
     elif isinstance(element, torch.Tensor):
         # List-derived tensor payloads are request-invariant; clone to
         # avoid accidental cross-request aliasing on downstream mutation.
+        if payload_already_cloned:
+            return element
         return element.clone()
     return element

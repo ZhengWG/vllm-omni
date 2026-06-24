@@ -759,6 +759,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
         seq_len: int,
+        payload_already_cloned: bool = False,
     ) -> dict[str, object]:
         if combined_multimodal_outputs:
             return self._build_combined_prefix_cache_mm_payload(
@@ -787,7 +788,17 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     )
                     continue
                 sparse_val = mm_val[sparse_idx]
-                mm_payload[mm_key] = sparse_val.clone() if isinstance(sparse_val, torch.Tensor) else sparse_val
+                # Defensive ``.clone()`` here protects against cross-request
+                # aliasing when the snapshot stage has not already cloned
+                # (e.g. the synchronous, non-async-output path). Under the
+                # async-output path with keep_on_gpu, the snapshot's
+                # ``_clone_cuda_tensor_payload`` already walks the list and
+                # returns independent clones — re-cloning here would issue
+                # another GPU D2D on the background-thread's compute
+                # stream, the very thing this commit is trying to avoid.
+                if isinstance(sparse_val, torch.Tensor) and not payload_already_cloned:
+                    sparse_val = sparse_val.clone()
+                mm_payload[mm_key] = sparse_val
                 continue
             mm_payload[mm_key] = to_payload_element(
                 element=mm_val,
@@ -796,6 +807,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 end=end,
                 pass_lists_through=False,
                 seq_len=seq_len,
+                payload_already_cloned=payload_already_cloned,
             )
         return mm_payload
 
@@ -814,6 +826,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         audio_sparse_output: bool,
         sparse_mm_index: dict[str, int],
         seq_len: int,
+        payload_already_cloned: bool = False,
     ) -> dict[str, object]:
         payload: dict[str, object] = {}
         if not audio_sparse_output:
@@ -840,6 +853,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             audio_sparse_output=audio_sparse_output,
             sparse_mm_index=sparse_mm_index,
             seq_len=seq_len,
+            payload_already_cloned=payload_already_cloned,
         )
         payload.update(mm_payload)
         return payload
@@ -1773,6 +1787,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         audio_sparse_output=audio_sparse_output,
                         sparse_mm_index=sparse_mm_index,
                         seq_len=seq_len,
+                        payload_already_cloned=payload_is_cloned,
                     )
                     pooler_output.append(flatten_payload(payload))
 
