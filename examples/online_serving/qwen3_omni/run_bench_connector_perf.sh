@@ -9,6 +9,8 @@ set -euo pipefail
 # Examples:
 #   bash run_bench_connector_perf.sh ipc
 #   CONCURRENCY_LIST="1 4 8" NUM_PROMPTS=64 bash run_bench_connector_perf.sh shm
+#   COMMON_BENCH_ARGS="--metric-percentiles 50,90,99 --trust-remote-code" \
+#     bash run_bench_connector_perf.sh ipc
 
 CONNECTOR_MODE="${1:-ipc}"
 shift || true
@@ -23,8 +25,17 @@ RANDOM_INPUT_LEN="${RANDOM_INPUT_LEN:-4000}"
 RANDOM_OUTPUT_LEN="${RANDOM_OUTPUT_LEN:-900}"
 EXTRA_BODY_JSON="${EXTRA_BODY_JSON:-{\"modalities\":[\"text\",\"audio\"]}}"
 PERCENTILE_METRICS="${PERCENTILE_METRICS:-ttft,tpot,itl,e2el,audio_ttfp,audio_rtf,audio_duration}"
+# Shell words appended to every bench invocation before CLI "$@".
+# Use this to keep bench args strictly identical across connector runs.
+COMMON_BENCH_ARGS="${COMMON_BENCH_ARGS:-}"
 
 mkdir -p "${RESULT_DIR}"
+
+common_bench_args_arr=()
+if [[ -n "${COMMON_BENCH_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  common_bench_args_arr=( ${COMMON_BENCH_ARGS} )
+fi
 
 for c in ${CONCURRENCY_LIST}; do
   result_file="qwen3_omni_${CONNECTOR_MODE}_c${c}_in${RANDOM_INPUT_LEN}_out${RANDOM_OUTPUT_LEN}.json"
@@ -36,6 +47,7 @@ for c in ${CONCURRENCY_LIST}; do
   echo "  num_prompts    : ${NUM_PROMPTS}"
   echo "  input/output   : ${RANDOM_INPUT_LEN}/${RANDOM_OUTPUT_LEN}"
   echo "  result_file    : ${RESULT_DIR}/${result_file}"
+  echo "  common_args    : ${COMMON_BENCH_ARGS:-<none>}"
   echo "------------------------------------------------------------"
 
   vllm bench serve \
@@ -58,6 +70,7 @@ for c in ${CONCURRENCY_LIST}; do
     --result-dir "${RESULT_DIR}" \
     --result-filename "${result_file}" \
     --print-stage \
+    "${common_bench_args_arr[@]}" \
     "$@"
 done
 

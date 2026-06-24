@@ -342,6 +342,14 @@ Start server with CUDA IPC connector:
 bash run_server_connector_perf.sh ipc
 ```
 
+To force identical server-side args for both connector runs, set
+`COMMON_SERVER_ARGS`:
+
+```bash
+COMMON_SERVER_ARGS="--stage-overrides '{\"2\":{\"devices\":\"1\"}}'" \
+bash run_server_connector_perf.sh ipc
+```
+
 By default, `run_server_connector_perf.sh` enables critical-path profiling logs.
 Disable if needed:
 
@@ -352,6 +360,14 @@ ENABLE_PROFILE_LOGS=0 bash run_server_connector_perf.sh ipc
 Run benchmark against the running server (default `c=1,4`):
 
 ```bash
+bash run_bench_connector_perf.sh ipc
+```
+
+To keep benchmark args strictly identical across runs, set
+`COMMON_BENCH_ARGS` (applies to every `vllm bench serve` call):
+
+```bash
+COMMON_BENCH_ARGS="--metric-percentiles 50,90,99 --trust-remote-code" \
 bash run_bench_connector_perf.sh ipc
 ```
 

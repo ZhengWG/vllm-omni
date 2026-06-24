@@ -9,6 +9,8 @@ set -euo pipefail
 # Examples:
 #   bash run_server_connector_perf.sh shm
 #   bash run_server_connector_perf.sh ipc --gpu-memory-utilization 0.9
+#   COMMON_SERVER_ARGS="--stage-overrides '{\"2\":{\"devices\":\"1\"}}'" \
+#     bash run_server_connector_perf.sh ipc
 
 CONNECTOR_MODE="${1:-ipc}"
 shift || true
@@ -18,6 +20,9 @@ HOST="${HOST:-0.0.0.0}"
 PORT="${PORT:-8091}"
 TRUST_REMOTE_CODE="${TRUST_REMOTE_CODE:-1}"
 ENABLE_PROFILE_LOGS="${ENABLE_PROFILE_LOGS:-1}"
+# Shell words appended to vllm serve before CLI "$@".
+# Use this to guarantee identical server-side args across connector runs.
+COMMON_SERVER_ARGS="${COMMON_SERVER_ARGS:-}"
 
 case "${CONNECTOR_MODE}" in
   shm)
@@ -59,6 +64,12 @@ if [[ "${TRUST_REMOTE_CODE}" == "1" ]]; then
   cmd+=(--trust-remote-code)
 fi
 
+if [[ -n "${COMMON_SERVER_ARGS}" ]]; then
+  # shellcheck disable=SC2206
+  common_server_args_arr=( ${COMMON_SERVER_ARGS} )
+  cmd+=("${common_server_args_arr[@]}")
+fi
+
 echo "============================================================"
 echo "Starting Qwen3-Omni server"
 echo "  connector_mode : ${CONNECTOR_MODE}"
@@ -66,6 +77,7 @@ echo "  model          : ${MODEL}"
 echo "  host:port      : ${HOST}:${PORT}"
 echo "  deploy_config  : ${DEPLOY_CONFIG}"
 echo "  profile_logs   : ${ENABLE_PROFILE_LOGS}"
+echo "  common_args    : ${COMMON_SERVER_ARGS:-<none>}"
 echo "============================================================"
 echo "Command: ${cmd[*]} $*"
 echo "============================================================"
