@@ -717,12 +717,14 @@ class CudaIPCConnector(OmniConnectorBase):
             # Order the pack after the producer's writes. Two paths:
             #
             # 1. Preferred: ``register_producer_stream`` was called by the model
-            #    runner with the actual producer stream (e.g. the AR runner's
-            #    ``_omni_payload_copy_stream`` used by keep_on_gpu snapshots).
+            #    runner with the actual producer stream — for the AR runner's
+            #    keep_on_gpu snapshot path that's the model's compute stream
+            #    (the snapshot clone has to live there to be CUDA-graph safe;
+            #    see _snapshot_omni_output_tensors_for_async_output).
             #    ``copy_stream.wait_stream(producer_stream)`` is the correct
             #    primitive on any host: it fences the pool D2D past every op
-            #    currently queued on ``producer_stream``, including the snapshot
-            #    clone, regardless of which thread queued it.
+            #    currently queued on ``producer_stream``, including the
+            #    snapshot clone, regardless of which thread queued it.
             # 2. Fallback (legacy): record an event on the save thread's
             #    ambient stream and wait on it. Only correct when PTDS is off
             #    AND the producer wrote on the legacy default stream — e.g.

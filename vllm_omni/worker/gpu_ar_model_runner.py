@@ -1460,41 +1460,49 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             multimodal_outputs=multimodal_outputs,
         )
         if self._payload_keep_on_gpu:
-            # Symmetric to the CPU path: do the snapshot D2D clones on a
-            # dedicated copy stream so the next model forward (queued on the
-            # current/default stream) is not serialized behind these copies.
-            # The downstream output builder waits on `ready_event` before
-            # consuming the snapshot, so ordering is preserved without
-            # blocking the producer stream.
-            copy_stream = self._get_or_create_omni_payload_copy_stream()
-            source_stream = torch.cuda.current_stream()
-            ready_event = torch.cuda.Event()
-            cuda_sources: list[torch.Tensor] = []
+            # SAFETY (CUDA-graph): keep_on_gpu reads ``hidden_states`` and the
+            # tensors in ``multimodal_outputs`` directly out of the producer's
+            # output buffers. Under ``CUDAGraphMode.FULL`` those are *static*
+            # output buffers reused across replays — the next forward writes
+            # the same addresses. The clone here MUST run on the producer's
+            # stream (the model thread's current/compute stream) so that it
+            # serialises before the next replay's writes.
+            #
+            # An earlier revision moved this clone onto a dedicated
+            # ``_omni_payload_copy_stream`` to overlap with the next forward.
+            # That introduced a cross-stream race because
+            # ``copy_stream.wait_stream(source_stream)`` is a one-way fence:
+            # it makes copy_stream wait for compute_stream's queued work, but
+            # does NOT make compute_stream wait for the clone. The next graph
+            # replay could then overwrite the static output buffer
+            # concurrently with the in-flight cross-stream clone — a torn
+            # read that ``seq``-style detection cannot catch, materialising
+            # as silent NaNs only at high transfer counts (the
+            # ~8400-iteration soak signature). See the discussion on
+            # PR #2507's review for the failure mode.
+            #
+            # Keeping the clone on the compute stream costs ~55µs of
+            # serialised compute critical path per chunk (the same overhead
+            # the SHM async-output path takes for its own on-compute clone).
+            # The off-compute overlap that path enjoys for the subsequent
+            # D2H is achieved on the IPC side by the connector's pool D2D
+            # running on its own ``_copy_stream`` and ordered after this
+            # clone via ``register_producer_stream`` — see
+            # ``_maybe_register_keep_on_gpu_producer_stream`` below.
+            self._maybe_register_keep_on_gpu_producer_stream()
             with record_function_or_nullcontext("omni_async_output:snapshot_gpu_payload"):
-                with torch.cuda.stream(copy_stream):
-                    copy_stream.wait_stream(source_stream)
-                    hidden_src = payload.get("hidden_states")
-                    if hidden_src is None:
-                        hidden_states_snapshot = hidden_states[:0]
-                    else:
-                        hidden_states_snapshot = hidden_src.detach().clone()
-                    mm_snapshot = _clone_cuda_tensor_payload(payload["multimodal_outputs"], cuda_sources)
-                    ready_event.record(copy_stream)
-            # Reuse _AsyncCPUPayloadSnapshot as a "GPU snapshot ready" handle:
-            # `wait()` only synchronizes the event; no payload swap is needed
-            # because the cloned tensors already live on GPU. The snapshot
-            # tensors hold their own refs, so passing an empty `cuda_sources`
-            # list is sufficient.
-            ready_handle = _AsyncCPUPayloadSnapshot(
-                payload=None,
-                ready_event=ready_event,
-                cuda_sources=[],
-            )
+                hidden_src = payload.get("hidden_states")
+                if hidden_src is None:
+                    hidden_states_snapshot = hidden_states[:0]
+                else:
+                    hidden_states_snapshot = hidden_src.detach().clone()
+                cuda_sources: list[torch.Tensor] = []
+                mm_snapshot = _clone_cuda_tensor_payload(payload["multimodal_outputs"], cuda_sources)
             return _OmniOutputTensorSnapshot(
                 hidden_states=hidden_states_snapshot,
                 staged_hidden_states_cpu=payload.get("staged_hidden_states_cpu"),
                 multimodal_outputs=mm_snapshot,
-                async_payload=ready_handle,
+                async_payload=None,
                 payload_is_cloned=True,
             )
 
@@ -1556,29 +1564,55 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return True
 
     def _get_or_create_omni_payload_copy_stream(self) -> torch.cuda.Stream:
+        """Lazy side stream used by the CPU async-output snapshot for D2H.
+
+        Only the CPU path uses this stream: it stages the device→host copy
+        of the snapshot off the compute stream so the next forward can
+        proceed immediately. The keep_on_gpu (GPU) path no longer uses
+        this stream — see ``_snapshot_omni_output_tensors_for_async_output``
+        for why the GPU snapshot clone has to live on the compute stream.
+        """
         stream = getattr(self, "_omni_payload_copy_stream", None)
         if stream is None:
             stream = torch.cuda.Stream()
             self._omni_payload_copy_stream = stream
-            # Tell the output connector (if it supports GPU tensors) which
-            # stream the keep_on_gpu snapshot path writes on. Connectors that
-            # need it (CudaIPCConnector) override register_producer_stream to
-            # use stream-based ordering for their pool D2D, instead of
-            # recording an event on the save thread's ambient stream — which
-            # is only correct when PTDS is off and the producer wrote on the
-            # legacy default stream.
-            output_connector = getattr(self, "_output_connector", None)
-            register = getattr(output_connector, "register_producer_stream", None)
-            if callable(register):
-                try:
-                    register(stream)
-                except Exception:
-                    logger.warning(
-                        "Failed to register producer stream on output connector %s",
-                        type(output_connector).__name__,
-                        exc_info=True,
-                    )
         return stream
+
+    def _maybe_register_keep_on_gpu_producer_stream(self) -> None:
+        """Register the model's compute stream on the output connector.
+
+        The keep_on_gpu snapshot clone runs on the producer (compute)
+        stream. The connector's pool D2D in the save thread therefore needs
+        to fence its private ``_copy_stream`` past the compute stream's
+        queued work to read the snapshot safely. ``register_producer_stream``
+        wires that up via ``copy_stream.wait_stream(producer_stream)``,
+        which is a portable two-way ordering primitive (TSO or weak-memory
+        host, PTDS on or off, any thread).
+
+        Idempotent and lazy: only the first invocation actually wires the
+        registration, so this is safe to call from the hot snapshot path.
+        Connectors without ``register_producer_stream`` (e.g. SHM) have
+        no equivalent need; we silently skip and latch to avoid retrying
+        the ``getattr`` on every snapshot.
+        """
+        if getattr(self, "_keep_on_gpu_producer_registered", False):
+            return
+        output_connector = getattr(self, "_output_connector", None)
+        register = getattr(output_connector, "register_producer_stream", None)
+        if not callable(register):
+            self._keep_on_gpu_producer_registered = True
+            return
+        try:
+            register(torch.cuda.current_stream())
+            self._keep_on_gpu_producer_registered = True
+        except Exception:
+            logger.warning(
+                "Failed to register compute stream as producer on output "
+                "connector %s; pool D2D will fall back to ambient-stream "
+                "ordering with a one-shot warning per process.",
+                type(output_connector).__name__,
+                exc_info=True,
+            )
 
     def _to_connector_payload_tensor(
         self,
