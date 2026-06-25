@@ -423,6 +423,14 @@ bash run_server_connector_perf.sh ipc
 `...ASYNC_INFLIGHT_LIMIT=0` means auto limit in connector (based on stream
 count and pool credits).
 
+For save-loop payload construction, the IPC server script defaults:
+
+- `VLLM_OMNI_CONNECTOR_SAVE_WORKERS=4`
+
+This parallelizes `custom_process` / inline CPU serialization across requests,
+while keeping each request's chunks ordered and serializing the final
+`connector.put()` critical section. Set to `1` for strict legacy behavior.
+
 For queueing diagnostics in the model-runner save thread, the script enables:
 
 - `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG=1`

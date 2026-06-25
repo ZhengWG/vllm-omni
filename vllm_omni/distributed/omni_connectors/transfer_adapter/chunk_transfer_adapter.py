@@ -3,7 +3,9 @@
 
 import importlib
 import os
+import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -132,6 +134,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._save_profile_log_every_n = max(1, _env_int("VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N", 64))
         self._save_profile_log_counter = 0
         self._producer_stream_registered = False
+        self._save_worker_count = max(1, _env_int("VLLM_OMNI_CONNECTOR_SAVE_WORKERS", 1))
+        self._output_put_lock = threading.Lock()
+        self._save_inflight_keys: set[str] = set()
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -263,9 +268,71 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             # event so pool D2D is ordered after the model's write stream.
             "_producer_event": producer_event or self._record_current_stream_event_if_cuda(),
         }
-        self._pending_save_reqs.append(task)
         with self._save_cond:
+            self._pending_save_reqs.append(task)
             self._save_cond.notify()
+
+    @staticmethod
+    def _save_task_key(task: dict) -> str:
+        request = task.get("request")
+        external_req_id = getattr(request, "external_req_id", None)
+        if external_req_id:
+            return str(external_req_id)
+        request_id = getattr(request, "request_id", None)
+        if request_id:
+            return str(request_id)
+        return str(id(task))
+
+    def save_loop(self):
+        """Loop to send outgoing data with optional save-side parallelism.
+
+        Payload construction can run concurrently, but tasks for the same
+        external request id stay ordered. The connector.put section remains
+        serialized in _send_single_request because CudaIPCConnector has a
+        single control ring and one-shot producer-event slot per connector.
+        """
+        if self._save_worker_count <= 1:
+            return super().save_loop()
+
+        futures: dict[Future, tuple[str, dict]] = {}
+        with ThreadPoolExecutor(
+            max_workers=self._save_worker_count,
+            thread_name_prefix="omni-save-worker",
+        ) as executor:
+            while not self.stop_event.is_set():
+                completed = [future for future in futures if future.done()]
+                for future in completed:
+                    key, task = futures.pop(future)
+                    self._save_inflight_keys.discard(key)
+                    try:
+                        future.result()
+                    except Exception as exc:
+                        logger.warning("Error saving data for %s: %s", task.get("request_id"), exc)
+
+                dispatched = False
+                with self._save_cond:
+                    while len(futures) < self._save_worker_count and self._pending_save_reqs:
+                        n_pending = len(self._pending_save_reqs)
+                        selected_task = None
+                        selected_key = None
+                        for _ in range(n_pending):
+                            task = self._pending_save_reqs.popleft()
+                            key = self._save_task_key(task)
+                            if key in self._save_inflight_keys:
+                                self._pending_save_reqs.append(task)
+                                continue
+                            selected_task = task
+                            selected_key = key
+                            break
+                        if selected_task is None or selected_key is None:
+                            break
+                        self._save_inflight_keys.add(selected_key)
+                        future = executor.submit(self._send_single_request, selected_task)
+                        futures[future] = (selected_key, selected_task)
+                        dispatched = True
+
+                    if not dispatched and not completed and not self.stop_event.is_set():
+                        self._save_cond.wait(timeout=0.001 if futures else 0.1)
 
     def _should_save_profile_log(self, elapsed_ms: float) -> bool:
         if elapsed_ms >= self._save_profile_log_threshold_ms:
@@ -462,16 +529,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if self.output_connector is None:
             return
-        register_producer_event = getattr(self.output_connector, "register_producer_event", None)
-        if callable(register_producer_event):
-            # Fence connector.put() after *payload construction* on the save
-            # thread. This covers tensors created by custom_process itself,
-            # not only tensors produced by the model runner before save_async().
-            payload_ready_event = self._record_current_stream_event_if_cuda()
-            try:
-                register_producer_event(payload_ready_event)
-            except Exception:
-                logger.debug("register_producer_event failed for key=%s", connector_put_key, exc_info=True)
         now_ns = time.perf_counter_ns()
         queue_wait_ms = 0.0
         total_age_ms = 0.0
@@ -482,12 +539,25 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         if isinstance(first_ns, int) and first_ns > 0:
             total_age_ms = (now_ns - first_ns) / 1_000_000.0
         put_t0 = time.perf_counter()
-        success, size, metadata = self.output_connector.put(
-            from_stage=str(stage_id),
-            to_stage=str(next_stage_id),
-            put_key=connector_put_key,
-            data=payload_data,
-        )
+        put_lock_wait_t0 = time.perf_counter()
+        with self._output_put_lock:
+            put_lock_wait_ms = (time.perf_counter() - put_lock_wait_t0) * 1000.0
+            register_producer_event = getattr(self.output_connector, "register_producer_event", None)
+            if callable(register_producer_event):
+                # Fence connector.put() after *payload construction* on the save
+                # thread. This covers tensors created by custom_process itself,
+                # not only tensors produced by the model runner before save_async().
+                payload_ready_event = self._record_current_stream_event_if_cuda()
+                try:
+                    register_producer_event(payload_ready_event)
+                except Exception:
+                    logger.debug("register_producer_event failed for key=%s", connector_put_key, exc_info=True)
+            success, size, metadata = self.output_connector.put(
+                from_stage=str(stage_id),
+                to_stage=str(next_stage_id),
+                put_key=connector_put_key,
+                data=payload_data,
+            )
         put_ms = (time.perf_counter() - put_t0) * 1000.0
         self._save_profile_log(
             "send_task",
@@ -496,6 +566,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             success=success,
             size=size,
             queue_wait_ms=round(queue_wait_ms, 3),
+            put_lock_wait_ms=round(put_lock_wait_ms, 3),
             total_age_ms=round(total_age_ms, 3),
         )
 

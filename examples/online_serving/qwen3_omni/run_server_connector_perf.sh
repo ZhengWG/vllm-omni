@@ -78,6 +78,10 @@ if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
   # inflight window to avoid excessive descriptor lead over copy completion.
   export VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS="${VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS:-4}"
   export VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT="${VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT:-16}"
+  # Parallelize save-loop payload construction while keeping connector.put()
+  # serialized per connector. This overlaps inline CPU serialization and
+  # custom_process work across requests without reordering chunks per request.
+  export VLLM_OMNI_CONNECTOR_SAVE_WORKERS="${VLLM_OMNI_CONNECTOR_SAVE_WORKERS:-4}"
 fi
 
 cmd=(
@@ -114,6 +118,7 @@ echo "  inline_cuda_max_bytes : ${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES:-<def
 echo "  get_pool_wait_current_stream : ${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-<default>}"
 echo "  put_pool_copy_streams : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS:-<default>}"
 echo "  put_pool_async_inflight_limit : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT:-<default>}"
+echo "  connector_save_workers : ${VLLM_OMNI_CONNECTOR_SAVE_WORKERS:-<default>}"
 echo "  save_profile_log : ${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG:-<default>}"
 echo "  profile_wait_split : ${VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT:-<default>}"
 echo "  common_args    : ${COMMON_SERVER_ARGS:-<none>}"
