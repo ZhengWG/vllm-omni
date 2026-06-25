@@ -1576,10 +1576,23 @@ class CudaIPCConnector(OmniConnectorBase):
 
             self._shm_compat_decode_failures.pop(get_key, None)
             seg.unlink()
-            obj = self._move_to_device(obj)
+            # Correctness-first fallback path: stage input may be consumed by a
+            # different stream/thread shortly after get(). Using non_blocking
+            # H2D here without an explicit consumer-stream fence can expose
+            # partially copied payloads under fallback pressure.
+            h2d_t0 = _time_mod.perf_counter()
+            obj = self._move_to_device(obj, non_blocking=False)
+            h2d_ms = (_time_mod.perf_counter() - h2d_t0) * 1000.0
             size = len(data_bytes)
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
+            self._profile_log(
+                "get_control_plane",
+                h2d_ms,
+                key=get_key,
+                pclass="shm_compat_h2d",
+                payload_bytes=size,
+            )
             return obj, size
         except Exception as e:
             logger.warning("CudaIPCConnector shm_compat get failed for %s: %s", get_key, e)
@@ -1590,7 +1603,7 @@ class CudaIPCConnector(OmniConnectorBase):
             except Exception:
                 pass
 
-    def _move_to_device(self, obj: Any, non_blocking: bool = True) -> Any:
+    def _move_to_device(self, obj: Any, non_blocking: bool = False) -> Any:
         """Move CPU tensors to local GPU so CUDA graph replay is safe."""
         if isinstance(obj, torch.Tensor) and obj.device.type == "cpu":
             return obj.to(self.local_device, non_blocking=non_blocking)
