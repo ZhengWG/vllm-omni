@@ -59,6 +59,9 @@ if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
   # This keeps IPC event ordering and source-lifetime tracking, while avoiding
   # hard sender-side waits in put_pool.
   export VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC="${VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC:-0}"
+  # Benchmark-oriented default: do not make pool-get copy stream wait the
+  # receiver current stream before D2D decode (improves overlap).
+  export VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM="${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-0}"
 fi
 
 cmd=(
@@ -90,6 +93,7 @@ echo "  deploy_config  : ${DEPLOY_CONFIG}"
 echo "  profile_logs   : ${ENABLE_PROFILE_LOGS}"
 echo "  shm_compat_on_miss : ${VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS:-<default>}"
 echo "  put_pool_blocking_sync : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC:-<default>}"
+echo "  get_pool_wait_current_stream : ${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-<default>}"
 echo "  common_args    : ${COMMON_SERVER_ARGS:-<none>}"
 echo "============================================================"
 echo "Command: ${cmd[*]} $*"

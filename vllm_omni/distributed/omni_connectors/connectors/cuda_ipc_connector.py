@@ -263,6 +263,15 @@ class CudaIPCConnector(OmniConnectorBase):
                 _env_bool("VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC", default=True),
             )
         )
+        # Receiver-side pool get behavior:
+        # - True  (default): force copy stream to wait current stream before D2D decode.
+        # - False: enqueue D2D decode directly on copy stream for better overlap.
+        self._get_pool_wait_current_stream = bool(
+            config.get(
+                "get_pool_wait_current_stream",
+                _env_bool("VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM", default=True),
+            )
+        )
 
     def _init_runtime_state(self) -> None:
         """Locks, ring/receiver caches, metrics, lifecycle flags."""
@@ -1116,12 +1125,18 @@ class CudaIPCConnector(OmniConnectorBase):
                 ipc_event = self._open_ipc_event(event_handle)
                 stream_wait_event(self._cudart, copy_stream.cuda_stream, ipc_event)
             copy_t0 = _time_mod.perf_counter()
-            copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
+            copy_wait_current_stream_ms = 0.0
+            if self._get_pool_wait_current_stream:
+                wait_t0 = _time_mod.perf_counter()
+                copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
+                copy_wait_current_stream_ms = (_time_mod.perf_counter() - wait_t0) * 1000.0
             obj = self._walk_decode_pool(raw["payload"], pool_ptr, raw["slot_offset"], stream=copy_stream)
             copy_done_event.record(copy_stream)
             # Block until the D2D finishes before hand-off (payload is consumed later on the
             # model thread), then mark the board synchronously so TTL can't race the transfer.
+            copy_finish_t0 = _time_mod.perf_counter()
             copy_done_event.synchronize()
+            copy_finish_sync_ms = (_time_mod.perf_counter() - copy_finish_t0) * 1000.0
             copy_sync_ms = (_time_mod.perf_counter() - copy_t0) * 1000.0
             self._mark_board_release(board_name, int(raw["slot_index"]))
             self._metrics["gets"] += 1
@@ -1134,6 +1149,9 @@ class CudaIPCConnector(OmniConnectorBase):
                 payload_bytes=len(body),
                 slot_idx=int(raw["slot_index"]),
                 copy_sync_ms=round(copy_sync_ms, 3),
+                copy_wait_current_stream_ms=round(copy_wait_current_stream_ms, 3),
+                copy_finish_sync_ms=round(copy_finish_sync_ms, 3),
+                wait_current_stream=self._get_pool_wait_current_stream,
             )
             return obj, len(body)
         except Exception as e:

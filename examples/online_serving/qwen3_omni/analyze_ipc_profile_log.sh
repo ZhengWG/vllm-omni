@@ -123,6 +123,8 @@ s0_desc = []
 s0_credit = []
 s1_get_pool = []
 s1_copy = []
+s1_copy_wait_current = []
+s1_copy_finish = []
 
 with open(path, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
@@ -156,6 +158,10 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
             s1_get_pool.append(elapsed)
             if "copy_sync_ms" in kv:
                 s1_copy.append(float(kv["copy_sync_ms"]))
+            if "copy_wait_current_stream_ms" in kv:
+                s1_copy_wait_current.append(float(kv["copy_wait_current_stream_ms"]))
+            if "copy_finish_sync_ms" in kv:
+                s1_copy_finish.append(float(kv["copy_finish_sync_ms"]))
 
 show("stage0 put_control_plane inline elapsed_ms", s0_inline)
 show("stage0 put_control_plane pool elapsed_ms", s0_pool_cp)
@@ -165,6 +171,8 @@ show("stage0 put_pool descriptor_ser_ms", s0_desc)
 show("stage0 put_pool credit_wait_ms", s0_credit)
 show("stage1 get_control_plane pool elapsed_ms", s1_get_pool)
 show("stage1 get_control_plane pool copy_sync_ms", s1_copy)
+show("stage1 get_control_plane pool copy_wait_current_stream_ms", s1_copy_wait_current)
+show("stage1 get_control_plane pool copy_finish_sync_ms", s1_copy_finish)
 
 ratio = [c / e for c, e in zip(s1_copy, s1_get_pool) if e > 0]
 if ratio:

@@ -375,6 +375,15 @@ VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC=1 \
 bash run_server_connector_perf.sh ipc
 ```
 
+It also defaults `VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=0` to avoid
+receiver-side pre-copy stream waits in pool-get (better overlap). Set to `1`
+to restore strict wait behavior:
+
+```bash
+VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=1 \
+bash run_server_connector_perf.sh ipc
+```
+
 Run benchmark against the running server (default `c=1,4`):
 
 ```bash
