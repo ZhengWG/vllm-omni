@@ -290,6 +290,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
         num_scheduled_tokens = scheduler_output.num_scheduled_tokens
         pooler_outputs = model_runner_output.pooler_output
         mm_outputs = getattr(model_runner_output, "multimodal_outputs", None)
+        connector_producer_events = getattr(model_runner_output, "connector_producer_events", None)
         num_nans_in_logits = model_runner_output.num_nans_in_logits
         kv_connector_output = model_runner_output.kv_connector_output
         cudagraph_stats: CUDAGraphStat | None = model_runner_output.cudagraph_stats
@@ -512,7 +513,17 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                     )
                 )
                 if self.chunk_transfer_adapter is not None:
-                    self.chunk_transfer_adapter.save_async(mm_output, request, is_segment_finished)
+                    producer_event = (
+                        connector_producer_events[req_index]
+                        if connector_producer_events and req_index < len(connector_producer_events)
+                        else None
+                    )
+                    self.chunk_transfer_adapter.save_async(
+                        mm_output,
+                        request,
+                        is_segment_finished,
+                        producer_event=producer_event,
+                    )
             else:
                 # Invariant: EngineCore returns no partial prefill outputs.
                 assert not prompt_logprobs_tensors
