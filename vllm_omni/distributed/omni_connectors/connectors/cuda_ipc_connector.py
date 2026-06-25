@@ -766,39 +766,20 @@ class CudaIPCConnector(OmniConnectorBase):
             )
         return 0
 
-    def _walk_copy_cuda_to_cpu_inline(self, obj: Any) -> tuple[Any, int, int]:
-        """Return an inline-ready object with CUDA tensors copied to CPU.
-
-        This mirrors SHM's wire behavior (CPU tensor bytes on the control path)
-        while keeping pool path unchanged.
-        """
-        copied_tensors = 0
-        copied_nbytes = 0
-
-        def _convert(value: Any) -> Any:
-            nonlocal copied_tensors, copied_nbytes
-            if isinstance(value, torch.Tensor):
-                detached = value.detach()
-                if detached.device.type == "cuda":
-                    copied_tensors += 1
-                    copied_nbytes += int(detached.nbytes)
-                    return detached.to("cpu").contiguous()
-                return detached.contiguous() if not detached.is_contiguous() else detached
-            if isinstance(value, dict):
-                return {k: _convert(v) for k, v in value.items()}
-            if isinstance(value, list):
-                return [_convert(v) for v in value]
-            if isinstance(value, tuple):
-                return tuple(_convert(v) for v in value)
-            if hasattr(value, "__struct_fields__"):
-                return {
-                    f: _convert(getattr(value, f))
-                    for f in value.__struct_fields__
-                    if getattr(value, f) is not None
-                }
-            return value
-
-        return _convert(obj), copied_tensors, copied_nbytes
+    def _count_cuda_tensors(self, obj: Any) -> int:
+        if isinstance(obj, torch.Tensor):
+            return 1 if obj.is_cuda else 0
+        if isinstance(obj, dict):
+            return sum(self._count_cuda_tensors(v) for v in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return sum(self._count_cuda_tensors(v) for v in obj)
+        if hasattr(obj, "__struct_fields__"):
+            return sum(
+                self._count_cuda_tensors(getattr(obj, f))
+                for f in obj.__struct_fields__
+                if getattr(obj, f) is not None
+            )
+        return 0
 
     # --- Pool slot codec ---
 
@@ -1080,11 +1061,12 @@ class CudaIPCConnector(OmniConnectorBase):
         inline_payload_obj = data
         inline_cuda_nbytes = est_nbytes if isinstance(est_nbytes, int) and est_nbytes >= 0 else self._estimate_nbytes(data)
         if inline_cuda_nbytes > 0:
-            # Inline is SHM-like: normalize CUDA tensors to CPU before msgpack.
+            # Inline is SHM-like: serialize_obj handles tensor.detach().cpu()
+            # in one pass. Do not pre-copy here; that duplicates work relative
+            # to SharedMemoryConnector and was measured as the dominant per-token
+            # inline cost for tiny CUDA payloads.
             producer_order_mode, producer_order_wait_ms = self._order_current_stream_after_producer(producer_event)
-            inline_d2h_t0 = _time_mod.perf_counter()
-            inline_payload_obj, inline_cuda_tensors, inline_cuda_nbytes = self._walk_copy_cuda_to_cpu_inline(data)
-            inline_cuda_to_cpu_ms = (_time_mod.perf_counter() - inline_d2h_t0) * 1000.0
+            inline_cuda_tensors = self._count_cuda_tensors(data)
         # Serialize (a cheap D2H for a tiny GPU tensor) straight into the ring body.
         serialize_t0 = _time_mod.perf_counter()
         payload = self.serialize_obj(inline_payload_obj)
