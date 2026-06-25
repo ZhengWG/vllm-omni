@@ -104,6 +104,9 @@ def load_cudart():
     lib.cudaStreamWaitEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
     lib.cudaStreamWaitEvent.restype = ctypes.c_int
 
+    lib.cudaEventQuery.argtypes = [ctypes.c_void_p]
+    lib.cudaEventQuery.restype = ctypes.c_int
+
     lib.cudaEventDestroy.argtypes = [ctypes.c_void_p]
     lib.cudaEventDestroy.restype = ctypes.c_int
 
@@ -128,3 +131,13 @@ def stream_wait_event(lib, stream: int, event) -> None:
     ret = lib.cudaStreamWaitEvent(ctypes.c_void_p(stream), event, ctypes.c_uint(0))
     if ret != 0:
         raise RuntimeError(f"cudaStreamWaitEvent failed: {ret}")
+
+
+def event_query(lib, event) -> bool:
+    ret = lib.cudaEventQuery(event)
+    if ret == 0:
+        return True
+    # cudaErrorNotReady
+    if ret == 34:
+        return False
+    raise RuntimeError(f"cudaEventQuery failed: {ret}")

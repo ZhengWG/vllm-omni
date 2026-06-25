@@ -51,6 +51,7 @@ from .cuda_ipc_runtime import (
     _CUDA_EVENT_INTERPROCESS,
     _CudaIpcEventHandle,
     _CudaIpcMemHandle,
+    event_query,
     load_cudart,
     memcpy_async_d2d,
     stream_wait_event,
@@ -339,6 +340,12 @@ class CudaIPCConnector(OmniConnectorBase):
                 _env_bool("VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT", default=False),
             )
         )
+        self._defer_unready_pool_get = bool(
+            config.get(
+                "defer_unready_pool_get",
+                _env_bool("VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET", default=True),
+            )
+        )
 
     def _init_runtime_state(self) -> None:
         """Locks, ring/receiver caches, metrics, lifecycle flags."""
@@ -348,6 +355,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._opened_pools: dict[bytes, ctypes.c_void_p] = {}
         self._opened_boards: dict[str, shm_pkg.SharedMemory] = {}
         self._opened_events: dict[bytes, ctypes.c_void_p] = {}
+        self._pending_pool_gets: dict[str, dict[str, Any]] = {}
         self._closed = False
         self._cudart = None
         self._held_lock = threading.Lock()
@@ -1491,7 +1499,11 @@ class CudaIPCConnector(OmniConnectorBase):
             if (from_stage, to_stage) not in self._ring_edge_handles:
                 # Header not ready — don't poll (poll consumes; a pool entry would be lost). Retry.
                 return None
-            r = ring.poll(key_hash16(composite_key))
+            pending_pool = self._pending_pool_gets.get(composite_key)
+            if pending_pool is None:
+                r = ring.poll(key_hash16(composite_key))
+            else:
+                r = (RING_PCLASS_POOL, pending_pool["body"])
             if r is None:
                 self._metrics["ring_misses"] += 1
                 if not self._enable_shm_compat_on_ring_miss:
@@ -1534,13 +1546,37 @@ class CudaIPCConnector(OmniConnectorBase):
             # POOL: handles from the ring header (guaranteed present — the poll above is gated
             # on _ring_edge_handles), descriptor from the entry body.
             pool_handle, event_handle, board_name = self._ring_edge_handles[(from_stage, to_stage)]
-            descriptor_decode_t0 = _time_mod.perf_counter()
-            raw = OmniSerializer.deserialize(body)
-            descriptor_decode_ms = (_time_mod.perf_counter() - descriptor_decode_t0) * 1000.0
-            event_source = "descriptor" if "event_handle" in raw else "header"
+            if pending_pool is not None:
+                raw = pending_pool["raw"]
+                descriptor_decode_ms = 0.0
+                event_source = pending_pool.get("event_source", "pending")
+            else:
+                descriptor_decode_t0 = _time_mod.perf_counter()
+                raw = OmniSerializer.deserialize(body)
+                descriptor_decode_ms = (_time_mod.perf_counter() - descriptor_decode_t0) * 1000.0
+                event_source = "descriptor" if "event_handle" in raw else "header"
             event_handle = raw.get("event_handle", event_handle)
             if event_handle is not None and not isinstance(event_handle, bytes):
                 event_handle = bytes(event_handle)
+            ipc_event = None
+            if event_handle:
+                ipc_event = self._open_ipc_event(event_handle)
+                if self._defer_unready_pool_get and not event_query(self._cudart, ipc_event):
+                    if pending_pool is None:
+                        self._pending_pool_gets[composite_key] = {
+                            "body": body,
+                            "raw": raw,
+                            "event_source": event_source,
+                        }
+                    self._profile_log(
+                        "get_control_plane",
+                        (_time_mod.perf_counter() - t0) * 1000.0,
+                        key=get_key,
+                        pclass="pool_event_not_ready",
+                        payload_bytes=len(body),
+                        event_source=event_source,
+                    )
+                    return None
             sender_desc_done_ns = raw.get("sender_desc_done_ns")
             recv_ingress_ms = 0.0
             if isinstance(sender_desc_done_ns, int) and sender_desc_done_ns > 0:
@@ -1554,8 +1590,7 @@ class CudaIPCConnector(OmniConnectorBase):
             copy_done_event = self._recv_copy_events[idx]
             event_wait_enqueue_ms = 0.0
             event_wait_sync_ms = 0.0
-            if event_handle:
-                ipc_event = self._open_ipc_event(event_handle)
+            if ipc_event is not None:
                 event_wait_t0 = _time_mod.perf_counter()
                 stream_wait_event(self._cudart, copy_stream.cuda_stream, ipc_event)
                 event_wait_enqueue_ms = (_time_mod.perf_counter() - event_wait_t0) * 1000.0
@@ -1589,6 +1624,7 @@ class CudaIPCConnector(OmniConnectorBase):
             board_release_ms = (_time_mod.perf_counter() - board_release_t0) * 1000.0
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += len(body)
+            self._pending_pool_gets.pop(composite_key, None)
             self._profile_log(
                 "get_control_plane",
                 (_time_mod.perf_counter() - t0) * 1000.0,
