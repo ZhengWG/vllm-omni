@@ -366,6 +366,15 @@ VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS=1 \
 bash run_server_connector_perf.sh ipc
 ```
 
+For IPC perf profiling, the server script also defaults
+`VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC=0` (async sender put_pool mode).
+Set to `1` to restore strict blocking behavior for A/B:
+
+```bash
+VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC=1 \
+bash run_server_connector_perf.sh ipc
+```
+
 Run benchmark against the running server (default `c=1,4`):
 
 ```bash
@@ -396,6 +405,10 @@ Analyze IPC profiling logs in one shot (grep-based):
 ```bash
 bash analyze_ipc_profile_log.sh /tmp/ipc_server.log
 ```
+
+The analyzer now also prints quantile/ratio summaries for the main IPC stages
+(`stage0 put_control_plane`, `stage0 put_pool`, `stage1 get_control_plane`)
+plus TopN slow rows for `pack_sync_ms` and `copy_sync_ms`.
 
 By default it analyzes only the tail of the log (last 4000 lines). You can
 override:

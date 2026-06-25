@@ -8,6 +8,7 @@ set -euo pipefail
 #  3) msgpack tensor encode profiling
 #  4) fallback / error signals
 #  5) top-N slow profile rows by elapsed_ms
+#  6) quantiles + sync-ratio summaries for key IPC stages
 #
 # Usage:
 #   bash analyze_ipc_profile_log.sh [log_path] [tail_lines]
@@ -72,6 +73,119 @@ grep -E "CudaIPCConnector profile" "${WORK_LOG}" \
 print_section "6) Top 20 slow msgpack tensor encode rows (by elapsed_ms)"
 grep -E "tensor_encode_profile" "${WORK_LOG}" \
   | sed -nE 's/.*elapsed_ms=([0-9]+(\.[0-9]+)?).*/\1\t&/p' \
+  | sort -t$'\t' -k1,1nr \
+  | head -n 20 \
+  | cut -f2- || true
+
+print_section "7) Quantiles & ratio summary for IPC hot paths"
+python3 - "${WORK_LOG}" <<'PY'
+import math
+import re
+import statistics as st
+import sys
+
+if len(sys.argv) < 2:
+    print("ERROR: missing work log path")
+    sys.exit(1)
+
+path = sys.argv[1]
+pat = re.compile(r"(\w+)=([^\s]+)")
+
+
+def pctl(xs, q):
+    if not xs:
+        return float("nan")
+    ys = sorted(xs)
+    k = (len(ys) - 1) * q
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return ys[int(k)]
+    return ys[f] + (ys[c] - ys[f]) * (k - f)
+
+
+def show(name, xs):
+    if not xs:
+        print(f"{name}: n=0")
+        return
+    print(
+        f"{name}: n={len(xs)} "
+        f"mean={st.mean(xs):.3f} p50={pctl(xs, 0.5):.3f} "
+        f"p90={pctl(xs, 0.9):.3f} p99={pctl(xs, 0.99):.3f}"
+    )
+
+
+s0_inline = []
+s0_pool_cp = []
+s0_put_pool = []
+s0_pack = []
+s0_desc = []
+s0_credit = []
+s1_get_pool = []
+s1_copy = []
+
+with open(path, "r", encoding="utf-8", errors="ignore") as f:
+    for line in f:
+        if "CudaIPCConnector profile" not in line:
+            continue
+        kv = dict(pat.findall(line))
+        phase = kv.get("phase")
+        stage = kv.get("stage")
+        try:
+            elapsed = float(kv.get("elapsed_ms", "nan"))
+        except ValueError:
+            continue
+
+        if phase == "put_control_plane" and stage == "0":
+            route = kv.get("route")
+            if route == "inline":
+                s0_inline.append(elapsed)
+            elif route == "pool":
+                s0_pool_cp.append(elapsed)
+
+        if phase == "put_pool" and stage == "0" and kv.get("outcome") == "ring_publish":
+            s0_put_pool.append(elapsed)
+            if "pack_sync_ms" in kv:
+                s0_pack.append(float(kv["pack_sync_ms"]))
+            if "descriptor_ser_ms" in kv:
+                s0_desc.append(float(kv["descriptor_ser_ms"]))
+            if "credit_wait_ms" in kv:
+                s0_credit.append(float(kv["credit_wait_ms"]))
+
+        if phase == "get_control_plane" and stage == "1" and kv.get("pclass") == "pool":
+            s1_get_pool.append(elapsed)
+            if "copy_sync_ms" in kv:
+                s1_copy.append(float(kv["copy_sync_ms"]))
+
+show("stage0 put_control_plane inline elapsed_ms", s0_inline)
+show("stage0 put_control_plane pool elapsed_ms", s0_pool_cp)
+show("stage0 put_pool(ring_publish) elapsed_ms", s0_put_pool)
+show("stage0 put_pool pack_sync_ms", s0_pack)
+show("stage0 put_pool descriptor_ser_ms", s0_desc)
+show("stage0 put_pool credit_wait_ms", s0_credit)
+show("stage1 get_control_plane pool elapsed_ms", s1_get_pool)
+show("stage1 get_control_plane pool copy_sync_ms", s1_copy)
+
+ratio = [c / e for c, e in zip(s1_copy, s1_get_pool) if e > 0]
+if ratio:
+    print(
+        "stage1 copy_sync/elapsed ratio: "
+        f"mean={st.mean(ratio) * 100:.1f}% "
+        f"p50={pctl(ratio, 0.5) * 100:.1f}% "
+        f"p90={pctl(ratio, 0.9) * 100:.1f}%"
+    )
+PY
+
+print_section "8) Top 20 slow stage0 put_pool rows (pack_sync_ms)"
+grep -E "CudaIPCConnector profile phase=put_pool .*stage=0 .*outcome=ring_publish" "${WORK_LOG}" \
+  | sed -nE 's/.*pack_sync_ms=([0-9]+(\.[0-9]+)?).*/\1\t&/p' \
+  | sort -t$'\t' -k1,1nr \
+  | head -n 20 \
+  | cut -f2- || true
+
+print_section "9) Top 20 slow stage1 pool-get rows (copy_sync_ms)"
+grep -E "CudaIPCConnector profile phase=get_control_plane .*stage=1 .*pclass=pool" "${WORK_LOG}" \
+  | sed -nE 's/.*copy_sync_ms=([0-9]+(\.[0-9]+)?).*/\1\t&/p' \
   | sort -t$'\t' -k1,1nr \
   | head -n 20 \
   | cut -f2- || true

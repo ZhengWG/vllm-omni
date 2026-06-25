@@ -253,6 +253,16 @@ class CudaIPCConnector(OmniConnectorBase):
                 )
             ),
         )
+        # Sender-side pool put synchronization mode:
+        # - True  (default): block on copy_stream.synchronize() for strict behavior.
+        # - False: publish descriptor after enqueue + IPC event record, relying on
+        #          stream/event ordering and record_stream lifetime tracking.
+        self._put_pool_blocking_sync = bool(
+            config.get(
+                "put_pool_blocking_sync",
+                _env_bool("VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC", default=True),
+            )
+        )
 
     def _init_runtime_state(self) -> None:
         """Locks, ring/receiver caches, metrics, lifecycle flags."""
@@ -576,6 +586,10 @@ class CudaIPCConnector(OmniConnectorBase):
         """Recursively replace CUDA tensors with pool offset metadata."""
         if isinstance(obj, torch.Tensor):
             if obj.is_cuda:
+                if not self._put_pool_blocking_sync:
+                    # Keep source storage alive on the copy stream when sender
+                    # does not block for pack completion.
+                    obj.record_stream(self._copy_stream)
                 t = obj.detach().contiguous()
                 tensor_offset = slot.pack(t)
                 return {
@@ -906,9 +920,11 @@ class CudaIPCConnector(OmniConnectorBase):
             ret = self._cudart.cudaEventRecord(self._ipc_event, ctypes.c_void_p(self._copy_stream.cuda_stream))
             if ret != 0:
                 logger.warning("cudaEventRecord (IPC) failed: %d", ret)
-            # Block until the pack D2D finishes: the source is a runner-owned tensor the
-            # next forward may free. Makes the pool D2D synchronous on both ends.
-            self._copy_stream.synchronize()
+            # In default mode, block until the pack D2D finishes.
+            # In async mode, rely on IPC event ordering + record_stream source
+            # lifetime tracking to avoid a sender-side hard sync.
+            if self._put_pool_blocking_sync:
+                self._copy_stream.synchronize()
             pack_sync_ms = (_time_mod.perf_counter() - pack_t0) * 1000.0
             descriptor_t0 = _time_mod.perf_counter()
             descriptor = OmniSerializer.serialize(
@@ -986,6 +1002,7 @@ class CudaIPCConnector(OmniConnectorBase):
             pack_sync_ms=round(pack_sync_ms, 3),
             descriptor_ser_ms=round(descriptor_ser_ms, 3),
             producer_stream_registered=self._producer_stream is not None,
+                blocking_sync=self._put_pool_blocking_sync,
         )
         return True, len(descriptor), {"ring": True, "size": len(descriptor)}
 
