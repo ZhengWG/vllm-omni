@@ -245,3 +245,28 @@ def construct_next_stage_streaming_input_prompt(payload_data: dict[str, Any], re
     request.prompt_token_ids.extend(new_prompt or ())
     request.update_block_hashes()
     request.num_prompt_tokens = len(request.prompt_token_ids)
+
+
+def construct_next_stage_initial_input_prompt(payload_data: dict[str, Any], request: Any) -> None:
+    """Initialize downstream stage prompt ids from connector payload metadata.
+
+    Stage-1 receives thinker token ids in ``ids.prompt`` but should not feed
+    those ids to the talker embedding table (different vocabulary). The real
+    inputs are built from ``additional_information`` in model preprocess; the
+    scheduler only needs a correctly-sized placeholder prompt for KV/block
+    allocation. This mirrors the streaming prompt update for the first chunk.
+    """
+    ids = payload_data.get("ids", {})
+    prompt_token_ids = ids.get("prompt", None)
+    if not prompt_token_ids:
+        return
+    next_prompt_len = max(1, compute_talker_prompt_ids_length(prompt_token_ids))
+    new_prompt = [0] * next_prompt_len
+    request.prompt_token_ids = list(new_prompt)
+    if hasattr(request, "_all_token_ids"):
+        del request._all_token_ids[:]
+        request._all_token_ids.extend(new_prompt)
+    if hasattr(request, "_output_token_ids"):
+        request._output_token_ids.clear()
+    request.update_block_hashes()
+    request.num_prompt_tokens = len(new_prompt)

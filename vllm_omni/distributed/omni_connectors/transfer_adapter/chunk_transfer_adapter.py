@@ -13,7 +13,7 @@ from vllm.v1.request import Request, RequestStatus
 
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
-from ..adapter import construct_next_stage_streaming_input_prompt
+from ..adapter import construct_next_stage_initial_input_prompt, construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
 from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
@@ -350,7 +350,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             payload_segment_finished = self._is_truthy_scalar(meta.get("is_segment_finished"))
             if self.model_mode == "ar":
                 request.additional_information = payload_data
-                if chunk_id > 0 and request.resumable:
+                if chunk_id == 0:
+                    construct_next_stage_initial_input_prompt(payload_data, request)
+                elif request.resumable:
                     # For new streaming input segment, we should update prompt from payload
                     construct_next_stage_streaming_input_prompt(payload_data, request)
 
