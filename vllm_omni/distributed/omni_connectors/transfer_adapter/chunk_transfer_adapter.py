@@ -544,24 +544,35 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             total_age_ms = (now_ns - first_ns) / 1_000_000.0
         put_t0 = time.perf_counter()
         put_lock_wait_t0 = time.perf_counter()
-        with self._output_put_lock:
-            put_lock_wait_ms = (time.perf_counter() - put_lock_wait_t0) * 1000.0
-            register_producer_event = getattr(self.output_connector, "register_producer_event", None)
-            if callable(register_producer_event):
-                # Fence connector.put() after *payload construction* on the save
-                # thread. This covers tensors created by custom_process itself,
-                # not only tensors produced by the model runner before save_async().
-                payload_ready_event = self._record_current_stream_event_if_cuda()
-                try:
-                    register_producer_event(payload_ready_event)
-                except Exception:
-                    logger.debug("register_producer_event failed for key=%s", connector_put_key, exc_info=True)
-            success, size, metadata = self.output_connector.put(
+        put_with_event = getattr(self.output_connector, "put_with_producer_event", None)
+        payload_ready_event = self._record_current_stream_event_if_cuda()
+        if callable(put_with_event):
+            put_lock_wait_ms = 0.0
+            success, size, metadata = put_with_event(
                 from_stage=str(stage_id),
                 to_stage=str(next_stage_id),
                 put_key=connector_put_key,
                 data=payload_data,
+                producer_event=payload_ready_event,
             )
+        else:
+            with self._output_put_lock:
+                put_lock_wait_ms = (time.perf_counter() - put_lock_wait_t0) * 1000.0
+                register_producer_event = getattr(self.output_connector, "register_producer_event", None)
+                if callable(register_producer_event):
+                    # Fence connector.put() after *payload construction* on the save
+                    # thread. This covers tensors created by custom_process itself,
+                    # not only tensors produced by the model runner before save_async().
+                    try:
+                        register_producer_event(payload_ready_event)
+                    except Exception:
+                        logger.debug("register_producer_event failed for key=%s", connector_put_key, exc_info=True)
+                success, size, metadata = self.output_connector.put(
+                    from_stage=str(stage_id),
+                    to_stage=str(next_stage_id),
+                    put_key=connector_put_key,
+                    data=payload_data,
+                )
         put_ms = (time.perf_counter() - put_t0) * 1000.0
         self._save_profile_log(
             "send_task",

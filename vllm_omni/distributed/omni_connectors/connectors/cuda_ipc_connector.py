@@ -360,6 +360,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._cudart = None
         self._held_lock = threading.Lock()
         self._open_lock = threading.Lock()
+        self._ring_publish_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
@@ -979,7 +980,37 @@ class CudaIPCConnector(OmniConnectorBase):
         composite_key = make_composite_key(put_key, from_stage, to_stage)
         return self._put_control_plane(from_stage, to_stage, put_key, composite_key, data)
 
-    def _put_control_plane(self, from_stage, to_stage, put_key, composite_key, data):
+    def put_with_producer_event(
+        self,
+        from_stage: str,
+        to_stage: str,
+        put_key: str,
+        data: Any,
+        producer_event: torch.cuda.Event | None = None,
+    ) -> tuple[bool, int, dict[str, Any] | None]:
+        if self._closed:
+            return False, 0, None
+        if not self._is_transfer_rank:
+            return False, 0, None
+        composite_key = make_composite_key(put_key, from_stage, to_stage)
+        return self._put_control_plane(
+            from_stage,
+            to_stage,
+            put_key,
+            composite_key,
+            data,
+            producer_event=producer_event,
+        )
+
+    def _put_control_plane(
+        self,
+        from_stage,
+        to_stage,
+        put_key,
+        composite_key,
+        data,
+        producer_event: torch.cuda.Event | None = None,
+    ):
         """Primary send path: route small payloads inline vs large via GPU pool (both publish to ring)."""
         t0 = _time_mod.perf_counter()
         try:
@@ -989,7 +1020,8 @@ class CudaIPCConnector(OmniConnectorBase):
                 est_nbytes > 0 and self._inline_cuda_max_bytes > 0 and est_nbytes <= self._inline_cuda_max_bytes
             )
             force_pool_for_cuda = est_nbytes > 0 and not self._inline_cuda_tensors and not inline_cuda_by_size
-            producer_event = self._consume_producer_event()
+            if producer_event is None:
+                producer_event = self._consume_producer_event()
             route_inline = est_nbytes < self._inline_threshold and not force_pool_for_cuda
             if route_inline:
                 result = self._put_inline(
@@ -1096,9 +1128,10 @@ class CudaIPCConnector(OmniConnectorBase):
             return result
         try:
             ring_publish_t0 = _time_mod.perf_counter()
-            self._ring.publish(
-                kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
-            )
+            with self._ring_publish_lock:
+                self._ring.publish(
+                    kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                )
             ring_publish_ms = (_time_mod.perf_counter() - ring_publish_t0) * 1000.0
         except RingFullError:
             result = self._put_cpu_fallback(
@@ -1342,9 +1375,10 @@ class CudaIPCConnector(OmniConnectorBase):
             self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
         try:
             ring_publish_t0 = _time_mod.perf_counter()
-            self._ring.publish(
-                kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
-            )
+            with self._ring_publish_lock:
+                self._ring.publish(
+                    kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
+                )
             ring_publish_ms = (_time_mod.perf_counter() - ring_publish_t0) * 1000.0
         except RingFullError:
             with self._held_lock:
