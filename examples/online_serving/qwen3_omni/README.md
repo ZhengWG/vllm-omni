@@ -391,6 +391,12 @@ RESULT_DIR=bench_results/ipc_vs_shm \
 bash run_bench_connector_perf.sh shm
 ```
 
+Analyze IPC profiling logs in one shot (grep-based):
+
+```bash
+bash analyze_ipc_profile_log.sh /tmp/ipc_server.log
+```
+
 
 ### FAQ
 
