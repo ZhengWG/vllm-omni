@@ -94,41 +94,6 @@ def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
     return value
 
 
-def _cpuize_small_cuda_tensors(value: Any, max_nbytes: int) -> tuple[Any, int, int]:
-    """Convert small CUDA tensors to CPU recursively.
-
-    Returns:
-        converted_value, converted_tensor_count, converted_total_nbytes
-    """
-    converted_tensors = 0
-    converted_nbytes = 0
-
-    def _convert(obj: Any) -> Any:
-        nonlocal converted_tensors, converted_nbytes
-        if isinstance(obj, torch.Tensor):
-            detached = obj.detach()
-            if detached.device.type == "cuda" and int(detached.nbytes) <= max_nbytes:
-                converted_tensors += 1
-                converted_nbytes += int(detached.nbytes)
-                return detached.to("cpu").contiguous()
-            return detached
-        if isinstance(obj, dict):
-            return {k: _convert(v) for k, v in obj.items()}
-        if isinstance(obj, list):
-            return [_convert(v) for v in obj]
-        if isinstance(obj, tuple):
-            return tuple(_convert(v) for v in obj)
-        if hasattr(obj, "__struct_fields__"):
-            return {
-                f: _convert(getattr(obj, f))
-                for f in obj.__struct_fields__
-                if getattr(obj, f) is not None
-            }
-        return obj
-
-    return _convert(value), converted_tensors, converted_nbytes
-
-
 class _AsyncCPUPayloadSnapshot:
     def __init__(
         self,
@@ -359,11 +324,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._payload_keep_on_gpu: bool = getattr(
             getattr(self, "_output_connector", None), "supports_gpu_tensor", False
         )
-        connector_inline_cuda_max = getattr(getattr(self, "_output_connector", None), "_inline_cuda_max_bytes", 0)
-        try:
-            self._connector_inline_cuda_max_bytes = max(0, int(connector_inline_cuda_max or 0))
-        except (TypeError, ValueError):
-            self._connector_inline_cuda_max_bytes = 0
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1867,31 +1827,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             multimodal_outputs = self._build_multimodal_outputs(pooler_output)
-        if (
-            multimodal_outputs
-            and self._payload_keep_on_gpu
-            and self._connector_inline_cuda_max_bytes > 0
-        ):
-            with record_function_or_nullcontext("omni_output_builder:cpuize_small_cuda_for_inline"):
-                total_converted_tensors = 0
-                total_converted_nbytes = 0
-                converted_outputs: list[dict[str, object]] = []
-                for payload in multimodal_outputs:
-                    converted_payload, converted_tensors, converted_nbytes = _cpuize_small_cuda_tensors(
-                        payload,
-                        self._connector_inline_cuda_max_bytes,
-                    )
-                    converted_outputs.append(converted_payload)
-                    total_converted_tensors += converted_tensors
-                    total_converted_nbytes += converted_nbytes
-                if total_converted_tensors > 0:
-                    logger.debug(
-                        "cpuize_small_cuda_for_inline converted_tensors=%d converted_nbytes=%d max_bytes=%d",
-                        total_converted_tensors,
-                        total_converted_nbytes,
-                        self._connector_inline_cuda_max_bytes,
-                    )
-                multimodal_outputs = converted_outputs
 
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None
