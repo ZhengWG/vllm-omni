@@ -341,6 +341,24 @@ class CudaIPCConnector(OmniConnectorBase):
         if ret != 0:
             raise RuntimeError(f"cudaIpcGetEventHandle failed: {ret}")
         self._ipc_event_handle_bytes = bytes(ipc_evt_handle)
+        # In async sender mode (non-blocking put_pool), one shared event for all
+        # slots can create cross-slot waits on receiver side because each new
+        # cudaEventRecord overwrites the same event timeline marker. Use one IPC
+        # event per slot and carry that handle in descriptor metadata.
+        self._slot_ipc_events: list[ctypes.c_void_p] = []
+        self._slot_ipc_event_handle_bytes: list[bytes] = []
+        if not self._put_pool_blocking_sync:
+            for _ in range(self._pool_credits):
+                slot_event = ctypes.c_void_p()
+                ret = self._cudart.cudaEventCreateWithFlags(ctypes.byref(slot_event), flags)
+                if ret != 0:
+                    raise RuntimeError(f"cudaEventCreateWithFlags (slot) failed: {ret}")
+                slot_evt_handle = _CudaIpcEventHandle()
+                ret = self._cudart.cudaIpcGetEventHandle(ctypes.byref(slot_evt_handle), slot_event)
+                if ret != 0:
+                    raise RuntimeError(f"cudaIpcGetEventHandle (slot) failed: {ret}")
+                self._slot_ipc_events.append(slot_event)
+                self._slot_ipc_event_handle_bytes.append(bytes(slot_evt_handle))
         self._credit_queue: _queue_mod.Queue[int] = _queue_mod.Queue(maxsize=self._pool_credits)
         for i in range(self._pool_credits):
             self._credit_queue.put_nowait(i * self._slot_size)
@@ -370,6 +388,8 @@ class CudaIPCConnector(OmniConnectorBase):
         self._fallback_segs = {}
         self._board_name = None
         self._board = None
+        self._slot_ipc_events = []
+        self._slot_ipc_event_handle_bytes = []
         if self.role == "receiver":
             with torch.cuda.device(self.local_device):
                 self._recv_copy_streams = [
@@ -877,6 +897,7 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
+            slot_idx = slot_offset // self._slot_size
             # Order the pack after the producer's writes. Two paths:
             #
             # 1. Preferred: ``register_producer_stream`` was called by the model
@@ -926,7 +947,12 @@ class CudaIPCConnector(OmniConnectorBase):
                     credit_wait_ms=round(credit_wait_ms, 3),
                 )
                 return result
-            ret = self._cudart.cudaEventRecord(self._ipc_event, ctypes.c_void_p(self._copy_stream.cuda_stream))
+            event_to_record = self._ipc_event
+            slot_event_handle: bytes | None = None
+            if not self._put_pool_blocking_sync and self._slot_ipc_events:
+                event_to_record = self._slot_ipc_events[slot_idx]
+                slot_event_handle = self._slot_ipc_event_handle_bytes[slot_idx]
+            ret = self._cudart.cudaEventRecord(event_to_record, ctypes.c_void_p(self._copy_stream.cuda_stream))
             if ret != 0:
                 logger.warning("cudaEventRecord (IPC) failed: %d", ret)
             # In default mode, block until the pack D2D finishes.
@@ -940,8 +966,11 @@ class CudaIPCConnector(OmniConnectorBase):
                 {
                     _POOL_MARKER: True,
                     "slot_offset": slot_offset,
-                    "slot_index": slot_offset // self._slot_size,
+                    "slot_index": slot_idx,
                     "payload": encoded_obj,
+                    # Optional per-slot event handle for async sender mode.
+                    # Receiver falls back to ring-header event handle when absent.
+                    **({"event_handle": slot_event_handle} if slot_event_handle is not None else {}),
                 }
             )
             descriptor_ser_ms = (_time_mod.perf_counter() - descriptor_t0) * 1000.0
@@ -1006,7 +1035,7 @@ class CudaIPCConnector(OmniConnectorBase):
             outcome="ring_publish",
             descriptor_bytes=descriptor_bytes,
             slot_used_bytes=slot_used_bytes,
-            slot_idx=slot_offset // self._slot_size,
+                slot_idx=slot_idx,
             credit_wait_ms=round(credit_wait_ms, 3),
             pack_sync_ms=round(pack_sync_ms, 3),
             descriptor_ser_ms=round(descriptor_ser_ms, 3),
@@ -1116,6 +1145,9 @@ class CudaIPCConnector(OmniConnectorBase):
             # on _ring_edge_handles), descriptor from the entry body.
             pool_handle, event_handle, board_name = self._ring_edge_handles[(from_stage, to_stage)]
             raw = OmniSerializer.deserialize(body)
+            event_handle = raw.get("event_handle", event_handle)
+            if event_handle is not None and not isinstance(event_handle, bytes):
+                event_handle = bytes(event_handle)
             pool_ptr = self._open_pool(pool_handle)
             idx = self._recv_stream_idx % len(self._recv_copy_streams)
             self._recv_stream_idx += 1
@@ -1277,6 +1309,10 @@ class CudaIPCConnector(OmniConnectorBase):
             if own_event is not None:
                 self._try_or_warn(lambda: self._cudart.cudaEventDestroy(own_event), "destroy sender IPC event")
                 self._ipc_event = None
+            for evt in getattr(self, "_slot_ipc_events", []) or []:
+                self._try_or_warn(lambda e=evt: self._cudart.cudaEventDestroy(e), "destroy sender slot IPC event")
+            self._slot_ipc_events = []
+            self._slot_ipc_event_handle_bytes = []
             for evt in self._opened_events.values():
                 self._try_or_warn(lambda e=evt: self._cudart.cudaEventDestroy(e), "destroy opened IPC event")
             self._opened_events.clear()
