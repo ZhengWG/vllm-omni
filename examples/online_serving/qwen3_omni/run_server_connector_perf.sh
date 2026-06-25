@@ -70,7 +70,7 @@ if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
   export VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS="${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS:-0}"
   # Even when inline_cuda_tensors=0, allow tiny CUDA payloads to take inline
   # route to avoid pool-credit pressure from slot-sized accounting.
-  export VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES="${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES:-4096}"
+  export VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES="${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES:-16384}"
   # Benchmark-oriented default: do not make pool-get copy stream wait the
   # receiver current stream before D2D decode (improves overlap).
   export VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM="${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-0}"

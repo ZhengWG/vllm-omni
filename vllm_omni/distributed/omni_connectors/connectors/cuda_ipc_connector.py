@@ -201,25 +201,30 @@ class CudaIPCConnector(OmniConnectorBase):
         # transmit, so must not create a same-named ring). Injected by the stage worker.
         self._is_transfer_rank = bool(config.get("is_transfer_rank", True))
         self._inline_threshold = int(config.get("inline_threshold_bytes", 16384))
-        # Inline route serializes payload on CPU. For CUDA tensors this invokes
-        # tensor.detach().cpu() and can block on producer-stream completion.
-        # Default to routing CUDA-bearing payloads through pool (D2D path) to
-        # avoid large inline put tail latencies from implicit D2H sync.
+        # Inline route serializes payload as CPU bytes (SHM-compatible semantics).
+        # Keep a guard knob for workloads that prefer forcing CUDA payloads to pool.
         self._inline_cuda_tensors = bool(
             config.get(
                 "inline_cuda_tensors",
                 _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS", default=False),
             )
         )
-        # Safety valve for tiny CUDA payloads: allow size-based inline route even
-        # when inline_cuda_tensors is disabled globally. This prevents severe pool
-        # credit pressure from 4KB-class payloads occupying full pool slots.
-        raw_inline_cuda_max_bytes = int(
-            config.get(
-                "inline_cuda_max_bytes",
-                _env_int("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES", default=4096),
+        # Size-based CUDA-inline gate (defaults to inline threshold): payloads
+        # <= this size can take inline route and be normalized to CPU before
+        # serialization, matching SHM connector behavior.
+        raw_inline_cuda_max_cfg = config.get("inline_cuda_max_bytes")
+        if raw_inline_cuda_max_cfg is None:
+            env_raw = os.environ.get("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES")
+            raw_inline_cuda_max_cfg = self._inline_threshold if env_raw is None else env_raw
+        try:
+            raw_inline_cuda_max_bytes = int(raw_inline_cuda_max_cfg)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid inline_cuda_max_bytes=%r; fallback to inline_threshold=%d",
+                raw_inline_cuda_max_cfg,
+                self._inline_threshold,
             )
-        )
+            raw_inline_cuda_max_bytes = self._inline_threshold
         self._inline_cuda_max_bytes = max(0, min(raw_inline_cuda_max_bytes, self._inline_threshold))
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         self._ring_body_max = int(config.get("ring_body_max", 524288))
@@ -751,6 +756,40 @@ class CudaIPCConnector(OmniConnectorBase):
             )
         return 0
 
+    def _walk_copy_cuda_to_cpu_inline(self, obj: Any) -> tuple[Any, int, int]:
+        """Return an inline-ready object with CUDA tensors copied to CPU.
+
+        This mirrors SHM's wire behavior (CPU tensor bytes on the control path)
+        while keeping pool path unchanged.
+        """
+        copied_tensors = 0
+        copied_nbytes = 0
+
+        def _convert(value: Any) -> Any:
+            nonlocal copied_tensors, copied_nbytes
+            if isinstance(value, torch.Tensor):
+                detached = value.detach()
+                if detached.device.type == "cuda":
+                    copied_tensors += 1
+                    copied_nbytes += int(detached.nbytes)
+                    return detached.to("cpu").contiguous()
+                return detached.contiguous() if not detached.is_contiguous() else detached
+            if isinstance(value, dict):
+                return {k: _convert(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [_convert(v) for v in value]
+            if isinstance(value, tuple):
+                return tuple(_convert(v) for v in value)
+            if hasattr(value, "__struct_fields__"):
+                return {
+                    f: _convert(getattr(value, f))
+                    for f in value.__struct_fields__
+                    if getattr(value, f) is not None
+                }
+            return value
+
+        return _convert(obj), copied_tensors, copied_nbytes
+
     # --- Pool slot codec ---
 
     def _walk_encode_pool(self, obj: Any, slot: _PoolSlot, copy_stream: torch.cuda.Stream) -> Any:
@@ -960,9 +999,17 @@ class CudaIPCConnector(OmniConnectorBase):
             )
             force_pool_for_cuda = est_nbytes > 0 and not self._inline_cuda_tensors and not inline_cuda_by_size
             producer_event = self._consume_producer_event()
-            if est_nbytes < self._inline_threshold and not force_pool_for_cuda:
+            route_inline = est_nbytes < self._inline_threshold and not force_pool_for_cuda
+            if route_inline:
                 result = self._put_inline(
-                    from_stage, to_stage, put_key, composite_key, data, kh, producer_event=producer_event
+                    from_stage,
+                    to_stage,
+                    put_key,
+                    composite_key,
+                    data,
+                    kh,
+                    producer_event=producer_event,
+                    est_nbytes=est_nbytes,
                 )
                 route = "inline"
             else:
@@ -1010,24 +1057,32 @@ class CudaIPCConnector(OmniConnectorBase):
         data,
         kh,
         producer_event: torch.cuda.Event | None = None,
+        est_nbytes: int | None = None,
     ):
         t0 = _time_mod.perf_counter()
-        if self._estimate_nbytes(data) > 0:
-            # Inline fallback path may still serialize CUDA tensors (e.g. when
-            # inline_cuda_tensors is enabled). Order this thread's stream after
-            # producer writes before any D2H in serialize_obj().
-            self._order_current_stream_after_producer(producer_event)
+        producer_order_mode = "none"
+        producer_order_wait_ms = 0.0
+        inline_cuda_to_cpu_ms = 0.0
+        inline_cuda_tensors = 0
+        inline_cuda_nbytes = 0
+        inline_payload_obj = data
+        inline_cuda_nbytes = est_nbytes if isinstance(est_nbytes, int) and est_nbytes >= 0 else self._estimate_nbytes(data)
+        if inline_cuda_nbytes > 0:
+            # Inline is SHM-like: normalize CUDA tensors to CPU before msgpack.
+            producer_order_mode, producer_order_wait_ms = self._order_current_stream_after_producer(producer_event)
+            inline_d2h_t0 = _time_mod.perf_counter()
+            inline_payload_obj, inline_cuda_tensors, inline_cuda_nbytes = self._walk_copy_cuda_to_cpu_inline(data)
+            inline_cuda_to_cpu_ms = (_time_mod.perf_counter() - inline_d2h_t0) * 1000.0
         # Serialize (a cheap D2H for a tiny GPU tensor) straight into the ring body.
-        payload = self.serialize_obj(data)
+        payload = self.serialize_obj(inline_payload_obj)
         if len(payload) > self._ring.body_max:
             result = self._put_cpu_fallback(
                 from_stage,
                 to_stage,
                 put_key,
                 composite_key,
-                data,
+                inline_payload_obj,
                 reason=f"inline_too_big {len(payload)}",
-                producer_event=producer_event,
             )
             self._profile_log(
                 "put_inline",
@@ -1035,6 +1090,11 @@ class CudaIPCConnector(OmniConnectorBase):
                 key=put_key,
                 payload_bytes=len(payload),
                 outcome="cpu_fallback",
+                producer_order_mode=producer_order_mode,
+                producer_order_wait_ms=round(producer_order_wait_ms, 3),
+                inline_cuda_to_cpu_ms=round(inline_cuda_to_cpu_ms, 3),
+                inline_cuda_tensors=inline_cuda_tensors,
+                inline_cuda_nbytes=inline_cuda_nbytes,
             )
             return result
         try:
@@ -1047,9 +1107,8 @@ class CudaIPCConnector(OmniConnectorBase):
                 to_stage,
                 put_key,
                 composite_key,
-                data,
+                inline_payload_obj,
                 reason="ring_full",
-                producer_event=producer_event,
             )
             self._profile_log(
                 "put_inline",
@@ -1057,6 +1116,11 @@ class CudaIPCConnector(OmniConnectorBase):
                 key=put_key,
                 payload_bytes=len(payload),
                 outcome="ring_full_fallback",
+                producer_order_mode=producer_order_mode,
+                producer_order_wait_ms=round(producer_order_wait_ms, 3),
+                inline_cuda_to_cpu_ms=round(inline_cuda_to_cpu_ms, 3),
+                inline_cuda_tensors=inline_cuda_tensors,
+                inline_cuda_nbytes=inline_cuda_nbytes,
             )
             return result
         self._metrics["puts"] += 1
@@ -1067,6 +1131,11 @@ class CudaIPCConnector(OmniConnectorBase):
             key=put_key,
             payload_bytes=len(payload),
             outcome="ring_publish",
+            producer_order_mode=producer_order_mode,
+            producer_order_wait_ms=round(producer_order_wait_ms, 3),
+            inline_cuda_to_cpu_ms=round(inline_cuda_to_cpu_ms, 3),
+            inline_cuda_tensors=inline_cuda_tensors,
+            inline_cuda_nbytes=inline_cuda_nbytes,
         )
         return True, len(payload), {"ring": True, "size": len(payload)}
 

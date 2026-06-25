@@ -376,9 +376,12 @@ bash run_server_connector_perf.sh ipc
 ```
 
 By default the IPC server script sets `VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=0`,
-so payloads that contain CUDA tensors use the pool route even when small.
-This avoids inline serialization's implicit `tensor.detach().cpu()` sync spikes.
-Set to `1` only for A/B:
+so large CUDA payloads prefer the pool route. Small CUDA payloads can still
+take inline route and are explicitly normalized to CPU (SHM-style) before
+msgpack encoding.
+
+Set to `1` to allow size-based inline for all CUDA payloads under the inline
+threshold:
 
 ```bash
 VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=1 \
@@ -388,10 +391,11 @@ bash run_server_connector_perf.sh ipc
 To avoid pool-credit pressure from tiny CUDA payloads while keeping large CUDA
 payloads on pool, the script also defaults:
 
-- `VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES=4096`
+- `VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES=16384`
 
-This allows CUDA payloads up to 4KB to use inline route even when
-`INLINE_CUDA_TENSORS=0`. Set to `0` to disable this size-based inline escape.
+This allows CUDA payloads up to 16KB to use inline route (with explicit CPU
+normalization) even when `INLINE_CUDA_TENSORS=0`. Set to `0` to disable this
+size-based inline escape.
 
 It also defaults `VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=0` to avoid
 receiver-side pre-copy stream waits in pool-get (better overlap). Set to `1`
