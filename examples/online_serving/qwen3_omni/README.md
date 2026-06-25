@@ -385,10 +385,6 @@ VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=1 \
 bash run_server_connector_perf.sh ipc
 ```
 
-When `...INLINE_CUDA_TENSORS=1`, inline CUDA D2H uses sender copy-stream staging
-(`VLLM_OMNI_CUDA_IPC_INLINE_CUDA_ASYNC_D2H=1` by default) before ring publish,
-instead of direct serializer-side default-stream D2H.
-
 It also defaults `VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=0` to avoid
 receiver-side pre-copy stream waits in pool-get (better overlap). Set to `1`
 to restore strict wait behavior:
