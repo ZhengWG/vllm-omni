@@ -147,6 +147,7 @@ s1_recv_ingress = []
 s1_decode_finish_sync = []
 save_send_task = []
 save_queue_wait = []
+save_put_lock_wait = []
 save_total_age = []
 
 with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -161,6 +162,8 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 save_send_task.append(save_elapsed)
             if "queue_wait_ms" in kv:
                 save_queue_wait.append(float(kv["queue_wait_ms"]))
+            if "put_lock_wait_ms" in kv:
+                save_put_lock_wait.append(float(kv["put_lock_wait_ms"]))
             if "total_age_ms" in kv:
                 save_total_age.append(float(kv["total_age_ms"]))
 
@@ -261,6 +264,7 @@ show("stage1 get_control_plane pool recv_ingress_ms", s1_recv_ingress)
 show("stage1 get_control_plane pool decode_finish_sync_ms", s1_decode_finish_sync)
 show("save_loop send_task elapsed_ms", save_send_task)
 show("save_loop send_task queue_wait_ms", save_queue_wait)
+show("save_loop send_task put_lock_wait_ms", save_put_lock_wait)
 show("save_loop send_task total_age_ms", save_total_age)
 
 ratio = [c / e for c, e in zip(s1_copy, s1_get_pool) if e > 0]
@@ -290,6 +294,13 @@ grep -E "CudaIPCConnector profile phase=get_control_plane .*stage=1 .*pclass=poo
 print_section "10) Top 20 slow save-loop send tasks (queue_wait_ms)"
 grep -E "OmniConnector save_profile phase=send_task" "${WORK_LOG}" \
   | sed -nE 's/.*queue_wait_ms=([0-9]+(\.[0-9]+)?).*/\1\t&/p' \
+  | sort -t$'\t' -k1,1nr \
+  | head -n 20 \
+  | cut -f2- || true
+
+print_section "10.5) Top 20 save-loop send tasks (put_lock_wait_ms)"
+grep -E "OmniConnector save_profile phase=send_task" "${WORK_LOG}" \
+  | sed -nE 's/.*put_lock_wait_ms=([0-9]+(\.[0-9]+)?).*/\1\t&/p' \
   | sort -t$'\t' -k1,1nr \
   | head -n 20 \
   | cut -f2- || true
