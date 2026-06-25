@@ -144,9 +144,21 @@ save_total_age = []
 
 with open(path, "r", encoding="utf-8", errors="ignore") as f:
     for line in f:
+        kv = dict(pat.findall(line))
+        if "OmniConnector save_profile" in line and kv.get("phase") == "send_task":
+            try:
+                save_elapsed = float(kv.get("elapsed_ms", "nan"))
+            except ValueError:
+                save_elapsed = None
+            if save_elapsed is not None:
+                save_send_task.append(save_elapsed)
+            if "queue_wait_ms" in kv:
+                save_queue_wait.append(float(kv["queue_wait_ms"]))
+            if "total_age_ms" in kv:
+                save_total_age.append(float(kv["total_age_ms"]))
+
         if "CudaIPCConnector profile" not in line:
             continue
-        kv = dict(pat.findall(line))
         phase = kv.get("phase")
         stage = kv.get("stage")
         try:
@@ -198,13 +210,6 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 s1_board_release.append(float(kv["board_release_ms"]))
             if "recv_ingress_ms" in kv:
                 s1_recv_ingress.append(float(kv["recv_ingress_ms"]))
-
-        if "OmniConnector save_profile" in line and kv.get("phase") == "send_task":
-            save_send_task.append(elapsed)
-            if "queue_wait_ms" in kv:
-                save_queue_wait.append(float(kv["queue_wait_ms"]))
-            if "total_age_ms" in kv:
-                save_total_age.append(float(kv["total_age_ms"]))
 
 show("stage0 put_control_plane inline elapsed_ms", s0_inline)
 show("stage0 put_control_plane pool elapsed_ms", s0_pool_cp)
