@@ -128,6 +128,11 @@ s0_credit_poll_iters = []
 s0_producer_order_wait = []
 s0_event_record = []
 s0_ring_publish = []
+s0_async_backpressure_wait = []
+s0_async_backpressure_wait_events = []
+s0_async_inflight_depth = []
+s0_sender_copy_stream_idx = []
+s0_sender_copy_streams = []
 s1_get_pool = []
 s1_copy = []
 s1_copy_wait_current = []
@@ -191,6 +196,16 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 s0_event_record.append(float(kv["event_record_ms"]))
             if "ring_publish_ms" in kv:
                 s0_ring_publish.append(float(kv["ring_publish_ms"]))
+            if "async_backpressure_wait_ms" in kv:
+                s0_async_backpressure_wait.append(float(kv["async_backpressure_wait_ms"]))
+            if "async_backpressure_wait_events" in kv:
+                s0_async_backpressure_wait_events.append(float(kv["async_backpressure_wait_events"]))
+            if "async_inflight_depth" in kv:
+                s0_async_inflight_depth.append(float(kv["async_inflight_depth"]))
+            if "sender_copy_stream_idx" in kv:
+                s0_sender_copy_stream_idx.append(float(kv["sender_copy_stream_idx"]))
+            if "sender_copy_streams" in kv:
+                s0_sender_copy_streams.append(float(kv["sender_copy_streams"]))
 
         if phase == "get_control_plane" and stage == "1" and kv.get("pclass") == "pool":
             s1_get_pool.append(elapsed)
@@ -227,6 +242,11 @@ show("stage0 put_pool credit_poll_iters", s0_credit_poll_iters)
 show("stage0 put_pool producer_order_wait_ms", s0_producer_order_wait)
 show("stage0 put_pool event_record_ms", s0_event_record)
 show("stage0 put_pool ring_publish_ms", s0_ring_publish)
+show("stage0 put_pool async_backpressure_wait_ms", s0_async_backpressure_wait)
+show("stage0 put_pool async_backpressure_wait_events", s0_async_backpressure_wait_events)
+show("stage0 put_pool async_inflight_depth", s0_async_inflight_depth)
+show("stage0 put_pool sender_copy_stream_idx", s0_sender_copy_stream_idx)
+show("stage0 put_pool sender_copy_streams", s0_sender_copy_streams)
 show("stage1 get_control_plane pool elapsed_ms", s1_get_pool)
 show("stage1 get_control_plane pool copy_sync_ms", s1_copy)
 show("stage1 get_control_plane pool copy_wait_current_stream_ms", s1_copy_wait_current)
@@ -270,6 +290,13 @@ grep -E "CudaIPCConnector profile phase=get_control_plane .*stage=1 .*pclass=poo
 print_section "10) Top 20 slow save-loop send tasks (queue_wait_ms)"
 grep -E "OmniConnector save_profile phase=send_task" "${WORK_LOG}" \
   | sed -nE 's/.*queue_wait_ms=([0-9]+(\.[0-9]+)?).*/\1\t&/p' \
+  | sort -t$'\t' -k1,1nr \
+  | head -n 20 \
+  | cut -f2- || true
+
+print_section "11) Top 20 stage0 put_pool rows (async_backpressure_wait_ms)"
+grep -E "CudaIPCConnector profile phase=put_pool .*stage=0 .*outcome=ring_publish" "${WORK_LOG}" \
+  | sed -nE 's/.*async_backpressure_wait_ms=([0-9]+(\.[0-9]+)?).*/\1\t&/p' \
   | sort -t$'\t' -k1,1nr \
   | head -n 20 \
   | cut -f2- || true

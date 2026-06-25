@@ -252,6 +252,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_segment_finished": is_segment_finished,
             "_save_first_enqueued_ns": time.perf_counter_ns(),
             "_save_enqueued_ns": time.perf_counter_ns(),
+            # Producer-thread fence point: connector.put() should prefer this
+            # event so pool D2D is ordered after the model's write stream.
             "_producer_event": self._record_current_stream_event_if_cuda(),
         }
         self._pending_save_reqs.append(task)
@@ -449,9 +451,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         register_producer_event = getattr(self.output_connector, "register_producer_event", None)
         if callable(register_producer_event):
+            # Prefer producer-thread event (recorded in save_async) so
+            # connector.put() fences copy_stream behind the model write stream.
+            # Save-thread event is only a fallback when producer event is absent.
             producer_event = task.get("_producer_event")
+            if not isinstance(producer_event, torch.cuda.Event):
+                producer_event = self._record_current_stream_event_if_cuda()
             try:
-                register_producer_event(producer_event if isinstance(producer_event, torch.cuda.Event) else None)
+                register_producer_event(producer_event)
             except Exception:
                 logger.debug("register_producer_event failed for key=%s", connector_put_key, exc_info=True)
         now_ns = time.perf_counter_ns()

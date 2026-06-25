@@ -384,6 +384,23 @@ VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=1 \
 bash run_server_connector_perf.sh ipc
 ```
 
+For sender async `put_pool`, the script also defaults:
+
+- `VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS=4` (round-robin sender pack streams)
+- `VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT=16`
+  (bound published-but-not-finished sender queue depth)
+
+Tune or disable backpressure for A/B:
+
+```bash
+VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS=2 \
+VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT=0 \
+bash run_server_connector_perf.sh ipc
+```
+
+`...ASYNC_INFLIGHT_LIMIT=0` means auto limit in connector (based on stream
+count and pool credits).
+
 For queueing diagnostics in the model-runner save thread, the script enables:
 
 - `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG=1`
@@ -396,7 +413,12 @@ For deeper receiver-side stall breakdown, you can opt in:
 
 This adds `event_wait_sync_ms` (upstream event wait) and
 `decode_finish_sync_ms` (post-wait decode/copy finish) to stage1 pool-get
-profiles.
+profiles. Sender-side `put_pool` profiles also include:
+
+- `async_backpressure_wait_ms`
+- `async_backpressure_wait_events`
+- `async_inflight_depth`
+- `sender_copy_stream_idx` / `sender_copy_streams`
 
 Run benchmark against the running server (default `c=1,4`):
 

@@ -68,6 +68,10 @@ if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
   # Benchmark-oriented default: do not make pool-get copy stream wait the
   # receiver current stream before D2D decode (improves overlap).
   export VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM="${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-0}"
+  # Sender-side async put_pool tuning: parallel pack streams + bounded
+  # inflight window to avoid excessive descriptor lead over copy completion.
+  export VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS="${VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS:-4}"
+  export VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT="${VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT:-16}"
 fi
 
 cmd=(
@@ -100,6 +104,8 @@ echo "  profile_logs   : ${ENABLE_PROFILE_LOGS}"
 echo "  shm_compat_on_miss : ${VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS:-<default>}"
 echo "  put_pool_blocking_sync : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC:-<default>}"
 echo "  get_pool_wait_current_stream : ${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-<default>}"
+echo "  put_pool_copy_streams : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS:-<default>}"
+echo "  put_pool_async_inflight_limit : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT:-<default>}"
 echo "  save_profile_log : ${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG:-<default>}"
 echo "  profile_wait_split : ${VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT:-<default>}"
 echo "  common_args    : ${COMMON_SERVER_ARGS:-<none>}"

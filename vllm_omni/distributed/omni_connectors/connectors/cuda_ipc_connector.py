@@ -22,6 +22,7 @@ import queue as _queue_mod
 import threading
 import time as _time_mod
 import uuid
+from collections import deque
 from multiprocessing import shared_memory as shm_pkg
 from multiprocessing.resource_tracker import unregister
 from typing import Any
@@ -68,6 +69,9 @@ _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 _DEFAULT_SLOT_SIZE_MB = 64
 _DEFAULT_POOL_CREDITS = 64
 _DEFAULT_RECV_STREAMS = 8  # receiver D2D copy streams (round-robined per get)
+_DEFAULT_PUT_POOL_COPY_STREAMS = 1
+_DEFAULT_PUT_POOL_ASYNC_INFLIGHT_FACTOR = 4
+_DEFAULT_PUT_POOL_ASYNC_INFLIGHT_MIN = 8
 
 # Timing constants — overridable via extra config keys of the same name
 # (without leading underscore), e.g. ``"credit_wait_sec": 0.01``.
@@ -263,6 +267,33 @@ class CudaIPCConnector(OmniConnectorBase):
                 _env_bool("VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC", default=True),
             )
         )
+        # Sender-side pool put parallelism / queue-depth controls in non-blocking mode:
+        # - put_pool_copy_streams: number of sender pack/copy streams to round-robin.
+        # - put_pool_async_inflight_limit: max published-but-not-locally-complete puts.
+        #   <=0 uses an auto limit (bounded by pool_credits).
+        self._put_pool_copy_streams = max(
+            1,
+            int(
+                config.get(
+                    "put_pool_copy_streams",
+                    _env_int("VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS", default=_DEFAULT_PUT_POOL_COPY_STREAMS),
+                )
+            ),
+        )
+        raw_async_inflight_limit = int(
+            config.get(
+                "put_pool_async_inflight_limit",
+                _env_int("VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT", default=0),
+            )
+        )
+        if raw_async_inflight_limit <= 0 and not self._put_pool_blocking_sync:
+            raw_async_inflight_limit = max(
+                _DEFAULT_PUT_POOL_ASYNC_INFLIGHT_MIN,
+                self._put_pool_copy_streams * _DEFAULT_PUT_POOL_ASYNC_INFLIGHT_FACTOR,
+            )
+        self._put_pool_async_inflight_limit = 0
+        if not self._put_pool_blocking_sync:
+            self._put_pool_async_inflight_limit = min(max(0, raw_async_inflight_limit), self._pool_credits)
         # Receiver-side pool get behavior:
         # - True  (default): force copy stream to wait current stream before D2D decode.
         # - False: enqueue D2D decode directly on copy stream for better overlap.
@@ -310,6 +341,11 @@ class CudaIPCConnector(OmniConnectorBase):
         self._producer_fallback_warned: bool = False
         self._last_credit_poll_iters: int = 0
         self._producer_order_lock = threading.Lock()
+        self._sender_copy_streams: list[torch.cuda.Stream] = []
+        self._sender_copy_stream_idx: int = 0
+        self._sender_copy_stream_lock = threading.Lock()
+        self._put_pool_async_inflight_events: deque[torch.cuda.Event] = deque()
+        self._put_pool_async_inflight_lock = threading.Lock()
         self._profile_log_counter = 0
         self._metrics = {
             "puts": 0,
@@ -341,9 +377,14 @@ class CudaIPCConnector(OmniConnectorBase):
         """Sender data-transfer rank: GPU pool, IPC event, release board, per-edge ring."""
         with torch.cuda.device(self.local_device):
             self._pool = torch.zeros(self._pool_size, dtype=torch.uint8, device=self.local_device)
-            self._copy_stream = torch.cuda.Stream(device=self.local_device)
+            self._sender_copy_streams = [
+                torch.cuda.Stream(device=self.local_device) for _ in range(self._put_pool_copy_streams)
+            ]
+            self._copy_stream = self._sender_copy_streams[0]
             self._compute_event = torch.cuda.Event()
-            self._copy_done_event = torch.cuda.Event()
+        self._sender_copy_stream_idx = 0
+        with self._put_pool_async_inflight_lock:
+            self._put_pool_async_inflight_events.clear()
         self._pool_handle = self._get_ipc_handle(self._pool.data_ptr())
         self._ipc_event = ctypes.c_void_p()
         flags = ctypes.c_uint(_CUDA_EVENT_INTERPROCESS | _CUDA_EVENT_DISABLE_TIMING)
@@ -404,6 +445,8 @@ class CudaIPCConnector(OmniConnectorBase):
         self._board = None
         self._slot_ipc_events = []
         self._slot_ipc_event_handle_bytes = []
+        self._sender_copy_streams = []
+        self._copy_stream = None
         if self.role == "receiver":
             with torch.cuda.device(self.local_device):
                 self._recv_copy_streams = [
@@ -515,6 +558,51 @@ class CudaIPCConnector(OmniConnectorBase):
             evt = self._producer_event
             self._producer_event = None
             return evt
+
+    def _next_sender_copy_stream(self) -> tuple[torch.cuda.Stream, int]:
+        streams = self._sender_copy_streams
+        if not streams:
+            if self._copy_stream is None:
+                raise RuntimeError("Sender copy stream is not initialized.")
+            return self._copy_stream, 0
+        if len(streams) == 1:
+            return streams[0], 0
+        with self._sender_copy_stream_lock:
+            idx = self._sender_copy_stream_idx % len(streams)
+            self._sender_copy_stream_idx += 1
+        return streams[idx], idx
+
+    def _wait_put_pool_async_window(self) -> tuple[float, int]:
+        limit = int(self._put_pool_async_inflight_limit)
+        if limit <= 0:
+            return 0.0, 0
+        wait_ms = 0.0
+        waited_events = 0
+        while True:
+            wait_evt = None
+            with self._put_pool_async_inflight_lock:
+                while self._put_pool_async_inflight_events and self._put_pool_async_inflight_events[0].query():
+                    self._put_pool_async_inflight_events.popleft()
+                if len(self._put_pool_async_inflight_events) < limit:
+                    break
+                wait_evt = self._put_pool_async_inflight_events.popleft()
+            if wait_evt is None:
+                break
+            wait_t0 = _time_mod.perf_counter()
+            wait_evt.synchronize()
+            wait_ms += (_time_mod.perf_counter() - wait_t0) * 1000.0
+            waited_events += 1
+        return wait_ms, waited_events
+
+    def _track_put_pool_async_event(self, copy_stream: torch.cuda.Stream) -> int:
+        limit = int(self._put_pool_async_inflight_limit)
+        if limit <= 0:
+            return 0
+        done_evt = torch.cuda.Event()
+        done_evt.record(copy_stream)
+        with self._put_pool_async_inflight_lock:
+            self._put_pool_async_inflight_events.append(done_evt)
+            return len(self._put_pool_async_inflight_events)
 
     # --- Device & SHM helpers ---
 
@@ -645,14 +733,17 @@ class CudaIPCConnector(OmniConnectorBase):
 
     # --- Pool slot codec ---
 
-    def _walk_encode_pool(self, obj: Any, slot: _PoolSlot) -> Any:
+    def _walk_encode_pool(self, obj: Any, slot: _PoolSlot, copy_stream: torch.cuda.Stream) -> Any:
         """Recursively replace CUDA tensors with pool offset metadata."""
         if isinstance(obj, torch.Tensor):
             if obj.is_cuda:
                 if not self._put_pool_blocking_sync:
-                    # Keep source storage alive on the copy stream when sender
-                    # does not block for pack completion.
-                    obj.record_stream(self._copy_stream)
+                    # Allocator-lifetime hint only: prevents caching-allocator
+                    # reuse of allocator-managed source storage until this
+                    # copy stream is done. Correctness ordering is established
+                    # by producer_event / producer_stream fences; graph-static
+                    # buffers are not protected by record_stream.
+                    obj.record_stream(copy_stream)
                 t = obj.detach().contiguous()
                 tensor_offset = slot.pack(t)
                 return {
@@ -664,16 +755,16 @@ class CudaIPCConnector(OmniConnectorBase):
                 }
             return obj
         if isinstance(obj, dict):
-            return {k: self._walk_encode_pool(v, slot) for k, v in obj.items()}
+            return {k: self._walk_encode_pool(v, slot, copy_stream) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [self._walk_encode_pool(v, slot) for v in obj]
+            return [self._walk_encode_pool(v, slot, copy_stream) for v in obj]
         if isinstance(obj, tuple):
-            return tuple(self._walk_encode_pool(v, slot) for v in obj)
+            return tuple(self._walk_encode_pool(v, slot, copy_stream) for v in obj)
         if hasattr(obj, "__struct_fields__"):
             # Drop None struct fields — matches data_entry_keys.to_dict (the SHM/inline wire
             # contract), so pool and SHM paths produce the same dict keys downstream.
             return {
-                f: self._walk_encode_pool(getattr(obj, f), slot)
+                f: self._walk_encode_pool(getattr(obj, f), slot, copy_stream)
                 for f in obj.__struct_fields__
                 if getattr(obj, f) is not None
             }
@@ -932,6 +1023,15 @@ class CudaIPCConnector(OmniConnectorBase):
         # TODO: support acquiring multiple contiguous credits/slots when a single payload
         # exceeds _slot_size (currently: _SlotOverflowError → CPU fallback).
         total_t0 = _time_mod.perf_counter()
+        async_backpressure_wait_ms = 0.0
+        async_backpressure_wait_events = 0
+        async_inflight_depth = 0
+        if not self._put_pool_blocking_sync:
+            # In non-blocking mode, bound sender queue lead so receiver doesn't
+            # stall on events that are far behind in sender stream queues.
+            async_backpressure_wait_ms, async_backpressure_wait_events = self._wait_put_pool_async_window()
+        sender_copy_stream_count = max(1, len(self._sender_copy_streams))
+        sender_copy_stream_idx = 0
         credit_t0 = _time_mod.perf_counter()
         slot_offset = self._acquire_credit()
         credit_wait_ms = (_time_mod.perf_counter() - credit_t0) * 1000.0
@@ -947,8 +1047,13 @@ class CudaIPCConnector(OmniConnectorBase):
                 outcome="credits_exhausted_fallback",
                 credit_wait_ms=round(credit_wait_ms, 3),
                 credit_poll_iters=credit_poll_iters,
+                async_backpressure_wait_ms=round(async_backpressure_wait_ms, 3),
+                async_backpressure_wait_events=async_backpressure_wait_events,
+                async_inflight_limit=self._put_pool_async_inflight_limit,
+                sender_copy_streams=sender_copy_stream_count,
             )
             return result
+        copy_stream, sender_copy_stream_idx = self._next_sender_copy_stream()
         credit_returned = False
         descriptor_bytes = 0
         pack_sync_ms = 0.0
@@ -981,25 +1086,24 @@ class CudaIPCConnector(OmniConnectorBase):
             #    assumption can't break unnoticed.
             producer_wait_t0 = _time_mod.perf_counter()
             if producer_event is not None:
-                self._copy_stream.wait_event(producer_event)
+                copy_stream.wait_event(producer_event)
                 producer_order_mode = "event"
             elif self._producer_stream is not None:
-                self._copy_stream.wait_stream(self._producer_stream)
+                copy_stream.wait_stream(self._producer_stream)
                 producer_order_mode = "stream"
             else:
                 self._maybe_warn_ambient_fallback()
                 self._compute_event.record()
-                self._copy_stream.wait_event(self._compute_event)
+                copy_stream.wait_event(self._compute_event)
                 producer_order_mode = "ambient"
             producer_order_wait_ms = (_time_mod.perf_counter() - producer_wait_t0) * 1000.0
             try:
                 pack_t0 = _time_mod.perf_counter()
-                with torch.cuda.stream(self._copy_stream):
-                    encoded_obj = self._walk_encode_pool(data, slot)
+                with torch.cuda.stream(copy_stream):
+                    encoded_obj = self._walk_encode_pool(data, slot, copy_stream)
                 slot_used_bytes = slot._cursor
             except _SlotOverflowError as e:
-                self._copy_done_event.record(self._copy_stream)
-                self._copy_done_event.synchronize()
+                copy_stream.synchronize()
                 credit_returned = True
                 self._credit_queue.put_nowait(slot_offset)
                 result = self._put_cpu_fallback(
@@ -1017,6 +1121,11 @@ class CudaIPCConnector(OmniConnectorBase):
                     outcome="slot_overflow_fallback",
                     credit_wait_ms=round(credit_wait_ms, 3),
                     credit_poll_iters=credit_poll_iters,
+                    async_backpressure_wait_ms=round(async_backpressure_wait_ms, 3),
+                    async_backpressure_wait_events=async_backpressure_wait_events,
+                    async_inflight_limit=self._put_pool_async_inflight_limit,
+                    sender_copy_stream_idx=sender_copy_stream_idx,
+                    sender_copy_streams=sender_copy_stream_count,
                 )
                 return result
             event_to_record = self._ipc_event
@@ -1025,7 +1134,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 event_to_record = self._slot_ipc_events[slot_idx]
                 slot_event_handle = self._slot_ipc_event_handle_bytes[slot_idx]
             event_record_t0 = _time_mod.perf_counter()
-            ret = self._cudart.cudaEventRecord(event_to_record, ctypes.c_void_p(self._copy_stream.cuda_stream))
+            ret = self._cudart.cudaEventRecord(event_to_record, ctypes.c_void_p(copy_stream.cuda_stream))
             event_record_ms = (_time_mod.perf_counter() - event_record_t0) * 1000.0
             if ret != 0:
                 logger.warning("cudaEventRecord (IPC) failed: %d", ret)
@@ -1033,7 +1142,7 @@ class CudaIPCConnector(OmniConnectorBase):
             # In async mode, rely on IPC event ordering + record_stream source
             # lifetime tracking to avoid a sender-side hard sync.
             if self._put_pool_blocking_sync:
-                self._copy_stream.synchronize()
+                copy_stream.synchronize()
             pack_sync_ms = (_time_mod.perf_counter() - pack_t0) * 1000.0
             descriptor_t0 = _time_mod.perf_counter()
             sender_desc_done_ns = _time_mod.perf_counter_ns()
@@ -1080,6 +1189,11 @@ class CudaIPCConnector(OmniConnectorBase):
                 descriptor_ser_ms=round(descriptor_ser_ms, 3),
                 producer_order_wait_ms=round(producer_order_wait_ms, 3),
                 event_record_ms=round(event_record_ms, 3),
+                async_backpressure_wait_ms=round(async_backpressure_wait_ms, 3),
+                async_backpressure_wait_events=async_backpressure_wait_events,
+                async_inflight_limit=self._put_pool_async_inflight_limit,
+                sender_copy_stream_idx=sender_copy_stream_idx,
+                sender_copy_streams=sender_copy_stream_count,
             )
             return result
         with self._held_lock:
@@ -1108,8 +1222,15 @@ class CudaIPCConnector(OmniConnectorBase):
                 descriptor_ser_ms=round(descriptor_ser_ms, 3),
                 producer_order_wait_ms=round(producer_order_wait_ms, 3),
                 event_record_ms=round(event_record_ms, 3),
+                async_backpressure_wait_ms=round(async_backpressure_wait_ms, 3),
+                async_backpressure_wait_events=async_backpressure_wait_events,
+                async_inflight_limit=self._put_pool_async_inflight_limit,
+                sender_copy_stream_idx=sender_copy_stream_idx,
+                sender_copy_streams=sender_copy_stream_count,
             )
             return result
+        if not self._put_pool_blocking_sync:
+            async_inflight_depth = self._track_put_pool_async_event(copy_stream)
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += len(descriptor)
         self._profile_log(
@@ -1130,6 +1251,12 @@ class CudaIPCConnector(OmniConnectorBase):
             ring_publish_ms=round(ring_publish_ms, 3),
             producer_stream_registered=self._producer_stream is not None,
             blocking_sync=self._put_pool_blocking_sync,
+            async_backpressure_wait_ms=round(async_backpressure_wait_ms, 3),
+            async_backpressure_wait_events=async_backpressure_wait_events,
+            async_inflight_depth=async_inflight_depth,
+            async_inflight_limit=self._put_pool_async_inflight_limit,
+            sender_copy_stream_idx=sender_copy_stream_idx,
+            sender_copy_streams=sender_copy_stream_count,
         )
         return True, len(descriptor), {"ring": True, "size": len(descriptor)}
 
@@ -1401,6 +1528,8 @@ class CudaIPCConnector(OmniConnectorBase):
             "pool_size_mb": self._pool_size // (1024 * 1024),
             "pool_credits": self._pool_credits,
             "held_credits": len(self._held_credits),
+            "put_pool_copy_streams": self._put_pool_copy_streams,
+            "put_pool_async_inflight_limit": self._put_pool_async_inflight_limit,
             **self._metrics,
         }
 
@@ -1423,6 +1552,8 @@ class CudaIPCConnector(OmniConnectorBase):
             self._release_thread.join(timeout=1.0)
         with self._held_lock:
             self._held_credits.clear()
+        with self._put_pool_async_inflight_lock:
+            self._put_pool_async_inflight_events.clear()
 
         for pool_ptr in self._opened_pools.values():
             self._try_or_warn(lambda p=pool_ptr: self._close_ipc_ptr(p), "close pool mapping")
@@ -1475,6 +1606,8 @@ class CudaIPCConnector(OmniConnectorBase):
         self._opened_rings.clear()
 
         self._pool = None
+        self._sender_copy_streams = []
+        self._copy_stream = None
         if torch.cuda.is_available():
             self._try_or_warn(torch.cuda.ipc_collect, "torch.cuda.ipc_collect")
         logger.info("CudaIPCConnector closed.")
