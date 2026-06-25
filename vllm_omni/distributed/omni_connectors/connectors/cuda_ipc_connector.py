@@ -380,6 +380,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._put_pool_async_inflight_events: deque[torch.cuda.Event] = deque()
         self._put_pool_async_inflight_lock = threading.Lock()
         self._profile_log_counter = 0
+        self._pool_event_not_ready_counter = 0
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -397,6 +398,7 @@ class CudaIPCConnector(OmniConnectorBase):
             "fallback_inline_too_big": 0,
             "ring_misses": 0,
             "shm_compat_checks": 0,
+            "pool_event_not_ready": 0,
         }
 
     def _init_cuda(self) -> None:
@@ -1568,14 +1570,24 @@ class CudaIPCConnector(OmniConnectorBase):
                             "raw": raw,
                             "event_source": event_source,
                         }
-                    self._profile_log(
-                        "get_control_plane",
-                        (_time_mod.perf_counter() - t0) * 1000.0,
-                        key=get_key,
-                        pclass="pool_event_not_ready",
-                        payload_bytes=len(body),
-                        event_source=event_source,
-                    )
+                    self._metrics["pool_event_not_ready"] = self._metrics.get("pool_event_not_ready", 0) + 1
+                    self._pool_event_not_ready_counter += 1
+                    # This path can be hit many times while polling chunk-0
+                    # descriptors. Logging every hit perturbs benchmark timing,
+                    # so emit only a low-rate signal plus naturally-slow probes.
+                    not_ready_ms = (_time_mod.perf_counter() - t0) * 1000.0
+                    if not_ready_ms >= self._profile_log_threshold_ms or (
+                        self._pool_event_not_ready_counter % max(1024, self._profile_log_every_n * 16) == 0
+                    ):
+                        self._profile_log(
+                            "get_control_plane",
+                            not_ready_ms,
+                            key=get_key,
+                            pclass="pool_event_not_ready",
+                            payload_bytes=len(body),
+                            event_source=event_source,
+                            not_ready_count=self._pool_event_not_ready_counter,
+                        )
                     return None
             sender_desc_done_ns = raw.get("sender_desc_done_ns")
             recv_ingress_ms = 0.0
