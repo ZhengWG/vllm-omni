@@ -440,6 +440,8 @@ For queueing diagnostics in the model-runner save thread, the script enables:
 For deeper receiver-side stall breakdown, you can opt in:
 
 - `VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT=1`
+- `VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET=1` (A/B only; can reduce
+  receiver copy-sync waits but may add polling latency)
 
 This adds `event_wait_sync_ms` (upstream event wait) and
 `decode_finish_sync_ms` (post-wait decode/copy finish) to stage1 pool-get

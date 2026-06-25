@@ -343,7 +343,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._defer_unready_pool_get = bool(
             config.get(
                 "defer_unready_pool_get",
-                _env_bool("VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET", default=True),
+                _env_bool("VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET", default=False),
             )
         )
 
