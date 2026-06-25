@@ -397,6 +397,17 @@ Analyze IPC profiling logs in one shot (grep-based):
 bash analyze_ipc_profile_log.sh /tmp/ipc_server.log
 ```
 
+By default it analyzes only the tail of the log (last 4000 lines). You can
+override:
+
+```bash
+# Analyze last 8000 lines
+bash analyze_ipc_profile_log.sh /tmp/ipc_server.log 8000
+
+# Analyze full file (no tail)
+bash analyze_ipc_profile_log.sh /tmp/ipc_server.log 0
+```
+
 
 ### FAQ
 
