@@ -946,8 +946,11 @@ class CudaIPCConnector(OmniConnectorBase):
             kh = key_hash16(composite_key)
             est_nbytes = self._estimate_nbytes(data)
             force_pool_for_cuda = est_nbytes > 0 and not self._inline_cuda_tensors
+            producer_event = self._consume_producer_event()
             if est_nbytes < self._inline_threshold and not force_pool_for_cuda:
-                result = self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
+                result = self._put_inline(
+                    from_stage, to_stage, put_key, composite_key, data, kh, producer_event=producer_event
+                )
                 route = "inline"
             else:
                 result = self._put_pool(
@@ -957,7 +960,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     composite_key,
                     data,
                     kh,
-                    self._consume_producer_event(),
+                    producer_event,
                 )
                 route = "pool"
             elapsed_ms = (_time_mod.perf_counter() - t0) * 1000.0
@@ -972,6 +975,10 @@ class CudaIPCConnector(OmniConnectorBase):
                 ok=result[0],
                 wire_size=result[1],
                 cpu_fallback=bool(isinstance(meta, dict) and meta.get("cpu_fallback")),
+                fallback_producer_order_mode=(meta.get("producer_order_mode") if isinstance(meta, dict) else None),
+                fallback_producer_order_wait_ms=(
+                    round(float(meta.get("producer_order_wait_ms", 0.0)), 3) if isinstance(meta, dict) else None
+                ),
             )
             return result
         except Exception as e:
@@ -979,13 +986,33 @@ class CudaIPCConnector(OmniConnectorBase):
             logger.error("CudaIPCConnector control-plane put failed for %s: %s", put_key, e, exc_info=True)
             return False, 0, None
 
-    def _put_inline(self, from_stage, to_stage, put_key, composite_key, data, kh):
+    def _put_inline(
+        self,
+        from_stage,
+        to_stage,
+        put_key,
+        composite_key,
+        data,
+        kh,
+        producer_event: torch.cuda.Event | None = None,
+    ):
         t0 = _time_mod.perf_counter()
+        if self._estimate_nbytes(data) > 0:
+            # Inline fallback path may still serialize CUDA tensors (e.g. when
+            # inline_cuda_tensors is enabled). Order this thread's stream after
+            # producer writes before any D2H in serialize_obj().
+            self._order_current_stream_after_producer(producer_event)
         # Serialize (a cheap D2H for a tiny GPU tensor) straight into the ring body.
         payload = self.serialize_obj(data)
         if len(payload) > self._ring.body_max:
             result = self._put_cpu_fallback(
-                from_stage, to_stage, put_key, composite_key, data, reason=f"inline_too_big {len(payload)}"
+                from_stage,
+                to_stage,
+                put_key,
+                composite_key,
+                data,
+                reason=f"inline_too_big {len(payload)}",
+                producer_event=producer_event,
             )
             self._profile_log(
                 "put_inline",
@@ -1000,7 +1027,15 @@ class CudaIPCConnector(OmniConnectorBase):
                 kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
             )
         except RingFullError:
-            result = self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
+            result = self._put_cpu_fallback(
+                from_stage,
+                to_stage,
+                put_key,
+                composite_key,
+                data,
+                reason="ring_full",
+                producer_event=producer_event,
+            )
             self._profile_log(
                 "put_inline",
                 (_time_mod.perf_counter() - t0) * 1000.0,
@@ -1050,7 +1085,13 @@ class CudaIPCConnector(OmniConnectorBase):
         credit_poll_iters = int(getattr(self, "_last_credit_poll_iters", 0))
         if slot_offset is None:
             result = self._put_cpu_fallback(
-                from_stage, to_stage, put_key, composite_key, data, reason="credits_exhausted"
+                from_stage,
+                to_stage,
+                put_key,
+                composite_key,
+                data,
+                reason="credits_exhausted",
+                producer_event=producer_event,
             )
             self._profile_log(
                 "put_pool",
@@ -1125,6 +1166,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     composite_key,
                     data,
                     reason=f"slot_overflow nbytes={e.nbytes} slot={e.slot_size}",
+                    producer_event=producer_event,
                 )
                 self._profile_log(
                     "put_pool",
@@ -1187,6 +1229,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 composite_key,
                 data,
                 reason=f"descriptor_too_big {len(descriptor)}>{self._ring.body_max}",
+                producer_event=producer_event,
             )
             self._profile_log(
                 "put_pool",
@@ -1220,7 +1263,15 @@ class CudaIPCConnector(OmniConnectorBase):
             with self._held_lock:
                 self._held_credits.pop(composite_key, None)
             self._credit_queue.put_nowait(slot_offset)
-            result = self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
+            result = self._put_cpu_fallback(
+                from_stage,
+                to_stage,
+                put_key,
+                composite_key,
+                data,
+                reason="ring_full",
+                producer_event=producer_event,
+            )
             self._profile_log(
                 "put_pool",
                 (_time_mod.perf_counter() - total_t0) * 1000.0,
@@ -1272,6 +1323,22 @@ class CudaIPCConnector(OmniConnectorBase):
         )
         return True, len(descriptor), {"ring": True, "size": len(descriptor)}
 
+    def _order_current_stream_after_producer(
+        self,
+        producer_event: torch.cuda.Event | None = None,
+    ) -> tuple[str, float]:
+        wait_t0 = _time_mod.perf_counter()
+        if producer_event is not None:
+            torch.cuda.current_stream(self.local_device).wait_event(producer_event)
+            return "event", (_time_mod.perf_counter() - wait_t0) * 1000.0
+        if self._producer_stream is not None:
+            torch.cuda.current_stream(self.local_device).wait_stream(self._producer_stream)
+            return "stream", (_time_mod.perf_counter() - wait_t0) * 1000.0
+        # Legacy/ambient fallback: only correct when producer also writes on the
+        # same ambient stream semantics. Keep warning behavior consistent.
+        self._maybe_warn_ambient_fallback()
+        return "ambient", (_time_mod.perf_counter() - wait_t0) * 1000.0
+
     def _put_cpu_fallback(
         self,
         from_stage: str,
@@ -1280,6 +1347,7 @@ class CudaIPCConnector(OmniConnectorBase):
         composite_key: str,
         data: Any,
         reason: str = "",
+        producer_event: torch.cuda.Event | None = None,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         logger.warning(
             "CudaIPCConnector CPU fallback for %s (from_stage=%s to_stage=%s): %s",
@@ -1292,6 +1360,10 @@ class CudaIPCConnector(OmniConnectorBase):
         # Categorize by the reason's leading token (ring_full / credits_exhausted / ...).
         cat = f"fallback_{reason.split(maxsplit=1)[0]}" if reason else "fallback_other"
         self._metrics[cat] = self._metrics.get(cat, 0) + 1
+        producer_order_mode = "none"
+        producer_order_wait_ms = 0.0
+        if self._estimate_nbytes(data) > 0:
+            producer_order_mode, producer_order_wait_ms = self._order_current_stream_after_producer(producer_event)
         payload = self.serialize_obj(data)
         size = len(payload)
 
@@ -1302,7 +1374,13 @@ class CudaIPCConnector(OmniConnectorBase):
 
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += size
-        return True, size, {"shm": meta, "size": size, "cpu_fallback": True}
+        return True, size, {
+            "shm": meta,
+            "size": size,
+            "cpu_fallback": True,
+            "producer_order_mode": producer_order_mode,
+            "producer_order_wait_ms": producer_order_wait_ms,
+        }
 
     # --- get() ---
 
