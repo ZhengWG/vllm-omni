@@ -252,6 +252,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "is_segment_finished": is_segment_finished,
             "_save_first_enqueued_ns": time.perf_counter_ns(),
             "_save_enqueued_ns": time.perf_counter_ns(),
+            "_producer_event": self._record_current_stream_event_if_cuda(),
         }
         self._pending_save_reqs.append(task)
         with self._save_cond:
@@ -276,6 +277,14 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             elapsed_ms,
             details,
         )
+
+    @staticmethod
+    def _record_current_stream_event_if_cuda() -> torch.cuda.Event | None:
+        if not torch.cuda.is_available():
+            return None
+        evt = torch.cuda.Event()
+        evt.record(torch.cuda.current_stream())
+        return evt
 
     def _maybe_register_output_producer_stream(self) -> None:
         if self._producer_stream_registered:
@@ -438,6 +447,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if self.output_connector is None:
             return
+        register_producer_event = getattr(self.output_connector, "register_producer_event", None)
+        if callable(register_producer_event):
+            producer_event = task.get("_producer_event")
+            try:
+                register_producer_event(producer_event if isinstance(producer_event, torch.cuda.Event) else None)
+            except Exception:
+                logger.debug("register_producer_event failed for key=%s", connector_put_key, exc_info=True)
         now_ns = time.perf_counter_ns()
         queue_wait_ms = 0.0
         total_age_ms = 0.0

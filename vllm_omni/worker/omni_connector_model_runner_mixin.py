@@ -1065,6 +1065,7 @@ class OmniConnectorModelRunnerMixin:
                 "request_id": req_id,
                 "_save_first_enqueued_ns": time.perf_counter_ns(),
                 "_save_enqueued_ns": time.perf_counter_ns(),
+                "_producer_event": self._record_current_stream_event_if_cuda(),
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(req_id, deque()).append(task)
@@ -1219,6 +1220,7 @@ class OmniConnectorModelRunnerMixin:
             "request_id": request_id,
             "_save_first_enqueued_ns": time.perf_counter_ns(),
             "_save_enqueued_ns": time.perf_counter_ns(),
+            "_producer_event": self._record_current_stream_event_if_cuda(),
         }
         with self._lock:
             self._pending_save_reqs.setdefault(request_id, deque()).append(task)
@@ -1752,6 +1754,14 @@ class OmniConnectorModelRunnerMixin:
             details,
         )
 
+    @staticmethod
+    def _record_current_stream_event_if_cuda() -> torch.cuda.Event | None:
+        if not torch.cuda.is_available():
+            return None
+        evt = torch.cuda.Event()
+        evt.record(torch.cuda.current_stream())
+        return evt
+
     def _save_loop(self) -> None:
         """Background thread: send outgoing data via connector."""
         while not self._stop_event.is_set():
@@ -2030,6 +2040,17 @@ class OmniConnectorModelRunnerMixin:
         connector = self._output_connector
         if connector is None:
             return True
+        register_producer_event = getattr(connector, "register_producer_event", None)
+        if callable(register_producer_event):
+            producer_event = task.get("_producer_event")
+            try:
+                register_producer_event(producer_event if isinstance(producer_event, torch.cuda.Event) else None)
+            except Exception:
+                logger.debug(
+                    "register_producer_event failed for put_key=%s",
+                    task.get("put_key"),
+                    exc_info=True,
+                )
 
         request_id = task.get("request_id")
         payload_data = task.get("data")

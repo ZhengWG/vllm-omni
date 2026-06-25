@@ -306,8 +306,10 @@ class CudaIPCConnector(OmniConnectorBase):
         # save thread's ambient stream — only correct when PTDS is off and the
         # producer wrote on the legacy default stream. See ``register_producer_stream``.
         self._producer_stream: torch.cuda.Stream | None = None
+        self._producer_event: torch.cuda.Event | None = None
         self._producer_fallback_warned: bool = False
         self._last_credit_poll_iters: int = 0
+        self._producer_order_lock = threading.Lock()
         self._profile_log_counter = 0
         self._metrics = {
             "puts": 0,
@@ -497,6 +499,22 @@ class CudaIPCConnector(OmniConnectorBase):
         # Reset the warn-once latch so a re-registration after clear can
         # surface a new warning if the fallback path is triggered later.
         self._producer_fallback_warned = False
+
+    def register_producer_event(self, producer_event: torch.cuda.Event | None) -> None:
+        """Register one-shot producer-ready event for the next put().
+
+        When set, _put_pool will order copy_stream by wait_event(producer_event)
+        (narrow fence: up to the recorded point) instead of wait_stream(producer_stream)
+        (broad fence: all currently queued producer stream work).
+        """
+        with self._producer_order_lock:
+            self._producer_event = producer_event
+
+    def _consume_producer_event(self) -> torch.cuda.Event | None:
+        with self._producer_order_lock:
+            evt = self._producer_event
+            self._producer_event = None
+            return evt
 
     # --- Device & SHM helpers ---
 
@@ -830,7 +848,15 @@ class CudaIPCConnector(OmniConnectorBase):
                 result = self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
                 route = "inline"
             else:
-                result = self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh)
+                result = self._put_pool(
+                    from_stage,
+                    to_stage,
+                    put_key,
+                    composite_key,
+                    data,
+                    kh,
+                    self._consume_producer_event(),
+                )
                 route = "pool"
             elapsed_ms = (_time_mod.perf_counter() - t0) * 1000.0
             meta = result[2] if len(result) >= 3 else None
@@ -891,7 +917,16 @@ class CudaIPCConnector(OmniConnectorBase):
         )
         return True, len(payload), {"ring": True, "size": len(payload)}
 
-    def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh):
+    def _put_pool(
+        self,
+        from_stage,
+        to_stage,
+        put_key,
+        composite_key,
+        data,
+        kh,
+        producer_event: torch.cuda.Event | None = None,
+    ):
         # Acquire a credit, D2D-pack into the slot, then publish a small descriptor
         # (slot_offset/slot_index + tensor layout) to the ring.
         # TODO: support acquiring multiple contiguous credits/slots when a single payload
@@ -919,6 +954,7 @@ class CudaIPCConnector(OmniConnectorBase):
         pack_sync_ms = 0.0
         descriptor_ser_ms = 0.0
         producer_order_wait_ms = 0.0
+        producer_order_mode = "ambient"
         event_record_ms = 0.0
         ring_publish_ms = 0.0
         slot_used_bytes = 0
@@ -944,12 +980,17 @@ class CudaIPCConnector(OmniConnectorBase):
             #    path is taken with PTDS enabled, so the silent-corruption
             #    assumption can't break unnoticed.
             producer_wait_t0 = _time_mod.perf_counter()
-            if self._producer_stream is not None:
+            if producer_event is not None:
+                self._copy_stream.wait_event(producer_event)
+                producer_order_mode = "event"
+            elif self._producer_stream is not None:
                 self._copy_stream.wait_stream(self._producer_stream)
+                producer_order_mode = "stream"
             else:
                 self._maybe_warn_ambient_fallback()
                 self._compute_event.record()
                 self._copy_stream.wait_event(self._compute_event)
+                producer_order_mode = "ambient"
             producer_order_wait_ms = (_time_mod.perf_counter() - producer_wait_t0) * 1000.0
             try:
                 pack_t0 = _time_mod.perf_counter()
@@ -1084,6 +1125,7 @@ class CudaIPCConnector(OmniConnectorBase):
             pack_sync_ms=round(pack_sync_ms, 3),
             descriptor_ser_ms=round(descriptor_ser_ms, 3),
             producer_order_wait_ms=round(producer_order_wait_ms, 3),
+            producer_order_mode=producer_order_mode,
             event_record_ms=round(event_record_ms, 3),
             ring_publish_ms=round(ring_publish_ms, 3),
             producer_stream_registered=self._producer_stream is not None,
