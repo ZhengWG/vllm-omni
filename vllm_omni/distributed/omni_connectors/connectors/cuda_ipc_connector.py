@@ -211,6 +211,22 @@ class CudaIPCConnector(OmniConnectorBase):
                 _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS", default=False),
             )
         )
+        # Optional async D2H path for inline CUDA payloads. When enabled and
+        # inline_cuda_tensors=1, tiny CUDA tensors are staged to CPU on a
+        # sender copy stream (ordered by producer event/stream) before ring
+        # publish, avoiding default-stream serializer stalls.
+        self._inline_cuda_async_d2h = bool(
+            config.get(
+                "inline_cuda_async_d2h",
+                _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_ASYNC_D2H", default=True),
+            )
+        )
+        self._inline_cuda_pin_memory = bool(
+            config.get(
+                "inline_cuda_pin_memory",
+                _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_PIN_MEMORY", default=True),
+            )
+        )
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         self._ring_body_max = int(config.get("ring_body_max", 524288))
         self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
@@ -780,6 +796,34 @@ class CudaIPCConnector(OmniConnectorBase):
             }
         return obj
 
+    def _walk_copy_cuda_to_cpu_inline(self, obj: Any, pin_memory: bool) -> Any:
+        """Recursively stage CUDA tensors to CPU for inline serialization.
+
+        Called from a ``with torch.cuda.stream(copy_stream)`` context so each
+        cuda->cpu ``copy_(..., non_blocking=True)`` is enqueued on the sender
+        copy stream after producer ordering fences.
+        """
+        if isinstance(obj, torch.Tensor):
+            if obj.is_cuda:
+                src = obj.detach()
+                dst = torch.empty_like(src, device="cpu", pin_memory=pin_memory)
+                dst.copy_(src, non_blocking=True)
+                return dst
+            return obj.detach()
+        if isinstance(obj, dict):
+            return {k: self._walk_copy_cuda_to_cpu_inline(v, pin_memory) for k, v in obj.items()}
+        if isinstance(obj, list):
+            return [self._walk_copy_cuda_to_cpu_inline(v, pin_memory) for v in obj]
+        if isinstance(obj, tuple):
+            return tuple(self._walk_copy_cuda_to_cpu_inline(v, pin_memory) for v in obj)
+        if hasattr(obj, "__struct_fields__"):
+            return {
+                f: self._walk_copy_cuda_to_cpu_inline(getattr(obj, f), pin_memory)
+                for f in obj.__struct_fields__
+                if getattr(obj, f) is not None
+            }
+        return obj
+
     def _decode_pool_tensor(
         self,
         meta: dict[str, Any],
@@ -945,9 +989,19 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             kh = key_hash16(composite_key)
             est_nbytes = self._estimate_nbytes(data)
+            producer_event = self._consume_producer_event()
             force_pool_for_cuda = est_nbytes > 0 and not self._inline_cuda_tensors
             if est_nbytes < self._inline_threshold and not force_pool_for_cuda:
-                result = self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
+                result = self._put_inline(
+                    from_stage,
+                    to_stage,
+                    put_key,
+                    composite_key,
+                    data,
+                    kh,
+                    producer_event=producer_event,
+                    has_cuda_tensors=est_nbytes > 0,
+                )
                 route = "inline"
             else:
                 result = self._put_pool(
@@ -957,7 +1011,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     composite_key,
                     data,
                     kh,
-                    self._consume_producer_event(),
+                    producer_event,
                 )
                 route = "pool"
             elapsed_ms = (_time_mod.perf_counter() - t0) * 1000.0
@@ -969,6 +1023,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 route=route,
                 est_nbytes=est_nbytes,
                 force_pool_for_cuda=force_pool_for_cuda,
+                inline_cuda_tensors=self._inline_cuda_tensors,
                 ok=result[0],
                 wire_size=result[1],
                 cpu_fallback=bool(isinstance(meta, dict) and meta.get("cpu_fallback")),
@@ -979,10 +1034,58 @@ class CudaIPCConnector(OmniConnectorBase):
             logger.error("CudaIPCConnector control-plane put failed for %s: %s", put_key, e, exc_info=True)
             return False, 0, None
 
-    def _put_inline(self, from_stage, to_stage, put_key, composite_key, data, kh):
+    def _put_inline(
+        self,
+        from_stage,
+        to_stage,
+        put_key,
+        composite_key,
+        data,
+        kh,
+        producer_event: torch.cuda.Event | None = None,
+        has_cuda_tensors: bool = False,
+    ):
         t0 = _time_mod.perf_counter()
-        # Serialize (a cheap D2H for a tiny GPU tensor) straight into the ring body.
-        payload = self.serialize_obj(data)
+        sender_copy_stream_count = max(1, len(self._sender_copy_streams))
+        sender_copy_stream_idx = 0
+        producer_order_wait_ms = 0.0
+        producer_order_mode = "none"
+        d2h_enqueue_ms = 0.0
+        d2h_wait_sync_ms = 0.0
+        serialize_ms = 0.0
+        used_async_cuda_d2h = bool(has_cuda_tensors and self._inline_cuda_async_d2h)
+        # Serialize to ring body. For CUDA-bearing inline payloads, optionally
+        # stage tensors to CPU on a sender copy stream first to avoid default-
+        # stream serializer stalls from implicit tensor.detach().cpu().
+        if used_async_cuda_d2h:
+            copy_stream, sender_copy_stream_idx = self._next_sender_copy_stream()
+            producer_wait_t0 = _time_mod.perf_counter()
+            if producer_event is not None:
+                copy_stream.wait_event(producer_event)
+                producer_order_mode = "event"
+            elif self._producer_stream is not None:
+                copy_stream.wait_stream(self._producer_stream)
+                producer_order_mode = "stream"
+            else:
+                self._maybe_warn_ambient_fallback()
+                self._compute_event.record()
+                copy_stream.wait_event(self._compute_event)
+                producer_order_mode = "ambient"
+            producer_order_wait_ms = (_time_mod.perf_counter() - producer_wait_t0) * 1000.0
+            d2h_enqueue_t0 = _time_mod.perf_counter()
+            with torch.cuda.stream(copy_stream):
+                cpu_data = self._walk_copy_cuda_to_cpu_inline(data, pin_memory=self._inline_cuda_pin_memory)
+            d2h_enqueue_ms = (_time_mod.perf_counter() - d2h_enqueue_t0) * 1000.0
+            d2h_wait_t0 = _time_mod.perf_counter()
+            copy_stream.synchronize()
+            d2h_wait_sync_ms = (_time_mod.perf_counter() - d2h_wait_t0) * 1000.0
+            serialize_t0 = _time_mod.perf_counter()
+            payload = self.serialize_obj(cpu_data)
+            serialize_ms = (_time_mod.perf_counter() - serialize_t0) * 1000.0
+        else:
+            serialize_t0 = _time_mod.perf_counter()
+            payload = self.serialize_obj(data)
+            serialize_ms = (_time_mod.perf_counter() - serialize_t0) * 1000.0
         if len(payload) > self._ring.body_max:
             result = self._put_cpu_fallback(
                 from_stage, to_stage, put_key, composite_key, data, reason=f"inline_too_big {len(payload)}"
@@ -993,6 +1096,15 @@ class CudaIPCConnector(OmniConnectorBase):
                 key=put_key,
                 payload_bytes=len(payload),
                 outcome="cpu_fallback",
+                has_cuda_tensors=has_cuda_tensors,
+                used_async_cuda_d2h=used_async_cuda_d2h,
+                producer_order_mode=producer_order_mode,
+                producer_order_wait_ms=round(producer_order_wait_ms, 3),
+                d2h_enqueue_ms=round(d2h_enqueue_ms, 3),
+                d2h_wait_sync_ms=round(d2h_wait_sync_ms, 3),
+                serialize_ms=round(serialize_ms, 3),
+                sender_copy_stream_idx=sender_copy_stream_idx,
+                sender_copy_streams=sender_copy_stream_count,
             )
             return result
         try:
@@ -1007,6 +1119,15 @@ class CudaIPCConnector(OmniConnectorBase):
                 key=put_key,
                 payload_bytes=len(payload),
                 outcome="ring_full_fallback",
+                has_cuda_tensors=has_cuda_tensors,
+                used_async_cuda_d2h=used_async_cuda_d2h,
+                producer_order_mode=producer_order_mode,
+                producer_order_wait_ms=round(producer_order_wait_ms, 3),
+                d2h_enqueue_ms=round(d2h_enqueue_ms, 3),
+                d2h_wait_sync_ms=round(d2h_wait_sync_ms, 3),
+                serialize_ms=round(serialize_ms, 3),
+                sender_copy_stream_idx=sender_copy_stream_idx,
+                sender_copy_streams=sender_copy_stream_count,
             )
             return result
         self._metrics["puts"] += 1
@@ -1017,6 +1138,15 @@ class CudaIPCConnector(OmniConnectorBase):
             key=put_key,
             payload_bytes=len(payload),
             outcome="ring_publish",
+            has_cuda_tensors=has_cuda_tensors,
+            used_async_cuda_d2h=used_async_cuda_d2h,
+            producer_order_mode=producer_order_mode,
+            producer_order_wait_ms=round(producer_order_wait_ms, 3),
+            d2h_enqueue_ms=round(d2h_enqueue_ms, 3),
+            d2h_wait_sync_ms=round(d2h_wait_sync_ms, 3),
+            serialize_ms=round(serialize_ms, 3),
+            sender_copy_stream_idx=sender_copy_stream_idx,
+            sender_copy_streams=sender_copy_stream_count,
         )
         return True, len(payload), {"ring": True, "size": len(payload)}
 

@@ -68,6 +68,9 @@ if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
   # Route CUDA-bearing payloads through pool by default to avoid inline-path
   # implicit D2H sync spikes on tensor.detach().cpu() serialization.
   export VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS="${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS:-0}"
+  # When inline CUDA payloads are enabled, stage D2H on sender copy stream
+  # (ordered by producer event/stream) before ring publish.
+  export VLLM_OMNI_CUDA_IPC_INLINE_CUDA_ASYNC_D2H="${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_ASYNC_D2H:-1}"
   # Benchmark-oriented default: do not make pool-get copy stream wait the
   # receiver current stream before D2D decode (improves overlap).
   export VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM="${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-0}"
@@ -107,6 +110,7 @@ echo "  profile_logs   : ${ENABLE_PROFILE_LOGS}"
 echo "  shm_compat_on_miss : ${VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS:-<default>}"
 echo "  put_pool_blocking_sync : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC:-<default>}"
 echo "  inline_cuda_tensors : ${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS:-<default>}"
+echo "  inline_cuda_async_d2h : ${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_ASYNC_D2H:-<default>}"
 echo "  get_pool_wait_current_stream : ${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-<default>}"
 echo "  put_pool_copy_streams : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS:-<default>}"
 echo "  put_pool_async_inflight_limit : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT:-<default>}"
