@@ -140,4 +140,10 @@ def event_query(lib, event) -> bool:
     # cudaErrorNotReady
     if ret == 34:
         return False
+    # Some CUDA IPC/interprocess events cannot be queried from the importing
+    # process (observed as cudaErrorNotPermitted=600). Treat as "ready" so the
+    # caller falls back to the normal stream-wait path instead of surfacing an
+    # error from an optional optimization.
+    if ret == 600:
+        return True
     raise RuntimeError(f"cudaEventQuery failed: {ret}")
