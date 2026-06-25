@@ -469,11 +469,11 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
                 # Build the wire-side mm payload for the engine-core → API
                 # msgspec hop. When this stage has a downstream connector
-                # actively taking the tensor data via its pool path, the
-                # engine-core only needs to forward token / metadata
-                # fields downstream. Stripping GPU tensors *before*
-                # OmniEngineCoreOutput is constructed removes the
-                # dominant TTFT/E2EL tax under c≥4 IPC keep_on_gpu:
+                # actively taking tensor data via its pool path, the
+                # engine-core only needs to carry a tiny tensor sentinel
+                # per key to satisfy the wire schema. Stripping large GPU
+                # tensors *before* OmniEngineCoreOutput is constructed
+                # removes the dominant TTFT/E2EL tax under c≥4 IPC keep_on_gpu:
                 # ``OmniMsgpackEncoder._encode_tensor`` calls
                 # ``tensor.detach().cpu()`` synchronously on the
                 # ``process_output_sockets`` thread, blocking on the
@@ -482,7 +482,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 # ``save_async`` call below still receives the original
                 # ``mm_output`` reference, so the downstream stage
                 # rebuilds tensors from the connector pool as before;
-                # only the redundant msgspec hop is short-circuited.
+                # only the redundant msgspec hop payload size is reduced.
                 wire_mm_output = mm_output
                 if (
                     mm_output is not None

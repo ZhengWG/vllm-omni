@@ -18,7 +18,6 @@ import pytest
 import torch
 
 from vllm_omni.utils.mm_outputs import (
-    _STRIPPED_GPU_TENSOR_MARKER,
     _detach_tensor,
     build_mm_cpu,
     strip_gpu_tensors_for_engine_output,
@@ -198,15 +197,15 @@ def _gpu_like(*shape: int, dtype: torch.dtype = torch.float32) -> _CudaLikeTenso
     return _CudaLikeTensor(torch.zeros(*shape, dtype=dtype))
 
 
-def test_strip_replaces_cuda_tensor_with_descriptor_dict():
+def test_strip_replaces_cuda_tensor_with_cpu_tensor_sentinel():
     src = _gpu_like(128, 256, dtype=torch.bfloat16)
 
     out = strip_gpu_tensors_for_engine_output(src)
 
-    assert isinstance(out, dict)
-    assert out[_STRIPPED_GPU_TENSOR_MARKER] is True
-    assert out["shape"] == [128, 256]
-    assert out["dtype"] == "bfloat16"
+    assert isinstance(out, torch.Tensor)
+    assert out.device.type == "cpu"
+    assert out.dtype == torch.bfloat16
+    assert out.numel() == 0
 
 
 def test_strip_passes_cpu_tensor_through_unchanged():
@@ -236,18 +235,18 @@ def test_strip_walks_dict_and_list_recursively():
 
     out = strip_gpu_tensors_for_engine_output(payload)
 
-    assert isinstance(out["embed"], dict) and out["embed"][_STRIPPED_GPU_TENSOR_MARKER] is True
-    assert isinstance(out["tts_bos"], dict) and out["tts_bos"]["shape"] == [1, 8]
+    assert isinstance(out["embed"], torch.Tensor) and out["embed"].numel() == 0 and out["embed"].device.type == "cpu"
+    assert isinstance(out["tts_bos"], torch.Tensor) and out["tts_bos"].numel() == 0
     # CPU meta dict passes through unchanged content (new dict object due to recursion).
     assert out["meta"] == cpu_meta
     assert isinstance(out["code_list"], list) and len(out["code_list"]) == 3
-    assert out["code_list"][0][_STRIPPED_GPU_TENSOR_MARKER] is True
-    assert out["code_list"][1][_STRIPPED_GPU_TENSOR_MARKER] is True
+    assert isinstance(out["code_list"][0], torch.Tensor) and out["code_list"][0].numel() == 0
+    assert isinstance(out["code_list"][1], torch.Tensor) and out["code_list"][1].numel() == 0
     # CPU tensor inside the list passes through.
     assert isinstance(out["code_list"][2], torch.Tensor)
     assert out["code_list"][2].device.type == "cpu"
     assert isinstance(out["nested_tuple"], tuple)
-    assert out["nested_tuple"][0][_STRIPPED_GPU_TENSOR_MARKER] is True
+    assert isinstance(out["nested_tuple"][0], torch.Tensor) and out["nested_tuple"][0].numel() == 0
     assert out["nested_tuple"][1] == "label"
 
 
@@ -268,6 +267,9 @@ def test_strip_does_not_mutate_input():
     # Output is a new dict.
     assert out is not payload
     assert out["embed"] is not src_tensor
+    assert isinstance(out["embed"], torch.Tensor)
+    assert out["embed"].device.type == "cpu"
+    assert out["embed"].numel() == 0
 
 
 def test_strip_handles_non_tensor_scalars_and_none():

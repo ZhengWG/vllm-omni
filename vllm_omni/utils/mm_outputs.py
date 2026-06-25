@@ -11,17 +11,8 @@ from vllm.logger import init_logger
 logger = init_logger(__name__)
 
 
-# Marker on a dict value indicating "this slot held a GPU tensor that was
-# stripped before crossing the engine-core → API msgspec boundary; the
-# real payload travelled via the connector pool". Downstream consumers
-# of ``OmniEngineCoreOutput.multimodal_output`` for non-terminal stages
-# should treat such values as opaque metadata and never call tensor
-# methods on them.
-_STRIPPED_GPU_TENSOR_MARKER = "_omni_stripped_gpu_tensor"
-
-
 def strip_gpu_tensors_for_engine_output(value: Any) -> Any:
-    """Replace CUDA tensors with msgspec-safe descriptors recursively.
+    """Replace CUDA tensors with tiny CPU tensor sentinels recursively.
 
     Why: the engine-core ``process_output_sockets`` thread serialises
     ``OmniEngineCoreOutput`` via ``OmniMsgpackEncoder``, which calls
@@ -36,8 +27,11 @@ def strip_gpu_tensors_for_engine_output(value: Any) -> Any:
 
     The fix is structural: when the actual tensor data is already
     travelling downstream via the connector pool path, the engine-core
-    msgspec hop does not need to forward the tensor at all. Strip it
-    here and let the receiver rebuild from the pool. Caller is
+    msgspec hop does not need to forward the full tensor payload. Replace
+    each CUDA tensor with an empty CPU tensor sentinel of the same dtype.
+    This preserves the wire contract
+    ``OmniEngineCoreOutput.multimodal_output: dict[str, torch.Tensor]``
+    while avoiding large D2H copies. Caller is
     responsible for gating this on "non-terminal stage with output
     connector active" — see the call site in ``omni_ar_scheduler``.
 
@@ -46,19 +40,14 @@ def strip_gpu_tensors_for_engine_output(value: Any) -> Any:
     is never mutated, so the connector's ``save_async`` callsite still
     sees the original GPU tensor refs.
 
-    Each stripped GPU tensor is replaced by a small descriptor dict
-    carrying ``shape`` and ``dtype`` (rather than ``None``) so any
-    downstream metric/trace path that reads the value can still tell
-    "this was a tensor of shape X, stripped because it's on the
-    connector path" without crashing on a missing attribute.
+    The sentinel contains no payload bytes (numel=0), so msgpack encode
+    overhead stays near-zero versus the original large CUDA tensor.
     """
     if isinstance(value, torch.Tensor):
         if value.device.type == "cuda":
-            return {
-                _STRIPPED_GPU_TENSOR_MARKER: True,
-                "shape": list(value.shape),
-                "dtype": str(value.dtype).removeprefix("torch."),
-            }
+            # Preserve the tensor-typed wire schema expected by msgspec
+            # decoding of ``OmniEngineCoreOutput.multimodal_output``.
+            return torch.empty((0,), dtype=value.dtype, device="cpu")
         return value
     if isinstance(value, Mapping):
         return {k: strip_gpu_tensors_for_engine_output(v) for k, v in value.items()}
