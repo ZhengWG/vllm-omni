@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import importlib
+import os
+import time
 from collections import defaultdict, deque
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -18,6 +20,35 @@ from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
 logger = get_connector_logger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; fallback to %.3f", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; fallback to %d", name, raw, default)
+        return default
 
 
 class OmniChunkTransferAdapter(OmniTransferAdapterBase):
@@ -96,6 +127,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._held_non_active: deque[Any] = deque()
         self.requests_num_chunks_sent: dict[str, int] = defaultdict(int)
         self._pending_streaming_prefills: dict[str, dict] = {}
+        self._save_profile_log_enabled = _env_bool("VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG", default=False)
+        self._save_profile_log_threshold_ms = _env_float("VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS", 2.0)
+        self._save_profile_log_every_n = max(1, _env_int("VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N", 64))
+        self._save_profile_log_counter = 0
+        self._producer_stream_registered = False
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -208,15 +244,59 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
+        self._maybe_register_output_producer_stream()
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
             "is_finished": is_finished,
             "is_segment_finished": is_segment_finished,
+            "_save_first_enqueued_ns": time.perf_counter_ns(),
+            "_save_enqueued_ns": time.perf_counter_ns(),
         }
         self._pending_save_reqs.append(task)
         with self._save_cond:
             self._save_cond.notify()
+
+    def _should_save_profile_log(self, elapsed_ms: float) -> bool:
+        if elapsed_ms >= self._save_profile_log_threshold_ms:
+            return True
+        if not self._save_profile_log_enabled:
+            return False
+        self._save_profile_log_counter += 1
+        return (self._save_profile_log_counter % self._save_profile_log_every_n) == 0
+
+    def _save_profile_log(self, phase: str, elapsed_ms: float, **fields: Any) -> None:
+        if not self._should_save_profile_log(elapsed_ms):
+            return
+        details = " ".join(f"{k}={v}" for k, v in sorted(fields.items()))
+        logger.info(
+            "[Stage-%s] OmniConnector save_profile phase=%s elapsed_ms=%.3f %s",
+            getattr(self.connector, "stage_id", "?"),
+            phase,
+            elapsed_ms,
+            details,
+        )
+
+    def _maybe_register_output_producer_stream(self) -> None:
+        if self._producer_stream_registered:
+            return
+        connector = getattr(self, "output_connector", None)
+        register = getattr(connector, "register_producer_stream", None)
+        if not callable(register):
+            self._producer_stream_registered = True
+            return
+        if not torch.cuda.is_available():
+            self._producer_stream_registered = True
+            return
+        try:
+            register(torch.cuda.current_stream())
+            self._producer_stream_registered = True
+        except Exception:
+            logger.warning(
+                "Failed to register producer stream on output connector %s in chunk adapter.",
+                type(connector).__name__,
+                exc_info=True,
+            )
 
     def _poll_single_request(self, request: Request):
         stage_id = int(self.connector.stage_id)
@@ -358,11 +438,31 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         if self.output_connector is None:
             return
+        now_ns = time.perf_counter_ns()
+        queue_wait_ms = 0.0
+        total_age_ms = 0.0
+        queued_ns = task.get("_save_enqueued_ns")
+        first_ns = task.get("_save_first_enqueued_ns")
+        if isinstance(queued_ns, int) and queued_ns > 0:
+            queue_wait_ms = (now_ns - queued_ns) / 1_000_000.0
+        if isinstance(first_ns, int) and first_ns > 0:
+            total_age_ms = (now_ns - first_ns) / 1_000_000.0
+        put_t0 = time.perf_counter()
         success, size, metadata = self.output_connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,
             data=payload_data,
+        )
+        put_ms = (time.perf_counter() - put_t0) * 1000.0
+        self._save_profile_log(
+            "send_task",
+            put_ms,
+            key=connector_put_key,
+            success=success,
+            size=size,
+            queue_wait_ms=round(queue_wait_ms, 3),
+            total_age_ms=round(total_age_ms, 3),
         )
 
         if success:

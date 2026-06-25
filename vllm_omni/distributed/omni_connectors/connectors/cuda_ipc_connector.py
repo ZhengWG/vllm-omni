@@ -1179,6 +1179,7 @@ class CudaIPCConnector(OmniConnectorBase):
             descriptor_decode_t0 = _time_mod.perf_counter()
             raw = OmniSerializer.deserialize(body)
             descriptor_decode_ms = (_time_mod.perf_counter() - descriptor_decode_t0) * 1000.0
+            event_source = "descriptor" if "event_handle" in raw else "header"
             event_handle = raw.get("event_handle", event_handle)
             if event_handle is not None and not isinstance(event_handle, bytes):
                 event_handle = bytes(event_handle)
@@ -1236,6 +1237,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 event_wait_enqueue_ms=round(event_wait_enqueue_ms, 3),
                 board_release_ms=round(board_release_ms, 3),
                 recv_ingress_ms=round(recv_ingress_ms, 3),
+                event_source=event_source,
                 wait_current_stream=self._get_pool_wait_current_stream,
             )
             return obj, len(body)
