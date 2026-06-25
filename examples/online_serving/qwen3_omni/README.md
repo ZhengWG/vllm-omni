@@ -425,7 +425,7 @@ count and pool credits).
 
 For save-loop payload construction, the IPC server script defaults:
 
-- `VLLM_OMNI_CONNECTOR_SAVE_WORKERS=4`
+- `VLLM_OMNI_CONNECTOR_SAVE_WORKERS=8`
 
 This parallelizes `custom_process` / inline CPU serialization across requests,
 while keeping each request's chunks ordered and serializing the final

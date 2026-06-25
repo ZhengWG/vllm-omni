@@ -81,7 +81,7 @@ if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
   # Parallelize save-loop payload construction while keeping connector.put()
   # serialized per connector. This overlaps inline CPU serialization and
   # custom_process work across requests without reordering chunks per request.
-  export VLLM_OMNI_CONNECTOR_SAVE_WORKERS="${VLLM_OMNI_CONNECTOR_SAVE_WORKERS:-4}"
+  export VLLM_OMNI_CONNECTOR_SAVE_WORKERS="${VLLM_OMNI_CONNECTOR_SAVE_WORKERS:-8}"
 fi
 
 cmd=(
