@@ -97,6 +97,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self.input_connector = self.output_connector = self.create_connector(model_config)
         # Backward compatibility: `self.connector` may be used for shared attrs.
         self.connector = self.input_connector or self.output_connector
+        # OmniTransferAdapterBase starts save_loop during super().__init__().
+        # Initialize fields read by the overridden save_loop before that thread
+        # can run.
+        self._save_worker_count = max(1, _env_int("VLLM_OMNI_CONNECTOR_SAVE_WORKERS", 1))
+        self._output_put_lock = threading.Lock()
+        self._save_inflight_keys: set[str] = set()
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -134,9 +140,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._save_profile_log_every_n = max(1, _env_int("VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N", 64))
         self._save_profile_log_counter = 0
         self._producer_stream_registered = False
-        self._save_worker_count = max(1, _env_int("VLLM_OMNI_CONNECTOR_SAVE_WORKERS", 1))
-        self._output_put_lock = threading.Lock()
-        self._save_inflight_keys: set[str] = set()
 
     @staticmethod
     def _is_truthy_scalar(value: Any) -> bool:
@@ -291,12 +294,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         serialized in _send_single_request because CudaIPCConnector has a
         single control ring and one-shot producer-event slot per connector.
         """
-        if self._save_worker_count <= 1:
+        save_worker_count = int(getattr(self, "_save_worker_count", 1) or 1)
+        if save_worker_count <= 1:
             return super().save_loop()
 
         futures: dict[Future, tuple[str, dict]] = {}
         with ThreadPoolExecutor(
-            max_workers=self._save_worker_count,
+            max_workers=save_worker_count,
             thread_name_prefix="omni-save-worker",
         ) as executor:
             while not self.stop_event.is_set():
@@ -311,7 +315,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
                 dispatched = False
                 with self._save_cond:
-                    while len(futures) < self._save_worker_count and self._pending_save_reqs:
+                    while len(futures) < save_worker_count and self._pending_save_reqs:
                         n_pending = len(self._pending_save_reqs)
                         selected_task = None
                         selected_key = None
