@@ -428,6 +428,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
         connector_put_key = f"{external_req_id}_{stage_id}_{chunk_id}"
+        producer_event = task.get("_producer_event")
+        if isinstance(producer_event, torch.cuda.Event):
+            # Ensure any CUDA work done while constructing the connector payload
+            # (e.g. talker->code2wav torch.cat/reshape on codec codes) is
+            # ordered after the model output tensors it reads.
+            torch.cuda.current_stream().wait_event(producer_event)
         # Process payload in save_loop thread
         payload_data: OmniPayloadStruct | None = None
         if self.custom_process_next_stage_input_func:
@@ -458,14 +464,12 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
         register_producer_event = getattr(self.output_connector, "register_producer_event", None)
         if callable(register_producer_event):
-            # Prefer producer-thread event (recorded in save_async) so
-            # connector.put() fences copy_stream behind the model write stream.
-            # Save-thread event is only a fallback when producer event is absent.
-            producer_event = task.get("_producer_event")
-            if not isinstance(producer_event, torch.cuda.Event):
-                producer_event = self._record_current_stream_event_if_cuda()
+            # Fence connector.put() after *payload construction* on the save
+            # thread. This covers tensors created by custom_process itself,
+            # not only tensors produced by the model runner before save_async().
+            payload_ready_event = self._record_current_stream_event_if_cuda()
             try:
-                register_producer_event(producer_event)
+                register_producer_event(payload_ready_event)
             except Exception:
                 logger.debug("register_producer_event failed for key=%s", connector_put_key, exc_info=True)
         now_ns = time.perf_counter_ns()
