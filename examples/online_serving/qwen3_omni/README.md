@@ -375,6 +375,16 @@ VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC=1 \
 bash run_server_connector_perf.sh ipc
 ```
 
+By default the IPC server script sets `VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=0`,
+so payloads that contain CUDA tensors use the pool route even when small.
+This avoids inline serialization's implicit `tensor.detach().cpu()` sync spikes.
+Set to `1` only for A/B:
+
+```bash
+VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=1 \
+bash run_server_connector_perf.sh ipc
+```
+
 It also defaults `VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=0` to avoid
 receiver-side pre-copy stream waits in pool-get (better overlap). Set to `1`
 to restore strict wait behavior:

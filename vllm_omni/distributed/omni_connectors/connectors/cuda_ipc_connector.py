@@ -201,6 +201,16 @@ class CudaIPCConnector(OmniConnectorBase):
         # transmit, so must not create a same-named ring). Injected by the stage worker.
         self._is_transfer_rank = bool(config.get("is_transfer_rank", True))
         self._inline_threshold = int(config.get("inline_threshold_bytes", 16384))
+        # Inline route serializes payload on CPU. For CUDA tensors this invokes
+        # tensor.detach().cpu() and can block on producer-stream completion.
+        # Default to routing CUDA-bearing payloads through pool (D2D path) to
+        # avoid large inline put tail latencies from implicit D2H sync.
+        self._inline_cuda_tensors = bool(
+            config.get(
+                "inline_cuda_tensors",
+                _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS", default=False),
+            )
+        )
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         self._ring_body_max = int(config.get("ring_body_max", 524288))
         self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
@@ -935,7 +945,8 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             kh = key_hash16(composite_key)
             est_nbytes = self._estimate_nbytes(data)
-            if est_nbytes < self._inline_threshold:
+            force_pool_for_cuda = est_nbytes > 0 and not self._inline_cuda_tensors
+            if est_nbytes < self._inline_threshold and not force_pool_for_cuda:
                 result = self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
                 route = "inline"
             else:
@@ -957,6 +968,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 key=put_key,
                 route=route,
                 est_nbytes=est_nbytes,
+                force_pool_for_cuda=force_pool_for_cuda,
                 ok=result[0],
                 wire_size=result[1],
                 cpu_fallback=bool(isinstance(meta, dict) and meta.get("cpu_fallback")),
