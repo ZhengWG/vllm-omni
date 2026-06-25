@@ -1145,10 +1145,21 @@ class Qwen3OmniMoeForConditionalGeneration(
             tts_pad_embed.device
         )  # [t, d]
 
+        def _pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
+            if x.shape[0] >= rows:
+                return x[:rows]
+            pad = torch.zeros(
+                (rows - x.shape[0], x.shape[1]),
+                device=x.device,
+                dtype=x.dtype,
+            )
+            return torch.cat((x, pad), dim=0)
+
         # [3 tokens] + [4 pad] + [1 BOS] + [1 first text] = 9 tokens
+        assistant_prefix = _pad_rows(assistant_hidden, 3)
         assistant_text_hidden = torch.cat(
             (
-                assistant_hidden[:3],
+                assistant_prefix,
                 tts_pad_embed.expand(4, -1),
                 tts_bos_embed,
                 assistant_hidden[3:4]
