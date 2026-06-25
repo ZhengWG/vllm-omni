@@ -1075,6 +1075,8 @@ class CudaIPCConnector(OmniConnectorBase):
         inline_cuda_to_cpu_ms = 0.0
         inline_cuda_tensors = 0
         inline_cuda_nbytes = 0
+        serialize_ms = 0.0
+        ring_publish_ms = 0.0
         inline_payload_obj = data
         inline_cuda_nbytes = est_nbytes if isinstance(est_nbytes, int) and est_nbytes >= 0 else self._estimate_nbytes(data)
         if inline_cuda_nbytes > 0:
@@ -1084,7 +1086,9 @@ class CudaIPCConnector(OmniConnectorBase):
             inline_payload_obj, inline_cuda_tensors, inline_cuda_nbytes = self._walk_copy_cuda_to_cpu_inline(data)
             inline_cuda_to_cpu_ms = (_time_mod.perf_counter() - inline_d2h_t0) * 1000.0
         # Serialize (a cheap D2H for a tiny GPU tensor) straight into the ring body.
+        serialize_t0 = _time_mod.perf_counter()
         payload = self.serialize_obj(inline_payload_obj)
+        serialize_ms = (_time_mod.perf_counter() - serialize_t0) * 1000.0
         if len(payload) > self._ring.body_max:
             result = self._put_cpu_fallback(
                 from_stage,
@@ -1103,14 +1107,17 @@ class CudaIPCConnector(OmniConnectorBase):
                 producer_order_mode=producer_order_mode,
                 producer_order_wait_ms=round(producer_order_wait_ms, 3),
                 inline_cuda_to_cpu_ms=round(inline_cuda_to_cpu_ms, 3),
+                serialize_ms=round(serialize_ms, 3),
                 inline_cuda_tensors=inline_cuda_tensors,
                 inline_cuda_nbytes=inline_cuda_nbytes,
             )
             return result
         try:
+            ring_publish_t0 = _time_mod.perf_counter()
             self._ring.publish(
                 kh, RING_PCLASS_INLINE, payload, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
             )
+            ring_publish_ms = (_time_mod.perf_counter() - ring_publish_t0) * 1000.0
         except RingFullError:
             result = self._put_cpu_fallback(
                 from_stage,
@@ -1129,6 +1136,8 @@ class CudaIPCConnector(OmniConnectorBase):
                 producer_order_mode=producer_order_mode,
                 producer_order_wait_ms=round(producer_order_wait_ms, 3),
                 inline_cuda_to_cpu_ms=round(inline_cuda_to_cpu_ms, 3),
+                serialize_ms=round(serialize_ms, 3),
+                ring_publish_ms=round(ring_publish_ms, 3),
                 inline_cuda_tensors=inline_cuda_tensors,
                 inline_cuda_nbytes=inline_cuda_nbytes,
             )
@@ -1144,6 +1153,8 @@ class CudaIPCConnector(OmniConnectorBase):
             producer_order_mode=producer_order_mode,
             producer_order_wait_ms=round(producer_order_wait_ms, 3),
             inline_cuda_to_cpu_ms=round(inline_cuda_to_cpu_ms, 3),
+            serialize_ms=round(serialize_ms, 3),
+            ring_publish_ms=round(ring_publish_ms, 3),
             inline_cuda_tensors=inline_cuda_tensors,
             inline_cuda_nbytes=inline_cuda_nbytes,
         )

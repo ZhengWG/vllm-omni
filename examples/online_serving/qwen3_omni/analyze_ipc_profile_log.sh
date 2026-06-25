@@ -119,6 +119,12 @@ def show(name, xs):
 
 
 s0_inline = []
+s0_inline_producer_order_wait = []
+s0_inline_cuda_to_cpu = []
+s0_inline_serialize = []
+s0_inline_ring_publish = []
+s0_inline_cuda_tensors = []
+s0_inline_cuda_nbytes = []
 s0_pool_cp = []
 s0_put_pool = []
 s0_pack = []
@@ -134,6 +140,13 @@ s0_async_inflight_depth = []
 s0_sender_copy_stream_idx = []
 s0_sender_copy_streams = []
 s1_put_pool = []
+s1_inline = []
+s1_inline_producer_order_wait = []
+s1_inline_cuda_to_cpu = []
+s1_inline_serialize = []
+s1_inline_ring_publish = []
+s1_inline_cuda_tensors = []
+s1_inline_cuda_nbytes = []
 s1_pack = []
 s1_desc = []
 s1_credit = []
@@ -206,6 +219,21 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
             elif route == "pool":
                 s0_pool_cp.append(elapsed)
 
+        if phase == "put_inline" and stage == "0" and kv.get("outcome") == "ring_publish":
+            s0_inline.append(elapsed)
+            if "producer_order_wait_ms" in kv:
+                s0_inline_producer_order_wait.append(float(kv["producer_order_wait_ms"]))
+            if "inline_cuda_to_cpu_ms" in kv:
+                s0_inline_cuda_to_cpu.append(float(kv["inline_cuda_to_cpu_ms"]))
+            if "serialize_ms" in kv:
+                s0_inline_serialize.append(float(kv["serialize_ms"]))
+            if "ring_publish_ms" in kv:
+                s0_inline_ring_publish.append(float(kv["ring_publish_ms"]))
+            if "inline_cuda_tensors" in kv:
+                s0_inline_cuda_tensors.append(float(kv["inline_cuda_tensors"]))
+            if "inline_cuda_nbytes" in kv:
+                s0_inline_cuda_nbytes.append(float(kv["inline_cuda_nbytes"]))
+
         if phase == "put_pool" and stage == "0" and kv.get("outcome") == "ring_publish":
             s0_put_pool.append(elapsed)
             if "pack_sync_ms" in kv:
@@ -255,6 +283,21 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 s1_async_backpressure_wait_events.append(float(kv["async_backpressure_wait_events"]))
             if "async_inflight_depth" in kv:
                 s1_async_inflight_depth.append(float(kv["async_inflight_depth"]))
+
+        if phase == "put_inline" and stage == "1" and kv.get("outcome") == "ring_publish":
+            s1_inline.append(elapsed)
+            if "producer_order_wait_ms" in kv:
+                s1_inline_producer_order_wait.append(float(kv["producer_order_wait_ms"]))
+            if "inline_cuda_to_cpu_ms" in kv:
+                s1_inline_cuda_to_cpu.append(float(kv["inline_cuda_to_cpu_ms"]))
+            if "serialize_ms" in kv:
+                s1_inline_serialize.append(float(kv["serialize_ms"]))
+            if "ring_publish_ms" in kv:
+                s1_inline_ring_publish.append(float(kv["ring_publish_ms"]))
+            if "inline_cuda_tensors" in kv:
+                s1_inline_cuda_tensors.append(float(kv["inline_cuda_tensors"]))
+            if "inline_cuda_nbytes" in kv:
+                s1_inline_cuda_nbytes.append(float(kv["inline_cuda_nbytes"]))
 
         if phase == "get_control_plane" and stage == "1" and kv.get("pclass") == "pool":
             s1_get_pool.append(elapsed)
@@ -307,6 +350,12 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 s2_decode_finish_sync.append(float(kv["decode_finish_sync_ms"]))
 
 show("stage0 put_control_plane inline elapsed_ms", s0_inline)
+show("stage0 put_inline producer_order_wait_ms", s0_inline_producer_order_wait)
+show("stage0 put_inline inline_cuda_to_cpu_ms", s0_inline_cuda_to_cpu)
+show("stage0 put_inline serialize_ms", s0_inline_serialize)
+show("stage0 put_inline ring_publish_ms", s0_inline_ring_publish)
+show("stage0 put_inline inline_cuda_tensors", s0_inline_cuda_tensors)
+show("stage0 put_inline inline_cuda_nbytes", s0_inline_cuda_nbytes)
 show("stage0 put_control_plane pool elapsed_ms", s0_pool_cp)
 show("stage0 put_pool(ring_publish) elapsed_ms", s0_put_pool)
 show("stage0 put_pool pack_sync_ms", s0_pack)
@@ -332,6 +381,13 @@ show("stage1 put_pool ring_publish_ms", s1_ring_publish)
 show("stage1 put_pool async_backpressure_wait_ms", s1_async_backpressure_wait)
 show("stage1 put_pool async_backpressure_wait_events", s1_async_backpressure_wait_events)
 show("stage1 put_pool async_inflight_depth", s1_async_inflight_depth)
+show("stage1 put_inline elapsed_ms", s1_inline)
+show("stage1 put_inline producer_order_wait_ms", s1_inline_producer_order_wait)
+show("stage1 put_inline inline_cuda_to_cpu_ms", s1_inline_cuda_to_cpu)
+show("stage1 put_inline serialize_ms", s1_inline_serialize)
+show("stage1 put_inline ring_publish_ms", s1_inline_ring_publish)
+show("stage1 put_inline inline_cuda_tensors", s1_inline_cuda_tensors)
+show("stage1 put_inline inline_cuda_nbytes", s1_inline_cuda_nbytes)
 show("stage1 get_control_plane pool elapsed_ms", s1_get_pool)
 show("stage1 get_control_plane pool copy_sync_ms", s1_copy)
 show("stage1 get_control_plane pool copy_wait_current_stream_ms", s1_copy_wait_current)
