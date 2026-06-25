@@ -140,6 +140,9 @@ class _OmniOutputTensorSnapshot(NamedTuple):
     staged_hidden_states_cpu: torch.Tensor | None
     multimodal_outputs: Any
     async_payload: _AsyncCPUPayloadSnapshot | None = None
+    # Optional readiness event recorded on the producer (compute) stream.
+    # Background output builders should wait on this before touching GPU payloads.
+    producer_ready_event: torch.cuda.Event | None = None
     # Whether ``hidden_states`` and ``multimodal_outputs`` are already
     # snapshot copies, i.e. independent of the model's CUDA-graph reuse
     # buffers. When True the downstream output builder can skip its
@@ -1461,6 +1464,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         staged_hidden_states_cpu: torch.Tensor | None,
         multimodal_outputs: Any,
     ) -> _OmniOutputTensorSnapshot:
+        producer_ready_event: torch.cuda.Event | None = None
         if not use_async_omni_output:
             # Even without async-output snapshotting, keep_on_gpu payloads can be
             # sent by the connector save thread. Register the producer stream so
@@ -1518,11 +1522,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_snapshot = hidden_src.detach().clone()
                 cuda_sources: list[torch.Tensor] = []
                 mm_snapshot = _clone_cuda_tensor_payload(payload["multimodal_outputs"], cuda_sources)
+                producer_ready_event = torch.cuda.Event()
+                producer_ready_event.record(torch.cuda.current_stream())
             return _OmniOutputTensorSnapshot(
                 hidden_states=hidden_states_snapshot,
                 staged_hidden_states_cpu=payload.get("staged_hidden_states_cpu"),
                 multimodal_outputs=mm_snapshot,
                 async_payload=None,
+                producer_ready_event=producer_ready_event,
                 payload_is_cloned=True,
             )
 
@@ -1675,12 +1682,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         seq_len: int,
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
+        producer_ready_event: torch.cuda.Event | None = None,
         postprocess_already_applied: bool = False,
         payload_is_cloned: bool = False,
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
         connector_producer_events: list[torch.cuda.Event | None] | None = None
+
+        if producer_ready_event is not None and torch.cuda.is_available():
+            # The async snapshot clone is queued on the model's compute stream.
+            # Background output build may run on a different ambient stream/thread;
+            # add an explicit stream dependency before any payload tensor access.
+            torch.cuda.current_stream().wait_event(producer_ready_event)
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         downstream_req_ids, sparse_mm_index, audio_sparse_output = self._resolve_sparse_mm_routing(
@@ -2044,6 +2058,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     seq_len=seq_len,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
+                    producer_ready_event=output_tensor_snapshot.producer_ready_event,
                     postprocess_already_applied=omni_postprocess_already_applied,
                     payload_is_cloned=output_tensor_snapshot.payload_is_cloned,
                 )
