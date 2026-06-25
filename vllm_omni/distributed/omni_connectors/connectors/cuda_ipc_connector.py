@@ -211,6 +211,16 @@ class CudaIPCConnector(OmniConnectorBase):
                 _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS", default=False),
             )
         )
+        # Safety valve for tiny CUDA payloads: allow size-based inline route even
+        # when inline_cuda_tensors is disabled globally. This prevents severe pool
+        # credit pressure from 4KB-class payloads occupying full pool slots.
+        raw_inline_cuda_max_bytes = int(
+            config.get(
+                "inline_cuda_max_bytes",
+                _env_int("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES", default=4096),
+            )
+        )
+        self._inline_cuda_max_bytes = max(0, min(raw_inline_cuda_max_bytes, self._inline_threshold))
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         self._ring_body_max = int(config.get("ring_body_max", 524288))
         self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
@@ -945,7 +955,10 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             kh = key_hash16(composite_key)
             est_nbytes = self._estimate_nbytes(data)
-            force_pool_for_cuda = est_nbytes > 0 and not self._inline_cuda_tensors
+            inline_cuda_by_size = (
+                est_nbytes > 0 and self._inline_cuda_max_bytes > 0 and est_nbytes <= self._inline_cuda_max_bytes
+            )
+            force_pool_for_cuda = est_nbytes > 0 and not self._inline_cuda_tensors and not inline_cuda_by_size
             producer_event = self._consume_producer_event()
             if est_nbytes < self._inline_threshold and not force_pool_for_cuda:
                 result = self._put_inline(
@@ -972,6 +985,8 @@ class CudaIPCConnector(OmniConnectorBase):
                 route=route,
                 est_nbytes=est_nbytes,
                 force_pool_for_cuda=force_pool_for_cuda,
+                inline_cuda_by_size=inline_cuda_by_size,
+                inline_cuda_max_bytes=self._inline_cuda_max_bytes,
                 ok=result[0],
                 wire_size=result[1],
                 cpu_fallback=bool(isinstance(meta, dict) and meta.get("cpu_fallback")),

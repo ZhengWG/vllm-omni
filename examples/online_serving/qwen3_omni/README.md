@@ -385,6 +385,14 @@ VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=1 \
 bash run_server_connector_perf.sh ipc
 ```
 
+To avoid pool-credit pressure from tiny CUDA payloads while keeping large CUDA
+payloads on pool, the script also defaults:
+
+- `VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES=4096`
+
+This allows CUDA payloads up to 4KB to use inline route even when
+`INLINE_CUDA_TENSORS=0`. Set to `0` to disable this size-based inline escape.
+
 It also defaults `VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=0` to avoid
 receiver-side pre-copy stream waits in pool-get (better overlap). Set to `1`
 to restore strict wait behavior:
