@@ -140,7 +140,6 @@ class _OmniOutputTensorSnapshot(NamedTuple):
     staged_hidden_states_cpu: torch.Tensor | None
     multimodal_outputs: Any
     async_payload: _AsyncCPUPayloadSnapshot | None = None
-    producer_ready_event: torch.cuda.Event | None = None
     # Whether ``hidden_states`` and ``multimodal_outputs`` are already
     # snapshot copies, i.e. independent of the model's CUDA-graph reuse
     # buffers. When True the downstream output builder can skip its
@@ -1463,20 +1462,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         multimodal_outputs: Any,
     ) -> _OmniOutputTensorSnapshot:
         if not use_async_omni_output:
-            producer_ready_event = None
             # Even without async-output snapshotting, keep_on_gpu payloads can be
             # sent by the connector save thread. Register the producer stream so
             # CudaIPCConnector can fence its pack stream with wait_stream(...) and
             # avoid ambient-stream fallback ordering.
             if self._payload_keep_on_gpu:
                 self._maybe_register_keep_on_gpu_producer_stream()
-                producer_ready_event = torch.cuda.Event()
-                producer_ready_event.record(torch.cuda.current_stream())
             return _OmniOutputTensorSnapshot(
                 hidden_states=hidden_states,
                 staged_hidden_states_cpu=staged_hidden_states_cpu,
                 multimodal_outputs=multimodal_outputs,
-                producer_ready_event=producer_ready_event,
             )
 
         payload = self._build_omni_async_snapshot_payload(
@@ -1523,14 +1518,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_snapshot = hidden_src.detach().clone()
                 cuda_sources: list[torch.Tensor] = []
                 mm_snapshot = _clone_cuda_tensor_payload(payload["multimodal_outputs"], cuda_sources)
-                producer_ready_event = torch.cuda.Event()
-                producer_ready_event.record(torch.cuda.current_stream())
             return _OmniOutputTensorSnapshot(
                 hidden_states=hidden_states_snapshot,
                 staged_hidden_states_cpu=payload.get("staged_hidden_states_cpu"),
                 multimodal_outputs=mm_snapshot,
                 async_payload=None,
-                producer_ready_event=producer_ready_event,
                 payload_is_cloned=True,
             )
 
@@ -1683,7 +1675,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         seq_len: int,
         num_scheduled_tokens_np: np.ndarray,
         query_start_loc_cpu: Any,
-        producer_ready_event: torch.cuda.Event | None = None,
         postprocess_already_applied: bool = False,
         payload_is_cloned: bool = False,
     ) -> OmniModelRunnerOutput:
@@ -1816,16 +1807,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         with record_function_or_nullcontext("omni_output_builder:build_multimodal_outputs"):
             multimodal_outputs = self._build_multimodal_outputs(pooler_output)
 
-        connector_producer_events: list[torch.cuda.Event | None] | None = None
-        if self._payload_keep_on_gpu and producer_ready_event is not None:
-            # Per-request, scheduler-local signal that connector.put() should
-            # fence pool copy after the producer stream point where payload
-            # tensors became ready.
-            connector_producer_events = [None] * len(req_ids_output_copy)
-            for rid in downstream_req_id_set:
-                idx = req_id_to_index_output_copy[rid]
-                connector_producer_events[idx] = producer_ready_event
-
         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
             routed_experts_lists = None
             if self._should_return_omni_routed_experts():
@@ -1838,7 +1819,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=None,
                 multimodal_outputs=multimodal_outputs,
-                connector_producer_events=connector_producer_events,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
@@ -2056,7 +2036,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     seq_len=seq_len,
                     num_scheduled_tokens_np=num_scheduled_tokens_np,
                     query_start_loc_cpu=query_start_loc_cpu,
-                    producer_ready_event=output_tensor_snapshot.producer_ready_event,
                     postprocess_already_applied=omni_postprocess_already_applied,
                     payload_is_cloned=output_tensor_snapshot.payload_is_cloned,
                 )
