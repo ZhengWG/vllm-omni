@@ -50,6 +50,10 @@ class OmniModelRunnerOutput(ModelRunnerOutput):
     """
 
     multimodal_outputs: list[dict[str, object]] | None = None
+    # Optional per-request producer-ready events for connector send paths.
+    # Indexed by req_index (same indexing as multimodal_outputs / sampled_token_ids).
+    # Intra-process signal for Scheduler -> transfer adapter ordering.
+    connector_producer_events: list[torch.cuda.Event | None] | None = None
     # IDs of requests whose KV cache has been extracted from GPU/NPU to CPU.
     # The Scheduler can safely free the block tables for these requests.
     kv_extracted_req_ids: list[str] | None = None

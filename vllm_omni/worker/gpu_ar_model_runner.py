@@ -1680,6 +1680,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> OmniModelRunnerOutput:
         combined_hidden_states = None
         combined_multimodal_outputs = None
+        connector_producer_events: list[torch.cuda.Event | None] | None = None
 
         engine_output_type, downstream_req_ids = self._resolve_pooler_payload_req_ids(req_ids_output_copy)
         downstream_req_ids, sparse_mm_index, audio_sparse_output = self._resolve_sparse_mm_routing(
@@ -1735,6 +1736,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # The actual multimodal wire transport uses multimodal_outputs instead.
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
+            if self._payload_keep_on_gpu and torch.cuda.is_available():
+                connector_producer_events = [None] * len(req_ids_output_copy)
             mm_cpu = None
             if self.omni_prefix_cache is not None:
                 (
@@ -1796,6 +1799,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         payload_already_cloned=payload_is_cloned,
                     )
                     pooler_output.append(flatten_payload(payload))
+                    if connector_producer_events is not None:
+                        producer_event = torch.cuda.Event()
+                        producer_event.record(torch.cuda.current_stream())
+                        connector_producer_events[idx] = producer_event
 
         if pooler_output and self._should_accumulate_full_payload_output():
             with record_function_or_nullcontext("omni_output_builder:accumulate_full_payload_output"):
@@ -1819,6 +1826,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 prompt_logprobs_dict=prompt_logprobs_dict,
                 pooler_output=None,
                 multimodal_outputs=multimodal_outputs,
+                connector_producer_events=connector_producer_events,
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,

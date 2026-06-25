@@ -211,6 +211,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         multimodal_output: dict[str, Any] | None = None,
         request: Request | None = None,
         is_segment_finished: bool = False,
+        producer_event: torch.cuda.Event | None = None,
     ):
         """Build and enqueue one chunk for asynchronous sending.
 
@@ -228,6 +229,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             multimodal_output: Per-request multimodal output dictionary
             request: Request object
             is_segment_finished: whether the segment of request is finished
+            producer_event: Optional event recorded on the producer stream
+                by the model runner for this request payload.
         """
         is_finished = request.is_finished() and not request.resumable
 
@@ -244,7 +247,11 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             return
 
         self.requests_num_chunks_sent[request.external_req_id] = confirmed_num_computed_tokens
-        self._maybe_register_output_producer_stream()
+        # Prefer per-request producer events from the model runner. They
+        # provide a precise fence without relying on a global producer stream
+        # registration from this scheduler thread.
+        if producer_event is None:
+            self._maybe_register_output_producer_stream()
         task = {
             "multimodal_output": multimodal_output,
             "request": request,
@@ -254,7 +261,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             "_save_enqueued_ns": time.perf_counter_ns(),
             # Producer-thread fence point: connector.put() should prefer this
             # event so pool D2D is ordered after the model's write stream.
-            "_producer_event": self._record_current_stream_event_if_cuda(),
+            "_producer_event": producer_event or self._record_current_stream_event_if_cuda(),
         }
         self._pending_save_reqs.append(task)
         with self._save_cond:
