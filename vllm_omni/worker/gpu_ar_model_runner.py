@@ -1462,6 +1462,12 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         multimodal_outputs: Any,
     ) -> _OmniOutputTensorSnapshot:
         if not use_async_omni_output:
+            # Even without async-output snapshotting, keep_on_gpu payloads can be
+            # sent by the connector save thread. Register the producer stream so
+            # CudaIPCConnector can fence its pack stream with wait_stream(...) and
+            # avoid ambient-stream fallback ordering.
+            if self._payload_keep_on_gpu:
+                self._maybe_register_keep_on_gpu_producer_stream()
             return _OmniOutputTensorSnapshot(
                 hidden_states=hidden_states,
                 staged_hidden_states_cpu=staged_hidden_states_cpu,
