@@ -272,6 +272,17 @@ class CudaIPCConnector(OmniConnectorBase):
                 _env_bool("VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM", default=True),
             )
         )
+        # Optional deep profiling for receiver pool-get wait split.
+        # When enabled, add a synchronized wait-probe event to split
+        # copy_finish stall into:
+        #   - event_wait_sync_ms (waiting on sender event)
+        #   - decode_finish_sync_ms (decode/copy stream completion wait)
+        self._profile_wait_split = bool(
+            config.get(
+                "profile_wait_split",
+                _env_bool("VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT", default=False),
+            )
+        )
 
     def _init_runtime_state(self) -> None:
         """Locks, ring/receiver caches, metrics, lifecycle flags."""
@@ -397,9 +408,13 @@ class CudaIPCConnector(OmniConnectorBase):
                     torch.cuda.Stream(device=self.local_device) for _ in range(_DEFAULT_RECV_STREAMS)
                 ]
                 self._recv_copy_events = [torch.cuda.Event() for _ in range(_DEFAULT_RECV_STREAMS)]
+                self._recv_wait_probe_events = (
+                    [torch.cuda.Event() for _ in range(_DEFAULT_RECV_STREAMS)] if self._profile_wait_split else []
+                )
         else:
             self._recv_copy_streams = []
             self._recv_copy_events = []
+            self._recv_wait_probe_events = []
         self._recv_stream_idx = 0
 
     def _start_release_thread(self) -> None:
@@ -1195,12 +1210,21 @@ class CudaIPCConnector(OmniConnectorBase):
             copy_stream = self._recv_copy_streams[idx]
             copy_done_event = self._recv_copy_events[idx]
             event_wait_enqueue_ms = 0.0
+            event_wait_sync_ms = 0.0
             if event_handle:
                 ipc_event = self._open_ipc_event(event_handle)
                 event_wait_t0 = _time_mod.perf_counter()
                 stream_wait_event(self._cudart, copy_stream.cuda_stream, ipc_event)
                 event_wait_enqueue_ms = (_time_mod.perf_counter() - event_wait_t0) * 1000.0
             copy_t0 = _time_mod.perf_counter()
+            if self._profile_wait_split and event_handle and self._recv_wait_probe_events:
+                # Force a one-time sync point right after the stream-side wait op so
+                # we can split receiver stall into upstream-event wait vs decode finish.
+                wait_probe_event = self._recv_wait_probe_events[idx]
+                wait_probe_event.record(copy_stream)
+                wait_sync_t0 = _time_mod.perf_counter()
+                wait_probe_event.synchronize()
+                event_wait_sync_ms = (_time_mod.perf_counter() - wait_sync_t0) * 1000.0
             copy_wait_current_stream_ms = 0.0
             if self._get_pool_wait_current_stream:
                 wait_t0 = _time_mod.perf_counter()
@@ -1215,6 +1239,7 @@ class CudaIPCConnector(OmniConnectorBase):
             copy_finish_t0 = _time_mod.perf_counter()
             copy_done_event.synchronize()
             copy_finish_sync_ms = (_time_mod.perf_counter() - copy_finish_t0) * 1000.0
+            decode_finish_sync_ms = copy_finish_sync_ms if self._profile_wait_split else 0.0
             copy_sync_ms = (_time_mod.perf_counter() - copy_t0) * 1000.0
             board_release_t0 = _time_mod.perf_counter()
             self._mark_board_release(board_name, int(raw["slot_index"]))
@@ -1235,9 +1260,12 @@ class CudaIPCConnector(OmniConnectorBase):
                 descriptor_decode_ms=round(descriptor_decode_ms, 3),
                 open_pool_ms=round(open_pool_ms, 3),
                 event_wait_enqueue_ms=round(event_wait_enqueue_ms, 3),
+                event_wait_sync_ms=round(event_wait_sync_ms, 3),
                 board_release_ms=round(board_release_ms, 3),
                 recv_ingress_ms=round(recv_ingress_ms, 3),
+                decode_finish_sync_ms=round(decode_finish_sync_ms, 3),
                 event_source=event_source,
+                wait_split_profiled=self._profile_wait_split,
                 wait_current_stream=self._get_pool_wait_current_stream,
             )
             return obj, len(body)

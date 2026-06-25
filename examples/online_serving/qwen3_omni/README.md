@@ -390,6 +390,14 @@ For queueing diagnostics in the model-runner save thread, the script enables:
 - `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS=2.0`
 - `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N=64`
 
+For deeper receiver-side stall breakdown, you can opt in:
+
+- `VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT=1`
+
+This adds `event_wait_sync_ms` (upstream event wait) and
+`decode_finish_sync_ms` (post-wait decode/copy finish) to stage1 pool-get
+profiles.
+
 Run benchmark against the running server (default `c=1,4`):
 
 ```bash

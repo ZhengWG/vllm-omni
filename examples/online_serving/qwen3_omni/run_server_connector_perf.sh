@@ -52,6 +52,8 @@ if [[ "${ENABLE_PROFILE_LOGS}" == "1" ]]; then
   export VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG="${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG:-1}"
   export VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS="${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS:-2.0}"
   export VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N="${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N:-64}"
+  # Optional deep split of receiver wait (disabled by default to avoid perturbing timings).
+  export VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT="${VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT:-0}"
 fi
 
 if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
@@ -99,6 +101,7 @@ echo "  shm_compat_on_miss : ${VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS:-<defa
 echo "  put_pool_blocking_sync : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC:-<default>}"
 echo "  get_pool_wait_current_stream : ${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-<default>}"
 echo "  save_profile_log : ${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG:-<default>}"
+echo "  profile_wait_split : ${VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT:-<default>}"
 echo "  common_args    : ${COMMON_SERVER_ARGS:-<none>}"
 echo "============================================================"
 echo "Command: ${cmd[*]} $*"

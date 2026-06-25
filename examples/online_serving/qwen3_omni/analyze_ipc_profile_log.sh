@@ -136,8 +136,10 @@ s1_decode_enqueue = []
 s1_desc_decode = []
 s1_open_pool = []
 s1_event_wait_enqueue = []
+s1_event_wait_sync = []
 s1_board_release = []
 s1_recv_ingress = []
+s1_decode_finish_sync = []
 save_send_task = []
 save_queue_wait = []
 save_total_age = []
@@ -206,10 +208,14 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 s1_open_pool.append(float(kv["open_pool_ms"]))
             if "event_wait_enqueue_ms" in kv:
                 s1_event_wait_enqueue.append(float(kv["event_wait_enqueue_ms"]))
+            if "event_wait_sync_ms" in kv:
+                s1_event_wait_sync.append(float(kv["event_wait_sync_ms"]))
             if "board_release_ms" in kv:
                 s1_board_release.append(float(kv["board_release_ms"]))
             if "recv_ingress_ms" in kv:
                 s1_recv_ingress.append(float(kv["recv_ingress_ms"]))
+            if "decode_finish_sync_ms" in kv:
+                s1_decode_finish_sync.append(float(kv["decode_finish_sync_ms"]))
 
 show("stage0 put_control_plane inline elapsed_ms", s0_inline)
 show("stage0 put_control_plane pool elapsed_ms", s0_pool_cp)
@@ -229,8 +235,10 @@ show("stage1 get_control_plane pool decode_enqueue_ms", s1_decode_enqueue)
 show("stage1 get_control_plane pool descriptor_decode_ms", s1_desc_decode)
 show("stage1 get_control_plane pool open_pool_ms", s1_open_pool)
 show("stage1 get_control_plane pool event_wait_enqueue_ms", s1_event_wait_enqueue)
+show("stage1 get_control_plane pool event_wait_sync_ms", s1_event_wait_sync)
 show("stage1 get_control_plane pool board_release_ms", s1_board_release)
 show("stage1 get_control_plane pool recv_ingress_ms", s1_recv_ingress)
+show("stage1 get_control_plane pool decode_finish_sync_ms", s1_decode_finish_sync)
 show("save_loop send_task elapsed_ms", save_send_task)
 show("save_loop send_task queue_wait_ms", save_queue_wait)
 show("save_loop send_task total_age_ms", save_total_age)
