@@ -1187,33 +1187,6 @@ class Qwen3OmniMoeForConditionalGeneration(
             ),
             dim=0,
         )
-        if assistant_codec_hidden.shape[0] != assistant_text_hidden.shape[0]:
-            target_len = int(assistant_text_hidden.shape[0])
-            src_len = int(assistant_codec_hidden.shape[0])
-            logger.warning(
-                "_get_talker_assistant_parts length mismatch (text=%d codec=%d, "
-                "im_start_index=%d segment_end_index=%d); aligning codec side.",
-                target_len,
-                src_len,
-                int(im_start_index),
-                int(segment_end_index),
-            )
-            if src_len > target_len:
-                assistant_codec_hidden = assistant_codec_hidden[:target_len]
-            else:
-                pad_len = target_len - src_len
-                if pad_len > 0:
-                    assistant_codec_hidden = torch.cat(
-                        (
-                            assistant_codec_hidden,
-                            torch.zeros(
-                                (pad_len, self.config.talker_config.text_config.hidden_size),
-                                device=assistant_codec_hidden.device,
-                                dtype=assistant_codec_hidden.dtype,
-                            ),
-                        ),
-                        dim=0,
-                    )
 
         if assistant_hidden.shape[0] > 4:
             trailing_text_hidden = torch.cat(
