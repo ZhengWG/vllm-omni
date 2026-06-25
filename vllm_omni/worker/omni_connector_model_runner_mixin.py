@@ -16,6 +16,7 @@ import importlib
 import inspect
 import os
 import threading
+import time
 from collections import defaultdict, deque
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
@@ -44,6 +45,35 @@ if TYPE_CHECKING:
     )
 
 logger = init_logger(__name__)
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; fallback to %.3f", name, raw, default)
+        return default
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        logger.warning("Invalid %s=%r; fallback to %d", name, raw, default)
+        return default
 
 
 def should_accumulate_full_payload_output(model_config, custom_process_func) -> bool:
@@ -119,6 +149,12 @@ class OmniConnectorModelRunnerMixin:
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
+        self._save_profile_log_enabled = _env_bool("VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG", default=False)
+        self._save_profile_log_threshold_ms = _env_float(
+            "VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS", default=2.0
+        )
+        self._save_profile_log_every_n = max(1, _env_int("VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N", default=64))
+        self._save_profile_log_counter = 0
         _in_name = type(self._input_connector).__name__ if self._input_connector else None
         _out_name = type(self._output_connector).__name__ if self._output_connector else None
         logger.info(
@@ -1027,6 +1063,8 @@ class OmniConnectorModelRunnerMixin:
                 "put_key": connector_put_key,
                 "data": payload,
                 "request_id": req_id,
+                "_save_first_enqueued_ns": time.perf_counter_ns(),
+                "_save_enqueued_ns": time.perf_counter_ns(),
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(req_id, deque()).append(task)
@@ -1179,6 +1217,8 @@ class OmniConnectorModelRunnerMixin:
             "put_key": connector_put_key,
             "data": payload_data,
             "request_id": request_id,
+            "_save_first_enqueued_ns": time.perf_counter_ns(),
+            "_save_enqueued_ns": time.perf_counter_ns(),
         }
         with self._lock:
             self._pending_save_reqs.setdefault(request_id, deque()).append(task)
@@ -1692,6 +1732,26 @@ class OmniConnectorModelRunnerMixin:
 
     _MAX_SEND_RETRIES = 3
 
+    def _should_save_profile_log(self, elapsed_ms: float) -> bool:
+        if elapsed_ms >= self._save_profile_log_threshold_ms:
+            return True
+        if not self._save_profile_log_enabled:
+            return False
+        self._save_profile_log_counter += 1
+        return (self._save_profile_log_counter % self._save_profile_log_every_n) == 0
+
+    def _save_profile_log(self, phase: str, elapsed_ms: float, **fields: Any) -> None:
+        if not self._should_save_profile_log(elapsed_ms):
+            return
+        details = " ".join(f"{k}={v}" for k, v in sorted(fields.items()))
+        logger.info(
+            "[Stage-%s] OmniConnector save_profile phase=%s elapsed_ms=%.3f %s",
+            getattr(self, "_stage_id", "?"),
+            phase,
+            elapsed_ms,
+            details,
+        )
+
     def _save_loop(self) -> None:
         """Background thread: send outgoing data via connector."""
         while not self._stop_event.is_set():
@@ -1729,6 +1789,7 @@ class OmniConnectorModelRunnerMixin:
         req_id = task.get("request_id")
         if retry_count <= self._MAX_SEND_RETRIES:
             task["_retry_count"] = retry_count
+            task["_save_enqueued_ns"] = time.perf_counter_ns()
             logger.warning(
                 "[Stage-%s] Re-enqueuing failed send for %s (retry %d/%d)",
                 getattr(self, "_stage_id", "?"),
@@ -1979,19 +2040,40 @@ class OmniConnectorModelRunnerMixin:
                 pooling_output=task.get("pooling_output"),
             )
         put_key = task.get("put_key")
+        now_ns = time.perf_counter_ns()
+        queue_wait_ms = 0.0
+        total_age_ms = 0.0
+        queued_ns = task.get("_save_enqueued_ns")
+        first_ns = task.get("_save_first_enqueued_ns")
+        if isinstance(queued_ns, int) and queued_ns > 0:
+            queue_wait_ms = (now_ns - queued_ns) / 1_000_000.0
+        if isinstance(first_ns, int) and first_ns > 0:
+            total_age_ms = (now_ns - first_ns) / 1_000_000.0
 
+        put_t0 = time.perf_counter()
         success, _size, _metadata = connector.put(
             from_stage=str(task["stage_id"]),
             to_stage=str(task["next_stage_id"]),
             put_key=put_key,
             data=payload_data,
         )
+        put_ms = (time.perf_counter() - put_t0) * 1000.0
         logger.debug(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],
             put_key,
             success,
             _size,
+        )
+        self._save_profile_log(
+            "send_task",
+            put_ms,
+            key=put_key,
+            success=success,
+            size=_size,
+            retry_count=task.get("_retry_count", 0),
+            queue_wait_ms=round(queue_wait_ms, 3),
+            total_age_ms=round(total_age_ms, 3),
         )
 
         if not success:

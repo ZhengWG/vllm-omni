@@ -48,6 +48,10 @@ if [[ "${ENABLE_PROFILE_LOGS}" == "1" ]]; then
   export VLLM_OMNI_MSGPACK_PROFILE_TENSORS_THRESHOLD_MS="${VLLM_OMNI_MSGPACK_PROFILE_TENSORS_THRESHOLD_MS:-3.0}"
   export VLLM_OMNI_MSGPACK_PROFILE_TENSORS_THRESHOLD_BYTES="${VLLM_OMNI_MSGPACK_PROFILE_TENSORS_THRESHOLD_BYTES:-1048576}"
   export VLLM_OMNI_MSGPACK_PROFILE_TENSORS_EVERY_N="${VLLM_OMNI_MSGPACK_PROFILE_TENSORS_EVERY_N:-32}"
+  # Save-loop profiling (queue wait + put elapsed) in model runner mixin.
+  export VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG="${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG:-1}"
+  export VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS="${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS:-2.0}"
+  export VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N="${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N:-64}"
 fi
 
 if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
@@ -94,6 +98,7 @@ echo "  profile_logs   : ${ENABLE_PROFILE_LOGS}"
 echo "  shm_compat_on_miss : ${VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS:-<default>}"
 echo "  put_pool_blocking_sync : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC:-<default>}"
 echo "  get_pool_wait_current_stream : ${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-<default>}"
+echo "  save_profile_log : ${VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG:-<default>}"
 echo "  common_args    : ${COMMON_SERVER_ARGS:-<none>}"
 echo "============================================================"
 echo "Command: ${cmd[*]} $*"

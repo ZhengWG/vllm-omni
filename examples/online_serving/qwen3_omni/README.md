@@ -384,6 +384,12 @@ VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=1 \
 bash run_server_connector_perf.sh ipc
 ```
 
+For queueing diagnostics in the model-runner save thread, the script enables:
+
+- `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG=1`
+- `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS=2.0`
+- `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N=64`
+
 Run benchmark against the running server (default `c=1,4`):
 
 ```bash
@@ -417,7 +423,8 @@ bash analyze_ipc_profile_log.sh /tmp/ipc_server.log
 
 The analyzer now also prints quantile/ratio summaries for the main IPC stages
 (`stage0 put_control_plane`, `stage0 put_pool`, `stage1 get_control_plane`)
-plus TopN slow rows for `pack_sync_ms` and `copy_sync_ms`.
+plus TopN slow rows for `pack_sync_ms`, `copy_sync_ms`, and save-loop
+`queue_wait_ms`.
 
 By default it analyzes only the tail of the log (last 4000 lines). You can
 override:

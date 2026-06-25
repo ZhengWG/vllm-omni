@@ -296,6 +296,7 @@ class CudaIPCConnector(OmniConnectorBase):
         # producer wrote on the legacy default stream. See ``register_producer_stream``.
         self._producer_stream: torch.cuda.Stream | None = None
         self._producer_fallback_warned: bool = False
+        self._last_credit_poll_iters: int = 0
         self._profile_log_counter = 0
         self._metrics = {
             "puts": 0,
@@ -705,17 +706,24 @@ class CudaIPCConnector(OmniConnectorBase):
         Bounded wait (``credit_wait_sec``) before giving up; returns None to
         trigger the CPU fallback.
         """
+        poll_iters = 0
         try:
-            return self._credit_queue.get_nowait()
+            slot = self._credit_queue.get_nowait()
+            self._last_credit_poll_iters = 0
+            return slot
         except _queue_mod.Empty:
             pass
         deadline = _time_mod.monotonic() + self._credit_wait_sec
         while _time_mod.monotonic() < deadline:
+            poll_iters += 1
             self._reclaim_board_credits()
             try:
-                return self._credit_queue.get_nowait()
+                slot = self._credit_queue.get_nowait()
+                self._last_credit_poll_iters = poll_iters
+                return slot
             except _queue_mod.Empty:
                 _time_mod.sleep(self._credit_poll_sec)
+        self._last_credit_poll_iters = poll_iters
         return None
 
     def _reclaim_board_credits(self) -> None:
@@ -877,6 +885,7 @@ class CudaIPCConnector(OmniConnectorBase):
         credit_t0 = _time_mod.perf_counter()
         slot_offset = self._acquire_credit()
         credit_wait_ms = (_time_mod.perf_counter() - credit_t0) * 1000.0
+        credit_poll_iters = int(getattr(self, "_last_credit_poll_iters", 0))
         if slot_offset is None:
             result = self._put_cpu_fallback(
                 from_stage, to_stage, put_key, composite_key, data, reason="credits_exhausted"
@@ -887,12 +896,16 @@ class CudaIPCConnector(OmniConnectorBase):
                 key=put_key,
                 outcome="credits_exhausted_fallback",
                 credit_wait_ms=round(credit_wait_ms, 3),
+                credit_poll_iters=credit_poll_iters,
             )
             return result
         credit_returned = False
         descriptor_bytes = 0
         pack_sync_ms = 0.0
         descriptor_ser_ms = 0.0
+        producer_order_wait_ms = 0.0
+        event_record_ms = 0.0
+        ring_publish_ms = 0.0
         slot_used_bytes = 0
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
@@ -915,12 +928,14 @@ class CudaIPCConnector(OmniConnectorBase):
             #    the synchronous, non-async-output path. Warn once when this
             #    path is taken with PTDS enabled, so the silent-corruption
             #    assumption can't break unnoticed.
+            producer_wait_t0 = _time_mod.perf_counter()
             if self._producer_stream is not None:
                 self._copy_stream.wait_stream(self._producer_stream)
             else:
                 self._maybe_warn_ambient_fallback()
                 self._compute_event.record()
                 self._copy_stream.wait_event(self._compute_event)
+            producer_order_wait_ms = (_time_mod.perf_counter() - producer_wait_t0) * 1000.0
             try:
                 pack_t0 = _time_mod.perf_counter()
                 with torch.cuda.stream(self._copy_stream):
@@ -945,6 +960,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     key=put_key,
                     outcome="slot_overflow_fallback",
                     credit_wait_ms=round(credit_wait_ms, 3),
+                    credit_poll_iters=credit_poll_iters,
                 )
                 return result
             event_to_record = self._ipc_event
@@ -952,7 +968,9 @@ class CudaIPCConnector(OmniConnectorBase):
             if not self._put_pool_blocking_sync and self._slot_ipc_events:
                 event_to_record = self._slot_ipc_events[slot_idx]
                 slot_event_handle = self._slot_ipc_event_handle_bytes[slot_idx]
+            event_record_t0 = _time_mod.perf_counter()
             ret = self._cudart.cudaEventRecord(event_to_record, ctypes.c_void_p(self._copy_stream.cuda_stream))
+            event_record_ms = (_time_mod.perf_counter() - event_record_t0) * 1000.0
             if ret != 0:
                 logger.warning("cudaEventRecord (IPC) failed: %d", ret)
             # In default mode, block until the pack D2D finishes.
@@ -962,12 +980,14 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._copy_stream.synchronize()
             pack_sync_ms = (_time_mod.perf_counter() - pack_t0) * 1000.0
             descriptor_t0 = _time_mod.perf_counter()
+            sender_desc_done_ns = _time_mod.perf_counter_ns()
             descriptor = OmniSerializer.serialize(
                 {
                     _POOL_MARKER: True,
                     "slot_offset": slot_offset,
                     "slot_index": slot_idx,
                     "payload": encoded_obj,
+                    "sender_desc_done_ns": sender_desc_done_ns,
                     # Optional per-slot event handle for async sender mode.
                     # Receiver falls back to ring-header event handle when absent.
                     **({"event_handle": slot_event_handle} if slot_event_handle is not None else {}),
@@ -999,16 +1019,21 @@ class CudaIPCConnector(OmniConnectorBase):
                 descriptor_bytes=len(descriptor),
                 slot_used_bytes=slot_used_bytes,
                 credit_wait_ms=round(credit_wait_ms, 3),
+                credit_poll_iters=credit_poll_iters,
                 pack_sync_ms=round(pack_sync_ms, 3),
                 descriptor_ser_ms=round(descriptor_ser_ms, 3),
+                producer_order_wait_ms=round(producer_order_wait_ms, 3),
+                event_record_ms=round(event_record_ms, 3),
             )
             return result
         with self._held_lock:
             self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
         try:
+            ring_publish_t0 = _time_mod.perf_counter()
             self._ring.publish(
                 kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
             )
+            ring_publish_ms = (_time_mod.perf_counter() - ring_publish_t0) * 1000.0
         except RingFullError:
             with self._held_lock:
                 self._held_credits.pop(composite_key, None)
@@ -1022,8 +1047,11 @@ class CudaIPCConnector(OmniConnectorBase):
                 descriptor_bytes=descriptor_bytes,
                 slot_used_bytes=slot_used_bytes,
                 credit_wait_ms=round(credit_wait_ms, 3),
+                credit_poll_iters=credit_poll_iters,
                 pack_sync_ms=round(pack_sync_ms, 3),
                 descriptor_ser_ms=round(descriptor_ser_ms, 3),
+                producer_order_wait_ms=round(producer_order_wait_ms, 3),
+                event_record_ms=round(event_record_ms, 3),
             )
             return result
         self._metrics["puts"] += 1
@@ -1035,12 +1063,16 @@ class CudaIPCConnector(OmniConnectorBase):
             outcome="ring_publish",
             descriptor_bytes=descriptor_bytes,
             slot_used_bytes=slot_used_bytes,
-                slot_idx=slot_idx,
+            slot_idx=slot_idx,
             credit_wait_ms=round(credit_wait_ms, 3),
+            credit_poll_iters=credit_poll_iters,
             pack_sync_ms=round(pack_sync_ms, 3),
             descriptor_ser_ms=round(descriptor_ser_ms, 3),
+            producer_order_wait_ms=round(producer_order_wait_ms, 3),
+            event_record_ms=round(event_record_ms, 3),
+            ring_publish_ms=round(ring_publish_ms, 3),
             producer_stream_registered=self._producer_stream is not None,
-                blocking_sync=self._put_pool_blocking_sync,
+            blocking_sync=self._put_pool_blocking_sync,
         )
         return True, len(descriptor), {"ring": True, "size": len(descriptor)}
 
@@ -1144,25 +1176,38 @@ class CudaIPCConnector(OmniConnectorBase):
             # POOL: handles from the ring header (guaranteed present — the poll above is gated
             # on _ring_edge_handles), descriptor from the entry body.
             pool_handle, event_handle, board_name = self._ring_edge_handles[(from_stage, to_stage)]
+            descriptor_decode_t0 = _time_mod.perf_counter()
             raw = OmniSerializer.deserialize(body)
+            descriptor_decode_ms = (_time_mod.perf_counter() - descriptor_decode_t0) * 1000.0
             event_handle = raw.get("event_handle", event_handle)
             if event_handle is not None and not isinstance(event_handle, bytes):
                 event_handle = bytes(event_handle)
+            sender_desc_done_ns = raw.get("sender_desc_done_ns")
+            recv_ingress_ms = 0.0
+            if isinstance(sender_desc_done_ns, int) and sender_desc_done_ns > 0:
+                recv_ingress_ms = (_time_mod.perf_counter_ns() - sender_desc_done_ns) / 1_000_000.0
+            open_pool_t0 = _time_mod.perf_counter()
             pool_ptr = self._open_pool(pool_handle)
+            open_pool_ms = (_time_mod.perf_counter() - open_pool_t0) * 1000.0
             idx = self._recv_stream_idx % len(self._recv_copy_streams)
             self._recv_stream_idx += 1
             copy_stream = self._recv_copy_streams[idx]
             copy_done_event = self._recv_copy_events[idx]
+            event_wait_enqueue_ms = 0.0
             if event_handle:
                 ipc_event = self._open_ipc_event(event_handle)
+                event_wait_t0 = _time_mod.perf_counter()
                 stream_wait_event(self._cudart, copy_stream.cuda_stream, ipc_event)
+                event_wait_enqueue_ms = (_time_mod.perf_counter() - event_wait_t0) * 1000.0
             copy_t0 = _time_mod.perf_counter()
             copy_wait_current_stream_ms = 0.0
             if self._get_pool_wait_current_stream:
                 wait_t0 = _time_mod.perf_counter()
                 copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
                 copy_wait_current_stream_ms = (_time_mod.perf_counter() - wait_t0) * 1000.0
+            decode_enqueue_t0 = _time_mod.perf_counter()
             obj = self._walk_decode_pool(raw["payload"], pool_ptr, raw["slot_offset"], stream=copy_stream)
+            decode_enqueue_ms = (_time_mod.perf_counter() - decode_enqueue_t0) * 1000.0
             copy_done_event.record(copy_stream)
             # Block until the D2D finishes before hand-off (payload is consumed later on the
             # model thread), then mark the board synchronously so TTL can't race the transfer.
@@ -1170,7 +1215,9 @@ class CudaIPCConnector(OmniConnectorBase):
             copy_done_event.synchronize()
             copy_finish_sync_ms = (_time_mod.perf_counter() - copy_finish_t0) * 1000.0
             copy_sync_ms = (_time_mod.perf_counter() - copy_t0) * 1000.0
+            board_release_t0 = _time_mod.perf_counter()
             self._mark_board_release(board_name, int(raw["slot_index"]))
+            board_release_ms = (_time_mod.perf_counter() - board_release_t0) * 1000.0
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += len(body)
             self._profile_log(
@@ -1183,6 +1230,12 @@ class CudaIPCConnector(OmniConnectorBase):
                 copy_sync_ms=round(copy_sync_ms, 3),
                 copy_wait_current_stream_ms=round(copy_wait_current_stream_ms, 3),
                 copy_finish_sync_ms=round(copy_finish_sync_ms, 3),
+                decode_enqueue_ms=round(decode_enqueue_ms, 3),
+                descriptor_decode_ms=round(descriptor_decode_ms, 3),
+                open_pool_ms=round(open_pool_ms, 3),
+                event_wait_enqueue_ms=round(event_wait_enqueue_ms, 3),
+                board_release_ms=round(board_release_ms, 3),
+                recv_ingress_ms=round(recv_ingress_ms, 3),
                 wait_current_stream=self._get_pool_wait_current_stream,
             )
             return obj, len(body)
