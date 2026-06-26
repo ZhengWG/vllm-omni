@@ -122,6 +122,18 @@ class _SlotOverflowError(Exception):
         self.slot_size = slot_size
 
 
+class _PoolPackStats:
+    __slots__ = ("tensors", "contiguous", "pitched", "fallback", "nbytes", "samples")
+
+    def __init__(self) -> None:
+        self.tensors = 0
+        self.contiguous = 0
+        self.pitched = 0
+        self.fallback = 0
+        self.nbytes = 0
+        self.samples: list[str] = []
+
+
 class _PoolSlot:
     """Tracks packing state for tensors within a single pool credit slot."""
 
@@ -170,9 +182,16 @@ class _PoolSlot:
             return None
         return row_pitch_bytes, width_bytes, height
 
-    def pack(self, tensor: torch.Tensor, cudart=None, stream: torch.cuda.Stream | None = None) -> int:
+    def pack(
+        self,
+        tensor: torch.Tensor,
+        cudart=None,
+        stream: torch.cuda.Stream | None = None,
+        stats: _PoolPackStats | None = None,
+    ) -> int:
         """Copy tensor into the pool slot and return byte offset."""
         nbytes = tensor.nbytes
+        mode = "torch"
         padding = (-self._cursor) % _POOL_ALIGNMENT
         aligned = self._cursor + padding
         if aligned + nbytes > self._size:
@@ -180,6 +199,7 @@ class _PoolSlot:
         if cudart is not None and stream is not None:
             dst_ptr = self._pool.data_ptr() + self._base + aligned
             if tensor.is_contiguous():
+                mode = "contiguous"
                 memcpy_async_d2d(
                     cudart,
                     dst_ptr,
@@ -188,6 +208,7 @@ class _PoolSlot:
                     stream.cuda_stream,
                 )
             elif (layout := self._pitched_2d_layout(tensor)) is not None:
+                mode = "pitched"
                 src_pitch_bytes, width_bytes, height = layout
                 memcpy_2d_async_d2d(
                     cudart,
@@ -200,6 +221,7 @@ class _PoolSlot:
                     stream.cuda_stream,
                 )
             else:
+                mode = "fallback_contiguous"
                 src_bytes = tensor.contiguous().view(torch.uint8).reshape(-1)
                 src_bytes.record_stream(stream)
                 memcpy_async_d2d(
@@ -210,8 +232,22 @@ class _PoolSlot:
                     stream.cuda_stream,
                 )
         else:
+            mode = "torch_fallback"
             src_bytes = tensor.contiguous().view(torch.uint8).reshape(-1)
             self._pool[self._base + aligned : self._base + aligned + nbytes].copy_(src_bytes)
+        if stats is not None:
+            stats.tensors += 1
+            stats.nbytes += int(nbytes)
+            if mode == "contiguous":
+                stats.contiguous += 1
+            elif mode == "pitched":
+                stats.pitched += 1
+            else:
+                stats.fallback += 1
+            if len(stats.samples) < 4:
+                stats.samples.append(
+                    f"{mode}:shape={tuple(tensor.shape)}:stride={tuple(tensor.stride())}:bytes={int(nbytes)}"
+                )
         self._cursor = aligned + nbytes
         return aligned
 
@@ -869,7 +905,13 @@ class CudaIPCConnector(OmniConnectorBase):
 
     # --- Pool slot codec ---
 
-    def _walk_encode_pool(self, obj: Any, slot: _PoolSlot, copy_stream: torch.cuda.Stream) -> Any:
+    def _walk_encode_pool(
+        self,
+        obj: Any,
+        slot: _PoolSlot,
+        copy_stream: torch.cuda.Stream,
+        pack_stats: _PoolPackStats | None = None,
+    ) -> Any:
         """Recursively replace CUDA tensors with pool offset metadata."""
         if isinstance(obj, torch.Tensor):
             if obj.is_cuda:
@@ -881,7 +923,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     # buffers are not protected by record_stream.
                     obj.record_stream(copy_stream)
                 t = obj.detach()
-                tensor_offset = slot.pack(t, self._cudart, copy_stream)
+                tensor_offset = slot.pack(t, self._cudart, copy_stream, stats=pack_stats)
                 return {
                     _GPU_TENSOR_MARKER: True,
                     "shape": list(t.shape),
@@ -891,16 +933,16 @@ class CudaIPCConnector(OmniConnectorBase):
                 }
             return obj
         if isinstance(obj, dict):
-            return {k: self._walk_encode_pool(v, slot, copy_stream) for k, v in obj.items()}
+            return {k: self._walk_encode_pool(v, slot, copy_stream, pack_stats) for k, v in obj.items()}
         if isinstance(obj, list):
-            return [self._walk_encode_pool(v, slot, copy_stream) for v in obj]
+            return [self._walk_encode_pool(v, slot, copy_stream, pack_stats) for v in obj]
         if isinstance(obj, tuple):
-            return tuple(self._walk_encode_pool(v, slot, copy_stream) for v in obj)
+            return tuple(self._walk_encode_pool(v, slot, copy_stream, pack_stats) for v in obj)
         if hasattr(obj, "__struct_fields__"):
             # Drop None struct fields — matches data_entry_keys.to_dict (the SHM/inline wire
             # contract), so pool and SHM paths produce the same dict keys downstream.
             return {
-                f: self._walk_encode_pool(getattr(obj, f), slot, copy_stream)
+                f: self._walk_encode_pool(getattr(obj, f), slot, copy_stream, pack_stats)
                 for f in obj.__struct_fields__
                 if getattr(obj, f) is not None
             }
@@ -1353,6 +1395,7 @@ class CudaIPCConnector(OmniConnectorBase):
         event_record_ms = 0.0
         ring_publish_ms = 0.0
         slot_used_bytes = 0
+        pack_stats = _PoolPackStats()
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
@@ -1390,7 +1433,7 @@ class CudaIPCConnector(OmniConnectorBase):
             try:
                 pack_t0 = _time_mod.perf_counter()
                 with torch.cuda.stream(copy_stream):
-                    encoded_obj = self._walk_encode_pool(data, slot, copy_stream)
+                    encoded_obj = self._walk_encode_pool(data, slot, copy_stream, pack_stats)
                 slot_used_bytes = slot._cursor
             except _SlotOverflowError as e:
                 copy_stream.synchronize()
@@ -1486,6 +1529,12 @@ class CudaIPCConnector(OmniConnectorBase):
                 async_inflight_limit=self._put_pool_async_inflight_limit,
                 sender_copy_stream_idx=sender_copy_stream_idx,
                 sender_copy_streams=sender_copy_stream_count,
+                pool_pack_tensors=pack_stats.tensors,
+                pool_pack_contiguous=pack_stats.contiguous,
+                pool_pack_pitched=pack_stats.pitched,
+                pool_pack_fallback=pack_stats.fallback,
+                pool_pack_nbytes=pack_stats.nbytes,
+                pool_pack_samples=";".join(pack_stats.samples),
             )
             return result
         with self._held_lock:
@@ -1528,6 +1577,12 @@ class CudaIPCConnector(OmniConnectorBase):
                 async_inflight_limit=self._put_pool_async_inflight_limit,
                 sender_copy_stream_idx=sender_copy_stream_idx,
                 sender_copy_streams=sender_copy_stream_count,
+                pool_pack_tensors=pack_stats.tensors,
+                pool_pack_contiguous=pack_stats.contiguous,
+                pool_pack_pitched=pack_stats.pitched,
+                pool_pack_fallback=pack_stats.fallback,
+                pool_pack_nbytes=pack_stats.nbytes,
+                pool_pack_samples=";".join(pack_stats.samples),
             )
             return result
         if not self._put_pool_blocking_sync:
@@ -1558,6 +1613,12 @@ class CudaIPCConnector(OmniConnectorBase):
             async_inflight_limit=self._put_pool_async_inflight_limit,
             sender_copy_stream_idx=sender_copy_stream_idx,
             sender_copy_streams=sender_copy_stream_count,
+            pool_pack_tensors=pack_stats.tensors,
+            pool_pack_contiguous=pack_stats.contiguous,
+            pool_pack_pitched=pack_stats.pitched,
+            pool_pack_fallback=pack_stats.fallback,
+            pool_pack_nbytes=pack_stats.nbytes,
+            pool_pack_samples=";".join(pack_stats.samples),
         )
         return True, len(descriptor), {"ring": True, "size": len(descriptor)}
 
