@@ -133,6 +133,43 @@ class _PoolSlot:
         self._size = slot_size
         self._cursor = 0
 
+    @staticmethod
+    def _pitched_2d_layout(tensor: torch.Tensor) -> tuple[int, int, int] | None:
+        """Return (src_pitch_bytes, width_bytes, height) if tensor can be
+        copied as a 2D pitched region without materializing a contiguous clone.
+
+        Safe for tensors whose last dimension is contiguous and whose leading
+        non-size-1 dimensions are compact row-major. Size-1 leading dims may
+        have arbitrary stride and are ignored.
+        """
+        if tensor.ndim < 2 or tensor.stride(-1) != 1:
+            return None
+        shape = tuple(int(x) for x in tensor.shape)
+        strides = tuple(int(x) for x in tensor.stride())
+        if shape[-1] <= 0:
+            return None
+        leading = [(shape[i], strides[i]) for i in range(tensor.ndim - 1) if shape[i] > 1]
+        height = 1
+        for size, _stride in leading:
+            height *= size
+        if height <= 0:
+            return None
+        elem_size = tensor.element_size()
+        width_bytes = shape[-1] * elem_size
+        if not leading:
+            return width_bytes, width_bytes, 1
+        # Adjacent logical rows must have a constant stride. This is true when
+        # the leading dims are compact after dropping size-1 dims.
+        for idx in range(len(leading) - 1):
+            _outer_size, outer_stride = leading[idx]
+            inner_size, inner_stride = leading[idx + 1]
+            if outer_stride != inner_stride * inner_size:
+                return None
+        row_pitch_bytes = leading[-1][1] * elem_size
+        if row_pitch_bytes < width_bytes:
+            return None
+        return row_pitch_bytes, width_bytes, height
+
     def pack(self, tensor: torch.Tensor, cudart=None, stream: torch.cuda.Stream | None = None) -> int:
         """Copy tensor into the pool slot and return byte offset."""
         nbytes = tensor.nbytes
@@ -150,23 +187,16 @@ class _PoolSlot:
                     nbytes,
                     stream.cuda_stream,
                 )
-            elif (
-                tensor.ndim == 2
-                and tensor.shape[0] > 0
-                and tensor.shape[1] > 0
-                and tensor.stride(1) == 1
-                and tensor.stride(0) >= tensor.shape[1]
-            ):
-                elem_size = tensor.element_size()
-                width_bytes = int(tensor.shape[1]) * elem_size
+            elif (layout := self._pitched_2d_layout(tensor)) is not None:
+                src_pitch_bytes, width_bytes, height = layout
                 memcpy_2d_async_d2d(
                     cudart,
                     dst_ptr,
                     width_bytes,
                     tensor.data_ptr(),
-                    int(tensor.stride(0)) * elem_size,
+                    src_pitch_bytes,
                     width_bytes,
-                    int(tensor.shape[0]),
+                    height,
                     stream.cuda_stream,
                 )
             else:
