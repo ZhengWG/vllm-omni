@@ -112,6 +112,9 @@ class CudaIPCConnector(OmniConnectorBase):
         self._closed = False
         self._lock = threading.Lock()
         self._seq = 0
+        # Producer's payload-write stream (registered by the model runner). The
+        # snapshot must be fenced after it, else it can read half-written tensors.
+        self._producer_stream: torch.cuda.Stream | None = None
         self._inflight: dict[str, list[tuple[int, int]]] = {}
         self._ack_dir = config.get("cudaipc_ack_dir", "/dev/shm/cudaipc_ack")
         os.makedirs(self._ack_dir, exist_ok=True)
@@ -156,10 +159,10 @@ class CudaIPCConnector(OmniConnectorBase):
         return torch.device("cuda", torch.accelerator.current_device_index())
 
     def register_producer_stream(self, producer_stream: torch.cuda.Stream | None) -> None:
-        """No-op (kept for interface compat). The shared-storage path snapshots
-        into its own pool slot on a dedicated stream, so pool-D2D ordering is
-        handled internally — no producer-stream fence is needed."""
-        return
+        """Register the stream the producer writes payload tensors on. ``put``
+        fences the pool snapshot after it (via an event recorded on this stream)
+        so the snapshot never reads half-written keep_on_gpu output."""
+        self._producer_stream = producer_stream
 
     @staticmethod
     def _safe(s: str) -> str:
@@ -200,10 +203,15 @@ class CudaIPCConnector(OmniConnectorBase):
         with self._lock:
             self._seq += 1
             tid = self._safe(f"{from_stage}_{to_stage}_{put_key}_{os.getpid()}_{self._seq}")
+        # Fence the snapshot after the producer's writes (keep_on_gpu clone).
+        ready_event = None
+        if self._producer_stream is not None:
+            ready_event = torch.cuda.Event()
+            ready_event.record(self._producer_stream)
         descs: list[TensorDescriptor] = []
         try:
             for t in tensors:
-                descs.append(self._pool.put(t))
+                descs.append(self._pool.put(t, payload_ready_event=ready_event))
         except PoolFull:
             for d in descs:  # free partial leases, fall back to SHM
                 self._pool.ack(d.slot_id, d.generation)
