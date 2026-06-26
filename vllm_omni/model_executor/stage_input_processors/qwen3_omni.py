@@ -4,6 +4,7 @@
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
 import logging
+import os
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -46,6 +47,18 @@ _QWEN3_CODEC_CODEBOOK_SIZE = 2048
 _QWEN3_CODEC_PAD_TOKEN_ID = 4196
 _QWEN3_CODEC_BOS_TOKEN_ID = 4197
 _QWEN3_CODEC_EOS_TOKEN_ID = 4198
+_DROP_PREFILL_EMBED_FOR_EXPERIMENT = os.environ.get("VLLM_OMNI_QWEN3_DROP_PREFILL_EMBED", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+_DROP_PREFILL_HIDDEN_FOR_EXPERIMENT = os.environ.get("VLLM_OMNI_QWEN3_DROP_PREFILL_HIDDEN", "").lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
 
 
 def _layer_tensor(layers: dict[Any, Any], key: str) -> torch.Tensor | None:
@@ -119,6 +132,33 @@ def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | 
     if t is None:
         return None
     return t.detach() if keep_on_gpu else t.detach().cpu()
+
+
+def _inline_cuda_max_bytes(connector: Any) -> int:
+    try:
+        return max(0, int(getattr(connector, "_inline_cuda_max_bytes", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _stage_tensor_for_connector(
+    tensor: torch.Tensor,
+    *,
+    keep_on_gpu: bool,
+    inline_cuda_max_bytes: int,
+) -> torch.Tensor:
+    """Place tensor for connector transport.
+
+    Large CUDA tensors stay on GPU for CUDA-IPC pool/D2D. Tiny per-token
+    tensors are moved to CPU here so IPC inline follows the SHM-style path and
+    avoids doing a blocking D2H inside connector.put().
+    """
+    detached = tensor.detach()
+    if not keep_on_gpu:
+        return detached.cpu()
+    if detached.is_cuda and inline_cuda_max_bytes > 0 and int(detached.nbytes) <= inline_cuda_max_bytes:
+        return detached.cpu()
+    return detached
 
 
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
@@ -453,6 +493,7 @@ def thinker2talker_async_chunk(
     # This is the SEND edge (thinker -> talker); supported for a dual-connector.
     _connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
     _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
+    _inline_cuda_max = _inline_cuda_max_bytes(_connector)
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
@@ -482,17 +523,32 @@ def thinker2talker_async_chunk(
             return None
         return t.detach() if _keep_on_gpu else t.detach().cpu()
 
+    def _decode_tensor(t: torch.Tensor) -> torch.Tensor:
+        return _stage_tensor_for_connector(
+            t,
+            keep_on_gpu=_keep_on_gpu,
+            inline_cuda_max_bytes=_inline_cuda_max,
+        )
+
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
+        prefill_tensor = _maybe_cpu(thinker_emb)
+        hidden_tensor = _maybe_cpu(thinker_hid)
+        if _DROP_PREFILL_EMBED_FOR_EXPERIMENT and isinstance(prefill_tensor, torch.Tensor):
+            logger.warning("Experiment enabled: dropping Qwen3 thinker prefill embed payload.")
+            prefill_tensor = prefill_tensor[:0]
+        if _DROP_PREFILL_HIDDEN_FOR_EXPERIMENT and isinstance(hidden_tensor, torch.Tensor):
+            logger.warning("Experiment enabled: dropping Qwen3 thinker prefill hidden payload.")
+            hidden_tensor = hidden_tensor[:0]
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=_maybe_cpu(thinker_emb),
+                prefill=prefill_tensor,
                 tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
                 tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
                 tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
             ),
-            hidden_states=HiddenStatesStruct(output=_maybe_cpu(thinker_hid)),
+            hidden_states=HiddenStatesStruct(output=hidden_tensor),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -532,7 +588,7 @@ def thinker2talker_async_chunk(
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
-            embed=EmbeddingsStruct(decode=_maybe_cpu(thinker_emb)),
+            embed=EmbeddingsStruct(decode=_decode_tensor(thinker_emb)),
             speaker=speaker,
             language=language,
         )
@@ -845,6 +901,8 @@ def talker2code2wav_async_chunk(
 
     # Send edge (talker -> code2wav): codec sizing comes from the OUTPUT connector's config.
     connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
+    keep_on_gpu = getattr(connector, "supports_gpu_tensor", False)
+    inline_cuda_max = _inline_cuda_max_bytes(connector)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))
@@ -887,6 +945,11 @@ def talker2code2wav_async_chunk(
 
     codes = (
         torch.cat(transfer_manager.code_prompt_token_ids[request_id][-end_index:], dim=0).transpose(0, 1).reshape(-1)
+    )
+    codes = _stage_tensor_for_connector(
+        codes,
+        keep_on_gpu=keep_on_gpu,
+        inline_cuda_max_bytes=inline_cuda_max,
     )
 
     return OmniPayloadStruct(

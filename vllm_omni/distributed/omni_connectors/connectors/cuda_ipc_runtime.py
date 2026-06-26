@@ -89,6 +89,18 @@ def load_cudart():
     ]
     lib.cudaMemcpyAsync.restype = ctypes.c_int
 
+    lib.cudaMemcpy2DAsync.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_void_p,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_size_t,
+        ctypes.c_int,
+        ctypes.c_void_p,
+    ]
+    lib.cudaMemcpy2DAsync.restype = ctypes.c_int
+
     lib.cudaEventCreateWithFlags.argtypes = [ctypes.POINTER(ctypes.c_void_p), ctypes.c_uint]
     lib.cudaEventCreateWithFlags.restype = ctypes.c_int
 
@@ -103,6 +115,9 @@ def load_cudart():
 
     lib.cudaStreamWaitEvent.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
     lib.cudaStreamWaitEvent.restype = ctypes.c_int
+
+    lib.cudaEventQuery.argtypes = [ctypes.c_void_p]
+    lib.cudaEventQuery.restype = ctypes.c_int
 
     lib.cudaEventDestroy.argtypes = [ctypes.c_void_p]
     lib.cudaEventDestroy.restype = ctypes.c_int
@@ -124,7 +139,41 @@ def memcpy_async_d2d(lib, dst: int, src: int, nbytes: int, stream: int) -> None:
         raise RuntimeError(f"cudaMemcpyAsync (D2D) failed: {ret}")
 
 
+def memcpy_2d_async_d2d(
+    lib,
+    dst: int,
+    dst_pitch: int,
+    src: int,
+    src_pitch: int,
+    width_bytes: int,
+    height: int,
+    stream: int,
+) -> None:
+    ret = lib.cudaMemcpy2DAsync(
+        ctypes.c_void_p(dst),
+        ctypes.c_size_t(dst_pitch),
+        ctypes.c_void_p(src),
+        ctypes.c_size_t(src_pitch),
+        ctypes.c_size_t(width_bytes),
+        ctypes.c_size_t(height),
+        ctypes.c_int(_CUDA_MEMCPY_D2D),
+        ctypes.c_void_p(stream),
+    )
+    if ret != 0:
+        raise RuntimeError(f"cudaMemcpy2DAsync (D2D) failed: {ret}")
+
+
 def stream_wait_event(lib, stream: int, event) -> None:
     ret = lib.cudaStreamWaitEvent(ctypes.c_void_p(stream), event, ctypes.c_uint(0))
     if ret != 0:
         raise RuntimeError(f"cudaStreamWaitEvent failed: {ret}")
+
+
+def event_query(lib, event) -> bool:
+    ret = lib.cudaEventQuery(event)
+    if ret == 0:
+        return True
+    # cudaErrorNotReady: 600 on modern CUDA runtime (12/13), 34 on legacy.
+    if ret in (600, 34):
+        return False
+    raise RuntimeError(f"cudaEventQuery failed: {ret}")

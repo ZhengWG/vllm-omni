@@ -321,6 +321,206 @@ python examples/online_serving/openai_chat_completion_client_for_multimodal_gene
 bash run_curl_multimodal_generation.sh use_image
 ```
 
+### Connector perf scripts (IPC vs SHM)
+
+Use the helper scripts below to compare connector performance with consistent
+server/bench settings.
+
+```bash
+cd examples/online_serving/qwen3_omni
+```
+
+Start server with shared-memory connector:
+
+```bash
+bash run_server_connector_perf.sh shm
+```
+
+Start server with CUDA IPC connector:
+
+```bash
+bash run_server_connector_perf.sh ipc
+```
+
+Start server with the per-edge hybrid profile (CudaIPC for stage0 -> stage1,
+SharedMemory for stage1 -> stage2):
+
+```bash
+bash run_server_connector_perf.sh hybrid
+```
+
+The hybrid mode also defaults:
+
+- `VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET=1`
+- `VLLM_OMNI_CONNECTOR_SAVE_WORKERS=16`
+
+These can be overridden from the environment for A/B testing.
+
+To force identical server-side args for both connector runs, set
+`COMMON_SERVER_ARGS`:
+
+```bash
+COMMON_SERVER_ARGS="--stage-overrides '{\"2\":{\"devices\":\"1\"}}'" \
+bash run_server_connector_perf.sh ipc
+```
+
+By default, `run_server_connector_perf.sh` enables critical-path profiling logs.
+Disable if needed:
+
+```bash
+ENABLE_PROFILE_LOGS=0 bash run_server_connector_perf.sh ipc
+```
+
+For dedicated IPC benchmarks where fallback is known to be absent, the server
+script defaults `VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS=0` to avoid extra
+`/dev/shm` probe overhead on ring misses. Re-enable if needed:
+
+```bash
+VLLM_OMNI_CUDA_IPC_SHM_COMPAT_ON_RING_MISS=1 \
+bash run_server_connector_perf.sh ipc
+```
+
+For IPC perf profiling, the server script also defaults
+`VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC=0` (async sender put_pool mode).
+Set to `1` to restore strict blocking behavior for A/B:
+
+```bash
+VLLM_OMNI_CUDA_IPC_PUT_POOL_BLOCKING_SYNC=1 \
+bash run_server_connector_perf.sh ipc
+```
+
+By default the IPC server script sets `VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=0`,
+so large CUDA payloads prefer the pool route. Small CUDA payloads can still
+take inline route and are explicitly normalized to CPU (SHM-style) before
+msgpack encoding.
+
+For the current hybrid performance path, small inline payloads reuse
+`SharedMemoryConnector`, while large payloads still use IPC pool/D2D:
+
+- `VLLM_OMNI_CUDA_IPC_INLINE_USE_SHM=1`
+
+This keeps IPC pool/D2D for large handoffs while using SHM's small payload
+behavior for per-token chunks. Set to `0` to force ring-inline bytes.
+
+Set to `1` to allow size-based inline for all CUDA payloads under the inline
+threshold:
+
+```bash
+VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS=1 \
+bash run_server_connector_perf.sh ipc
+```
+
+To avoid pool-credit pressure from tiny CUDA payloads while keeping large CUDA
+payloads on pool, the script also defaults:
+
+- `VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES=16384`
+
+This allows CUDA payloads up to 16KB to use inline route (with explicit CPU
+normalization) even when `INLINE_CUDA_TENSORS=0`. Set to `0` to disable this
+size-based inline escape.
+
+It also defaults `VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=0` to avoid
+receiver-side pre-copy stream waits in pool-get (better overlap). Set to `1`
+to restore strict wait behavior:
+
+```bash
+VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM=1 \
+bash run_server_connector_perf.sh ipc
+```
+
+For sender async `put_pool`, the script also defaults:
+
+- `VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS=4` (round-robin sender pack streams)
+- `VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT=16`
+  (bound published-but-not-finished sender queue depth)
+
+Tune or disable backpressure for A/B:
+
+```bash
+VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS=2 \
+VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT=0 \
+bash run_server_connector_perf.sh ipc
+```
+
+`...ASYNC_INFLIGHT_LIMIT=0` means auto limit in connector (based on stream
+count and pool credits).
+
+For save-loop payload construction, the IPC server script defaults:
+
+- `VLLM_OMNI_CONNECTOR_SAVE_WORKERS=8`
+
+This parallelizes `custom_process` / inline CPU serialization across requests,
+while keeping each request's chunks ordered and serializing the final
+`connector.put()` critical section. Set to `1` for strict legacy behavior.
+
+For queueing diagnostics in the model-runner save thread, the script enables:
+
+- `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG=1`
+- `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_THRESHOLD_MS=2.0`
+- `VLLM_OMNI_CONNECTOR_SAVE_PROFILE_LOG_EVERY_N=64`
+
+For deeper receiver-side stall breakdown, you can opt in:
+
+- `VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT=1`
+- `VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET=1` (A/B only; can reduce
+  receiver copy-sync waits but may add polling latency)
+
+This adds `event_wait_sync_ms` (upstream event wait) and
+`decode_finish_sync_ms` (post-wait decode/copy finish) to stage1 pool-get
+profiles. Sender-side `put_pool` profiles also include:
+
+- `async_backpressure_wait_ms`
+- `async_backpressure_wait_events`
+- `async_inflight_depth`
+- `sender_copy_stream_idx` / `sender_copy_streams`
+
+Run benchmark against the running server (default `c=1,4`):
+
+```bash
+bash run_bench_connector_perf.sh ipc
+```
+
+To keep benchmark args strictly identical across runs, set
+`COMMON_BENCH_ARGS` (applies to every `vllm bench serve` call):
+
+```bash
+COMMON_BENCH_ARGS="--metric-percentiles 50,90,99 --trust-remote-code" \
+bash run_bench_connector_perf.sh ipc
+```
+
+Customize sweep/output:
+
+```bash
+CONCURRENCY_LIST="1 4 8" \
+NUM_PROMPTS=64 \
+RANDOM_INPUT_LEN=4000 \
+RANDOM_OUTPUT_LEN=900 \
+RESULT_DIR=bench_results/ipc_vs_shm \
+bash run_bench_connector_perf.sh shm
+```
+
+Analyze IPC profiling logs in one shot (grep-based):
+
+```bash
+bash analyze_ipc_profile_log.sh /tmp/ipc_server.log
+```
+
+The analyzer now also prints quantile/ratio summaries for the main IPC stages
+(`stage0 put_control_plane`, `stage0 put_pool`, `stage1 get_control_plane`)
+plus TopN slow rows for `pack_sync_ms`, `copy_sync_ms`, and save-loop
+`queue_wait_ms`.
+
+By default it analyzes only the tail of the log (last 4000 lines). You can
+override:
+
+```bash
+# Analyze last 8000 lines
+bash analyze_ipc_profile_log.sh /tmp/ipc_server.log 8000
+
+# Analyze full file (no tail)
+bash analyze_ipc_profile_log.sh /tmp/ipc_server.log 0
+```
+
 
 ### FAQ
 

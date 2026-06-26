@@ -203,6 +203,72 @@ def _receiver_proc(cmd_q: mp.Queue, res_q: mp.Queue, cfg: dict):
         receiver.close()
 
 
+# ════════════════════════════════════════════════════════════════════
+# Layer 1.5 — register_producer_stream wiring (CPU-only, no real GPU work)
+# ════════════════════════════════════════════════════════════════════
+#
+# These tests exercise the producer-stream registration plumbing on a
+# bare CudaIPCConnector instance built via ``object.__new__`` so we can
+# call _init_runtime_state without booting CUDA. They lock in the
+# contract that:
+#
+# 1. ``register_producer_stream`` stashes the stream on the connector and
+#    resets the warn-once latch.
+# 2. ``_maybe_warn_ambient_fallback`` warns exactly once per registration
+#    cycle, so a future PTDS rollout can't silently corrupt put() data
+#    without surfacing in the logs.
+
+
+def _bare_connector():
+    """Skeleton CudaIPCConnector with only the runtime-state slots populated.
+
+    Avoids ``__init__`` (which would try to load cudart and allocate a pool).
+    """
+    from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
+
+    conn = object.__new__(CudaIPCConnector)
+    CudaIPCConnector._init_runtime_state(conn)
+    return conn
+
+
+def test_register_producer_stream_sets_field_and_resets_warn_latch():
+    conn = _bare_connector()
+    assert conn._producer_stream is None
+    assert conn._producer_fallback_warned is False
+
+    sentinel = object()  # opaque placeholder; the connector never inspects it
+    conn.register_producer_stream(sentinel)
+    assert conn._producer_stream is sentinel
+    assert conn._producer_fallback_warned is False
+
+    conn._producer_fallback_warned = True
+    conn.register_producer_stream(None)
+    assert conn._producer_stream is None
+    assert conn._producer_fallback_warned is False, (
+        "Re-registration must reset the warn-once latch so the next ambient "
+        "fallback (e.g. after clearing the producer stream) is observable."
+    )
+
+
+def test_maybe_warn_ambient_fallback_is_one_shot(caplog):
+    import logging
+
+    from vllm_omni.distributed.omni_connectors.connectors import cuda_ipc_connector as conn_mod
+
+    conn = _bare_connector()
+
+    with caplog.at_level(logging.WARNING, logger=conn_mod.logger.name):
+        conn._maybe_warn_ambient_fallback()
+        conn._maybe_warn_ambient_fallback()
+        conn._maybe_warn_ambient_fallback()
+
+    fallback_warnings = [r for r in caplog.records if "ambient-stream fallback" in r.getMessage()]
+    assert len(fallback_warnings) == 1, (
+        f"Expected exactly one ambient-fallback warning, got {len(fallback_warnings)}; "
+        "the warning must be one-shot or the log will spam under steady-state put() traffic."
+    )
+
+
 def _materialize(spec: dict, device: str) -> dict:
     import torch
 

@@ -777,9 +777,23 @@ async def async_request_openai_chat_omni_completions(
                                     modality = data.get("modality")
                                     choice = choices[0]
                                     delta = choice.get("delta") or {}
-                                    content = delta.get("content")
-                                    if not content and isinstance(delta.get("audio"), dict):
-                                        content = delta["audio"].get("data")
+                                    text_content = delta.get("content")
+                                    audio_content = None
+                                    if isinstance(delta.get("audio"), dict):
+                                        audio_content = delta["audio"].get("data")
+                                    # Some server paths do not emit a top-level
+                                    # ``modality`` field in each SSE chunk. Infer
+                                    # the modality from delta payload so TTFT/TPOT/
+                                    # AUDIO_TTFP accounting still works.
+                                    if modality is None:
+                                        if audio_content:
+                                            modality = "audio"
+                                        elif text_content or choice.get("token_ids"):
+                                            modality = "text"
+                                    if modality == "audio":
+                                        content = audio_content
+                                    else:
+                                        content = text_content
                                     if modality == "text":
                                         token_delta, completion_tokens_seen = _resolve_token_delta_from_usage(
                                             completion_tokens,
