@@ -342,6 +342,13 @@ Start server with CUDA IPC connector:
 bash run_server_connector_perf.sh ipc
 ```
 
+Start server with the per-edge hybrid profile (CudaIPC for stage0 -> stage1,
+SharedMemory for stage1 -> stage2):
+
+```bash
+bash run_server_connector_perf.sh hybrid
+```
+
 To force identical server-side args for both connector runs, set
 `COMMON_SERVER_ARGS`:
 

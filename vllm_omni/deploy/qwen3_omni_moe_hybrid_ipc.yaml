@@ -1,0 +1,87 @@
+# Qwen3-Omni-MoE hybrid connector profile.
+#
+# Recommended for streaming-chunk-heavy CUDA deployments where full CudaIPC
+# regresses on the high-frequency codec edge (for example H20):
+#
+#   * Stage 0 -> Stage 1 (thinker prefill handoff): CudaIPCConnector
+#   * Stage 1 -> Stage 2 (streaming codec chunks): SharedMemoryConnector
+#
+# This keeps the large prefill tensor handoff on the GPU-direct path while
+# reusing the mature SHM path for small/frequent streaming payloads.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0,1,2 vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct --omni \
+#       --deploy-config vllm_omni/deploy/qwen3_omni_moe_hybrid_ipc.yaml
+
+async_chunk: true
+
+connectors:
+  connector_of_cuda_ipc:
+    name: CudaIPCConnector
+    extra:
+      tensor_lifetime_sec: 30.0
+      # Pool holds the big prefill handoff (embed + hidden ~64MB/req @ in4000).
+      pool_size_mb: 4096
+      pool_credits: 64
+      inline_threshold_bytes: 16384
+      ring_body_max: 524288
+      ring_entries: 2048
+
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.9
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_cuda_ipc
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.6
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_cuda_ipc
+    output_connectors:
+      to_stage_2: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    max_num_batched_tokens: 65536
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.5
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "2"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      seed: 42
+      repetition_penalty: 1.1

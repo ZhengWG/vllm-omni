@@ -9,6 +9,7 @@ set -euo pipefail
 # Examples:
 #   bash run_server_connector_perf.sh shm
 #   bash run_server_connector_perf.sh ipc --gpu-memory-utilization 0.9
+#   bash run_server_connector_perf.sh hybrid
 #   COMMON_SERVER_ARGS="--stage-overrides '{\"2\":{\"devices\":\"1\"}}'" \
 #     bash run_server_connector_perf.sh ipc
 
@@ -31,9 +32,12 @@ case "${CONNECTOR_MODE}" in
   ipc)
     DEPLOY_CONFIG="${DEPLOY_CONFIG:-vllm_omni/deploy/qwen3_omni_moe_cuda_ipc.yaml}"
     ;;
+  hybrid)
+    DEPLOY_CONFIG="${DEPLOY_CONFIG:-vllm_omni/deploy/qwen3_omni_moe_hybrid_ipc.yaml}"
+    ;;
   *)
     echo "Unsupported connector mode: ${CONNECTOR_MODE}"
-    echo "Usage: $0 [shm|ipc] [extra vllm serve args...]"
+    echo "Usage: $0 [shm|ipc|hybrid] [extra vllm serve args...]"
     exit 1
     ;;
 esac
@@ -56,7 +60,7 @@ if [[ "${ENABLE_PROFILE_LOGS}" == "1" ]]; then
   export VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT="${VLLM_OMNI_CUDA_IPC_PROFILE_WAIT_SPLIT:-0}"
 fi
 
-if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
+if [[ "${CONNECTOR_MODE}" == "ipc" || "${CONNECTOR_MODE}" == "hybrid" ]]; then
   # Benchmark-oriented default: disable shm-compat probe on ring miss to
   # remove extra /dev/shm miss overhead in dedicated IPC deployments.
   # Set to 1 if you still want receiver-side fallback probing.
