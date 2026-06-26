@@ -68,8 +68,8 @@ if [[ "${CONNECTOR_MODE}" == "ipc" ]]; then
   # Route CUDA-bearing payloads through pool by default to avoid inline-path
   # implicit D2H sync spikes on tensor.detach().cpu() serialization.
   export VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS="${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS:-0}"
-  # Hybrid route: small inline payloads use SHM bytes announced by ring; large
-  # GPU payloads use IPC pool/D2D.
+  # Hybrid route: small inline payloads reuse SharedMemoryConnector; large GPU
+  # payloads use IPC pool/D2D.
   export VLLM_OMNI_CUDA_IPC_INLINE_USE_SHM="${VLLM_OMNI_CUDA_IPC_INLINE_USE_SHM:-1}"
   # Even when inline_cuda_tensors=0, allow tiny CUDA payloads to take inline
   # route to avoid pool-credit pressure from slot-sized accounting.
