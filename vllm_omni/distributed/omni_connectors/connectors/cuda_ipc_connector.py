@@ -132,15 +132,24 @@ class _PoolSlot:
         self._size = slot_size
         self._cursor = 0
 
-    def pack(self, tensor: torch.Tensor) -> int:
-        """Copy tensor into the pool slot via PyTorch .copy_(), return byte offset."""
+    def pack(self, tensor: torch.Tensor, cudart=None, stream: torch.cuda.Stream | None = None) -> int:
+        """Copy tensor into the pool slot and return byte offset."""
         nbytes = tensor.nbytes
         padding = (-self._cursor) % _POOL_ALIGNMENT
         aligned = self._cursor + padding
         if aligned + nbytes > self._size:
             raise _SlotOverflowError(nbytes, self._size)
-        src_bytes = tensor.view(torch.uint8).reshape(-1)
-        self._pool[self._base + aligned : self._base + aligned + nbytes].copy_(src_bytes)
+        if cudart is not None and stream is not None:
+            memcpy_async_d2d(
+                cudart,
+                self._pool.data_ptr() + self._base + aligned,
+                tensor.data_ptr(),
+                nbytes,
+                stream.cuda_stream,
+            )
+        else:
+            src_bytes = tensor.view(torch.uint8).reshape(-1)
+            self._pool[self._base + aligned : self._base + aligned + nbytes].copy_(src_bytes)
         self._cursor = aligned + nbytes
         return aligned
 
@@ -810,7 +819,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     # buffers are not protected by record_stream.
                     obj.record_stream(copy_stream)
                 t = obj.detach().contiguous()
-                tensor_offset = slot.pack(t)
+                tensor_offset = slot.pack(t, self._cudart, copy_stream)
                 return {
                     _GPU_TENSOR_MARKER: True,
                     "shape": list(t.shape),
