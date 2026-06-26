@@ -53,6 +53,7 @@ from .cuda_ipc_runtime import (
     _CudaIpcMemHandle,
     event_query,
     load_cudart,
+    memcpy_2d_async_d2d,
     memcpy_async_d2d,
     stream_wait_event,
 )
@@ -140,15 +141,46 @@ class _PoolSlot:
         if aligned + nbytes > self._size:
             raise _SlotOverflowError(nbytes, self._size)
         if cudart is not None and stream is not None:
-            memcpy_async_d2d(
-                cudart,
-                self._pool.data_ptr() + self._base + aligned,
-                tensor.data_ptr(),
-                nbytes,
-                stream.cuda_stream,
-            )
+            dst_ptr = self._pool.data_ptr() + self._base + aligned
+            if tensor.is_contiguous():
+                memcpy_async_d2d(
+                    cudart,
+                    dst_ptr,
+                    tensor.data_ptr(),
+                    nbytes,
+                    stream.cuda_stream,
+                )
+            elif (
+                tensor.ndim == 2
+                and tensor.shape[0] > 0
+                and tensor.shape[1] > 0
+                and tensor.stride(1) == 1
+                and tensor.stride(0) >= tensor.shape[1]
+            ):
+                elem_size = tensor.element_size()
+                width_bytes = int(tensor.shape[1]) * elem_size
+                memcpy_2d_async_d2d(
+                    cudart,
+                    dst_ptr,
+                    width_bytes,
+                    tensor.data_ptr(),
+                    int(tensor.stride(0)) * elem_size,
+                    width_bytes,
+                    int(tensor.shape[0]),
+                    stream.cuda_stream,
+                )
+            else:
+                src_bytes = tensor.contiguous().view(torch.uint8).reshape(-1)
+                src_bytes.record_stream(stream)
+                memcpy_async_d2d(
+                    cudart,
+                    dst_ptr,
+                    src_bytes.data_ptr(),
+                    nbytes,
+                    stream.cuda_stream,
+                )
         else:
-            src_bytes = tensor.view(torch.uint8).reshape(-1)
+            src_bytes = tensor.contiguous().view(torch.uint8).reshape(-1)
             self._pool[self._base + aligned : self._base + aligned + nbytes].copy_(src_bytes)
         self._cursor = aligned + nbytes
         return aligned
@@ -818,7 +850,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     # by producer_event / producer_stream fences; graph-static
                     # buffers are not protected by record_stream.
                     obj.record_stream(copy_stream)
-                t = obj.detach().contiguous()
+                t = obj.detach()
                 tensor_offset = slot.pack(t, self._cudart, copy_stream)
                 return {
                     _GPU_TENSOR_MARKER: True,
