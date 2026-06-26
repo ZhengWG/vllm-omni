@@ -119,6 +119,10 @@ def show(name, xs):
 
 
 s0_inline = []
+s0_shm_inline = []
+s0_shm_inline_serialize = []
+s0_shm_inline_write = []
+s0_shm_inline_ring_publish = []
 s0_inline_producer_order_wait = []
 s0_inline_cuda_to_cpu = []
 s0_inline_serialize = []
@@ -141,6 +145,10 @@ s0_sender_copy_stream_idx = []
 s0_sender_copy_streams = []
 s1_put_pool = []
 s1_inline = []
+s1_shm_inline = []
+s1_shm_inline_serialize = []
+s1_shm_inline_write = []
+s1_shm_inline_ring_publish = []
 s1_inline_producer_order_wait = []
 s1_inline_cuda_to_cpu = []
 s1_inline_serialize = []
@@ -181,6 +189,8 @@ s2_event_wait_sync = []
 s2_board_release = []
 s2_recv_ingress = []
 s2_decode_finish_sync = []
+s1_get_shm_inline = []
+s2_get_shm_inline = []
 save_send_task = []
 save_queue_wait = []
 save_put_lock_wait = []
@@ -233,6 +243,15 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
                 s0_inline_cuda_tensors.append(float(kv["inline_cuda_tensors"]))
             if "inline_cuda_nbytes" in kv:
                 s0_inline_cuda_nbytes.append(float(kv["inline_cuda_nbytes"]))
+
+        if phase == "put_shm_inline" and stage == "0" and kv.get("outcome") == "ring_publish":
+            s0_shm_inline.append(elapsed)
+            if "serialize_ms" in kv:
+                s0_shm_inline_serialize.append(float(kv["serialize_ms"]))
+            if "shm_write_ms" in kv:
+                s0_shm_inline_write.append(float(kv["shm_write_ms"]))
+            if "ring_publish_ms" in kv:
+                s0_shm_inline_ring_publish.append(float(kv["ring_publish_ms"]))
 
         if phase == "put_pool" and stage == "0" and kv.get("outcome") == "ring_publish":
             s0_put_pool.append(elapsed)
@@ -299,6 +318,15 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
             if "inline_cuda_nbytes" in kv:
                 s1_inline_cuda_nbytes.append(float(kv["inline_cuda_nbytes"]))
 
+        if phase == "put_shm_inline" and stage == "1" and kv.get("outcome") == "ring_publish":
+            s1_shm_inline.append(elapsed)
+            if "serialize_ms" in kv:
+                s1_shm_inline_serialize.append(float(kv["serialize_ms"]))
+            if "shm_write_ms" in kv:
+                s1_shm_inline_write.append(float(kv["shm_write_ms"]))
+            if "ring_publish_ms" in kv:
+                s1_shm_inline_ring_publish.append(float(kv["ring_publish_ms"]))
+
         if phase == "get_control_plane" and stage == "1" and kv.get("pclass") == "pool":
             s1_get_pool.append(elapsed)
             if "copy_sync_ms" in kv:
@@ -349,7 +377,16 @@ with open(path, "r", encoding="utf-8", errors="ignore") as f:
             if "decode_finish_sync_ms" in kv:
                 s2_decode_finish_sync.append(float(kv["decode_finish_sync_ms"]))
 
+        if phase == "get_control_plane" and stage == "1" and kv.get("pclass") == "shm_inline":
+            s1_get_shm_inline.append(elapsed)
+        if phase == "get_control_plane" and stage == "2" and kv.get("pclass") == "shm_inline":
+            s2_get_shm_inline.append(elapsed)
+
 show("stage0 put_control_plane inline elapsed_ms", s0_inline)
+show("stage0 put_shm_inline elapsed_ms", s0_shm_inline)
+show("stage0 put_shm_inline serialize_ms", s0_shm_inline_serialize)
+show("stage0 put_shm_inline shm_write_ms", s0_shm_inline_write)
+show("stage0 put_shm_inline ring_publish_ms", s0_shm_inline_ring_publish)
 show("stage0 put_inline producer_order_wait_ms", s0_inline_producer_order_wait)
 show("stage0 put_inline inline_cuda_to_cpu_ms", s0_inline_cuda_to_cpu)
 show("stage0 put_inline serialize_ms", s0_inline_serialize)
@@ -388,6 +425,10 @@ show("stage1 put_inline serialize_ms", s1_inline_serialize)
 show("stage1 put_inline ring_publish_ms", s1_inline_ring_publish)
 show("stage1 put_inline inline_cuda_tensors", s1_inline_cuda_tensors)
 show("stage1 put_inline inline_cuda_nbytes", s1_inline_cuda_nbytes)
+show("stage1 put_shm_inline elapsed_ms", s1_shm_inline)
+show("stage1 put_shm_inline serialize_ms", s1_shm_inline_serialize)
+show("stage1 put_shm_inline shm_write_ms", s1_shm_inline_write)
+show("stage1 put_shm_inline ring_publish_ms", s1_shm_inline_ring_publish)
 show("stage1 get_control_plane pool elapsed_ms", s1_get_pool)
 show("stage1 get_control_plane pool copy_sync_ms", s1_copy)
 show("stage1 get_control_plane pool copy_wait_current_stream_ms", s1_copy_wait_current)
@@ -412,6 +453,8 @@ show("stage2 get_control_plane pool event_wait_sync_ms", s2_event_wait_sync)
 show("stage2 get_control_plane pool board_release_ms", s2_board_release)
 show("stage2 get_control_plane pool recv_ingress_ms", s2_recv_ingress)
 show("stage2 get_control_plane pool decode_finish_sync_ms", s2_decode_finish_sync)
+show("stage1 get_control_plane shm_inline elapsed_ms", s1_get_shm_inline)
+show("stage2 get_control_plane shm_inline elapsed_ms", s2_get_shm_inline)
 show("save_loop send_task elapsed_ms", save_send_task)
 show("save_loop send_task queue_wait_ms", save_queue_wait)
 show("save_loop send_task put_lock_wait_ms", save_put_lock_wait)

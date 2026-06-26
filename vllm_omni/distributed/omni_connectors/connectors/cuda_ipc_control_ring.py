@@ -34,6 +34,7 @@ _RING_VERSION = 1  # bump on incompatible wire layout changes
 # Per-entry payload-class tags (ring slot pclass byte).
 RING_PCLASS_INLINE = 0  # ring body: serialized payload (small, < inline_threshold)
 RING_PCLASS_POOL = 1  # ring body: pool descriptor (big GPU tensor, D2D path)
+RING_PCLASS_SHM = 2  # ring body: shm descriptor (small CPU/inline payload)
 
 
 def make_composite_key(key: str, from_stage: str, to_stage: str) -> str:

@@ -38,6 +38,7 @@ from .cuda_ipc_control_ring import (
     RING_HEADER_BYTES,
     RING_PCLASS_INLINE,
     RING_PCLASS_POOL,
+    RING_PCLASS_SHM,
     CudaIpcControlRing,
     RingFullError,
     RingHeader,
@@ -208,6 +209,12 @@ class CudaIPCConnector(OmniConnectorBase):
             config.get(
                 "inline_cuda_tensors",
                 _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS", default=False),
+            )
+        )
+        self._inline_use_shm = bool(
+            config.get(
+                "inline_use_shm",
+                _env_bool("VLLM_OMNI_CUDA_IPC_INLINE_USE_SHM", default=True),
             )
         )
         # Size-based CUDA-inline gate (defaults to inline threshold): payloads
@@ -1024,17 +1031,21 @@ class CudaIPCConnector(OmniConnectorBase):
                 producer_event = self._consume_producer_event()
             route_inline = est_nbytes < self._inline_threshold and not force_pool_for_cuda
             if route_inline:
-                result = self._put_inline(
-                    from_stage,
-                    to_stage,
-                    put_key,
-                    composite_key,
-                    data,
-                    kh,
-                    producer_event=producer_event,
-                    est_nbytes=est_nbytes,
-                )
-                route = "inline"
+                if self._inline_use_shm:
+                    result = self._put_shm_inline(from_stage, to_stage, put_key, composite_key, data, kh)
+                    route = "shm_inline"
+                else:
+                    result = self._put_inline(
+                        from_stage,
+                        to_stage,
+                        put_key,
+                        composite_key,
+                        data,
+                        kh,
+                        producer_event=producer_event,
+                        est_nbytes=est_nbytes,
+                    )
+                    route = "inline"
             else:
                 result = self._put_pool(
                     from_stage,
@@ -1057,6 +1068,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 force_pool_for_cuda=force_pool_for_cuda,
                 inline_cuda_by_size=inline_cuda_by_size,
                 inline_cuda_max_bytes=self._inline_cuda_max_bytes,
+                inline_use_shm=self._inline_use_shm,
                 ok=result[0],
                 wire_size=result[1],
                 cpu_fallback=bool(isinstance(meta, dict) and meta.get("cpu_fallback")),
@@ -1174,6 +1186,65 @@ class CudaIPCConnector(OmniConnectorBase):
             inline_cuda_nbytes=inline_cuda_nbytes,
         )
         return True, len(payload), {"ring": True, "size": len(payload)}
+
+    def _put_shm_inline(self, from_stage, to_stage, put_key, composite_key, data, kh):
+        """SHM-backed small-payload path announced through the ring.
+
+        This keeps IPC's ring control-plane notification while using the same
+        CPU-byte payload transport shape as SharedMemoryConnector for frequent
+        small chunks.
+        """
+        t0 = _time_mod.perf_counter()
+        serialize_t0 = _time_mod.perf_counter()
+        payload = self.serialize_obj(data)
+        serialize_ms = (_time_mod.perf_counter() - serialize_t0) * 1000.0
+        shm_t0 = _time_mod.perf_counter()
+        meta = self._atomic_shm_write(payload, name=put_key)
+        shm_write_ms = (_time_mod.perf_counter() - shm_t0) * 1000.0
+        if getattr(self, "_fallback_segs", None) is not None:
+            self._fallback_segs[put_key] = _time_mod.time()
+        descriptor = OmniSerializer.serialize({"shm": meta, "size": len(payload)})
+        ring_publish_ms = 0.0
+        try:
+            ring_publish_t0 = _time_mod.perf_counter()
+            with self._ring_publish_lock:
+                self._ring.publish(
+                    kh,
+                    RING_PCLASS_SHM,
+                    descriptor,
+                    ts=int(_time_mod.time()),
+                    ttl_sec=int(self.tensor_lifetime_sec),
+                )
+            ring_publish_ms = (_time_mod.perf_counter() - ring_publish_t0) * 1000.0
+        except RingFullError:
+            # Receiver can still discover this through shm-compat ring-miss path.
+            self._metrics["fallback_ring_full"] = self._metrics.get("fallback_ring_full", 0) + 1
+            self._profile_log(
+                "put_shm_inline",
+                (_time_mod.perf_counter() - t0) * 1000.0,
+                key=put_key,
+                payload_bytes=len(payload),
+                descriptor_bytes=len(descriptor),
+                outcome="ring_full_shm_compat",
+                serialize_ms=round(serialize_ms, 3),
+                shm_write_ms=round(shm_write_ms, 3),
+            )
+            return True, len(payload), {"shm": meta, "size": len(payload), "cpu_fallback": True}
+
+        self._metrics["puts"] += 1
+        self._metrics["bytes_transferred"] += len(payload)
+        self._profile_log(
+            "put_shm_inline",
+            (_time_mod.perf_counter() - t0) * 1000.0,
+            key=put_key,
+            payload_bytes=len(payload),
+            descriptor_bytes=len(descriptor),
+            outcome="ring_publish",
+            serialize_ms=round(serialize_ms, 3),
+            shm_write_ms=round(shm_write_ms, 3),
+            ring_publish_ms=round(ring_publish_ms, 3),
+        )
+        return True, len(payload), {"ring": True, "shm": meta, "size": len(payload)}
 
     def _put_pool(
         self,
@@ -1571,6 +1642,25 @@ class CudaIPCConnector(OmniConnectorBase):
                     payload_bytes=len(body),
                 )
                 return obj, len(body)
+
+            if pclass == RING_PCLASS_SHM:
+                meta_t0 = _time_mod.perf_counter()
+                raw = OmniSerializer.deserialize(body)
+                meta_decode_ms = (_time_mod.perf_counter() - meta_t0) * 1000.0
+                shm_meta = raw.get("shm") if isinstance(raw, dict) else None
+                shm_name = shm_meta.get("name") if isinstance(shm_meta, dict) else get_key
+                shm_result = self._try_get_shm_compat(str(shm_name))
+                if shm_result is not None:
+                    self._profile_log(
+                        "get_control_plane",
+                        (_time_mod.perf_counter() - t0) * 1000.0,
+                        key=get_key,
+                        pclass="shm_inline",
+                        payload_bytes=shm_result[1],
+                        descriptor_bytes=len(body),
+                        descriptor_decode_ms=round(meta_decode_ms, 3),
+                    )
+                return shm_result
 
             # POOL: handles from the ring header (guaranteed present — the poll above is gated
             # on _ring_edge_handles), descriptor from the entry body.

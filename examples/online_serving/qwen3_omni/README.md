@@ -380,6 +380,14 @@ so large CUDA payloads prefer the pool route. Small CUDA payloads can still
 take inline route and are explicitly normalized to CPU (SHM-style) before
 msgpack encoding.
 
+For the current hybrid performance path, small inline payloads use SHM bytes
+announced through the IPC ring:
+
+- `VLLM_OMNI_CUDA_IPC_INLINE_USE_SHM=1`
+
+This keeps IPC pool/D2D for large handoffs while using SHM's lighter small
+payload behavior for per-token chunks. Set to `0` to force ring-inline bytes.
+
 Set to `1` to allow size-based inline for all CUDA payloads under the inline
 threshold:
 
