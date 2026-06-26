@@ -349,6 +349,13 @@ SharedMemory for stage1 -> stage2):
 bash run_server_connector_perf.sh hybrid
 ```
 
+The hybrid mode also defaults:
+
+- `VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET=1`
+- `VLLM_OMNI_CONNECTOR_SAVE_WORKERS=16`
+
+These can be overridden from the environment for A/B testing.
+
 To force identical server-side args for both connector runs, set
 `COMMON_SERVER_ARGS`:
 

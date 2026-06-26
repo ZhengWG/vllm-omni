@@ -61,6 +61,14 @@ if [[ "${ENABLE_PROFILE_LOGS}" == "1" ]]; then
 fi
 
 if [[ "${CONNECTOR_MODE}" == "ipc" || "${CONNECTOR_MODE}" == "hybrid" ]]; then
+  if [[ "${CONNECTOR_MODE}" == "hybrid" ]]; then
+    # Hybrid profile is intended to combine IPC's large-prefill fast path with
+    # SHM's streaming chunk path. Defer unready pool gets to avoid receiver-side
+    # event wait tails on the prefill edge, and size save workers for the peak
+    # benchmark concurrency used by the Qwen3-Omni perf profile.
+    export VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET="${VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET:-1}"
+    export VLLM_OMNI_CONNECTOR_SAVE_WORKERS="${VLLM_OMNI_CONNECTOR_SAVE_WORKERS:-16}"
+  fi
   # Benchmark-oriented default: disable shm-compat probe on ring miss to
   # remove extra /dev/shm miss overhead in dedicated IPC deployments.
   # Set to 1 if you still want receiver-side fallback probing.
@@ -124,6 +132,7 @@ echo "  inline_cuda_tensors : ${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_TENSORS:-<default
 echo "  inline_use_shm : ${VLLM_OMNI_CUDA_IPC_INLINE_USE_SHM:-<default>}"
 echo "  inline_cuda_max_bytes : ${VLLM_OMNI_CUDA_IPC_INLINE_CUDA_MAX_BYTES:-<default>}"
 echo "  get_pool_wait_current_stream : ${VLLM_OMNI_CUDA_IPC_GET_POOL_WAIT_CURRENT_STREAM:-<default>}"
+echo "  defer_unready_pool_get : ${VLLM_OMNI_CUDA_IPC_DEFER_UNREADY_POOL_GET:-<default>}"
 echo "  put_pool_copy_streams : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_COPY_STREAMS:-<default>}"
 echo "  put_pool_async_inflight_limit : ${VLLM_OMNI_CUDA_IPC_PUT_POOL_ASYNC_INFLIGHT_LIMIT:-<default>}"
 echo "  connector_save_workers : ${VLLM_OMNI_CONNECTOR_SAVE_WORKERS:-<default>}"
