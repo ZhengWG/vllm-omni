@@ -1780,6 +1780,10 @@ class CudaIPCConnector(OmniConnectorBase):
             seg = shm_pkg.SharedMemory(name=get_key)
         except FileNotFoundError:
             return None
+        except ValueError as e:
+            if "empty file" in str(e):
+                return None
+            raise
         # Hold this one handle through read AND unlink — never close-then-reopen-by-name,
         # which races a same-key segment the sender may have just rewritten.
         try:
