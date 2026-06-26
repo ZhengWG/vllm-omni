@@ -19,6 +19,7 @@ import ctypes
 import hashlib
 import os
 import queue as _queue_mod
+import struct
 import threading
 import time as _time_mod
 import uuid
@@ -63,6 +64,7 @@ logger = get_connector_logger(__name__)
 
 _GPU_TENSOR_MARKER = "__cuda_ipc_tensor__"
 _POOL_MARKER = "__cuda_ipc_pool__"
+_INT_LIST_MARKER = "__cuda_ipc_int_list__"
 
 _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 
@@ -903,6 +905,43 @@ class CudaIPCConnector(OmniConnectorBase):
             )
         return 0
 
+    @staticmethod
+    def _encode_int_list(value: list[Any]) -> dict[str, Any] | None:
+        """Compact long int lists in pool descriptors.
+
+        Pool descriptors can otherwise spend tens of KB on msgpack-encoding
+        token ids as individual Python ints (for example ids.all / ids.prompt).
+        Keep the decoded payload type as list[int] for downstream code.
+        """
+        if len(value) < 64:
+            return None
+        try:
+            ints = [int(v) for v in value]
+        except (TypeError, ValueError):
+            return None
+        if any(v < -(1 << 31) or v >= (1 << 31) for v in ints):
+            data = struct.pack(f"<{len(ints)}q", *ints)
+            dtype = "int64"
+        else:
+            data = struct.pack(f"<{len(ints)}i", *ints)
+            dtype = "int32"
+        return {
+            _INT_LIST_MARKER: True,
+            "dtype": dtype,
+            "len": len(ints),
+            "data": data,
+        }
+
+    @staticmethod
+    def _decode_int_list(meta: dict[str, Any]) -> list[int]:
+        n = int(meta["len"])
+        data = meta["data"]
+        if n <= 0:
+            return []
+        if meta.get("dtype") == "int64":
+            return list(struct.unpack(f"<{n}q", data))
+        return list(struct.unpack(f"<{n}i", data))
+
     # --- Pool slot codec ---
 
     def _walk_encode_pool(
@@ -935,6 +974,9 @@ class CudaIPCConnector(OmniConnectorBase):
         if isinstance(obj, dict):
             return {k: self._walk_encode_pool(v, slot, copy_stream, pack_stats) for k, v in obj.items()}
         if isinstance(obj, list):
+            encoded_ints = self._encode_int_list(obj)
+            if encoded_ints is not None:
+                return encoded_ints
             return [self._walk_encode_pool(v, slot, copy_stream, pack_stats) for v in obj]
         if isinstance(obj, tuple):
             return tuple(self._walk_encode_pool(v, slot, copy_stream, pack_stats) for v in obj)
@@ -992,6 +1034,8 @@ class CudaIPCConnector(OmniConnectorBase):
         """Recursively restore tensors from pool offset metadata."""
         if isinstance(obj, dict) and obj.get(_GPU_TENSOR_MARKER):
             return self._decode_pool_tensor(obj, pool_ptr, slot_offset, stream=stream)
+        if isinstance(obj, dict) and obj.get(_INT_LIST_MARKER):
+            return self._decode_int_list(obj)
         if isinstance(obj, dict):
             return {k: self._walk_decode_pool(v, pool_ptr, slot_offset, stream=stream) for k, v in obj.items()}
         if isinstance(obj, list):
