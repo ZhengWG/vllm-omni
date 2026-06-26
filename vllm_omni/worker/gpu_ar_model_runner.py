@@ -1530,6 +1530,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         if stream is None:
             stream = torch.cuda.Stream()
             self._omni_payload_copy_stream = stream
+            # Tell the output connector (if it supports it) which stream the
+            # keep_on_gpu snapshot writes on, for correct pool-D2D ordering.
+            register = getattr(getattr(self, "_output_connector", None), "register_producer_stream", None)
+            if callable(register):
+                register(stream)
         return stream
 
     def _to_connector_payload_tensor(self, tensor: torch.Tensor) -> torch.Tensor:

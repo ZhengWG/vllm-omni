@@ -210,6 +210,9 @@ class CudaIPCConnector(OmniConnectorBase):
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
+        # Producer's payload-write stream, registered by the model runner so
+        # ``_put_pool`` can fence its pool D2D after it via ``wait_stream``.
+        self._producer_stream: torch.cuda.Stream | None = None
         self._metrics = {
             "puts": 0,
             "gets": 0,
@@ -295,6 +298,13 @@ class CudaIPCConnector(OmniConnectorBase):
     def _start_release_thread(self) -> None:
         self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
         self._release_thread.start()
+
+    def register_producer_stream(self, producer_stream: torch.cuda.Stream | None) -> None:
+        """Register the stream the producer writes payload tensors on, so
+        ``_put_pool`` orders its pool D2D after it via
+        ``copy_stream.wait_stream(producer_stream)`` — the correct primitive
+        when ``put()`` runs on a different thread than the producer."""
+        self._producer_stream = producer_stream
 
     # --- Device & SHM helpers ---
 
@@ -650,10 +660,15 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
-            # Order the pack after the producer's writes. record() captures the AMBIENT stream
-            # (default — no PTDS in current wheels); correct only while the producer writes there.
-            self._compute_event.record()
-            self._copy_stream.wait_event(self._compute_event)
+            # Fence the pack after the producer's writes. Prefer the registered
+            # producer stream (correct on any host/thread); else fall back to an
+            # ambient-stream event (only correct when PTDS is off and the
+            # producer wrote on the legacy default stream).
+            if self._producer_stream is not None:
+                self._copy_stream.wait_stream(self._producer_stream)
+            else:
+                self._compute_event.record()
+                self._copy_stream.wait_event(self._compute_event)
             try:
                 with torch.cuda.stream(self._copy_stream):
                     encoded_obj = self._walk_encode_pool(data, slot)
