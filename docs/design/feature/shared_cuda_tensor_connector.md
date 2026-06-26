@@ -373,6 +373,13 @@ Minimum soak tests:
 Add a script to inspect `_share_cuda_` / `_new_shared_cuda` signatures in the
 actual serving container.
 
+Initial probe:
+
+```bash
+python3 examples/online_serving/qwen3_omni/probe_shared_cuda_storage.py
+python3 examples/online_serving/qwen3_omni/probe_shared_cuda_storage.py --roundtrip
+```
+
 ### Phase 1: Micro prototype
 
 Two-process standalone prototype:
