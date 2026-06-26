@@ -1649,7 +1649,10 @@ class CudaIPCConnector(OmniConnectorBase):
                 meta_decode_ms = (_time_mod.perf_counter() - meta_t0) * 1000.0
                 shm_meta = raw.get("shm") if isinstance(raw, dict) else None
                 shm_name = shm_meta.get("name") if isinstance(shm_meta, dict) else get_key
-                shm_result = self._try_get_shm_compat(str(shm_name))
+                # SHM-inline is a normal small-payload route. Match
+                # SharedMemoryConnector semantics and return CPU tensors; the
+                # downstream model/preprocess owns H2D.
+                shm_result = self._try_get_shm_compat(str(shm_name), move_to_device=False)
                 if shm_result is not None:
                     self._profile_log(
                         "get_control_plane",
@@ -1798,7 +1801,7 @@ class CudaIPCConnector(OmniConnectorBase):
             return
         board.buf[slot_index] = 1
 
-    def _try_get_shm_compat(self, get_key: str) -> tuple[Any, int] | None:
+    def _try_get_shm_compat(self, get_key: str, *, move_to_device: bool = True) -> tuple[Any, int] | None:
         try:
             seg = shm_pkg.SharedMemory(name=get_key)
         except FileNotFoundError:
@@ -1825,23 +1828,27 @@ class CudaIPCConnector(OmniConnectorBase):
 
             self._shm_compat_decode_failures.pop(get_key, None)
             seg.unlink()
-            # Correctness-first fallback path: stage input may be consumed by a
-            # different stream/thread shortly after get(). Using non_blocking
-            # H2D here without an explicit consumer-stream fence can expose
-            # partially copied payloads under fallback pressure.
-            h2d_t0 = _time_mod.perf_counter()
-            obj = self._move_to_device(obj, non_blocking=False)
-            h2d_ms = (_time_mod.perf_counter() - h2d_t0) * 1000.0
+            h2d_ms = 0.0
+            if move_to_device:
+                # Correctness-first fallback path: stage input may be consumed
+                # by a different stream/thread shortly after get(). Using
+                # non_blocking H2D here without an explicit consumer-stream
+                # fence can expose partially copied payloads under fallback
+                # pressure.
+                h2d_t0 = _time_mod.perf_counter()
+                obj = self._move_to_device(obj, non_blocking=False)
+                h2d_ms = (_time_mod.perf_counter() - h2d_t0) * 1000.0
             size = len(data_bytes)
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += size
-            self._profile_log(
-                "get_control_plane",
-                h2d_ms,
-                key=get_key,
-                pclass="shm_compat_h2d",
-                payload_bytes=size,
-            )
+            if move_to_device:
+                self._profile_log(
+                    "get_control_plane",
+                    h2d_ms,
+                    key=get_key,
+                    pclass="shm_compat_h2d",
+                    payload_bytes=size,
+                )
             return obj, size
         except Exception as e:
             logger.warning("CudaIPCConnector shm_compat get failed for %s: %s", get_key, e)
