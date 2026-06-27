@@ -27,6 +27,7 @@ class _CudaIpcEventHandle(ctypes.Structure):
 _CUDA_MEMCPY_D2D = 3  # cudaMemcpyDeviceToDevice
 _CUDA_EVENT_INTERPROCESS = 0x04
 _CUDA_EVENT_DISABLE_TIMING = 0x02
+_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x01  # cudaIpcMemLazyEnablePeerAccess (only valid open flag)
 
 
 def load_cudart():

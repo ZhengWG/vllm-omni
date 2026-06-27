@@ -1,9 +1,13 @@
 # Qwen3-Omni-MoE — CudaIPCConnector (one stage per GPU, all cross-GPU CudaIPC).
 #
-# The connector routes put()/get() through the per-edge SPSC mailbox (_ipc_ring.IpcRing)
+# The connector routes put()/get() through the per-edge SPSC mailbox (CudaIpcControlRing)
 # instead of a per-transfer /dev/shm round-trip. Small payloads (< inline_threshold_bytes)
 # ride inline in the ring; big ones use the pool + D2D (descriptor in the ring); overflow /
 # ring-full / abort fall back to /dev/shm (read via _try_get_shm_compat).
+#
+# Memory: the GPU pool (pool_size_mb) is OUTSIDE gpu_memory_utilization, so real usage ~= gmu + pool.
+# /dev/shm: each ring needs ~ring_entries * ring_body_max host shm (~1GB/edge here); raise the 64MB
+# container default (e.g. `docker run --shm-size=4g`) or CudaIpcControlRing.create fails with OSError.
 #
 # Usage:
 #   CUDA_VISIBLE_DEVICES=0,1,2 vllm serve <model> --omni \

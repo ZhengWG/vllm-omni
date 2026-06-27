@@ -62,8 +62,10 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         else:
             # Legacy single spec: share one instance across both directions.
             self.input_connector = self.output_connector = self.create_connector(model_config)
-        # Backward compatibility: `self.connector` may be used for shared attrs.
-        self.connector = self.input_connector or self.output_connector
+        # Backward compatibility: `self.connector` may be used for shared attrs. Prefer the
+        # output connector — sender-side helpers read it for send-direction capability/config
+        # (supports_gpu_tensor, codec chunk params); fall back to input when send-only is absent.
+        self.connector = self.output_connector or self.input_connector
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management

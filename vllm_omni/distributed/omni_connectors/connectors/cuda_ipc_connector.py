@@ -48,6 +48,7 @@ from .cuda_ipc_control_ring import (
 from .cuda_ipc_runtime import (
     _CUDA_EVENT_DISABLE_TIMING,
     _CUDA_EVENT_INTERPROCESS,
+    _CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS,
     _CudaIpcEventHandle,
     _CudaIpcMemHandle,
     load_cudart,
@@ -239,7 +240,6 @@ class CudaIPCConnector(OmniConnectorBase):
         with torch.cuda.device(self.local_device):
             self._pool = torch.zeros(self._pool_size, dtype=torch.uint8, device=self.local_device)
             self._copy_stream = torch.cuda.Stream(device=self.local_device)
-            self._compute_event = torch.cuda.Event()
             self._copy_done_event = torch.cuda.Event()
         self._pool_handle = self._get_ipc_handle(self._pool.data_ptr())
         self._ipc_event = ctypes.c_void_p()
@@ -356,7 +356,9 @@ class CudaIPCConnector(OmniConnectorBase):
         """Open a CUDA IPC handle and return the mapped device pointer."""
         handle = _CudaIpcMemHandle.from_buffer_copy(handle_bytes)
         dev_ptr = ctypes.c_void_p()
-        ret = self._cudart.cudaIpcOpenMemHandle(ctypes.byref(dev_ptr), handle, ctypes.c_uint(1))
+        ret = self._cudart.cudaIpcOpenMemHandle(
+            ctypes.byref(dev_ptr), handle, ctypes.c_uint(_CUDA_IPC_MEM_LAZY_ENABLE_PEER_ACCESS)
+        )
         if ret != 0:
             raise RuntimeError(f"cudaIpcOpenMemHandle failed with code {ret}")
         return dev_ptr
@@ -415,7 +417,7 @@ class CudaIPCConnector(OmniConnectorBase):
             return obj.nbytes if obj.is_cuda else 0
         if isinstance(obj, dict):
             return sum(self._estimate_nbytes(v) for v in obj.values())
-        if isinstance(obj, (list, tuple)):
+        if isinstance(obj, list | tuple):
             return sum(self._estimate_nbytes(v) for v in obj)
         if hasattr(obj, "__struct_fields__"):
             return sum(
@@ -548,7 +550,7 @@ class CudaIPCConnector(OmniConnectorBase):
     def _release_expired_credits(self) -> None:
         """TTL sweep: reclaim slots whose receiver never marked the board
         (e.g. the request was aborted or the receiver died)."""
-        now = _time_mod.time()
+        now = _time_mod.monotonic()
         with self._held_lock:
             expired = [
                 (key, slot_offset)
@@ -597,6 +599,7 @@ class CudaIPCConnector(OmniConnectorBase):
         to_stage: str,
         put_key: str,
         data: Any,
+        compute_event: "torch.cuda.Event | None" = None,
     ) -> tuple[bool, int, dict[str, Any] | None]:
         if self._closed:
             return False, 0, None
@@ -605,15 +608,15 @@ class CudaIPCConnector(OmniConnectorBase):
             return False, 0, None
 
         composite_key = make_composite_key(put_key, from_stage, to_stage)
-        return self._put_control_plane(from_stage, to_stage, put_key, composite_key, data)
+        return self._put_control_plane(from_stage, to_stage, put_key, composite_key, data, compute_event)
 
-    def _put_control_plane(self, from_stage, to_stage, put_key, composite_key, data):
+    def _put_control_plane(self, from_stage, to_stage, put_key, composite_key, data, compute_event=None):
         """Primary send path: route small payloads inline vs large via GPU pool (both publish to ring)."""
         try:
             kh = key_hash16(composite_key)
             if self._estimate_nbytes(data) < self._inline_threshold:
                 return self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
-            return self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh)
+            return self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh, compute_event)
         except Exception as e:
             self._metrics["errors"] += 1
             logger.error("CudaIPCConnector control-plane put failed for %s: %s", put_key, e, exc_info=True)
@@ -636,7 +639,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._metrics["bytes_transferred"] += len(payload)
         return True, len(payload), {"ring": True, "size": len(payload)}
 
-    def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh):
+    def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh, compute_event=None):
         # Acquire a credit, D2D-pack into the slot, then publish a small descriptor
         # (slot_offset/slot_index + tensor layout) to the ring.
         # TODO: support acquiring multiple contiguous credits/slots when a single payload
@@ -650,10 +653,12 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
-            # Order the pack after the producer's writes. record() captures the AMBIENT stream
-            # (default — no PTDS in current wheels); correct only while the producer writes there.
-            self._compute_event.record()
-            self._copy_stream.wait_event(self._compute_event)
+            # Order the pack after the producer's writes: fence the producer-stream event when
+            # supplied, else (unknown producer stream on legacy/bg-thread callers) fence the device.
+            if compute_event is not None:
+                self._copy_stream.wait_event(compute_event)
+            else:
+                torch.accelerator.synchronize(self.local_device)
             try:
                 with torch.cuda.stream(self._copy_stream):
                     encoded_obj = self._walk_encode_pool(data, slot)
@@ -701,7 +706,8 @@ class CudaIPCConnector(OmniConnectorBase):
                 reason=f"descriptor_too_big {len(descriptor)}>{self._ring.body_max}",
             )
         with self._held_lock:
-            self._held_credits[composite_key] = (_time_mod.time(), slot_offset)
+            # monotonic() to match the TTL sweep's clock (NTP-step safe; see _release_expired_credits).
+            self._held_credits[composite_key] = (_time_mod.monotonic(), slot_offset)
         try:
             self._ring.publish(
                 kh, RING_PCLASS_POOL, descriptor, ts=int(_time_mod.time()), ttl_sec=int(self.tensor_lifetime_sec)
@@ -741,7 +747,7 @@ class CudaIPCConnector(OmniConnectorBase):
         meta = self._atomic_shm_write(payload, name=put_key)
         # Track for TTL cleanup in case the receiver aborts and never reads/unlinks it.
         if getattr(self, "_fallback_segs", None) is not None:
-            self._fallback_segs[put_key] = _time_mod.time()
+            self._fallback_segs[put_key] = _time_mod.monotonic()
 
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += size

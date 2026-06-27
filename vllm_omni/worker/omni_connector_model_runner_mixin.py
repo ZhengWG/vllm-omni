@@ -486,7 +486,7 @@ class OmniConnectorModelRunnerMixin:
             return False
         if isinstance(value, torch.Tensor):
             return value.numel() > 0
-        if isinstance(value, (list, tuple, dict, set)):
+        if isinstance(value, list | tuple | dict | set):
             return len(value) > 0
         return True
 
@@ -844,7 +844,7 @@ class OmniConnectorModelRunnerMixin:
                 exc_info=True,
             )
             keys = frozenset()
-        if not isinstance(keys, (frozenset, set)):
+        if not isinstance(keys, frozenset | set):
             logger.debug(
                 "Ignoring non-set _FULL_PAYLOAD_REPLACE_KEYS from %s: %s",
                 module_name,
@@ -1027,6 +1027,7 @@ class OmniConnectorModelRunnerMixin:
                 "put_key": connector_put_key,
                 "data": payload,
                 "request_id": req_id,
+                "compute_event": self._record_compute_event(),
             }
             with self._lock:
                 self._pending_save_reqs.setdefault(req_id, deque()).append(task)
@@ -1120,6 +1121,15 @@ class OmniConnectorModelRunnerMixin:
         self._chunk_ready_req_ids.update(finished)
         return result
 
+    def _record_compute_event(self):
+        """Record an event on the current (producer) stream so a GPU-tensor connector's copy
+        stream can order its D2D pack after the forward — model thread owns the real stream."""
+        if not getattr(self._output_connector, "supports_gpu_tensor", False) or not torch.cuda.is_available():
+            return None
+        ev = torch.cuda.Event()
+        ev.record(torch.cuda.current_stream())
+        return ev
+
     def send_chunk(
         self,
         request: Any,
@@ -1179,6 +1189,7 @@ class OmniConnectorModelRunnerMixin:
             "put_key": connector_put_key,
             "data": payload_data,
             "request_id": request_id,
+            "compute_event": self._record_compute_event(),
         }
         with self._lock:
             self._pending_save_reqs.setdefault(request_id, deque()).append(task)
@@ -1980,12 +1991,22 @@ class OmniConnectorModelRunnerMixin:
             )
         put_key = task.get("put_key")
 
-        success, _size, _metadata = connector.put(
-            from_stage=str(task["stage_id"]),
-            to_stage=str(task["next_stage_id"]),
-            put_key=put_key,
-            data=payload_data,
-        )
+        compute_event = task.get("compute_event")
+        if compute_event is not None and getattr(connector, "supports_gpu_tensor", False):
+            success, _size, _metadata = connector.put(
+                from_stage=str(task["stage_id"]),
+                to_stage=str(task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
+                compute_event=compute_event,
+            )
+        else:
+            success, _size, _metadata = connector.put(
+                from_stage=str(task["stage_id"]),
+                to_stage=str(task["next_stage_id"]),
+                put_key=put_key,
+                data=payload_data,
+            )
         logger.debug(
             "[Stage-%s] _send_single_request: put_key=%s success=%s size=%s",
             task["stage_id"],
