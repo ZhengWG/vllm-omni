@@ -56,6 +56,17 @@ def _to_cpu_contiguous(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.to("cpu").contiguous()
 
 
+def _payload_max_cuda_nbytes(value: Any) -> int:
+    """Largest CUDA-tensor nbytes anywhere in the payload (pure metadata, no sync)."""
+    if isinstance(value, torch.Tensor):
+        return int(value.nbytes) if value.is_cuda else 0
+    if isinstance(value, dict):
+        return max((_payload_max_cuda_nbytes(v) for v in value.values()), default=0)
+    if isinstance(value, (list, tuple)):
+        return max((_payload_max_cuda_nbytes(v) for v in value), default=0)
+    return 0
+
+
 def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
     """Clone CUDA tensors on the current stream before async CPU copies.
 
@@ -315,6 +326,10 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._payload_keep_on_gpu: bool = getattr(
             getattr(self, "_output_connector", None), "supports_gpu_tensor", False
         )
+        _kc = getattr(getattr(self, "_output_connector", None), "config", {}) or {}
+        # Only payloads with a CUDA tensor >= this stay GPU/D2D (the big prefill
+        # handoff); smaller/decode batches ride the async-D2H overlap = SHM parity.
+        self._keep_gpu_min_bytes: int = int(_kc.get("keep_gpu_min_bytes", 1 << 20))
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1453,7 +1468,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             staged_hidden_states_cpu=staged_hidden_states_cpu,
             multimodal_outputs=multimodal_outputs,
         )
-        if self._payload_keep_on_gpu:
+        if self._payload_keep_on_gpu and _payload_max_cuda_nbytes(payload) >= self._keep_gpu_min_bytes:
             with record_function_or_nullcontext("omni_async_output:snapshot_gpu_payload"):
                 hidden_states_snapshot = payload.get("hidden_states")
                 if hidden_states_snapshot is None:

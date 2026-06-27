@@ -121,6 +121,17 @@ def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | 
     return t.detach() if keep_on_gpu else t.detach().cpu()
 
 
+def _cat_aligned(tensors, dim: int = 0):
+    """torch.cat after moving all operands onto the first operand's device.
+    Guards size-gated payloads where prefill (GPU) and decode (CPU) chunks
+    accumulate across streaming chunks and would otherwise raise on cat."""
+    seq = [t for t in tensors if t is not None]
+    if not seq:
+        raise ValueError("_cat_aligned: nothing to concatenate")
+    dev = seq[0].device
+    return torch.cat([t if t.device == dev else t.to(dev) for t in seq], dim=dim)
+
+
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
     try:
         token_id = int(token_id)
@@ -237,8 +248,8 @@ def _merge_pd_embeddings(
     raw_total = p_emb.shape[0] + decode_emb.shape[0]
     overlap = max(0, raw_total - expected_total) if expected_total is not None else 0
 
-    merged_emb = torch.cat([p_emb, decode_emb[overlap:]], dim=0)
-    merged_hid = torch.cat([p_hid, decode_hid[overlap:]], dim=0)
+    merged_emb = _cat_aligned([p_emb, decode_emb[overlap:]], dim=0)
+    merged_hid = _cat_aligned([p_hid, decode_hid[overlap:]], dim=0)
     return merged_emb, merged_hid
 
 
@@ -318,8 +329,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 if isinstance(saved_prefill, torch.Tensor) and isinstance(saved_output, torch.Tensor):
                     return OmniPayloadStruct(
                         meta=MetaStruct(finished=finished),
-                        embed=EmbeddingsStruct(prefill=torch.cat((saved_prefill, emb_cpu), dim=0)),
-                        hidden_states=HiddenStatesStruct(output=torch.cat((saved_output, hid_cpu), dim=0)),
+                        embed=EmbeddingsStruct(prefill=_cat_aligned((saved_prefill, emb_cpu), dim=0)),
+                        hidden_states=HiddenStatesStruct(output=_cat_aligned((saved_output, hid_cpu), dim=0)),
                         ids=IdsStruct(
                             all=save_payload.get("ids", {}).get("all"),
                             prompt=save_payload.get("ids", {}).get("prompt"),
@@ -504,10 +515,10 @@ def thinker2talker_async_chunk(
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            payload.embed.prefill = torch.cat(
+            payload.embed.prefill = _cat_aligned(
                 (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
             )
-            payload.hidden_states.output = torch.cat(
+            payload.hidden_states.output = _cat_aligned(
                 (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
             )
             prefill_shape = payload.embed.prefill.shape[0]

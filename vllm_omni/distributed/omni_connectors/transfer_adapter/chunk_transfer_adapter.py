@@ -343,7 +343,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 )
 
             except Exception as e:
-                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}")
+                logger.error(f"Failed to use custom_process_input_func for payload extraction: {e}", exc_info=True)
 
         if payload_data is None:
             if not (is_segment_finished or is_finished):
