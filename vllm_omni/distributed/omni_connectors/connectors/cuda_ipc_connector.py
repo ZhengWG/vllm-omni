@@ -18,6 +18,7 @@ Limitation: no sender live-restart (receiver caches the sender's IPC handles); r
 import ctypes
 import hashlib
 import os
+import platform
 import queue as _queue_mod
 import threading
 import time as _time_mod
@@ -262,6 +263,13 @@ class CudaIPCConnector(OmniConnectorBase):
         self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
         self._board = shm_pkg.SharedMemory(create=True, size=self._pool_credits, name=self._board_name)
         self._board.buf[: self._pool_credits] = bytes(self._pool_credits)
+        # Seqlock ring is fenceless — only correct on x86 TSO; warn loudly on weak-memory hosts.
+        if platform.machine() not in ("x86_64", "AMD64"):
+            logger.warning(
+                "CudaIpcControlRing seqlock is fenceless and only correct on x86 TSO; on %s "
+                "(ARM/POWER) a torn read is possible — memory fences needed before production use.",
+                platform.machine(),
+            )
         n_slots = self._ring_entries_cfg or max(64, self._pool_credits * 4)
         body_max = max(self._ring_body_max, self._inline_threshold)
         self._ring = CudaIpcControlRing.create(
