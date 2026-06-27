@@ -22,17 +22,19 @@ def build_mm_cpu(multimodal_outputs: dict, keep_on_gpu: bool = False) -> dict[st
         keep_on_gpu: When True, detach tensors but keep them on GPU for
             D2D transfer (e.g. via CudaIPCConnector).
     """
+    if not multimodal_outputs:
+        return {}
+
     mm_cpu: dict[str, object] = {}
     # Currently there are some cases where this is true at the
     # moment, which should be fixed.
     if not isinstance(multimodal_outputs, Mapping):
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
-    if multimodal_outputs:
-        for k, v in multimodal_outputs.items():
-            converted = _detach_tensor(v, keep_on_gpu)
-            if converted is not None:
-                mm_cpu[k] = converted
+    for k, v in multimodal_outputs.items():
+        converted = _detach_tensor(v, keep_on_gpu)
+        if converted is not None:
+            mm_cpu[k] = converted
     return mm_cpu
 
 
