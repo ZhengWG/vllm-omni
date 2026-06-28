@@ -1126,7 +1126,10 @@ class OmniConnectorModelRunnerMixin:
         stream can order its D2D pack after the forward — model thread owns the real stream."""
         if not getattr(self._output_connector, "supports_gpu_tensor", False) or not torch.cuda.is_available():
             return None
-        ev = torch.cuda.Event()
+        ev = getattr(self, "_omni_compute_event", None)
+        if ev is None:
+            ev = torch.cuda.Event()
+            self._omni_compute_event = ev
         ev.record(torch.cuda.current_stream())
         return ev
 
@@ -2199,9 +2202,15 @@ class OmniConnectorModelRunnerMixin:
             return OmniConnectorFactory.create_connector(ConnectorSpec(name=name.strip(), extra=extra))
 
         if "input" in connector_config or "output" in connector_config:
-            inp = _make(connector_config["input"]) if "input" in connector_config else None
-            out = _make(connector_config["output"]) if "output" in connector_config else None
-            return inp, out
+            connectors = []
+            for direction in ("input", "output"):
+                spec = connector_config.get(direction)
+                if spec is not None and not isinstance(spec, dict):
+                    raise RuntimeError(
+                        f"Invalid {direction!r} connector spec: expected dict, got {type(spec).__name__}"
+                    )
+                connectors.append(_make(spec) if spec is not None else None)
+            return connectors[0], connectors[1]
 
         conn = _make(connector_config)
         return conn, conn

@@ -16,7 +16,6 @@ Limitation: no sender live-restart (receiver caches the sender's IPC handles); r
 """
 
 import ctypes
-import hashlib
 import os
 import platform
 import queue as _queue_mod
@@ -317,12 +316,6 @@ class CudaIPCConnector(OmniConnectorBase):
                 return torch.device(local_device_cfg)
             return torch.device("cuda", int(local_device_cfg))
         return torch.device("cuda", torch.accelerator.current_device_index())
-
-    @staticmethod
-    def _safe_name(prefix: str, key: str) -> str:
-        """Generate a short, collision-free SHM name via SHA1 hash."""
-        digest = hashlib.sha1(key.encode("utf-8")).hexdigest()[:20]
-        return f"{prefix}_{digest}"
 
     @staticmethod
     def _atomic_shm_write(payload: bytes, name: str) -> dict[str, Any]:
