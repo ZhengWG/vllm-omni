@@ -67,6 +67,7 @@ connectors:
 |-----------------|----------|--------------|
 | `SharedMemoryConnector` | Same-host KV transfer between stages (default for bundled YAMLs). | `shm_threshold_bytes` (int, default `65536`). |
 | `MooncakeStoreConnector` | Cross-host KV transfer over TCP. Required for multi-node deployments. | `host`, `metadata_server`, `master`, `segment` (int bytes), `localbuf` (int bytes), `proto` (`"tcp"` / `"rdma"`). |
+| `CudaIPCConnector` | **Experimental.** Same-host, cross-GPU D2D handoff via CUDA IPC. `pool_size_mb` is allocated outside `gpu_memory_utilization`; ring SHM (~`ring_entries * ring_body_max` per edge) requires raising the container `/dev/shm` size (e.g. `--shm-size=4g`). | `pool_size_mb` (default `4096`), `pool_credits` (`64`), `inline_threshold_bytes` (`16384`), `ring_body_max` (`524288`), `ring_entries` (`2048`), `tensor_lifetime_sec` (`30.0`). |
 
 A stage references a connector by name in its `input_connectors` / `output_connectors`:
 
