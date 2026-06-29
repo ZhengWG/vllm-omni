@@ -713,8 +713,6 @@ def build_engine_args_dict(
     # Stage id must come from stage config instead of inherited CLI kwargs
     # (e.g. `--stage-id` defaulting to None).
     engine_args_dict["stage_id"] = stage_id
-    # Propagate the connector spec for BOTH modes: full_payload (async_chunk=false) also
-    # uses _output_connector, so gating on async_chunk would drop the configured connector.
     engine_args_dict["stage_connector_spec"] = dict(stage_connector_spec or {})
 
     if stage_type == "diffusion":
@@ -1050,9 +1048,26 @@ def load_omni_transfer_config_for_model(model: str, config_path: str | None) -> 
         return None
 
 
+def stage_uses_worker_connector(stage_config: Any | None) -> bool:
+    """Gate ``get_stage_connector_spec``: True if the worker mixin will put/get on the edge.
+
+    True when ``async_chunk`` (chunk stream) or ``custom_process_next_stage_input_func``
+    (full-payload send). False for KV/orchestrator-only stages (Bagel thinker): KV manager
+    owns the edge connector; do not also create mixin ``_output_connector``.
+    """
+    if stage_config is None:
+        return False
+    engine_args = _to_dict(getattr(stage_config, "engine_args", None) or {})
+    if bool(engine_args.get("async_chunk", False)):
+        return True
+    next_stage_func = engine_args.get("custom_process_next_stage_input_func")
+    return isinstance(next_stage_func, str) and bool(next_stage_func.strip())
+
+
 def get_stage_connector_spec(
     omni_transfer_config: Any,
     stage_id: int,
+    stage_config: Any | None = None,
 ) -> dict[str, Any]:
     """Return the resolved stage connector spec (mode-independent).
 
@@ -1065,11 +1080,12 @@ def get_stage_connector_spec(
             "output": {"name": "...", "extra": {...}},
         }
 
-    NOT gated on async_chunk: full_payload mode (async_chunk=false) also uses
-    ``self._output_connector`` in ``send_full_payload_outputs``, so it must honor
-    the configured connector (e.g. CudaIPC). Unconfigured edges still fall back to
-    the SharedMemoryConnector default via the ``not stage_connectors_cfg`` guard.
+    Returns ``{}`` when the stage does not use the worker connector data plane
+    (KV/orchestrator-only inter-stage paths). See ``stage_uses_worker_connector``.
     """
+    if not stage_uses_worker_connector(stage_config):
+        return {}
+
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
 
     stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)

@@ -81,6 +81,29 @@ class OmniConnectorModelRunnerMixin:
     via ``OmniConnectorOutput``.
     """
 
+    @property
+    def _omni_connector(self) -> OmniConnectorBase | None:
+        return getattr(self, "_output_connector", None) or getattr(self, "_input_connector", None)
+
+    @_omni_connector.setter
+    def _omni_connector(self, conn: OmniConnectorBase | None) -> None:
+        if conn is None:
+            self._input_connector = None
+            self._output_connector = None
+            return
+        inp = getattr(self, "_input_connector", None)
+        out = getattr(self, "_output_connector", None)
+        # Dual-connector prod: distinct instances — legacy setter must not clobber.
+        if inp is not None and out is not None and inp is not out:
+            logger.warning(
+                "[Stage-%s] Ignoring _omni_connector assignment: "
+                "dual-connector mode uses separate input/output instances",
+                getattr(self, "_stage_id", "?"),
+            )
+            return
+        self._input_connector = conn
+        self._output_connector = conn
+
     # ------------------------------------------------------------------ #
     #  Init / Shutdown
     # ------------------------------------------------------------------ #
@@ -107,7 +130,6 @@ class OmniConnectorModelRunnerMixin:
         self._input_connector, self._output_connector = self._create_connectors(
             model_config, is_transfer_rank=self.is_data_transfer_rank()
         )
-        self._omni_connector: OmniConnectorBase | None = self._input_connector or self._output_connector
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -235,12 +257,13 @@ class OmniConnectorModelRunnerMixin:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:
             self._save_thread.join(timeout=5)
-        for conn in (self._input_connector, self._output_connector):
-            if conn is not None:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+        # Legacy single-connector shares one instance on both sides; hybrid uses
+        # two. dict.fromkeys dedupes by identity so shared instances close once.
+        for conn in dict.fromkeys(c for c in (self._input_connector, self._output_connector) if c is not None):
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def cleanup_finished_request(self, req_id: str) -> None:
         """Clean up per-request state after a request is fully finished.

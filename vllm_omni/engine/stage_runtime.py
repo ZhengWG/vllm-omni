@@ -346,6 +346,7 @@ class StageRuntime:
             stage_connector_spec = get_stage_connector_spec(
                 omni_transfer_config=omni_transfer_config,
                 stage_id=stage_id,
+                stage_config=stage_cfg,
             )
             omni_kv_connector = resolve_omni_kv_config_for_stage(omni_transfer_config, stage_id)
             num_replicas = replicas_per_stage[stage_idx]
