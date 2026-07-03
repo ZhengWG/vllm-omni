@@ -13,7 +13,6 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
-from ..utils.config import ConnectorSpec
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
@@ -55,17 +54,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
                 "race to evict it).",
                 self._active_window,
             )
-        connector_config = self._connector_config(model_config)
-        if "input" in connector_config or "output" in connector_config:
-            self.input_connector = self.create_connector(model_config, "input")
-            self.output_connector = self.create_connector(model_config, "output")
-        else:
-            # Legacy single spec: share one instance across both directions.
-            self.input_connector = self.output_connector = self.create_connector(model_config)
-        # Backward compatibility: `self.connector` may be used for shared attrs. Prefer the
-        # output connector — sender-side helpers read it for send-direction capability/config
-        # (supports_gpu_tensor, codec chunk params); fall back to input when send-only is absent.
-        self.connector = self.output_connector or self.input_connector
+        self.connector = self.create_connector(model_config)
         super().__init__(model_config)
         self.model_mode = getattr(model_config, "worker_type", None) or "ar"
         # State specific to Chunk management
@@ -115,39 +104,16 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         return max(0, num_computed - num_placeholders)
 
     @classmethod
-    def _connector_config(cls, model_config: Any) -> dict[str, Any]:
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is None:
-            return {}
-        if not isinstance(connector_config, dict):
-            return {
-                "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", {}),
-            }
-        return connector_config
+    def create_connector(cls, model_config: Any):
+        """Build the stage's connector via the factory single entry point.
 
-    @classmethod
-    def create_connector(cls, model_config: Any, direction: str | None = None):
-        """Build a single connector for this stage.
-
-        direction:
-            None              -> legacy single-connector spec (top-level
-                                 ``name``/``extra``).
-            "input"/"output"  -> dual-connector spec; returns ``None`` when
-                                 that direction is not configured.
+        Direction routing (dual ``{"input": ..., "output": ...}`` configs) is
+        a connector implementation detail — the factory returns an
+        ``EdgeRoutedConnector`` for that shape.  An unconfigured stage keeps
+        the legacy default of a SharedMemoryConnector.
         """
-        connector_config = cls._connector_config(model_config)
-        if direction in ("input", "output"):
-            spec_dict = connector_config.get(direction)
-            if not spec_dict:
-                return None
-        else:
-            spec_dict = connector_config
-        spec = ConnectorSpec(
-            name=spec_dict.get("name", "SharedMemoryConnector"),
-            extra=spec_dict.get("extra", {}),
-        )
-        return OmniConnectorFactory.create_connector(spec)
+        connector_config = getattr(model_config, "stage_connector_config", None)
+        return OmniConnectorFactory.create_stage_connector(connector_config if connector_config is not None else {})
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -230,9 +196,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
-            if self.input_connector is None:
+            if not self.connector.can_recv:
                 return False
-            result = self.input_connector.get(
+            result = self.connector.get(
                 str(target_stage_id),
                 str(stage_id),
                 connector_get_key,
@@ -358,9 +324,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
-        if self.output_connector is None:
+        if not self.connector.can_send:
             return
-        success, size, metadata = self.output_connector.put(
+        success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
             put_key=connector_put_key,

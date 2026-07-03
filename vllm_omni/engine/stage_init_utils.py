@@ -1053,7 +1053,7 @@ def stage_uses_worker_connector(stage_config: Any | None) -> bool:
 
     True when ``async_chunk`` (chunk stream) or ``custom_process_next_stage_input_func``
     (full-payload send). False for KV/orchestrator-only stages (Bagel thinker): KV manager
-    owns the edge connector; do not also create mixin ``_output_connector``.
+    owns the edge connector; do not also create the mixin's stage connector.
     """
     if stage_config is None:
         return False

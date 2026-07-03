@@ -114,8 +114,14 @@ def build_adapter(monkeypatch, mocker: MockerFixture):
 @pytest.mark.parametrize(
     ("raw_cfg", "expected_name", "expected_extra"),
     [
-        (None, "SharedMemoryConnector", {}),
-        (SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}), "YuanrongConnector", {"k": "v"}),
+        # Unconfigured stage keeps the legacy SHM default; the factory injects
+        # is_transfer_rank (defaults True on the scheduler-side adapter path).
+        (None, "SharedMemoryConnector", {"is_transfer_rank": True}),
+        (
+            SimpleNamespace(name="YuanrongConnector", extra={"k": "v"}),
+            "YuanrongConnector",
+            {"is_transfer_rank": True, "k": "v"},
+        ),
     ],
 )
 def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, expected_extra):
@@ -126,8 +132,7 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
         return "ok"
 
     monkeypatch.setattr(
-        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
-        ".OmniConnectorFactory.create_connector",
+        "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
         _fake_create,
     )
 
@@ -140,50 +145,84 @@ def test_create_connector_config_parsing(monkeypatch, raw_cfg, expected_name, ex
     assert captured["spec"].extra == expected_extra
 
 
-_DUAL_CFG = {
-    "input": {"name": "SharedMemoryConnector"},
-    "output": {"name": "CudaIPCConnector", "extra": {"pool_size_mb": 256}},
-}
+class _StubBackend:
+    """Minimal duck-typed backend recording put/get routing."""
+
+    def __init__(self, spec: ConnectorSpec):
+        self.name = spec.name
+        self.config = spec.extra
+        self.stage_id = spec.extra.get("stage_id", -1)
+        self.supports_gpu_tensor = spec.name == "CudaIPCConnector"
+        self.calls: list[tuple] = []
+
+    def put(self, from_stage, to_stage, put_key, data, **kwargs):
+        self.calls.append(("put", from_stage, to_stage, put_key))
+        return True, 1, {}
+
+    def get(self, from_stage, to_stage, get_key, metadata=None):
+        self.calls.append(("get", from_stage, to_stage, get_key))
+        return None
+
+    def cleanup(self, request_id):
+        pass
+
+    def health(self):
+        return {}
+
+    def close(self):
+        pass
 
 
-@pytest.mark.parametrize(
-    ("raw_cfg", "direction", "expected"),
-    [
-        # Dual spec: each direction resolves to its own sub-config. The input edge gets
-        # SHM, the output (send) edge gets CudaIPC — the mixed setup where the capability
-        # check on the send path must read from `output_connector`, not the shared one.
-        (_DUAL_CFG, "input", ("SharedMemoryConnector", {})),
-        (_DUAL_CFG, "output", ("CudaIPCConnector", {"pool_size_mb": 256})),
-        # A direction that is not configured returns None (and never calls the factory).
-        ({"input": {"name": "SharedMemoryConnector"}}, "output", None),
-        ({"output": {"name": "CudaIPCConnector"}}, "input", None),
-    ],
-)
-def test_create_connector_dual_direction(monkeypatch, raw_cfg, direction, expected):
-    captured = {}
+def test_create_connector_dual_routes_by_edge(monkeypatch):
+    """Dual {input, output} config yields ONE routed connector: put() goes to
+    the output backend, get() to the input backend, and the send-edge
+    capability (supports_gpu_tensor) reflects the output backend."""
+    made = {}
 
     def _fake_create(spec):
-        captured["spec"] = spec
-        return "ok"
+        made[spec.name] = _StubBackend(spec)
+        return made[spec.name]
 
     monkeypatch.setattr(
-        "vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter"
-        ".OmniConnectorFactory.create_connector",
+        "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
         _fake_create,
     )
 
-    model_config = SimpleNamespace(stage_connector_config=raw_cfg)
-    connector = OmniChunkTransferAdapter.create_connector(model_config, direction)
+    cfg = {
+        "input": {"name": "SharedMemoryConnector", "extra": {"stage_id": 1}},
+        "output": {"name": "CudaIPCConnector", "extra": {"stage_id": 1, "pool_size_mb": 256}},
+    }
+    conn = OmniChunkTransferAdapter.create_connector(SimpleNamespace(stage_connector_config=cfg))
 
-    if expected is None:
-        assert connector is None
-        assert "spec" not in captured  # unconfigured direction -> factory not called
-    else:
-        expected_name, expected_extra = expected
-        assert connector == "ok"
-        assert isinstance(captured["spec"], ConnectorSpec)
-        assert captured["spec"].name == expected_name
-        assert captured["spec"].extra == expected_extra
+    assert conn.can_send and conn.can_recv
+    assert conn.supports_gpu_tensor  # send-edge capability comes from the output backend
+    assert conn.supports_gpu_tensor_for("1", "2") is True  # output edge
+    assert conn.supports_gpu_tensor_for("0", "1") is False  # input edge (SHM)
+    assert int(conn.stage_id) == 1
+    # merged config view: send-edge extra visible to codec-config readers
+    assert conn.config["pool_size_mb"] == 256
+
+    conn.put("1", "2", "key-a", {})
+    conn.get("0", "1", "key-b")
+    assert made["CudaIPCConnector"].calls == [("put", "1", "2", "key-a")]
+    assert made["SharedMemoryConnector"].calls == [("get", "0", "1", "key-b")]
+
+
+def test_create_connector_single_direction_degrades(monkeypatch):
+    """A direction that is not configured no-ops: put() reports failure and
+    can_send is False, so send paths skip work instead of crashing."""
+    monkeypatch.setattr(
+        "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
+        lambda spec: _StubBackend(spec),
+    )
+
+    cfg = {"input": {"name": "SharedMemoryConnector", "extra": {"stage_id": 2}}}
+    conn = OmniChunkTransferAdapter.create_connector(SimpleNamespace(stage_connector_config=cfg))
+
+    assert conn.can_recv and not conn.can_send
+    assert conn.supports_gpu_tensor is False
+    assert conn.put("2", "3", "key", {}) == (False, 0, None)
+    assert conn.get("1", "2", "key") is None  # routes to input backend, stub returns None
 
 
 def test_load_poll(build_adapter):

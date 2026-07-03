@@ -23,6 +23,29 @@ class OmniConnectorBase(ABC):
     # When True, payload processors may skip .cpu() on tensors.
     supports_gpu_tensor: bool = False
 
+    # --- Direction capabilities ---
+    # A plain connector serves both directions of its stage.  A routed
+    # connector (EdgeRoutedConnector) overrides these to reflect which
+    # edges are actually configured, so callers gate send/recv work on
+    # capability instead of holding per-direction connector instances.
+
+    @property
+    def can_send(self) -> bool:
+        """Whether this connector has a send (output) edge."""
+        return True
+
+    @property
+    def can_recv(self) -> bool:
+        """Whether this connector has a receive (input) edge."""
+        return True
+
+    def supports_gpu_tensor_for(self, from_stage: str, to_stage: str) -> bool:
+        """Per-edge GPU-direct capability; defaults to the class-level flag.
+
+        A routed connector answers per edge (e.g. CudaIPC in, SHM out).
+        """
+        return self.supports_gpu_tensor
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.

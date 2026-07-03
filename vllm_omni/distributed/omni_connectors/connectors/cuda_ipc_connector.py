@@ -129,15 +129,10 @@ class CudaIPCConnector(OmniConnectorBase):
         self._parse_config(config)
         self._init_runtime_state()
         self._init_cuda()
-        if self._is_sender_owner:
-            self._init_sender_resources()
-        else:
-            self._init_inert_state()
-        if self._is_sender_owner:
-            self._start_release_thread()
+        self._init_lazy_defaults()
         logger.info(
-            "CudaIPCConnector initialized: role=%s, local_device=%s, "
-            "replica_id=%s, pool=%dMB (%d credits x %dMB slots)",
+            "CudaIPCConnector initialized: role=%s, local_device=%s, replica_id=%s, "
+            "pool=%dMB (%d credits x %dMB slots) — edge resources allocate lazily on first use",
             self.role,
             self.local_device,
             self._replica_id,
@@ -146,11 +141,6 @@ class CudaIPCConnector(OmniConnectorBase):
             self._slot_size // 1024 // 1024,
         )
         logger.debug("CudaIPCConnector config_keys=%s", sorted(config.keys()))
-
-    @property
-    def _is_sender_owner(self) -> bool:
-        """The sender's data-transfer rank — the only one that owns a pool/board/ring."""
-        return self.role == "sender" and self._is_transfer_rank
 
     def _parse_config(self, config: dict[str, Any]) -> None:
         """Resolve role, edge identity, thresholds, timing, and pool sizing."""
@@ -208,6 +198,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._cudart = None
         self._held_lock = threading.Lock()
         self._open_lock = threading.Lock()
+        self._lazy_init_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
@@ -279,8 +270,18 @@ class CudaIPCConnector(OmniConnectorBase):
         )
         self._ring.write_header(self._ring_header_blob())
 
-    def _init_inert_state(self) -> None:
-        """Receiver, or an inert non-transfer-rank sender: no pool/board/ring."""
+    def _init_lazy_defaults(self) -> None:
+        """Baseline state for every instance: no pool/board/ring, no recv streams.
+
+        Edge resources are allocated lazily — sender resources on the first
+        put() (see ``_ensure_sender_resources``), receiver copy streams on
+        the first pool-class get() (see ``_ensure_recv_streams``).  Lazy
+        allocation is what allows both the scheduler-side transfer adapter
+        and the worker mixin to construct a connector from the same stage
+        config without double-allocating the GPU pool or create/unlinking
+        the same-named per-edge ring: only the object that actually
+        transmits ends up owning edge resources.
+        """
         self._pool = None
         self._pool_handle = None
         self._credit_queue = None
@@ -288,16 +289,38 @@ class CudaIPCConnector(OmniConnectorBase):
         self._fallback_segs = {}
         self._board_name = None
         self._board = None
-        if self.role == "receiver":
+        self._recv_copy_streams = []
+        self._recv_copy_events = []
+        self._recv_stream_idx = 0
+
+    def _ensure_sender_resources(self) -> None:
+        """Allocate pool/board/ring + start the release loop on first send."""
+        if self._pool is not None:
+            return
+        with self._lazy_init_lock:
+            if self._pool is not None or self._closed:
+                return
+            self._init_sender_resources()
+            self._start_release_thread()
+            logger.info(
+                "CudaIPCConnector(stage=%s): sender resources allocated (pool=%dMB, ring=%s)",
+                self.stage_id,
+                self._pool_size // (1024 * 1024),
+                ring_shm_name(self.stage_id, self.stage_id + 1, self._replica_id),
+            )
+
+    def _ensure_recv_streams(self) -> None:
+        """Create receiver D2D copy streams/events on first pool-class get()."""
+        if self._recv_copy_streams:
+            return
+        with self._lazy_init_lock:
+            if self._recv_copy_streams:
+                return
             with torch.cuda.device(self.local_device):
+                self._recv_copy_events = [torch.cuda.Event() for _ in range(_DEFAULT_RECV_STREAMS)]
                 self._recv_copy_streams = [
                     torch.cuda.Stream(device=self.local_device) for _ in range(_DEFAULT_RECV_STREAMS)
                 ]
-                self._recv_copy_events = [torch.cuda.Event() for _ in range(_DEFAULT_RECV_STREAMS)]
-        else:
-            self._recv_copy_streams = []
-            self._recv_copy_events = []
-        self._recv_stream_idx = 0
 
     def _start_release_thread(self) -> None:
         self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
@@ -614,6 +637,7 @@ class CudaIPCConnector(OmniConnectorBase):
     def _put_control_plane(self, from_stage, to_stage, put_key, composite_key, data, compute_event=None):
         """Primary send path: route small payloads inline vs large via GPU pool (both publish to ring)."""
         try:
+            self._ensure_sender_resources()
             kh = key_hash16(composite_key)
             if self._estimate_nbytes(data) < self._inline_threshold:
                 return self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
@@ -797,6 +821,7 @@ class CudaIPCConnector(OmniConnectorBase):
             pool_handle, event_handle, board_name = self._ring_edge_handles[(from_stage, to_stage)]
             raw = OmniSerializer.deserialize(body)
             pool_ptr = self._open_pool(pool_handle)
+            self._ensure_recv_streams()
             idx = self._recv_stream_idx % len(self._recv_copy_streams)
             self._recv_stream_idx += 1
             copy_stream = self._recv_copy_streams[idx]

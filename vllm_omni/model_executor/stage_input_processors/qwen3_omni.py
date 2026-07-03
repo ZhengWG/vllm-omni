@@ -450,8 +450,10 @@ def thinker2talker_async_chunk(
     3. Package for talker with additional information
     """
 
-    # This is the SEND edge (thinker -> talker); supported for a dual-connector.
-    _connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
+    # Send-edge capability: both transfer-manager shapes (chunk adapter and
+    # worker mixin) expose ``connector``; a routed connector answers
+    # ``supports_gpu_tensor`` for its output edge.
+    _connector = getattr(transfer_manager, "connector", None)
     _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
 
     request_id = request.external_req_id
@@ -599,9 +601,9 @@ def thinker2talker_full_payload(
     else:
         thinker_hid_prefill = thinker_hid
 
-    # Honor the output connector's capability: a GPU-tensor connector (CudaIPC) keeps
+    # Honor the send edge's capability: a GPU-tensor connector (CudaIPC) keeps
     # tensors on-device for D2D; otherwise drop to CPU (SharedMemoryConnector wire format).
-    _connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
+    _connector = getattr(transfer_manager, "connector", None)
     _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
 
     def _place(t: torch.Tensor) -> torch.Tensor:
@@ -843,8 +845,9 @@ def talker2code2wav_async_chunk(
     if not code_predictor_codes.any():
         return None
 
-    # Send edge (talker -> code2wav): codec sizing comes from the OUTPUT connector's config.
-    connector = getattr(transfer_manager, "output_connector", None) or getattr(transfer_manager, "connector", None)
+    # Send edge (talker -> code2wav): codec sizing comes from the connector's
+    # merged config view (send-edge extra wins on collision).
+    connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}
     chunk_size_config = int(cfg.get("codec_chunk_frames", 25))

@@ -316,7 +316,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     @property
     def _payload_keep_on_gpu(self) -> bool:
-        return bool(getattr(getattr(self, "_output_connector", None), "supports_gpu_tensor", False))
+        return bool(getattr(getattr(self, "_omni_connector", None), "supports_gpu_tensor", False))
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size

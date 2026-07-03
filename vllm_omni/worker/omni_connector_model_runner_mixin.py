@@ -26,7 +26,6 @@ from vllm.logger import init_logger
 
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
-from vllm_omni.distributed.omni_connectors.utils.config import ConnectorSpec
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.worker.payload_span import (
     get_tensor_span,
@@ -81,29 +80,6 @@ class OmniConnectorModelRunnerMixin:
     via ``OmniConnectorOutput``.
     """
 
-    @property
-    def _omni_connector(self) -> OmniConnectorBase | None:
-        return getattr(self, "_output_connector", None) or getattr(self, "_input_connector", None)
-
-    @_omni_connector.setter
-    def _omni_connector(self, conn: OmniConnectorBase | None) -> None:
-        if conn is None:
-            self._input_connector = None
-            self._output_connector = None
-            return
-        inp = getattr(self, "_input_connector", None)
-        out = getattr(self, "_output_connector", None)
-        # Dual-connector prod: distinct instances — legacy setter must not clobber.
-        if inp is not None and out is not None and inp is not out:
-            logger.warning(
-                "[Stage-%s] Ignoring _omni_connector assignment: "
-                "dual-connector mode uses separate input/output instances",
-                getattr(self, "_stage_id", "?"),
-            )
-            return
-        self._input_connector = conn
-        self._output_connector = conn
-
     # ------------------------------------------------------------------ #
     #  Init / Shutdown
     # ------------------------------------------------------------------ #
@@ -121,14 +97,13 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._input_connector: OmniConnectorBase | None
-        self._output_connector: OmniConnectorBase | None
         # Parse rank mapping once: is_data_transfer_rank() (used right below to gate ring
         # ownership) needs _local_rank, and the heterogeneous-TP fields reuse rank_cfg below.
         rank_cfg = self._parse_rank_mapping(model_config)
         self._local_rank: int = rank_cfg["local_rank"]
-        self._input_connector, self._output_connector = self._create_connectors(
-            model_config, is_transfer_rank=self.is_data_transfer_rank()
+        self._omni_connector: OmniConnectorBase | None = OmniConnectorFactory.create_stage_connector(
+            getattr(model_config, "stage_connector_config", None),
+            is_transfer_rank=self.is_data_transfer_rank(),
         )
         self._kv_transfer_manager = kv_transfer_manager
 
@@ -141,16 +116,12 @@ class OmniConnectorModelRunnerMixin:
 
         self._custom_process_func_path, self._custom_process_func = self._load_custom_func(model_config)
         self._custom_process_supports_is_finished = self._custom_process_supports_is_finished_kwarg()
-        _in_name = type(self._input_connector).__name__ if self._input_connector else None
-        _out_name = type(self._output_connector).__name__ if self._output_connector else None
         logger.info(
-            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, "
-            "input_connector=%s, output_connector=%s, func_path=%s",
+            "[Stage-%s] init_omni_connectors: async_chunk=%s, custom_process_func=%s, connector=%s, func_path=%s",
             self._stage_id,
             self._async_chunk,
             self._custom_process_func,
-            _in_name,
-            _out_name,
+            repr(self._omni_connector) if self._omni_connector else None,
             self._custom_process_func_path,
         )
 
@@ -229,7 +200,7 @@ class OmniConnectorModelRunnerMixin:
         # Start background threads only when there's a connector
         self._recv_thread: threading.Thread | None = None
         self._save_thread: threading.Thread | None = None
-        if self._input_connector is not None or self._output_connector is not None:
+        if self._omni_connector is not None:
             self._recv_thread = threading.Thread(
                 target=self._recv_loop,
                 daemon=True,
@@ -257,11 +228,9 @@ class OmniConnectorModelRunnerMixin:
             self._recv_thread.join(timeout=5)
         if self._save_thread is not None:
             self._save_thread.join(timeout=5)
-        # Legacy single-connector shares one instance on both sides; hybrid uses
-        # two. dict.fromkeys dedupes by identity so shared instances close once.
-        for conn in dict.fromkeys(c for c in (self._input_connector, self._output_connector) if c is not None):
+        if self._omni_connector is not None:
             try:
-                conn.close()
+                self._omni_connector.close()
             except Exception:
                 pass
 
@@ -771,8 +740,9 @@ class OmniConnectorModelRunnerMixin:
         _custom_process_func, both of which are set at init time. Avoid
         the per-step dynamic import inside the model decode loop.
         """
-        if getattr(self, "_output_connector", None) is None:
-            # No output connector: send_full_payload_outputs would no-op.
+        conn = getattr(self, "_omni_connector", None)
+        if conn is None or not getattr(conn, "can_send", True):
+            # No send edge: send_full_payload_outputs would no-op.
             # Skip the per-step accumulator+build that would otherwise be
             # silently discarded.  Defends against a terminal stage whose
             # custom_process_input_func has a *_full_payload derivative in
@@ -984,8 +954,8 @@ class OmniConnectorModelRunnerMixin:
 
         Returns list of request IDs successfully enqueued.
         """
-        if self._output_connector is None:
-            logger.info("[Stage-%s] send_full_payload_outputs: output_connector is None, skip", self._stage_id)
+        if self._omni_connector is None or not getattr(self._omni_connector, "can_send", True):
+            logger.debug("[Stage-%s] send_full_payload_outputs: no send edge, skip", self._stage_id)
             return []
         if not self.is_data_transfer_rank():
             logger.debug(
@@ -1147,7 +1117,8 @@ class OmniConnectorModelRunnerMixin:
     def _record_compute_event(self):
         """Record an event on the current (producer) stream so a GPU-tensor connector's copy
         stream can order its D2D pack after the forward — model thread owns the real stream."""
-        if not getattr(self._output_connector, "supports_gpu_tensor", False) or not torch.cuda.is_available():
+        conn = self._omni_connector
+        if conn is None or not getattr(conn, "supports_gpu_tensor", False) or not torch.cuda.is_available():
             return None
         ev = getattr(self, "_omni_compute_event", None)
         if ev is None:
@@ -1168,8 +1139,8 @@ class OmniConnectorModelRunnerMixin:
         ``connector.put()`` is done by the background save thread.
         Non-KV data is identical across TP ranks; only rank 0 sends.
         """
-        if self._output_connector is None:
-            logger.warning("[Stage-%s] send_chunk: output_connector is None", self._stage_id)
+        if self._omni_connector is None or not getattr(self._omni_connector, "can_send", True):
+            logger.warning("[Stage-%s] send_chunk: no send edge", self._stage_id)
             return False
         if not self.is_data_transfer_rank():
             return True
@@ -1686,7 +1657,9 @@ class OmniConnectorModelRunnerMixin:
 
     @property
     def connector(self) -> Any | None:
-        return self._omni_connector
+        """Public connector view for stage input processors (parity with
+        ``OmniChunkTransferAdapter.connector``)."""
+        return getattr(self, "_omni_connector", None)
 
     # ------------------------------------------------------------------ #
     #  Background I/O threads
@@ -1791,8 +1764,8 @@ class OmniConnectorModelRunnerMixin:
 
     def _poll_single_request(self, req_id: str) -> bool:
         """Poll connector for one chunk of a request (non-blocking)."""
-        connector = self._input_connector
-        if connector is None:
+        connector = self._omni_connector
+        if connector is None or not getattr(connector, "can_recv", True):
             return False
 
         if self._async_chunk and self._model_mode != "ar":
@@ -2003,8 +1976,8 @@ class OmniConnectorModelRunnerMixin:
         ``success=False``), returns False **without** decrementing
         ``_pending_save_counts`` so the caller can retry or clean up.
         """
-        connector = self._output_connector
-        if connector is None:
+        connector = self._omni_connector
+        if connector is None or not getattr(connector, "can_send", True):
             return True
 
         request_id = task.get("request_id")
@@ -2188,55 +2161,6 @@ class OmniConnectorModelRunnerMixin:
         snapshot = SimpleNamespace(**attrs)
         snapshot.is_finished = lambda: finished
         return snapshot
-
-    @staticmethod
-    def _create_connectors(
-        model_config: Any, is_transfer_rank: bool = True
-    ) -> tuple[OmniConnectorBase | None, OmniConnectorBase | None]:
-        """Create (input_connector, output_connector) from model_config.
-
-        Dual-connector format ``{"input": {...}, "output": {...}}`` produces
-        separate instances.  Legacy single format shares one instance for both.
-        Returns ``(None, None)`` when unconfigured.
-
-        ``is_transfer_rank`` is forwarded into each connector's extra config so a
-        GPU-direct connector (CudaIPC) only creates per-edge resources on the rank
-        that actually transmits (TP>1 owns one ring per edge, not one per rank).
-        """
-        connector_config = getattr(model_config, "stage_connector_config", None)
-        if connector_config is None:
-            return None, None
-
-        if not isinstance(connector_config, dict):
-            connector_config = {
-                "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", None),
-            }
-
-        def _make(spec_dict: dict) -> OmniConnectorBase:
-            name = spec_dict.get("name")
-            if not isinstance(name, str) or not name.strip():
-                raise RuntimeError("Invalid stage connector config: missing connector name")
-            extra = spec_dict.get("extra") or {}
-            if not isinstance(extra, dict):
-                raise RuntimeError(f"Invalid extra config for connector {name}: expected dict")
-            # Inject the rank role; an explicit config value (if any) still wins.
-            extra = {"is_transfer_rank": is_transfer_rank, **extra}
-            return OmniConnectorFactory.create_connector(ConnectorSpec(name=name.strip(), extra=extra))
-
-        if "input" in connector_config or "output" in connector_config:
-            connectors = []
-            for direction in ("input", "output"):
-                spec = connector_config.get(direction)
-                if spec is not None and not isinstance(spec, dict):
-                    raise RuntimeError(
-                        f"Invalid {direction!r} connector spec: expected dict, got {type(spec).__name__}"
-                    )
-                connectors.append(_make(spec) if spec is not None else None)
-            return connectors[0], connectors[1]
-
-        conn = _make(connector_config)
-        return conn, conn
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:
