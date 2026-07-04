@@ -41,10 +41,26 @@ connectors:
     name: CudaIPCConnector
     extra:
       <<: *cuda_ipc_extra
-      pool_size_mb: 512
-      pool_credits: 8                # slot = 512/8 = 64MB (outliers)
-      small_slot_count: 256          # +64MB; streaming chunks live here
+      # Transport-only IPC: payloads stay on the tuned CPU async-output
+      # pipeline (keep_on_gpu would flip the talker's per-step output path to
+      # GPU clones + tiny-tensor syncs — measured as a uniform TTFT/TTFP
+      # inflation). Serialized chunks <= ring_body_max ride the ring inline
+      # (no per-transfer /dev/shm syscalls); bigger ones fall back to shm.
+      keep_on_gpu: false
+      # CPU payloads never take the GPU pool path — keep it minimal (the pool
+      # only lazily allocates on first put anyway; this caps the worst case).
+      pool_size_mb: 64
+      pool_credits: 1
+      small_slot_count: 0
       ring_entries: 512
+  # Kept for A/B triage: flip the two *_stream edge refs below to this to
+  # compare the codec edge over host SHM vs D2D.
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
 
 stages:
   - stage_id: 0
@@ -54,8 +70,6 @@ stages:
     trust_remote_code: true
     enable_prefix_caching: false
     devices: "0"
-    output_connectors:
-      to_stage_1: connector_of_cuda_ipc
     default_sampling_params:
       temperature: 0.0
       max_tokens: 2048
@@ -69,8 +83,6 @@ stages:
     devices: "1"
     input_connectors:
       from_stage_0: connector_of_cuda_ipc          # prefill handoff: D2D
-    output_connectors:
-      to_stage_2: connector_of_cuda_ipc_stream     # codec stream: D2D small slots
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -89,7 +101,9 @@ stages:
     async_scheduling: false
     devices: "2"
     input_connectors:
-      from_stage_1: connector_of_cuda_ipc_stream   # codec stream: D2D small slots
+      from_stage_1: connector_of_cuda_ipc_stream   # codec stream: ring transport
+      # NOTE: each edge is declared ONCE, on its receiving stage — the sender's
+      # output connector is derived from the same edge spec (original schema).
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

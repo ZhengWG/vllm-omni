@@ -122,6 +122,12 @@ class EdgeRoutedConnector(OmniConnectorBase):
             try:
                 backend.close()
             except Exception:
-                logger.warning("EdgeRoutedConnector: backend close failed", exc_info=True)
+                # ``logger`` may already be torn down when __del__ fires at
+                # interpreter shutdown — never let close() raise from logging.
+                if logger is not None:
+                    try:
+                        logger.warning("EdgeRoutedConnector: backend close failed", exc_info=True)
+                    except Exception:
+                        pass
         self._input = None
         self._output = None

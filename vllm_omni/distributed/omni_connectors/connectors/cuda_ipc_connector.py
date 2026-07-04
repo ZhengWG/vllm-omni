@@ -163,6 +163,15 @@ class CudaIPCConnector(OmniConnectorBase):
         # TP>1: only the data-transfer rank owns the per-edge ring (non-transfer ranks never
         # transmit, so must not create a same-named ring). Injected by the stage worker.
         self._is_transfer_rank = bool(config.get("is_transfer_rank", True))
+        # keep_on_gpu=false decouples transport from payload placement: the edge
+        # still rides the CudaIPC ring (syscall-free control plane; /dev/shm
+        # fallback for oversize), but upstream payload builders see
+        # supports_gpu_tensor=False and keep tensors on the CPU async-output
+        # pipeline. Right choice for high-frequency small-tensor streams
+        # (talker codec chunks): per-step GPU clones + tiny-tensor syncs cost
+        # more than the small D2H they would replace; GPU-direct D2D pays off
+        # on big low-frequency payloads (prefill handoff).
+        self.supports_gpu_tensor = bool(config.get("keep_on_gpu", True))
         self._inline_threshold = int(config.get("inline_threshold_bytes", 16384))
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         self._ring_body_max = int(config.get("ring_body_max", 524288))
