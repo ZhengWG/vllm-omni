@@ -22,6 +22,7 @@ import queue as _queue_mod
 import threading
 import time as _time_mod
 import uuid
+from collections import deque
 from multiprocessing import shared_memory as shm_pkg
 from multiprocessing.resource_tracker import unregister
 from typing import Any
@@ -130,6 +131,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._init_runtime_state()
         self._init_cuda()
         self._init_lazy_defaults()
+        self._reclaim_stale_ring_at_init()
         logger.info(
             "CudaIPCConnector initialized: role=%s, local_device=%s, replica_id=%s, "
             "pool=%dMB (%d credits x %dMB slots) — edge resources allocate lazily on first use",
@@ -191,6 +193,12 @@ class CudaIPCConnector(OmniConnectorBase):
         self._ring: CudaIpcControlRing | None = None
         self._opened_rings: dict[tuple[str, str], CudaIpcControlRing] = {}
         self._ring_edge_handles: dict[tuple[str, str], tuple[bytes, bytes, str]] = {}
+        # Staleness tracking for receiver-opened rings: the sender may
+        # unlink+recreate its ring (lazy create over a leftover segment, or a
+        # sender restart). inode change on the shm file marks our cached
+        # mapping orphaned; the miss path refreshes it.
+        self._ring_inodes: dict[tuple[str, str], int] = {}
+        self._ring_miss_counts: dict[tuple[str, str], int] = {}
         self._opened_pools: dict[bytes, ctypes.c_void_p] = {}
         self._opened_boards: dict[str, shm_pkg.SharedMemory] = {}
         self._opened_events: dict[bytes, ctypes.c_void_p] = {}
@@ -199,6 +207,17 @@ class CudaIPCConnector(OmniConnectorBase):
         self._held_lock = threading.Lock()
         self._open_lock = threading.Lock()
         self._lazy_init_lock = threading.Lock()
+        # Sender: packs published before their D2D completes; each entry holds a
+        # (done_event, payload_ref) so the source tensors outlive the in-flight
+        # copy (replaces the per-put _copy_stream.synchronize()). Drained by the
+        # release loop (1ms tick) and flushed at close().
+        self._inflight_packs: deque[tuple[torch.cuda.Event, Any]] = deque()
+        self._inflight_lock = threading.Lock()
+        # Receiver: board releases deferred until the slot D2D completes; each
+        # entry is (done_event, board_name, slot_index). Drained at each get()
+        # (replaces the per-get copy_done_event.synchronize()).
+        self._pending_board_marks: deque[tuple[torch.cuda.Event, str, int]] = deque()
+        self._board_mark_lock = threading.Lock()
         self._stop_event = threading.Event()
         self._release_thread: threading.Thread | None = None
         self._shm_compat_decode_failures: dict[str, int] = {}
@@ -290,7 +309,6 @@ class CudaIPCConnector(OmniConnectorBase):
         self._board_name = None
         self._board = None
         self._recv_copy_streams = []
-        self._recv_copy_events = []
         self._recv_stream_idx = 0
 
     def _ensure_sender_resources(self) -> None:
@@ -317,10 +335,67 @@ class CudaIPCConnector(OmniConnectorBase):
             if self._recv_copy_streams:
                 return
             with torch.cuda.device(self.local_device):
-                self._recv_copy_events = [torch.cuda.Event() for _ in range(_DEFAULT_RECV_STREAMS)]
                 self._recv_copy_streams = [
                     torch.cuda.Stream(device=self.local_device) for _ in range(_DEFAULT_RECV_STREAMS)
                 ]
+
+    def _reclaim_stale_ring_at_init(self) -> None:
+        """Sender: unlink a dead previous run's ring BEFORE lazy create.
+
+        Ring names are deterministic, so a killed previous server leaves a
+        same-named segment in /dev/shm. With lazy sender init the ring is
+        only created at first put(); a receiver polling in that window would
+        open and cache the stale segment and then poll an orphaned mapping
+        forever once the real create() replaces it. Reclaiming (dead owner
+        only) at init closes that window.
+        """
+        if self.role != "sender" or not self._is_transfer_rank:
+            return
+        name = ring_shm_name(self.stage_id, self.stage_id + 1, self._replica_id)
+        if CudaIpcControlRing.reclaim_stale(name):
+            logger.info(
+                "CudaIPCConnector(stage=%s): reclaimed stale ring %s from a dead previous run", self.stage_id, name
+            )
+
+    _RING_REFRESH_EVERY_N_MISSES = 50
+
+    def _maybe_refresh_stale_ring(self, from_stage, to_stage) -> None:
+        """Receiver: drop a cached ring whose shm file was replaced/unlinked.
+
+        Cheap inode check, run only every N consecutive poll misses (the miss
+        path already pays a shm_open syscall for the CPU fallback, so this
+        adds no meaningful overhead). On staleness, cached mapping + header
+        handles are dropped and the next poll reopens the live segment.
+        """
+        edge = (from_stage, to_stage)
+        if edge not in self._opened_rings:
+            return
+        n = self._ring_miss_counts.get(edge, 0) + 1
+        self._ring_miss_counts[edge] = n
+        if n % self._RING_REFRESH_EVERY_N_MISSES:
+            return
+        name = ring_shm_name(from_stage, to_stage, self._replica_id)
+        try:
+            inode = os.stat(f"/dev/shm/{name}").st_ino
+        except OSError:
+            inode = -1  # unlinked with no replacement yet
+        if inode == self._ring_inodes.get(edge, inode):
+            return
+        logger.warning(
+            "CudaIPCConnector(stage=%s): ring %s for edge %s was replaced (sender restart or "
+            "lazy re-create); reopening.",
+            self.stage_id,
+            name,
+            edge,
+        )
+        stale = self._opened_rings.pop(edge, None)
+        self._ring_edge_handles.pop(edge, None)
+        self._ring_inodes.pop(edge, None)
+        if stale is not None:
+            try:
+                stale.close()
+            except Exception:
+                pass
 
     def _start_release_thread(self) -> None:
         self._release_thread = threading.Thread(target=self._release_loop, daemon=True, name="cuda-ipc-release-loop")
@@ -421,11 +496,16 @@ class CudaIPCConnector(OmniConnectorBase):
         edge = (from_stage, to_stage)
         ring = self._opened_rings.get(edge)
         if ring is None:
+            name = ring_shm_name(from_stage, to_stage, self._replica_id)
             try:
-                ring = CudaIpcControlRing.open(ring_shm_name(from_stage, to_stage, self._replica_id))
+                ring = CudaIpcControlRing.open(name)
             except FileNotFoundError:
                 return None  # sender not up yet; poll loop tolerates None
             self._opened_rings[edge] = ring
+            try:
+                self._ring_inodes[edge] = os.stat(f"/dev/shm/{name}").st_ino
+            except OSError:
+                pass
         # Cache the parsed header only once a valid (magic+version) one is present — never
         # cache zero handles from a ring whose sender hasn't written the header yet.
         if edge not in self._ring_edge_handles:
@@ -603,11 +683,33 @@ class CudaIPCConnector(OmniConnectorBase):
                 except Exception as e:
                     logger.debug("fallback seg unlink %s: %s", name, e)
 
+    def _drain_inflight_packs(self) -> None:
+        """Sender: drop payload refs whose pool D2D has completed."""
+        with self._inflight_lock:
+            dq = self._inflight_packs
+            while dq and dq[0][0].query():
+                dq.popleft()
+
+    def _drain_pending_board_marks(self) -> None:
+        """Receiver: mark the release board for completed slot D2Ds.
+
+        Deferred marking keeps get() free of host syncs. A mark that never
+        drains (traffic stopped) is covered by the sender's TTL sweep.
+        """
+        with self._board_mark_lock:
+            ready = []
+            dq = self._pending_board_marks
+            while dq and dq[0][0].query():
+                ready.append(dq.popleft())
+        for _ev, board_name, slot_index in ready:
+            self._mark_board_release(board_name, slot_index)
+
     def _release_loop(self) -> None:
         tick = 0
         while not self._stop_event.is_set():
             try:
                 self._reclaim_board_credits()
+                self._drain_inflight_packs()
                 tick += 1
                 if tick % self._release_ttl_every == 0:
                     self._release_expired_credits()
@@ -640,15 +742,20 @@ class CudaIPCConnector(OmniConnectorBase):
             self._ensure_sender_resources()
             kh = key_hash16(composite_key)
             if self._estimate_nbytes(data) < self._inline_threshold:
-                return self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh)
+                return self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh, compute_event)
             return self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh, compute_event)
         except Exception as e:
             self._metrics["errors"] += 1
             logger.error("CudaIPCConnector control-plane put failed for %s: %s", put_key, e, exc_info=True)
             return False, 0, None
 
-    def _put_inline(self, from_stage, to_stage, put_key, composite_key, data, kh):
+    def _put_inline(self, from_stage, to_stage, put_key, composite_key, data, kh, compute_event=None):
         # Serialize (a cheap D2H for a tiny GPU tensor) straight into the ring body.
+        # Order the D2H after the producer's writes — same fence contract as the
+        # pool path; without it a small keep_on_gpu tensor could serialize stale
+        # bytes when the producer wrote on a non-ambient stream.
+        if compute_event is not None:
+            torch.cuda.current_stream(self.local_device).wait_event(compute_event)
         payload = self.serialize_obj(data)
         if len(payload) > self._ring.body_max:
             return self._put_cpu_fallback(
@@ -679,11 +786,13 @@ class CudaIPCConnector(OmniConnectorBase):
             self._board.buf[slot_offset // self._slot_size] = 0
             slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
             # Order the pack after the producer's writes: fence the producer-stream event when
-            # supplied, else (unknown producer stream on legacy/bg-thread callers) fence the device.
+            # supplied, else fence the ambient (legacy default) stream — correct when PTDS is
+            # off and the producer wrote on the default stream, the same assumption the SHM
+            # async-output path already relies on. Both are async stream fences, not host syncs.
             if compute_event is not None:
                 self._copy_stream.wait_event(compute_event)
             else:
-                torch.accelerator.synchronize(self.local_device)
+                self._copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
             try:
                 with torch.cuda.stream(self._copy_stream):
                     encoded_obj = self._walk_encode_pool(data, slot)
@@ -703,9 +812,14 @@ class CudaIPCConnector(OmniConnectorBase):
             ret = self._cudart.cudaEventRecord(self._ipc_event, ctypes.c_void_p(self._copy_stream.cuda_stream))
             if ret != 0:
                 logger.warning("cudaEventRecord (IPC) failed: %d", ret)
-            # Block until the pack D2D finishes: the source is a runner-owned tensor the
-            # next forward may free. Makes the pool D2D synchronous on both ends.
-            self._copy_stream.synchronize()
+            # No host sync: publish immediately and let the receiver order on the
+            # IPC event recorded above. Source lifetime is protected by holding a
+            # payload ref until the pack completes (see _inflight_packs) — the
+            # runner may otherwise free/reuse the source before the D2D retires.
+            pack_done = torch.cuda.Event()
+            pack_done.record(self._copy_stream)
+            with self._inflight_lock:
+                self._inflight_packs.append((pack_done, data))
             descriptor = OmniSerializer.serialize(
                 {
                     _POOL_MARKER: True,
@@ -796,6 +910,7 @@ class CudaIPCConnector(OmniConnectorBase):
     def _get_control_plane(self, from_stage, to_stage, get_key, composite_key):
         """Primary recv path: poll ring (inline or pool); on miss try CPU-fallback /dev/shm."""
         try:
+            self._drain_pending_board_marks()
             ring = self._open_ring_receiver(from_stage, to_stage)
             if ring is None:
                 return None
@@ -804,9 +919,12 @@ class CudaIPCConnector(OmniConnectorBase):
                 return None
             r = ring.poll(key_hash16(composite_key))
             if r is None:
-                # Ring miss: chunk not published yet (poll retry), or the sender took the CPU
-                # fallback (/dev/shm by put_key) — read that so the consumer never hangs.
+                # Ring miss: chunk not published yet (poll retry), the sender replaced the
+                # ring (staleness refresh below), or the sender took the CPU fallback
+                # (/dev/shm by put_key) — checked last so the consumer never hangs.
+                self._maybe_refresh_stale_ring(from_stage, to_stage)
                 return self._try_get_shm_compat(get_key)
+            self._ring_miss_counts.pop((from_stage, to_stage), None)
             pclass, body = r
             if pclass == RING_PCLASS_INLINE:
                 # Return CPU tensors; the downstream model does the H2D (parity with SHM).
@@ -825,17 +943,22 @@ class CudaIPCConnector(OmniConnectorBase):
             idx = self._recv_stream_idx % len(self._recv_copy_streams)
             self._recv_stream_idx += 1
             copy_stream = self._recv_copy_streams[idx]
-            copy_done_event = self._recv_copy_events[idx]
             if event_handle:
                 ipc_event = self._open_ipc_event(event_handle)
                 stream_wait_event(self._cudart, copy_stream.cuda_stream, ipc_event)
             copy_stream.wait_stream(torch.cuda.current_stream(self.local_device))
             obj = self._walk_decode_pool(raw["payload"], pool_ptr, raw["slot_offset"], stream=copy_stream)
+            # No host sync: fence the consuming (ambient) stream on the D2D instead —
+            # the model thread reads dst on that stream, and each dst is already
+            # record_stream()'d for allocator safety. A fresh event per get keeps
+            # deferred board marks independent (a recycled event would be
+            # re-recorded before its pending mark drains). Round-robined copy
+            # streams now genuinely overlap consecutive gets.
+            copy_done_event = torch.cuda.Event()
             copy_done_event.record(copy_stream)
-            # Block until the D2D finishes before hand-off (payload is consumed later on the
-            # model thread), then mark the board synchronously so TTL can't race the transfer.
-            copy_done_event.synchronize()
-            self._mark_board_release(board_name, int(raw["slot_index"]))
+            torch.cuda.current_stream(self.local_device).wait_event(copy_done_event)
+            with self._board_mark_lock:
+                self._pending_board_marks.append((copy_done_event, board_name, int(raw["slot_index"])))
             self._metrics["gets"] += 1
             self._metrics["bytes_transferred"] += len(body)
             return obj, len(body)
@@ -949,6 +1072,14 @@ class CudaIPCConnector(OmniConnectorBase):
         self._stop_event.set()
         if self._release_thread is not None and self._release_thread.is_alive():
             self._release_thread.join(timeout=1.0)
+        # Flush deferred completions best-effort: mark finished slot D2Ds on the
+        # board and drop in-flight pack refs (pending GPU work is torn down with
+        # the process; the sender's TTL sweep covers anything unmarked).
+        self._try_or_warn(self._drain_pending_board_marks, "drain pending board marks")
+        with self._inflight_lock:
+            self._inflight_packs.clear()
+        with self._board_mark_lock:
+            self._pending_board_marks.clear()
         with self._held_lock:
             self._held_credits.clear()
 

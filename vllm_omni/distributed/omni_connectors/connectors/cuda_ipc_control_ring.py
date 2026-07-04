@@ -19,6 +19,7 @@ seq u64@0 | consumed u8@8 | pclass u8@9 | ts u32@10 | keyhash 16B@14 | blen u32@
 """
 
 import hashlib
+import os
 import struct
 from dataclasses import dataclass
 from multiprocessing import shared_memory as shm_pkg
@@ -103,6 +104,17 @@ class RingFullError(Exception):
     """Raised by publish() when no free slot exists in the probe window (backpressure)."""
 
 
+def _pid_alive(pid: int) -> bool:
+    """Best-effort owner liveness (same-host IPC): signal-0 probe."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
 class CudaIpcControlRing:
     """One directed-edge SPSC keyed mailbox. Sender side calls create()+publish();
     receiver side calls open()+poll(). A fixed header region carries edge-constant
@@ -128,11 +140,59 @@ class CudaIpcControlRing:
 
     # ---- construction -------------------------------------------------
     @classmethod
+    def reclaim_stale(cls, name: str, header_bytes: int = RING_HEADER_BYTES) -> bool:
+        """Unlink a leftover ring whose owner process is dead; True if reclaimed.
+
+        Called by the sender at connector init (before any lazy create) so a
+        receiver polling during the init->first-put window cannot open and
+        cache a stale segment from a previous run. A ring with a LIVE owner is
+        left untouched.
+        """
+        try:
+            old = shm_pkg.SharedMemory(name=name)
+        except FileNotFoundError:
+            return False
+        try:
+            old_slots, old_body = struct.unpack_from("<II", old.buf, 0)
+            owner_pid = 0
+            if old_slots > 0 and old_body > 0 and header_bytes >= 4:
+                # Fixed offset from the caller's layout — do NOT derive from
+                # old.size (tmpfs/macOS round segment sizes up to page size).
+                owner_pid = struct.unpack_from("<I", old.buf, 8 + header_bytes - 4)[0]
+            if owner_pid and _pid_alive(owner_pid):
+                return False
+            old.unlink()
+            return True
+        except Exception:
+            return False
+        finally:
+            old.close()
+
+    @classmethod
     def create(cls, name, n_slots, body_max, header_bytes=0):
         size = 8 + header_bytes + n_slots * (_OFF_BODY + body_max)
         try:
             old = shm_pkg.SharedMemory(name=name)
             try:
+                # A pre-existing INITIALIZED ring whose owner is still alive means a
+                # second sender-owner is being created on the same edge (dual-putter
+                # bug): unlink-recreate would orphan the live owner's segment and
+                # strand any receiver that cached the old mapping — a silent
+                # pipeline hang. Refuse loudly instead. A dead owner (previous run
+                # crashed without cleanup) is reclaimed as before.
+                old_slots, old_body = struct.unpack_from("<II", old.buf, 0)
+                if old_slots > 0 and old_body > 0:
+                    # Fixed offset from this caller's layout — old.size is
+                    # page-rounded on some tmpfs/macOS and must not be used.
+                    owner_pid = struct.unpack_from("<I", old.buf, 8 + header_bytes - 4)[0] if header_bytes >= 4 else 0
+                    if owner_pid and _pid_alive(owner_pid):
+                        raise RuntimeError(
+                            f"CudaIpcControlRing.create: ring {name!r} already exists with a "
+                            f"LIVE owner (pid={owner_pid}). Two sender-owners on one edge are "
+                            f"not supported (SPSC): the second create would unlink the first "
+                            f"owner's segment and strand receivers that already opened it. "
+                            f"Fix the duplicate putter instead of overriding this error."
+                        )
                 old.unlink()
             finally:
                 old.close()
@@ -143,10 +203,14 @@ class CudaIpcControlRing:
         # reads seq==0 (empty). No explicit memset — avoids a transient bytes(size) heap
         # spike (a 2048 x 128KB ring = 256MB) on the hot init path.
         struct.pack_into("<II", shm.buf, 0, n_slots, body_max)
+        if header_bytes >= 4:
+            # Owner pid at the tail of the reserved header region — lets a later
+            # create() distinguish "live duplicate owner" from "stale leftover".
+            struct.pack_into("<I", shm.buf, 8 + header_bytes - 4, os.getpid() & 0xFFFFFFFF)
         return cls(shm, n_slots, body_max, header_bytes, owner=True)
 
     @classmethod
-    def open(cls, name):
+    def open(cls, name, header_bytes: int = RING_HEADER_BYTES):
         shm = shm_pkg.SharedMemory(name=name)
         untrack_shm(name)  # non-owner: never unlink the sender's ring at exit
         n_slots, body_max = struct.unpack_from("<II", shm.buf, 0)
@@ -154,16 +218,23 @@ class CudaIpcControlRing:
             # Opened before the sender's header write (zero-filled) — not ready; caller retries.
             shm.close()
             raise FileNotFoundError(f"ring {name!r} not initialized yet (n_slots={n_slots}, body_max={body_max})")
-        # header size is implied by the on-wire layout the sender chose; the caller
-        # passes the same header_bytes contract. We recover it from total size.
-        total = shm.size
-        header_bytes = total - 8 - n_slots * (_OFF_BODY + body_max)
+        # header size is a layout constant shared by both sides of the edge
+        # (same code version). Deriving it from shm.size is WRONG on filesystems
+        # that round segment sizes up to page granularity (macOS, some tmpfs).
+        required = 8 + header_bytes + n_slots * (_OFF_BODY + body_max)
+        if shm.size < required:
+            shm.close()
+            raise FileNotFoundError(
+                f"ring {name!r} smaller than its declared layout ({shm.size} < {required}); "
+                f"stale or foreign segment — caller retries"
+            )
         return cls(shm, n_slots, body_max, header_bytes, owner=False)
 
     # ---- header (edge-constant, written once by the sender) -----------
     def write_header(self, data: bytes) -> None:
-        if len(data) > self._hdr:
-            raise ValueError(f"header {len(data)}B exceeds reserved {self._hdr}B")
+        limit = self._hdr - 4 if self._hdr >= 4 else self._hdr  # last 4B: owner pid
+        if len(data) > limit:
+            raise ValueError(f"header {len(data)}B exceeds reserved {limit}B (pid tail excluded)")
         self._buf[8 : 8 + len(data)] = data
 
     def read_header(self, n: int) -> bytes:
