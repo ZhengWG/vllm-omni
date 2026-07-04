@@ -36,6 +36,17 @@ _RING_VERSION = 1  # bump on incompatible wire layout changes
 RING_PCLASS_INLINE = 0  # ring body: serialized payload (small, < inline_threshold)
 RING_PCLASS_POOL = 1  # ring body: pool descriptor (big GPU tensor, D2D path)
 
+# Open-addressing probe bound, shared by publish() and poll(). Consumed slots
+# stay as tombstones (seq!=0, consumed=1) on a key's probe chain — they are
+# recycled by publish() but never reset to seq==0, so without a bound a poll
+# miss on a long-running ring degrades to a full O(n_slots) Python scan once
+# every slot has been used at least once. Bounding BOTH sides to the same
+# window keeps the invariant (an entry is always placed within the window of
+# its home slot) while capping the worst-case miss at _PROBE_WINDOW slot
+# reads. Must be identical on both sides of an edge — a layout constant, not
+# a config knob.
+_PROBE_WINDOW = 64
+
 
 def make_composite_key(key: str, from_stage: str, to_stage: str) -> str:
     """Per-edge composite key. Change here once if the wire format ever changes."""
@@ -250,7 +261,7 @@ class CudaIpcControlRing:
             raise ValueError(f"body {len(body)}B exceeds slot body_max {self._body_max}B")
         buf = self._buf
         home = struct.unpack_from("<Q", key_hash, 0)[0] % self._n
-        for p in range(self._n):
+        for p in range(min(self._n, _PROBE_WINDOW)):
             idx = (home + p) % self._n
             off = self._base + idx * self._slot
             seq = struct.unpack_from("<Q", buf, off + _OFF_SEQ)[0]
@@ -280,7 +291,7 @@ class CudaIpcControlRing:
         buf = self._buf
         home = struct.unpack_from("<Q", key_hash, 0)[0] % self._n
         target = key_hash[:_KEY_BYTES]
-        for p in range(self._n):
+        for p in range(min(self._n, _PROBE_WINDOW)):
             idx = (home + p) % self._n
             off = self._base + idx * self._slot
             seq_a = struct.unpack_from("<Q", buf, off + _OFF_SEQ)[0]

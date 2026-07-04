@@ -69,6 +69,9 @@ _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 # handoff @ input 4000). Explicit pool_size_mb / pool_credits / slot_size_mb override.
 _DEFAULT_SLOT_SIZE_MB = 64
 _DEFAULT_POOL_CREDITS = 64
+_DEFAULT_SMALL_SLOT_KB = 256  # small-slot pool: streaming-chunk sized
+_DEFAULT_SMALL_SLOT_COUNT = 128  # +32MB GPU with the defaults
+_SMALL_SLOT_SLACK = 4096  # routing headroom for per-tensor alignment padding
 _DEFAULT_RECV_STREAMS = 8  # receiver D2D copy streams (round-robined per get)
 
 # Timing constants — overridable via extra config keys of the same name
@@ -176,6 +179,14 @@ class CudaIPCConnector(OmniConnectorBase):
             auto_credits = _DEFAULT_POOL_CREDITS
         slot_size_mb = int(config.get("slot_size_mb", _DEFAULT_SLOT_SIZE_MB))
         self._pool_credits = int(config.get("pool_credits", auto_credits))
+        # Small-slot pool for streaming chunks (e.g. codec frames): payloads far
+        # below the big-slot size stop burning a whole big credit, which keeps
+        # big credits available for prefill handoffs under load. Disable with
+        # small_slot_count: 0.
+        self._small_slot_size = int(config.get("small_slot_kb", _DEFAULT_SMALL_SLOT_KB)) * 1024
+        self._small_slot_count = int(config.get("small_slot_count", _DEFAULT_SMALL_SLOT_COUNT))
+        if self._small_slot_size <= 0:
+            self._small_slot_count = 0
         if "pool_size_mb" in config:
             auto_size_mb = int(config["pool_size_mb"])
         else:
@@ -247,8 +258,12 @@ class CudaIPCConnector(OmniConnectorBase):
 
     def _init_sender_resources(self) -> None:
         """Sender data-transfer rank: GPU pool, IPC event, release board, per-edge ring."""
+        total_pool_bytes = self._pool_size + self._small_slot_count * self._small_slot_size
         with torch.cuda.device(self.local_device):
-            self._pool = torch.zeros(self._pool_size, dtype=torch.uint8, device=self.local_device)
+            # One tensor, one IPC handle: big slots at [0, pool_size), small
+            # slots at [pool_size, total). slot_offset stays an absolute pool
+            # offset on the wire, so the receiver decode path is unchanged.
+            self._pool = torch.zeros(total_pool_bytes, dtype=torch.uint8, device=self.local_device)
             self._copy_stream = torch.cuda.Stream(device=self.local_device)
             self._copy_done_event = torch.cuda.Event()
         self._pool_handle = self._get_ipc_handle(self._pool.data_ptr())
@@ -265,13 +280,17 @@ class CudaIPCConnector(OmniConnectorBase):
         self._credit_queue: _queue_mod.Queue[int] = _queue_mod.Queue(maxsize=self._pool_credits)
         for i in range(self._pool_credits):
             self._credit_queue.put_nowait(i * self._slot_size)
+        self._small_credit_queue: _queue_mod.Queue[int] = _queue_mod.Queue(maxsize=max(1, self._small_slot_count))
+        for j in range(self._small_slot_count):
+            self._small_credit_queue.put_nowait(self._pool_size + j * self._small_slot_size)
         self._held_credits: dict[str, tuple[float, int]] = {}
         # CPU-fallback /dev/shm segments {name: ts}: receiver unlinks on read, else the
         # release loop TTL-sweeps them (the adapter never calls connector cleanup()).
         self._fallback_segs: dict[str, float] = {}
         self._board_name = f"cudaipc_board_{uuid.uuid4().hex[:16]}"
-        self._board = shm_pkg.SharedMemory(create=True, size=self._pool_credits, name=self._board_name)
-        self._board.buf[: self._pool_credits] = bytes(self._pool_credits)
+        n_board = self._pool_credits + self._small_slot_count
+        self._board = shm_pkg.SharedMemory(create=True, size=n_board, name=self._board_name)
+        self._board.buf[:n_board] = bytes(n_board)
         # Seqlock ring is fenceless — only correct on x86 TSO; warn loudly on weak-memory hosts.
         if platform.machine() not in ("x86_64", "AMD64"):
             logger.warning(
@@ -304,6 +323,7 @@ class CudaIPCConnector(OmniConnectorBase):
         self._pool = None
         self._pool_handle = None
         self._credit_queue = None
+        self._small_credit_queue = None
         self._held_credits = {}
         self._fallback_segs = {}
         self._board_name = None
@@ -615,23 +635,45 @@ class CudaIPCConnector(OmniConnectorBase):
 
     # --- Credit pool (sender) ---
 
-    def _acquire_credit(self) -> int | None:
+    def _slot_index_for_offset(self, slot_offset: int) -> int:
+        """Board index for an absolute pool offset (big region first, then small)."""
+        if slot_offset < self._pool_size:
+            return slot_offset // self._slot_size
+        return self._pool_credits + (slot_offset - self._pool_size) // self._small_slot_size
+
+    def _slot_capacity_for_offset(self, slot_offset: int) -> int:
+        return self._slot_size if slot_offset < self._pool_size else self._small_slot_size
+
+    def _queue_for_offset(self, slot_offset: int) -> "_queue_mod.Queue[int]":
+        return self._credit_queue if slot_offset < self._pool_size else self._small_credit_queue
+
+    def _acquire_credit(self, prefer_small: bool = False) -> int | None:
         """Get a free slot offset, reclaiming board credits inline.
 
+        ``prefer_small`` tries the small-slot pool first (streaming chunks)
+        and falls back to a big slot when small credits are exhausted, so a
+        burst of small chunks degrades to big slots instead of /dev/shm.
         Bounded wait (``credit_wait_sec``) before giving up; returns None to
         trigger the CPU fallback.
         """
-        try:
-            return self._credit_queue.get_nowait()
-        except _queue_mod.Empty:
-            pass
+        if prefer_small and self._small_slot_count > 0:
+            queues = (self._small_credit_queue, self._credit_queue)
+        else:
+            queues = (self._credit_queue,)
+        for q in queues:
+            try:
+                return q.get_nowait()
+            except _queue_mod.Empty:
+                pass
         deadline = _time_mod.monotonic() + self._credit_wait_sec
         while _time_mod.monotonic() < deadline:
             self._reclaim_board_credits()
-            try:
-                return self._credit_queue.get_nowait()
-            except _queue_mod.Empty:
-                _time_mod.sleep(self._credit_poll_sec)
+            for q in queues:
+                try:
+                    return q.get_nowait()
+                except _queue_mod.Empty:
+                    pass
+            _time_mod.sleep(self._credit_poll_sec)
         return None
 
     def _reclaim_board_credits(self) -> None:
@@ -643,12 +685,12 @@ class CudaIPCConnector(OmniConnectorBase):
             released = [
                 (key, slot_offset)
                 for key, (_ts, slot_offset) in self._held_credits.items()
-                if buf[slot_offset // self._slot_size] == 1
+                if buf[self._slot_index_for_offset(slot_offset)] == 1
             ]
             for key, slot_offset in released:
                 self._held_credits.pop(key, None)
-                buf[slot_offset // self._slot_size] = 0
-                self._credit_queue.put_nowait(slot_offset)
+                buf[self._slot_index_for_offset(slot_offset)] = 0
+                self._queue_for_offset(slot_offset).put_nowait(slot_offset)
                 self._metrics["board_releases"] += 1
 
     def _release_expired_credits(self) -> None:
@@ -663,8 +705,8 @@ class CudaIPCConnector(OmniConnectorBase):
             ]
             for key, slot_offset in expired:
                 self._held_credits.pop(key, None)
-                self._board.buf[slot_offset // self._slot_size] = 0
-                self._credit_queue.put_nowait(slot_offset)
+                self._board.buf[self._slot_index_for_offset(slot_offset)] = 0
+                self._queue_for_offset(slot_offset).put_nowait(slot_offset)
                 self._metrics["ttl_releases"] += 1
         # also TTL-sweep orphaned CPU-fallback /dev/shm segments (receiver aborted before
         # reading; normally the receiver unlinks on read so these are already gone).
@@ -771,20 +813,29 @@ class CudaIPCConnector(OmniConnectorBase):
         self._metrics["bytes_transferred"] += len(payload)
         return True, len(payload), {"ring": True, "size": len(payload)}
 
-    def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh, compute_event=None):
+    def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh, compute_event=None, force_big=False):
         # Acquire a credit, D2D-pack into the slot, then publish a small descriptor
         # (slot_offset/slot_index + tensor layout) to the ring.
         # TODO: support acquiring multiple contiguous credits/slots when a single payload
         # exceeds _slot_size (currently: _SlotOverflowError → CPU fallback).
-        slot_offset = self._acquire_credit()
+        # Route by payload size: streaming-sized payloads take a small slot so a
+        # codec chunk burst does not burn 64MB big credits. The estimate ignores
+        # per-tensor alignment padding, hence the slack; a small-slot overflow
+        # retries once with a big slot (force_big) before the CPU fallback.
+        prefer_small = (
+            not force_big
+            and self._small_slot_count > 0
+            and self._estimate_nbytes(data) <= self._small_slot_size - _SMALL_SLOT_SLACK
+        )
+        slot_offset = self._acquire_credit(prefer_small=prefer_small)
         if slot_offset is None:
             return self._put_cpu_fallback(
                 from_stage, to_stage, put_key, composite_key, data, reason="credits_exhausted"
             )
         credit_returned = False
         try:
-            self._board.buf[slot_offset // self._slot_size] = 0
-            slot = _PoolSlot(self._pool, slot_offset, self._slot_size)
+            self._board.buf[self._slot_index_for_offset(slot_offset)] = 0
+            slot = _PoolSlot(self._pool, slot_offset, self._slot_capacity_for_offset(slot_offset))
             # Order the pack after the producer's writes: fence the producer-stream event when
             # supplied, else fence the ambient (legacy default) stream — correct when PTDS is
             # off and the producer wrote on the default stream, the same assumption the SHM
@@ -800,7 +851,12 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._copy_done_event.record(self._copy_stream)
                 self._copy_done_event.synchronize()
                 credit_returned = True
-                self._credit_queue.put_nowait(slot_offset)
+                self._queue_for_offset(slot_offset).put_nowait(slot_offset)
+                if slot_offset >= self._pool_size:
+                    # Small slot underestimated (alignment/metadata) — retry with a big slot.
+                    return self._put_pool(
+                        from_stage, to_stage, put_key, composite_key, data, kh, compute_event, force_big=True
+                    )
                 return self._put_cpu_fallback(
                     from_stage,
                     to_stage,
@@ -824,18 +880,18 @@ class CudaIPCConnector(OmniConnectorBase):
                 {
                     _POOL_MARKER: True,
                     "slot_offset": slot_offset,
-                    "slot_index": slot_offset // self._slot_size,
+                    "slot_index": self._slot_index_for_offset(slot_offset),
                     "payload": encoded_obj,
                 }
             )
         except Exception:
             if not credit_returned:
-                self._credit_queue.put_nowait(slot_offset)
+                self._queue_for_offset(slot_offset).put_nowait(slot_offset)
             raise
         # Descriptor grows with sequence length; if it overflows the ring body,
         # degrade to the CPU fallback (read via _try_get_shm_compat) — never crash.
         if len(descriptor) > self._ring.body_max:
-            self._credit_queue.put_nowait(slot_offset)
+            self._queue_for_offset(slot_offset).put_nowait(slot_offset)
             return self._put_cpu_fallback(
                 from_stage,
                 to_stage,
@@ -854,7 +910,7 @@ class CudaIPCConnector(OmniConnectorBase):
         except RingFullError:
             with self._held_lock:
                 self._held_credits.pop(composite_key, None)
-            self._credit_queue.put_nowait(slot_offset)
+            self._queue_for_offset(slot_offset).put_nowait(slot_offset)
             return self._put_cpu_fallback(from_stage, to_stage, put_key, composite_key, data, reason="ring_full")
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += len(descriptor)
@@ -1051,6 +1107,8 @@ class CudaIPCConnector(OmniConnectorBase):
             "replica_id": self._replica_id,
             "pool_size_mb": self._pool_size // (1024 * 1024),
             "pool_credits": self._pool_credits,
+            "small_slot_kb": self._small_slot_size // 1024,
+            "small_slot_count": self._small_slot_count,
             "held_credits": len(self._held_credits),
             **self._metrics,
         }
