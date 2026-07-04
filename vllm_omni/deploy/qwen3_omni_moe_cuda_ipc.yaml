@@ -6,7 +6,7 @@
 # ring-full / abort fall back to /dev/shm (read via _try_get_shm_compat).
 #
 # Memory: the GPU pool (pool_size_mb) is OUTSIDE gpu_memory_utilization, so real usage ~= gmu + pool.
-# /dev/shm: each ring needs ~ring_entries * ring_body_max host shm (~1GB/edge here); raise the 64MB
+# /dev/shm: rings need ~ring_entries * ring_body_max host shm (~1GB s0->s1 + ~256MB s1->s2); raise the 64MB
 # container default (e.g. `docker run --shm-size=4g`) or CudaIpcControlRing.create fails with OSError.
 #
 # Usage:
@@ -16,24 +16,35 @@
 async_chunk: true
 
 connectors:
+  # Prefill handoff edge (thinker -> talker): ~33MB/req payloads -> big slots.
+  # Shared knobs are anchored here; the stream edge below only overrides pool
+  # sizing — capacity is a per-edge property (like per-stage gmu), so the two
+  # definitions deliberately stay separate.
   connector_of_cuda_ipc:
     name: CudaIPCConnector
-    extra:
+    extra: &cuda_ipc_extra
       tensor_lifetime_sec: 30.0
       pool_size_mb: 4096
       pool_credits: 64               # slot = 4096/64 = 64MB
+      small_slot_kb: 256             # decode-step small payloads
+      small_slot_count: 128          # +32MB
       inline_threshold_bytes: 16384  # < 16KB -> inline
       ring_body_max: 524288
       ring_entries: 2048
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
-  connector_of_shared_memory:
-    name: SharedMemoryConnector
+  # Codec stream edge (talker -> code2wav): many small chunks -> the small-slot
+  # pool carries the traffic; a few big slots absorb oversize outliers.
+  # Ring: 512 x 512KB ~ 256MB host shm for this edge.
+  connector_of_cuda_ipc_stream:
+    name: CudaIPCConnector
     extra:
-      initial_codec_chunk_frames: 4
-      codec_chunk_frames: 25
-      codec_left_context_frames: 25
+      <<: *cuda_ipc_extra
+      pool_size_mb: 512
+      pool_credits: 8                # slot = 512/8 = 64MB (outliers)
+      small_slot_count: 256          # +64MB; streaming chunks live here
+      ring_entries: 512
 
 stages:
   - stage_id: 0
@@ -59,7 +70,7 @@ stages:
     input_connectors:
       from_stage_0: connector_of_cuda_ipc          # prefill handoff: D2D
     output_connectors:
-      to_stage_2: connector_of_shared_memory       # codec stream: host SHM
+      to_stage_2: connector_of_cuda_ipc_stream     # codec stream: D2D small slots
     default_sampling_params:
       temperature: 0.9
       top_k: 50
@@ -78,7 +89,7 @@ stages:
     async_scheduling: false
     devices: "2"
     input_connectors:
-      from_stage_1: connector_of_shared_memory     # codec stream: host SHM
+      from_stage_1: connector_of_cuda_ipc_stream   # codec stream: D2D small slots
     default_sampling_params:
       temperature: 0.0
       top_p: 1.0

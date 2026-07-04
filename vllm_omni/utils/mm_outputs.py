@@ -3,6 +3,7 @@ payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
 
 from collections.abc import Mapping
+from typing import Any
 
 import torch
 from vllm.logger import init_logger
@@ -57,6 +58,49 @@ def partition_payload_list(
         None if all(item is None for item in inter_stage_list) else inter_stage_list,
         None if all(item is None for item in client_mm_list) else client_mm_list,
     )
+
+
+# Marker on a dict value indicating "this slot held a GPU tensor that was
+# stripped before crossing the engine-core -> API msgspec boundary; the real
+# payload travelled via the connector pool". Downstream consumers of
+# ``OmniEngineCoreOutput.multimodal_output`` for non-terminal stages should
+# treat such values as opaque metadata and never call tensor methods on them.
+_STRIPPED_GPU_TENSOR_MARKER = "_omni_stripped_gpu_tensor"
+
+
+def strip_gpu_tensors_for_engine_output(value: Any) -> Any:
+    """Replace CUDA tensors with msgspec-safe descriptors recursively.
+
+    Why: the engine-core ``process_output_sockets`` thread serialises
+    ``OmniEngineCoreOutput`` via msgpack, which calls ``tensor.detach().cpu()``
+    on every tensor it encounters. For a keep_on_gpu mm payload (~57MB/chunk
+    for Qwen3-Omni prefill) that call blocks on the GPU compute stream's
+    drain (~145ms mean, multi-second p99 at c>=4 in profiling) — a redundant
+    D2H tax, because the actual tensor data already travels downstream via
+    the connector pool path. Callers gate this on the send edge being a
+    GPU-tensor connector (see omni_ar_scheduler).
+
+    Walks dict/list/tuple containers; CPU tensors and non-tensor values pass
+    through unchanged. Returns new containers — the input is never mutated,
+    so the connector's save_async callsite still sees the original GPU
+    tensor refs. Each stripped tensor becomes a small dict carrying shape
+    and dtype so metric/trace readers fail soft instead of crashing.
+    """
+    if isinstance(value, torch.Tensor):
+        if value.device.type == "cuda":
+            return {
+                _STRIPPED_GPU_TENSOR_MARKER: True,
+                "shape": list(value.shape),
+                "dtype": str(value.dtype).removeprefix("torch."),
+            }
+        return value
+    if isinstance(value, Mapping):
+        return {k: strip_gpu_tensors_for_engine_output(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [strip_gpu_tensors_for_engine_output(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(strip_gpu_tensors_for_engine_output(v) for v in value)
+    return value
 
 
 def build_mm_cpu(

@@ -31,6 +31,7 @@ from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapt
 from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
+from vllm_omni.utils.mm_outputs import strip_gpu_tensors_for_engine_output
 
 logger = init_logger(__name__)
 
@@ -468,6 +469,22 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
             # Get prompt logprobs for this request.
             prompt_logprobs_tensors = prompt_logprobs_dict.get(req_id)
             if new_token_ids or mm_output is not None or pooler_output is not None or kv_transfer_params or stopped:
+                # Wire-side mm payload for the engine-core -> API msgspec hop.
+                # When the send edge is a GPU-tensor connector, the real data
+                # travels via the connector pool; forwarding the GPU tensors
+                # here only buys a ~145ms/chunk synchronous D2H inside msgpack
+                # encoding (the dominant c>=4 TTFT/E2EL tax in profiling).
+                # save_async below still receives the original mm_output refs.
+                # Gated on supports_gpu_tensor so CPU-payload deployments (SHM)
+                # skip the container-rebuild walk entirely.
+                wire_mm_output = mm_output
+                adapter = self.chunk_transfer_adapter
+                if (
+                    mm_output is not None
+                    and adapter is not None
+                    and getattr(adapter.connector, "supports_gpu_tensor", False)
+                ):
+                    wire_mm_output = strip_gpu_tensors_for_engine_output(mm_output)
                 # Add EngineCoreOutput for this Request.
                 outputs[request.client_index].append(
                     OmniEngineCoreOutput(
@@ -477,7 +494,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                         new_logprobs=new_logprobs,
                         new_prompt_logprobs_tensors=prompt_logprobs_tensors,
                         pooling_output=pooler_output,
-                        multimodal_output=mm_output,
+                        multimodal_output=wire_mm_output,
                         stop_reason=request.stop_reason,
                         events=request.take_events(),
                         prefill_stats=request.take_prefill_stats(),
