@@ -36,15 +36,9 @@ _RING_VERSION = 1  # bump on incompatible wire layout changes
 RING_PCLASS_INLINE = 0  # ring body: serialized payload (small, < inline_threshold)
 RING_PCLASS_POOL = 1  # ring body: pool descriptor (big GPU tensor, D2D path)
 
-# Open-addressing probe bound, shared by publish() and poll(). Consumed slots
-# stay as tombstones (seq!=0, consumed=1) on a key's probe chain — they are
-# recycled by publish() but never reset to seq==0, so without a bound a poll
-# miss on a long-running ring degrades to a full O(n_slots) Python scan once
-# every slot has been used at least once. Bounding BOTH sides to the same
-# window keeps the invariant (an entry is always placed within the window of
-# its home slot) while capping the worst-case miss at _PROBE_WINDOW slot
-# reads. Must be identical on both sides of an edge — a layout constant, not
-# a config knob.
+# Probe bound shared by publish() and poll(): consumed slots stay as tombstones,
+# so an unbounded miss-scan degrades to O(n_slots) once the ring has wrapped.
+# Both sides must use the same value — layout constant, not a config knob.
 _PROBE_WINDOW = 64
 
 
@@ -154,11 +148,8 @@ class CudaIpcControlRing:
     def reclaim_stale(cls, name: str, header_bytes: int = RING_HEADER_BYTES) -> bool:
         """Unlink a leftover ring whose owner process is dead; True if reclaimed.
 
-        Called by the sender at connector init (before any lazy create) so a
-        receiver polling during the init->first-put window cannot open and
-        cache a stale segment from a previous run. A ring with a LIVE owner is
-        left untouched.
-        """
+        Sender calls this at init so receivers cannot cache a stale segment
+        during the init -> first-put window. Live-owner rings are untouched."""
         try:
             old = shm_pkg.SharedMemory(name=name)
         except FileNotFoundError:
@@ -185,12 +176,8 @@ class CudaIpcControlRing:
         try:
             old = shm_pkg.SharedMemory(name=name)
             try:
-                # A pre-existing INITIALIZED ring whose owner is still alive means a
-                # second sender-owner is being created on the same edge (dual-putter
-                # bug): unlink-recreate would orphan the live owner's segment and
-                # strand any receiver that cached the old mapping — a silent
-                # pipeline hang. Refuse loudly instead. A dead owner (previous run
-                # crashed without cleanup) is reclaimed as before.
+                # A live-owner ring means a second sender-owner on this edge (SPSC
+                # violation) — refuse; a dead owner's leftover is reclaimed below.
                 old_slots, old_body = struct.unpack_from("<II", old.buf, 0)
                 if old_slots > 0 and old_body > 0:
                     # Fixed offset from this caller's layout — old.size is

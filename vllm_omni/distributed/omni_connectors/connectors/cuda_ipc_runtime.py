@@ -190,14 +190,10 @@ _pycapsule_new.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
 
 
 def make_dlpack_view(ptr: int, shape, dtype_str: str, device_type: str, device_id: int, keepalive: list):
-    """Wrap a raw pointer as a torch tensor via a DLPack capsule (zero copy).
+    """Wrap a raw pointer as a torch tensor via DLPack (zero copy).
 
-    The underlying memory's lifetime is managed by the CALLER (pool mapping
-    owned by the connector); the deleter is a no-op. ``keepalive`` must be a
-    list owned by the caller that outlives the returned tensor's storage —
-    the ctypes structs are appended to it so they aren't garbage collected
-    while torch still references them.
-    """
+    Memory lifetime is owned by the caller (pool mapping); append-only
+    ``keepalive`` must hold the ctypes structs through from_dlpack()."""
     import torch as _torch
 
     if dtype_str not in _DLPACK_DTYPES:
@@ -215,12 +211,8 @@ def make_dlpack_view(ptr: int, shape, dtype_str: str, device_type: str, device_i
     managed.dl_tensor.strides = None  # compact row-major
     managed.dl_tensor.byte_offset = 0
     managed.manager_ctx = None
-    # NULL deleter (allowed by the DLPack spec): the consumer skips the
-    # destructor call entirely, so no Python-side trampoline can be invoked
-    # after interpreter teardown (a ctypes CFUNCTYPE deleter segfaults there).
-    # torch copies shape/strides into its own TensorImpl at construction, so
-    # the structs only need to survive the from_dlpack() call itself; the
-    # keepalive list guards against GC racing that construction.
+    # NULL deleter (DLPack-legal): a Python trampoline deleter segfaults when
+    # invoked during interpreter teardown; torch copies shape at construction.
     managed.deleter = ctypes.cast(None, _DLManagedTensorDeleter)
     keepalive.append((managed, shape_arr))
     capsule = _pycapsule_new(ctypes.byref(managed), b"dltensor", None)

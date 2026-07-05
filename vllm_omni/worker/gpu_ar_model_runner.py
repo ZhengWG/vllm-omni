@@ -103,17 +103,6 @@ def _payload_has_any_gpu_tensor(value: Any) -> bool:
     return False
 
 
-def _payload_has_gpu_tensor_at_least(value: Any, min_bytes: int) -> bool:
-    """True when the payload holds any CUDA tensor >= min_bytes (tiered placement)."""
-    if isinstance(value, torch.Tensor):
-        return value.is_cuda and value.nbytes >= min_bytes
-    if isinstance(value, dict):
-        return any(_payload_has_gpu_tensor_at_least(v, min_bytes) for v in value.values())
-    if isinstance(value, (list, tuple)):
-        return any(_payload_has_gpu_tensor_at_least(v, min_bytes) for v in value)
-    return False
-
-
 def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
     if isinstance(value, torch.Tensor):
         if value.device.type != "cuda":
@@ -176,9 +165,7 @@ class _OmniOutputTensorSnapshot(NamedTuple):
     staged_hidden_states_cpu: torch.Tensor | None
     multimodal_outputs: Any
     async_payload: _AsyncCPUPayloadSnapshot | None = None
-    # True when hidden_states/multimodal_outputs are already independent
-    # snapshot clones (keep_on_gpu path): the output builder can then skip
-    # its defensive clones instead of re-copying the payload on GPU.
+    # Snapshot tensors already independently cloned -> builder skips clones.
     payload_is_cloned: bool = False
 
 
@@ -355,19 +342,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._downstream_payload_cache: dict[str, bool] = {}
 
     @property
-    def _payload_gpu_min_bytes(self) -> int | None:
-        """Send-edge tiered placement policy (None=CPU wire, N=big tensors stay GPU)."""
-        return getattr(getattr(self, "_omni_connector", None), "gpu_tensor_min_bytes", None)
-
-    @property
     def _payload_gpu_keys(self) -> frozenset | None:
-        """Stable per-key GPU placement set (device must not flap across chunks
-        for tensors that downstream code concatenates)."""
+        """Stable per-key GPU placement set (must not flap across chunks)."""
         return getattr(getattr(self, "_omni_connector", None), "gpu_tensor_keys", None)
 
     @property
     def _payload_keep_on_gpu(self) -> bool:
-        return self._payload_gpu_min_bytes is not None
+        return bool(getattr(getattr(self, "_omni_connector", None), "supports_gpu_tensor", False))
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1514,12 +1495,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             staged_hidden_states_cpu=staged_hidden_states_cpu,
             multimodal_outputs=multimodal_outputs,
         )
-        _gpu_min = self._payload_gpu_min_bytes
         _gpu_keys = self._payload_gpu_keys
-        _wants_gpu = (
+        _wants_gpu = self._payload_keep_on_gpu and (
             _payload_has_gpu_tensor_under_keys(payload, _gpu_keys)
-            if (_gpu_min is not None and _gpu_keys is not None)
-            else (_gpu_min is not None and _payload_has_gpu_tensor_at_least(payload, _gpu_min))
+            if _gpu_keys is not None
+            else _payload_has_any_gpu_tensor(payload)
         )
         if _wants_gpu:
             with record_function_or_nullcontext("omni_async_output:snapshot_gpu_payload"):
@@ -1602,27 +1582,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         return stream
 
     def _to_connector_payload_tensor(self, tensor: torch.Tensor, *, already_cloned: bool = False) -> torch.Tensor:
-        """Detached tensor staged for the downstream connector (GPU or CPU).
-
-        ``already_cloned`` skips the defensive GPU clone when the input is a
-        keep_on_gpu snapshot copy (independent of CUDA-graph reuse buffers);
-        re-cloning would issue a redundant full-size D2D on the background
-        builder thread that competes with the next forward.
-        """
+        """Stage a detached tensor for the connector (GPU per placement policy,
+        else CPU); ``already_cloned`` skips the defensive GPU clone."""
         detached = tensor.detach()
-        min_bytes = self._payload_gpu_min_bytes
         keys = self._payload_gpu_keys
-        if keys is not None:
-            # Stable key mode: hidden_states placement follows the key list.
-            if min_bytes is not None and "hidden_states" in keys and detached.is_cuda:
-                if already_cloned:
-                    return detached.contiguous()
-                return detached.clone()
-            return _to_cpu_contiguous(detached)
-        if min_bytes is not None and detached.is_cuda and detached.nbytes >= min_bytes:
-            if already_cloned:
-                return detached.contiguous()
-            return detached.clone()
+        keep = self._payload_keep_on_gpu and detached.is_cuda and (keys is None or "hidden_states" in keys)
+        if keep:
+            return detached.contiguous() if already_cloned else detached.clone()
         return _to_cpu_contiguous(detached)
 
     def _build_omni_model_runner_output_from_snapshot(
@@ -1722,7 +1688,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                         keep_on_gpu=self._payload_keep_on_gpu,
                         payload_already_cloned=payload_is_cloned,
-                        gpu_min_bytes=self._payload_gpu_min_bytes or 0,
                         gpu_keys=self._payload_gpu_keys,
                     )
 

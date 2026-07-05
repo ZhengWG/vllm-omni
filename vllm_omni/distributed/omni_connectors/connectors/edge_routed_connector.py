@@ -36,10 +36,7 @@ class EdgeRoutedConnector(OmniConnectorBase):
     ):
         self._input = input_connector
         self._output = output_connector
-        # Shared attrs consumed by adapter/processor helpers.  ``config`` is
-        # the merged extra view (output wins on collision — send-edge helpers
-        # such as codec sizing read it); ``stage_id`` is identical on both
-        # backends (injected from the same stage config).
+        # Merged extra view (output wins) + stage_id for adapter helpers.
         in_cfg = getattr(input_connector, "config", None) or {}
         out_cfg = getattr(output_connector, "config", None) or {}
         self.config: dict[str, Any] = {**in_cfg, **out_cfg}
@@ -66,13 +63,6 @@ class EdgeRoutedConnector(OmniConnectorBase):
         return bool(self._output is not None and self._output.supports_gpu_tensor)
 
     @property
-    def gpu_tensor_min_bytes(self) -> int | None:
-        # Placement policy is a send-side concern — answer for the output edge.
-        if self._output is None:
-            return None
-        return self._output.gpu_tensor_min_bytes
-
-    @property
     def gpu_tensor_keys(self):
         if self._output is None:
             return None
@@ -95,17 +85,6 @@ class EdgeRoutedConnector(OmniConnectorBase):
             to_stage,
         )
         return None
-
-    @property
-    def pack_at_snapshot_enabled(self) -> bool:
-        return bool(self._output is not None and getattr(self._output, "pack_at_snapshot_enabled", False))
-
-    def pack_on_stream(self, data: Any, stream: Any = None):
-        """Forward snapshot-time packing to the send-edge backend (L3)."""
-        if self._output is None:
-            return None
-        pack = getattr(self._output, "pack_on_stream", None)
-        return pack(data, stream) if callable(pack) else None
 
     # --- Data plane ---
 

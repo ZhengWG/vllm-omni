@@ -110,15 +110,7 @@ def _ensure_list(x):
     return list(x)
 
 
-def _keep_tensor_on_gpu(t: torch.Tensor, gpu_min_bytes: int | None) -> bool:
-    """Tiered placement: keep on GPU only when the send edge accepts GPU
-    tensors (gpu_min_bytes is not None) AND the tensor is big enough that a
-    D2D pool transfer beats the CPU bounce. Small/control tensors always go
-    CPU — per-step GPU clones + tiny-tensor syncs cost more than they save."""
-    return gpu_min_bytes is not None and t.is_cuda and t.nbytes >= gpu_min_bytes
-
-
-def _as_tensor_or_none(value: Any, gpu_min_bytes: int | None = None) -> torch.Tensor | None:
+def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | None:
     t: torch.Tensor | None = None
     if isinstance(value, torch.Tensor):
         t = value
@@ -126,7 +118,7 @@ def _as_tensor_or_none(value: Any, gpu_min_bytes: int | None = None) -> torch.Te
         t = value[0]
     if t is None:
         return None
-    return t.detach() if _keep_tensor_on_gpu(t, gpu_min_bytes) else t.detach().cpu()
+    return t.detach() if (keep_on_gpu and t.is_cuda) else t.detach().cpu()
 
 
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
@@ -279,7 +271,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     thinker_emb,
     thinker_hid,
     transfer_manager,
-    gpu_min_bytes: int | None = None,
+    keep_on_gpu: bool = False,
 ) -> OmniPayloadStruct | None:
     """Build Thinker -> Talker payloads for realtime streaming input chunks.
 
@@ -296,9 +288,9 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    # Tiered placement: big tensors ride D2D, small ones drop to CPU.
-    emb_cpu = thinker_emb.detach() if _keep_tensor_on_gpu(thinker_emb, gpu_min_bytes) else thinker_emb.detach().cpu()
-    hid_cpu = thinker_hid.detach() if _keep_tensor_on_gpu(thinker_hid, gpu_min_bytes) else thinker_hid.detach().cpu()
+    # Keep on GPU for a GPU-direct connector (D2D); else drop to CPU.
+    emb_cpu = thinker_emb.detach() if (keep_on_gpu and thinker_emb.is_cuda) else thinker_emb.detach().cpu()
+    hid_cpu = thinker_hid.detach() if (keep_on_gpu and thinker_hid.is_cuda) else thinker_hid.detach().cpu()
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
@@ -458,11 +450,9 @@ def thinker2talker_async_chunk(
     3. Package for talker with additional information
     """
 
-    # Send-edge placement policy: both transfer-manager shapes (chunk adapter
-    # and worker mixin) expose ``connector``; a routed connector answers for
-    # its output edge. None -> CPU wire; N -> tensors >= N bytes stay on GPU.
+    # Send-edge capability: a routed connector answers for its output edge.
     _connector = getattr(transfer_manager, "connector", None)
-    _gpu_min_bytes = getattr(_connector, "gpu_tensor_min_bytes", None)
+    _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
@@ -490,7 +480,7 @@ def thinker2talker_async_chunk(
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
         if not isinstance(t, torch.Tensor):
             return None
-        return t.detach() if _keep_tensor_on_gpu(t, _gpu_min_bytes) else t.detach().cpu()
+        return t.detach() if (_keep_on_gpu and t.is_cuda) else t.detach().cpu()
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
@@ -527,7 +517,7 @@ def thinker2talker_async_chunk(
     else:
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
-                is_finished, request, thinker_emb, thinker_hid, transfer_manager, gpu_min_bytes=_gpu_min_bytes
+                is_finished, request, thinker_emb, thinker_hid, transfer_manager, keep_on_gpu=_keep_on_gpu
             )
         if thinker_emb.shape[0] > 1:
             logger.warning(
@@ -609,20 +599,19 @@ def thinker2talker_full_payload(
     else:
         thinker_hid_prefill = thinker_hid
 
-    # Send-edge tiered placement: big tensors stay on GPU for D2D, the rest
-    # drop to CPU (SharedMemoryConnector wire format when policy is None).
+    # Send-edge capability: a GPU-direct connector keeps tensors on device.
     _connector = getattr(transfer_manager, "connector", None)
-    _gpu_min_bytes = getattr(_connector, "gpu_tensor_min_bytes", None)
+    _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
 
     def _place(t: torch.Tensor) -> torch.Tensor:
-        return t.detach() if _keep_tensor_on_gpu(t, _gpu_min_bytes) else t.detach().cpu()
+        return t.detach() if (_keep_on_gpu and t.is_cuda) else t.detach().cpu()
 
     payload: OmniPayload = {
         "embed": {
             "prefill": _place(thinker_emb_prefill),
-            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos"), gpu_min_bytes=_gpu_min_bytes),
-            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos"), gpu_min_bytes=_gpu_min_bytes),
-            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad"), gpu_min_bytes=_gpu_min_bytes),
+            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos"), keep_on_gpu=_keep_on_gpu),
+            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos"), keep_on_gpu=_keep_on_gpu),
+            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad"), keep_on_gpu=_keep_on_gpu),
         },
         "hidden_states": {"output": _place(thinker_hid_prefill)},
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},

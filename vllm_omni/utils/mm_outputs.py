@@ -69,23 +69,11 @@ _STRIPPED_GPU_TENSOR_MARKER = "_omni_stripped_gpu_tensor"
 
 
 def strip_gpu_tensors_for_engine_output(value: Any) -> Any:
-    """Replace CUDA tensors with msgspec-safe descriptors recursively.
+    """Replace CUDA tensors with small shape/dtype descriptor dicts (recursive).
 
-    Why: the engine-core ``process_output_sockets`` thread serialises
-    ``OmniEngineCoreOutput`` via msgpack, which calls ``tensor.detach().cpu()``
-    on every tensor it encounters. For a keep_on_gpu mm payload (~57MB/chunk
-    for Qwen3-Omni prefill) that call blocks on the GPU compute stream's
-    drain (~145ms mean, multi-second p99 at c>=4 in profiling) — a redundant
-    D2H tax, because the actual tensor data already travels downstream via
-    the connector pool path. Callers gate this on the send edge being a
-    GPU-tensor connector (see omni_ar_scheduler).
-
-    Walks dict/list/tuple containers; CPU tensors and non-tensor values pass
-    through unchanged. Returns new containers — the input is never mutated,
-    so the connector's save_async callsite still sees the original GPU
-    tensor refs. Each stripped tensor becomes a small dict carrying shape
-    and dtype so metric/trace readers fail soft instead of crashing.
-    """
+    The engine-core msgpack hop would otherwise call ``tensor.detach().cpu()``
+    on keep_on_gpu payloads (~145ms/57MB chunk) that already travel via the
+    connector pool. Never mutates the input; callers gate on the send edge."""
     if isinstance(value, torch.Tensor):
         if value.device.type == "cuda":
             return {
@@ -107,7 +95,6 @@ def build_mm_cpu(
     multimodal_outputs: dict,
     keep_on_gpu: bool = False,
     payload_already_cloned: bool = False,
-    gpu_min_bytes: int = 0,
     gpu_keys: "frozenset | None" = None,
 ) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
@@ -137,25 +124,19 @@ def build_mm_cpu(
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
     for k, v in multimodal_outputs.items():
-        if gpu_keys is not None:
-            # STABLE per-key placement: a key either always stays on GPU or
-            # always drops to CPU. Per-instance size decisions flap the device
-            # across chunks and break downstream torch.cat over the stream.
-            key_on_gpu = keep_on_gpu and isinstance(k, str) and k.split(".", 1)[0] in gpu_keys
-            converted = _detach_tensor(v, key_on_gpu, payload_already_cloned, 0)
-        else:
-            converted = _detach_tensor(v, keep_on_gpu, payload_already_cloned, gpu_min_bytes)
+        # A listed key root always stays on GPU, the rest always drop to CPU
+        # (device flapping across chunks breaks downstream torch.cat).
+        key_on_gpu = keep_on_gpu and (gpu_keys is None or (isinstance(k, str) and k.split(".", 1)[0] in gpu_keys))
+        converted = _detach_tensor(v, key_on_gpu, payload_already_cloned)
         if converted is not None:
             mm_cpu[k] = converted
     return mm_cpu
 
 
-def _detach_tensor(value, keep_on_gpu: bool = False, payload_already_cloned: bool = False, gpu_min_bytes: int = 0):
+def _detach_tensor(value, keep_on_gpu: bool = False, payload_already_cloned: bool = False):
     """Recursively detach tensors; move to CPU unless keep_on_gpu is set."""
     if isinstance(value, torch.Tensor):
-        # Tiered placement: only CUDA tensors >= gpu_min_bytes stay on GPU
-        # (0 keeps everything); smaller/control tensors drop to CPU.
-        if keep_on_gpu and value.is_cuda and value.nbytes >= gpu_min_bytes:
+        if keep_on_gpu and value.is_cuda:
             # Snapshot is already an independent clone — just detach. Avoids a
             # redundant D2D on the model's compute stream in the async builder.
             if payload_already_cloned:
@@ -165,14 +146,14 @@ def _detach_tensor(value, keep_on_gpu: bool = False, payload_already_cloned: boo
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            converted = _detach_tensor(v, keep_on_gpu, payload_already_cloned, gpu_min_bytes)
+            converted = _detach_tensor(v, keep_on_gpu, payload_already_cloned)
             if converted is not None:
                 out[k] = converted
         return out or None
     if isinstance(value, list):
         if not value:
             return value
-        return [_detach_tensor(v, keep_on_gpu, payload_already_cloned, gpu_min_bytes) for v in value]
+        return [_detach_tensor(v, keep_on_gpu, payload_already_cloned) for v in value]
     return value
 
 
