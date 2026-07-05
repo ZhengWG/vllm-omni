@@ -129,3 +129,99 @@ def stream_wait_event(lib, stream: int, event) -> None:
     ret = lib.cudaStreamWaitEvent(ctypes.c_void_p(stream), event, ctypes.c_uint(0))
     if ret != 0:
         raise RuntimeError(f"cudaStreamWaitEvent failed: {ret}")
+
+
+# --- DLPack view construction (L4 zero-copy receive) ---------------------
+# Minimal ctypes DLPack producer: wraps a raw device/host pointer as a torch
+# tensor WITHOUT copying. Used by the receiver to view a pool slot in place.
+
+_DL_KDLCPU = 1
+_DL_KDLCUDA = 2
+
+_DLPACK_DTYPES = {
+    # dtype string (torch, sans "torch.") -> (type_code, bits, lanes)
+    "float16": (2, 16, 1),
+    "bfloat16": (4, 16, 1),
+    "float32": (2, 32, 1),
+    "float64": (2, 64, 1),
+    "int8": (0, 8, 1),
+    "int16": (0, 16, 1),
+    "int32": (0, 32, 1),
+    "int64": (0, 64, 1),
+    "uint8": (1, 8, 1),
+    "bool": (6, 8, 1),
+}
+
+
+class _DLDevice(ctypes.Structure):
+    _fields_ = [("device_type", ctypes.c_int), ("device_id", ctypes.c_int)]
+
+
+class _DLDataType(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_uint8), ("bits", ctypes.c_uint8), ("lanes", ctypes.c_uint16)]
+
+
+class _DLTensor(ctypes.Structure):
+    _fields_ = [
+        ("data", ctypes.c_void_p),
+        ("device", _DLDevice),
+        ("ndim", ctypes.c_int),
+        ("dtype", _DLDataType),
+        ("shape", ctypes.POINTER(ctypes.c_int64)),
+        ("strides", ctypes.POINTER(ctypes.c_int64)),
+        ("byte_offset", ctypes.c_uint64),
+    ]
+
+
+class _DLManagedTensor(ctypes.Structure):
+    pass
+
+
+_DLManagedTensorDeleter = ctypes.CFUNCTYPE(None, ctypes.POINTER(_DLManagedTensor))
+_DLManagedTensor._fields_ = [
+    ("dl_tensor", _DLTensor),
+    ("manager_ctx", ctypes.c_void_p),
+    ("deleter", _DLManagedTensorDeleter),
+]
+
+_pycapsule_new = ctypes.pythonapi.PyCapsule_New
+_pycapsule_new.restype = ctypes.py_object
+_pycapsule_new.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_void_p]
+
+
+def make_dlpack_view(ptr: int, shape, dtype_str: str, device_type: str, device_id: int, keepalive: list):
+    """Wrap a raw pointer as a torch tensor via a DLPack capsule (zero copy).
+
+    The underlying memory's lifetime is managed by the CALLER (pool mapping
+    owned by the connector); the deleter is a no-op. ``keepalive`` must be a
+    list owned by the caller that outlives the returned tensor's storage —
+    the ctypes structs are appended to it so they aren't garbage collected
+    while torch still references them.
+    """
+    import torch as _torch
+
+    if dtype_str not in _DLPACK_DTYPES:
+        raise ValueError(f"unsupported dtype for zero-copy view: {dtype_str}")
+    code, bits, lanes = _DLPACK_DTYPES[dtype_str]
+    ndim = len(shape)
+    shape_arr = (ctypes.c_int64 * ndim)(*shape)
+
+    managed = _DLManagedTensor()
+    managed.dl_tensor.data = ctypes.c_void_p(ptr)
+    managed.dl_tensor.device = _DLDevice(_DL_KDLCUDA if device_type == "cuda" else _DL_KDLCPU, device_id)
+    managed.dl_tensor.ndim = ndim
+    managed.dl_tensor.dtype = _DLDataType(code, bits, lanes)
+    managed.dl_tensor.shape = shape_arr
+    managed.dl_tensor.strides = None  # compact row-major
+    managed.dl_tensor.byte_offset = 0
+    managed.manager_ctx = None
+    # NULL deleter (allowed by the DLPack spec): the consumer skips the
+    # destructor call entirely, so no Python-side trampoline can be invoked
+    # after interpreter teardown (a ctypes CFUNCTYPE deleter segfaults there).
+    # torch copies shape/strides into its own TensorImpl at construction, so
+    # the structs only need to survive the from_dlpack() call itself; the
+    # keepalive list guards against GC racing that construction.
+    managed.deleter = ctypes.cast(None, _DLManagedTensorDeleter)
+    keepalive.append((managed, shape_arr))
+    capsule = _pycapsule_new(ctypes.byref(managed), b"dltensor", None)
+    return _torch.from_dlpack(capsule)

@@ -78,6 +78,42 @@ def _clone_cuda_tensor_payload(value: Any, sources: list[torch.Tensor]) -> Any:
     return value
 
 
+def _payload_has_gpu_tensor_under_keys(value: Any, keys: frozenset) -> bool:
+    """True when any listed key root holds a CUDA tensor (stable key placement)."""
+    if isinstance(value, dict):
+        for k, v in value.items():
+            if isinstance(k, str) and k.split(".", 1)[0] in keys:
+                if _payload_has_any_gpu_tensor(v):
+                    return True
+            elif _payload_has_gpu_tensor_under_keys(v, keys):
+                return True
+        return False
+    if isinstance(value, (list, tuple)):
+        return any(_payload_has_gpu_tensor_under_keys(v, keys) for v in value)
+    return False
+
+
+def _payload_has_any_gpu_tensor(value: Any) -> bool:
+    if isinstance(value, torch.Tensor):
+        return value.is_cuda
+    if isinstance(value, dict):
+        return any(_payload_has_any_gpu_tensor(v) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_payload_has_any_gpu_tensor(v) for v in value)
+    return False
+
+
+def _payload_has_gpu_tensor_at_least(value: Any, min_bytes: int) -> bool:
+    """True when the payload holds any CUDA tensor >= min_bytes (tiered placement)."""
+    if isinstance(value, torch.Tensor):
+        return value.is_cuda and value.nbytes >= min_bytes
+    if isinstance(value, dict):
+        return any(_payload_has_gpu_tensor_at_least(v, min_bytes) for v in value.values())
+    if isinstance(value, (list, tuple)):
+        return any(_payload_has_gpu_tensor_at_least(v, min_bytes) for v in value)
+    return False
+
+
 def _copy_tensor_payload_to_cpu(value: Any, pin_memory: bool) -> Any:
     if isinstance(value, torch.Tensor):
         if value.device.type != "cuda":
@@ -319,8 +355,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         self._downstream_payload_cache: dict[str, bool] = {}
 
     @property
+    def _payload_gpu_min_bytes(self) -> int | None:
+        """Send-edge tiered placement policy (None=CPU wire, N=big tensors stay GPU)."""
+        return getattr(getattr(self, "_omni_connector", None), "gpu_tensor_min_bytes", None)
+
+    @property
+    def _payload_gpu_keys(self) -> frozenset | None:
+        """Stable per-key GPU placement set (device must not flap across chunks
+        for tensors that downstream code concatenates)."""
+        return getattr(getattr(self, "_omni_connector", None), "gpu_tensor_keys", None)
+
+    @property
     def _payload_keep_on_gpu(self) -> bool:
-        return bool(getattr(getattr(self, "_omni_connector", None), "supports_gpu_tensor", False))
+        return self._payload_gpu_min_bytes is not None
 
     def _make_buffer(self, *size, dtype, numpy=True):
         # Prevent ray from pinning the buffer due to large size
@@ -1467,7 +1514,14 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             staged_hidden_states_cpu=staged_hidden_states_cpu,
             multimodal_outputs=multimodal_outputs,
         )
-        if self._payload_keep_on_gpu:
+        _gpu_min = self._payload_gpu_min_bytes
+        _gpu_keys = self._payload_gpu_keys
+        _wants_gpu = (
+            _payload_has_gpu_tensor_under_keys(payload, _gpu_keys)
+            if (_gpu_min is not None and _gpu_keys is not None)
+            else (_gpu_min is not None and _payload_has_gpu_tensor_at_least(payload, _gpu_min))
+        )
+        if _wants_gpu:
             with record_function_or_nullcontext("omni_async_output:snapshot_gpu_payload"):
                 hidden_states_snapshot = payload.get("hidden_states")
                 if hidden_states_snapshot is None:
@@ -1556,7 +1610,16 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         builder thread that competes with the next forward.
         """
         detached = tensor.detach()
-        if self._payload_keep_on_gpu:
+        min_bytes = self._payload_gpu_min_bytes
+        keys = self._payload_gpu_keys
+        if keys is not None:
+            # Stable key mode: hidden_states placement follows the key list.
+            if min_bytes is not None and "hidden_states" in keys and detached.is_cuda:
+                if already_cloned:
+                    return detached.contiguous()
+                return detached.clone()
+            return _to_cpu_contiguous(detached)
+        if min_bytes is not None and detached.is_cuda and detached.nbytes >= min_bytes:
             if already_cloned:
                 return detached.contiguous()
             return detached.clone()
@@ -1659,6 +1722,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                         flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
                         keep_on_gpu=self._payload_keep_on_gpu,
                         payload_already_cloned=payload_is_cloned,
+                        gpu_min_bytes=self._payload_gpu_min_bytes or 0,
+                        gpu_keys=self._payload_gpu_keys,
                     )
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):

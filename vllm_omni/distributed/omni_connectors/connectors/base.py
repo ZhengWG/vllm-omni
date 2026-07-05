@@ -46,6 +46,32 @@ class OmniConnectorBase(ABC):
         """
         return self.supports_gpu_tensor
 
+    @property
+    def gpu_tensor_min_bytes(self) -> int | None:
+        """Send-side tensor placement policy for payload builders.
+
+        ``None``  -> keep nothing on GPU (CPU wire format);
+        ``0``     -> keep every tensor on GPU (full GPU-direct);
+        ``N > 0`` -> keep only tensors with ``nbytes >= N`` on GPU — the tiered
+                     placement that captures D2D savings for big tensors without
+                     paying per-step GPU-clone/sync overhead on tiny ones.
+
+        Defaults derive from ``supports_gpu_tensor``; connectors with a
+        configurable threshold override this.
+        """
+        return 0 if self.supports_gpu_tensor else None
+
+    @property
+    def gpu_tensor_keys(self) -> "frozenset | None":
+        """Optional stable per-key GPU placement filter (None = no filter).
+
+        Keys are matched against the ROOT of flattened payload keys
+        ("hidden_states.output" -> "hidden_states"). Listed keys stay on GPU
+        for every chunk — device stability is required for tensors that get
+        concatenated across chunks downstream.
+        """
+        return None
+
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:
         """Store Python object, internal serialization handled by connector.

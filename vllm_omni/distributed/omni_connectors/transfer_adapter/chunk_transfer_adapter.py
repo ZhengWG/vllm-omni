@@ -392,6 +392,13 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
+        # Release connector-held per-request resources (e.g. zero-copy slot
+        # leases under CudaIPC zero_copy_recv; pending shm keys under SHM).
+        try:
+            if self.connector is not None:
+                self.connector.cleanup(request_id)
+        except Exception:
+            logger.warning("connector cleanup failed for %s", request_id, exc_info=True)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)

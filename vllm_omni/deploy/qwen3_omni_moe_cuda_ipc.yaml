@@ -41,17 +41,27 @@ connectors:
     name: CudaIPCConnector
     extra:
       <<: *cuda_ipc_extra
-      # Transport-only IPC: payloads stay on the tuned CPU async-output
-      # pipeline (keep_on_gpu would flip the talker's per-step output path to
-      # GPU clones + tiny-tensor syncs — measured as a uniform TTFT/TTFP
-      # inflation). Serialized chunks <= ring_body_max ride the ring inline
-      # (no per-transfer /dev/shm syscalls); bigger ones fall back to shm.
-      keep_on_gpu: false
-      # CPU payloads never take the GPU pool path — keep it minimal (the pool
-      # only lazily allocates on first put anyway; this caps the worst case).
-      pool_size_mb: 64
-      pool_credits: 1
-      small_slot_count: 0
+      # L2 tiered placement: tensors >= keep_on_gpu_min_bytes ride the GPU
+      # pool D2D (on the co-located-stage topology this is an HBM-internal
+      # copy, zero PCIe); smaller/control tensors drop to CPU and ride the
+      # ring inline — avoids the per-step GPU-clone/tiny-tensor-sync tax that
+      # full keep_on_gpu was measured to add (uniform TTFT/TTFP inflation).
+      # L1 fallback if L2 regresses: set keep_on_gpu: false (and the pool
+      # can then be shrunk — CPU payloads never touch it).
+      keep_on_gpu: true
+      # STABLE per-key placement (L2 v2): listed key roots stay on GPU for
+      # EVERY chunk; everything else drops to CPU. Never size-tier streamed
+      # tensors — per-instance thresholds flap the device across chunks and
+      # break downstream torch.cat (measured: dropped chunks, -25% audio).
+      keep_on_gpu_keys: ["hidden_states"]
+      # Experimental ladder knobs (A/B one at a time, default off):
+      #   pack_at_snapshot: true   # L3 — producer packs into the slot at snapshot
+      #                            #      (runner integration pending; connector ready)
+      #   zero_copy_recv: true     # L4 — receiver consumes slots as DLPack views,
+      #                            #      slot released at request cleanup + TTL
+      pool_size_mb: 512
+      pool_credits: 8                # slot = 64MB (outliers)
+      small_slot_count: 256          # +64MB; big-enough chunk tensors live here
       ring_entries: 512
   # Kept for A/B triage: flip the two *_stream edge refs below to this to
   # compare the codec edge over host SHM vs D2D.

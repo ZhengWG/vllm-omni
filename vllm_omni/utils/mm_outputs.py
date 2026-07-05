@@ -104,7 +104,11 @@ def strip_gpu_tensors_for_engine_output(value: Any) -> Any:
 
 
 def build_mm_cpu(
-    multimodal_outputs: dict, keep_on_gpu: bool = False, payload_already_cloned: bool = False
+    multimodal_outputs: dict,
+    keep_on_gpu: bool = False,
+    payload_already_cloned: bool = False,
+    gpu_min_bytes: int = 0,
+    gpu_keys: "frozenset | None" = None,
 ) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
@@ -133,16 +137,25 @@ def build_mm_cpu(
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
     for k, v in multimodal_outputs.items():
-        converted = _detach_tensor(v, keep_on_gpu, payload_already_cloned)
+        if gpu_keys is not None:
+            # STABLE per-key placement: a key either always stays on GPU or
+            # always drops to CPU. Per-instance size decisions flap the device
+            # across chunks and break downstream torch.cat over the stream.
+            key_on_gpu = keep_on_gpu and isinstance(k, str) and k.split(".", 1)[0] in gpu_keys
+            converted = _detach_tensor(v, key_on_gpu, payload_already_cloned, 0)
+        else:
+            converted = _detach_tensor(v, keep_on_gpu, payload_already_cloned, gpu_min_bytes)
         if converted is not None:
             mm_cpu[k] = converted
     return mm_cpu
 
 
-def _detach_tensor(value, keep_on_gpu: bool = False, payload_already_cloned: bool = False):
+def _detach_tensor(value, keep_on_gpu: bool = False, payload_already_cloned: bool = False, gpu_min_bytes: int = 0):
     """Recursively detach tensors; move to CPU unless keep_on_gpu is set."""
     if isinstance(value, torch.Tensor):
-        if keep_on_gpu:
+        # Tiered placement: only CUDA tensors >= gpu_min_bytes stay on GPU
+        # (0 keeps everything); smaller/control tensors drop to CPU.
+        if keep_on_gpu and value.is_cuda and value.nbytes >= gpu_min_bytes:
             # Snapshot is already an independent clone — just detach. Avoids a
             # redundant D2D on the model's compute stream in the async builder.
             if payload_already_cloned:
@@ -152,14 +165,14 @@ def _detach_tensor(value, keep_on_gpu: bool = False, payload_already_cloned: boo
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            converted = _detach_tensor(v, keep_on_gpu, payload_already_cloned)
+            converted = _detach_tensor(v, keep_on_gpu, payload_already_cloned, gpu_min_bytes)
             if converted is not None:
                 out[k] = converted
         return out or None
     if isinstance(value, list):
         if not value:
             return value
-        return [_detach_tensor(v, keep_on_gpu, payload_already_cloned) for v in value]
+        return [_detach_tensor(v, keep_on_gpu, payload_already_cloned, gpu_min_bytes) for v in value]
     return value
 
 

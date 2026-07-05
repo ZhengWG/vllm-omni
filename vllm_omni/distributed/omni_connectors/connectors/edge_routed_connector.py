@@ -65,6 +65,19 @@ class EdgeRoutedConnector(OmniConnectorBase):
         # (keep_on_gpu decisions), so answer for the output edge.
         return bool(self._output is not None and self._output.supports_gpu_tensor)
 
+    @property
+    def gpu_tensor_min_bytes(self) -> int | None:
+        # Placement policy is a send-side concern — answer for the output edge.
+        if self._output is None:
+            return None
+        return self._output.gpu_tensor_min_bytes
+
+    @property
+    def gpu_tensor_keys(self):
+        if self._output is None:
+            return None
+        return getattr(self._output, "gpu_tensor_keys", None)
+
     def supports_gpu_tensor_for(self, from_stage: str, to_stage: str) -> bool:
         backend = self._route(from_stage, to_stage)
         return bool(backend is not None and backend.supports_gpu_tensor)
@@ -82,6 +95,17 @@ class EdgeRoutedConnector(OmniConnectorBase):
             to_stage,
         )
         return None
+
+    @property
+    def pack_at_snapshot_enabled(self) -> bool:
+        return bool(self._output is not None and getattr(self._output, "pack_at_snapshot_enabled", False))
+
+    def pack_on_stream(self, data: Any, stream: Any = None):
+        """Forward snapshot-time packing to the send-edge backend (L3)."""
+        if self._output is None:
+            return None
+        pack = getattr(self._output, "pack_on_stream", None)
+        return pack(data, stream) if callable(pack) else None
 
     # --- Data plane ---
 
