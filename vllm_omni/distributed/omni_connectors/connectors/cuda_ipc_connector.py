@@ -126,6 +126,7 @@ class CudaIPCConnector(OmniConnectorBase):
     """
 
     supports_gpu_tensor: bool = True
+    request_scoped_cleanup: bool = True  # zero-copy slot lease release; no-op otherwise
 
     # --- Init ---
 

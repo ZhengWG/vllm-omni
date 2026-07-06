@@ -109,9 +109,16 @@ class EdgeRoutedConnector(OmniConnectorBase):
         """Distinct live backends (legacy single spec may share one instance)."""
         return list(dict.fromkeys(c for c in (self._input, self._output) if c is not None))
 
+    @property
+    def request_scoped_cleanup(self) -> bool:
+        return any(getattr(b, "request_scoped_cleanup", False) for b in self._backends())
+
     def cleanup(self, request_id: str) -> None:
+        # Opt-in fan-out only: SHM's cleanup unlinks real segments and must not
+        # fire on streaming transitions (would starve the downstream stage).
         for backend in self._backends():
-            backend.cleanup(request_id)
+            if getattr(backend, "request_scoped_cleanup", False):
+                backend.cleanup(request_id)
 
     def health(self) -> dict[str, Any]:
         return {

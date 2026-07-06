@@ -23,6 +23,11 @@ class OmniConnectorBase(ABC):
     # When True, payload processors may skip .cpu() on tensors.
     supports_gpu_tensor: bool = False
 
+    # Opt-in: framework calls cleanup(request_id) at request end. Default off —
+    # SHM's cleanup unlinks unconsumed segments and firing it on receiver-side
+    # transitions starves the downstream stage (silent pipeline hang).
+    request_scoped_cleanup: bool = False
+
     # Direction capabilities: a routed connector overrides these so callers
     # gate send/recv work on capability, not per-direction instances.
 

@@ -250,7 +250,7 @@ class OmniConnectorModelRunnerMixin:
         decrement path drains it without leaving orphans.
         """
         conn = getattr(self, "_omni_connector", None)
-        if conn is not None:
+        if conn is not None and getattr(conn, "request_scoped_cleanup", False):
             try:
                 conn.cleanup(req_id)
             except Exception:
