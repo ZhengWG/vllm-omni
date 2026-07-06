@@ -25,7 +25,10 @@ connectors:
     extra: &cuda_ipc_extra
       tensor_lifetime_sec: 30.0
       pool_size_mb: 4096
-      pool_credits: 64               # slot = 4096/64 = 64MB
+      # slot = pool/credits; prefill payload ~= prompt_tokens x 8KB (2 bf16
+      # layers x 2048 dims), so 128MB slots hold ~14k-token prompts. 64MB
+      # slots overflowed at 8k inputs -> every prefill took the CPU fallback.
+      pool_credits: 32               # slot = 4096/32 = 128MB
       small_slot_kb: 256             # decode-step small payloads
       small_slot_count: 128          # +32MB
       inline_threshold_bytes: 16384  # < 16KB -> inline
