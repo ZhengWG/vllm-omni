@@ -323,6 +323,29 @@ class CudaIPCConnector(OmniConnectorBase):
         self._recv_copy_streams = []
         self._recv_stream_idx = 0
 
+    def _rollback_partial_sender_resources(self) -> None:
+        """Undo a partially-failed _init_sender_resources.
+
+        `_pool is not None` is the initialized fast-path; latching it without a
+        ring would make every later put crash on `self._ring` instead of
+        re-raising the root cause (e.g. ring-create OSError on a full /dev/shm)."""
+        if self._ring is not None:
+            self._try_or_warn(self._ring.close, "rollback ring close")  # owner -> unlinks
+            self._ring = None
+        if self._board is not None:
+            self._try_or_warn(self._board.close, "rollback board close")
+            self._try_or_warn(self._board.unlink, "rollback board unlink")
+            self._board = None
+        self._board_name = None
+        ipc_event = getattr(self, "_ipc_event", None)
+        if ipc_event is not None and self._cudart is not None:
+            self._try_or_warn(lambda: self._cudart.cudaEventDestroy(ipc_event), "rollback IPC event destroy")
+            self._ipc_event = None
+        self._pool = None
+        self._pool_handle = None
+        self._credit_queue = None
+        self._small_credit_queue = None
+
     def _ensure_sender_resources(self) -> None:
         """Allocate pool/board/ring + start the release loop on first send."""
         if self._pool is not None:
@@ -330,7 +353,11 @@ class CudaIPCConnector(OmniConnectorBase):
         with self._lazy_init_lock:
             if self._pool is not None or self._closed:
                 return
-            self._init_sender_resources()
+            try:
+                self._init_sender_resources()
+            except Exception:
+                self._rollback_partial_sender_resources()
+                raise
             self._start_release_thread()
             logger.info(
                 "CudaIPCConnector(stage=%s): sender resources allocated (pool=%dMB + %d small slots, ring=%s)",
