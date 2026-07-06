@@ -1069,19 +1069,11 @@ def get_stage_connector_spec(
     stage_id: int,
     stage_config: Any | None = None,
 ) -> dict[str, Any]:
-    """Return the resolved stage connector spec (mode-independent).
+    """Resolve the stage connector spec from from_stage_*/to_stage_* edges.
 
-    Legacy format:
-        {"name": "...", "extra": {...}}
-
-    Dual format:
-        {
-            "input":  {"name": "...", "extra": {...}},
-            "output": {"name": "...", "extra": {...}},
-        }
-
-    Returns ``{}`` when the stage does not use the worker connector data plane
-    (KV/orchestrator-only inter-stage paths). See ``stage_uses_worker_connector``.
+    Returns ``{"input": spec, "output": spec}`` (either side optional), or
+    ``{}`` when the stage does not use the worker connector data plane
+    (see ``stage_uses_worker_connector``).
     """
     if not stage_uses_worker_connector(stage_config):
         return {}

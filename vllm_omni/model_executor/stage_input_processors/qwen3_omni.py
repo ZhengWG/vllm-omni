@@ -842,8 +842,6 @@ def talker2code2wav_async_chunk(
     if not code_predictor_codes.any():
         return None
 
-    # Send edge (talker -> code2wav): codec sizing comes from the connector's
-    # merged config view (send-edge extra wins on collision).
     connector = getattr(transfer_manager, "connector", None)
     raw_cfg = getattr(connector, "config", {}) or {}
     cfg = raw_cfg.get("extra", raw_cfg) if isinstance(raw_cfg, dict) else {}

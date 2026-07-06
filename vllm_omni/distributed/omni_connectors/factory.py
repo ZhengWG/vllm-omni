@@ -108,7 +108,9 @@ class OmniConnectorFactory:
                 backends[direction] = _make(spec) if spec else None
             from .connectors.edge_routed_connector import EdgeRoutedConnector
 
-            return EdgeRoutedConnector(backends["input"], backends["output"])
+            connector = EdgeRoutedConnector(backends["input"], backends["output"])
+            logger.info(f"Created stage connector: {connector!r}")
+            return connector
 
         return _make(config)
 
