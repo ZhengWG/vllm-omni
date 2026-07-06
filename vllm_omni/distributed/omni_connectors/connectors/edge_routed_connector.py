@@ -43,8 +43,9 @@ class EdgeRoutedConnector(OmniConnectorBase):
         self.stage_id = getattr(output_connector or input_connector, "stage_id", -1)
 
     def __repr__(self) -> str:
-        _name = lambda c: type(c).__name__ if c is not None else None  # noqa: E731
-        return f"EdgeRoutedConnector(input={_name(self._input)}, output={_name(self._output)})"
+        inp = type(self._input).__name__ if self._input is not None else None
+        out = type(self._output).__name__ if self._output is not None else None
+        return f"EdgeRoutedConnector(input={inp}, output={out})"
 
     # --- Capabilities ---
 

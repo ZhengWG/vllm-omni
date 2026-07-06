@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from time import time
@@ -34,10 +33,6 @@ from vllm_omni.engine import OmniEngineCoreOutput
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.outputs import OmniConnectorOutput
 from vllm_omni.utils.mm_outputs import strip_gpu_tensors_for_engine_output
-
-# Bisect kill-switch: VLLM_OMNI_DISABLE_MM_STRIP=1 restores pre-strip wire
-# behaviour without a code edit (perf triage aid).
-_MM_STRIP_DISABLED = os.environ.get("VLLM_OMNI_DISABLE_MM_STRIP", "0") in ("1", "true", "yes")
 
 logger = init_logger(__name__)
 
@@ -499,8 +494,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
                 wire_mm_output = mm_output
                 adapter = self.chunk_transfer_adapter
                 if (
-                    not _MM_STRIP_DISABLED
-                    and mm_output is not None
+                    mm_output is not None
                     and adapter is not None
                     and getattr(adapter.connector, "supports_gpu_tensor", False)
                 ):

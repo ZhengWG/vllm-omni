@@ -1118,11 +1118,6 @@ def get_stage_connector_spec(
             result["output"] = output_specs[0][1]
         return result
 
-    # Fallback to first available connector (legacy behavior).
-    for cfg in stage_connectors_cfg.values():
-        spec = dict(cfg.get("spec", {}))
-        if spec:
-            return spec
     return {}
 
 

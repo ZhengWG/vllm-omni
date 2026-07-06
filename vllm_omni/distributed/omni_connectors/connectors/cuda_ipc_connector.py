@@ -65,9 +65,7 @@ _POOL_MARKER = "__cuda_ipc_pool__"
 
 _POOL_ALIGNMENT = 16  # bytes, for GPU copy efficiency
 
-# Auto-size when pool_size_mb / pool_credits are omitted: credits = max(64, max_num_seqs*2),
-# pool_size_mb = credits * slot_size_mb (default 64 MB/slot — fits Qwen3-Omni ~33 MB prefill
-# handoff @ input 4000). Explicit pool_size_mb / pool_credits / slot_size_mb override.
+# Defaults: 64 x 64MB big slots (fits Qwen3-Omni ~33MB prefill handoff).
 _DEFAULT_SLOT_SIZE_MB = 64
 _DEFAULT_POOL_CREDITS = 64
 _DEFAULT_SMALL_SLOT_KB = 256  # small-slot pool: streaming-chunk sized
@@ -75,8 +73,7 @@ _DEFAULT_SMALL_SLOT_COUNT = 128  # +32MB GPU with the defaults
 _SMALL_SLOT_SLACK = 4096  # routing headroom for per-tensor alignment padding
 _DEFAULT_RECV_STREAMS = 8  # receiver D2D copy streams (round-robined per get)
 
-# Timing constants — overridable via extra config keys of the same name
-# (without leading underscore), e.g. ``"credit_wait_sec": 0.01``.
+# Timing constants for the credit reclaim / release loop.
 _CREDIT_WAIT_SEC = 0.05  # put() inline reclaim window before CPU fallback
 _CREDIT_POLL_SEC = 0.0005  # poll interval within the reclaim window
 _RELEASE_FAST_INTERVAL_SEC = 0.001  # board-reclaim thread fast tick
@@ -181,18 +178,10 @@ class CudaIPCConnector(OmniConnectorBase):
         self._ring_entries_cfg = int(config.get("ring_entries", 0))  # 0 => auto from credits
         self._ring_body_max = int(config.get("ring_body_max", 524288))
         self.local_device = self._resolve_local_device(config.get("local_device", "auto"))
-        # Pool sizing: credits (concurrency) and slot_size_mb (max single pool put) are independent;
-        # pool_size_mb defaults to credits * slot_size_mb unless explicitly set.
-        max_num_seqs = int(config.get("max_num_seqs", 0))
-        if "pool_credits" in config:
-            auto_credits = int(config["pool_credits"])
-        elif max_num_seqs > 0:
-            # ~1 pool credit per req (chunk-0 prefill); x2 headroom for board-reclaim lag.
-            auto_credits = max(_DEFAULT_POOL_CREDITS, max_num_seqs * 2)
-        else:
-            auto_credits = _DEFAULT_POOL_CREDITS
+        # Pool sizing: credits (concurrency) and slot_size_mb (max single pool put)
+        # are independent; pool_size_mb defaults to credits * slot_size_mb.
         slot_size_mb = int(config.get("slot_size_mb", _DEFAULT_SLOT_SIZE_MB))
-        self._pool_credits = int(config.get("pool_credits", auto_credits))
+        self._pool_credits = int(config.get("pool_credits", _DEFAULT_POOL_CREDITS))
         # Small-slot pool for streaming chunks (e.g. codec frames): payloads far
         # below the big-slot size stop burning a whole big credit, which keeps
         # big credits available for prefill handoffs under load. Disable with
@@ -201,17 +190,8 @@ class CudaIPCConnector(OmniConnectorBase):
         self._small_slot_count = int(config.get("small_slot_count", _DEFAULT_SMALL_SLOT_COUNT))
         if self._small_slot_size <= 0:
             self._small_slot_count = 0
-        if "pool_size_mb" in config:
-            auto_size_mb = int(config["pool_size_mb"])
-        else:
-            auto_size_mb = self._pool_credits * slot_size_mb
-        self._pool_size = auto_size_mb * 1024 * 1024
+        self._pool_size = int(config.get("pool_size_mb", self._pool_credits * slot_size_mb)) * 1024 * 1024
         self._slot_size = self._pool_size // self._pool_credits
-        # Timing overrides via extra config.
-        self._credit_wait_sec = float(config.get("credit_wait_sec", _CREDIT_WAIT_SEC))
-        self._credit_poll_sec = float(config.get("credit_poll_sec", _CREDIT_POLL_SEC))
-        self._release_interval_sec = float(config.get("release_fast_interval_sec", _RELEASE_FAST_INTERVAL_SEC))
-        self._release_ttl_every = int(config.get("release_ttl_every_n_ticks", _RELEASE_TTL_EVERY_N_TICKS))
 
     @property
     def gpu_tensor_keys(self) -> frozenset | None:
@@ -670,7 +650,7 @@ class CudaIPCConnector(OmniConnectorBase):
         ``prefer_small`` tries the small-slot pool first (streaming chunks)
         and falls back to a big slot when small credits are exhausted, so a
         burst of small chunks degrades to big slots instead of /dev/shm.
-        Bounded wait (``credit_wait_sec``) before giving up; returns None to
+        Bounded wait (``_CREDIT_WAIT_SEC``) before giving up; returns None to
         trigger the CPU fallback.
         """
         if prefer_small and self._small_slot_count > 0:
@@ -682,7 +662,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 return q.get_nowait()
             except _queue_mod.Empty:
                 pass
-        deadline = _time_mod.monotonic() + self._credit_wait_sec
+        deadline = _time_mod.monotonic() + _CREDIT_WAIT_SEC
         while _time_mod.monotonic() < deadline:
             self._reclaim_board_credits()
             for q in queues:
@@ -690,7 +670,7 @@ class CudaIPCConnector(OmniConnectorBase):
                     return q.get_nowait()
                 except _queue_mod.Empty:
                     pass
-            _time_mod.sleep(self._credit_poll_sec)
+            _time_mod.sleep(_CREDIT_POLL_SEC)
         return None
 
     def _reclaim_board_credits(self) -> None:
@@ -727,7 +707,7 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._metrics["ttl_releases"] += 1
         # also TTL-sweep orphaned CPU-fallback /dev/shm segments (receiver aborted before
         # reading; normally the receiver unlinks on read so these are already gone).
-        segs = getattr(self, "_fallback_segs", None)
+        segs = self._fallback_segs
         if segs:
             stale = [name for name, ts in segs.items() if now - ts > self.tensor_lifetime_sec]
             for name in stale:
@@ -770,11 +750,11 @@ class CudaIPCConnector(OmniConnectorBase):
                 self._reclaim_board_credits()
                 self._drain_inflight_packs()
                 tick += 1
-                if tick % self._release_ttl_every == 0:
+                if tick % _RELEASE_TTL_EVERY_N_TICKS == 0:
                     self._release_expired_credits()
             except Exception as e:
                 logger.warning("Release loop error: %s", e, exc_info=True)
-            self._stop_event.wait(timeout=self._release_interval_sec)
+            self._stop_event.wait(timeout=_RELEASE_FAST_INTERVAL_SEC)
 
     # --- put() ---
 
@@ -800,9 +780,10 @@ class CudaIPCConnector(OmniConnectorBase):
         try:
             self._ensure_sender_resources()
             kh = key_hash16(composite_key)
-            if self._estimate_nbytes(data) < self._inline_threshold:
+            est_nbytes = self._estimate_nbytes(data)
+            if est_nbytes < self._inline_threshold:
                 return self._put_inline(from_stage, to_stage, put_key, composite_key, data, kh, compute_event)
-            return self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh, compute_event)
+            return self._put_pool(from_stage, to_stage, put_key, composite_key, data, kh, compute_event, est_nbytes)
         except Exception as e:
             self._metrics["errors"] += 1
             logger.error("CudaIPCConnector control-plane put failed for %s: %s", put_key, e, exc_info=True)
@@ -830,7 +811,9 @@ class CudaIPCConnector(OmniConnectorBase):
         self._metrics["bytes_transferred"] += len(payload)
         return True, len(payload), {"ring": True, "size": len(payload)}
 
-    def _put_pool(self, from_stage, to_stage, put_key, composite_key, data, kh, compute_event=None, force_big=False):
+    def _put_pool(
+        self, from_stage, to_stage, put_key, composite_key, data, kh, compute_event=None, est_nbytes=0, force_big=False
+    ):
         # Acquire a credit, D2D-pack into the slot, then publish a small descriptor
         # (slot_offset/slot_index + tensor layout) to the ring.
         # TODO: support acquiring multiple contiguous credits/slots when a single payload
@@ -840,9 +823,7 @@ class CudaIPCConnector(OmniConnectorBase):
         # per-tensor alignment padding, hence the slack; a small-slot overflow
         # retries once with a big slot (force_big) before the CPU fallback.
         prefer_small = (
-            not force_big
-            and self._small_slot_count > 0
-            and self._estimate_nbytes(data) <= self._small_slot_size - _SMALL_SLOT_SLACK
+            not force_big and self._small_slot_count > 0 and est_nbytes <= self._small_slot_size - _SMALL_SLOT_SLACK
         )
         slot_offset = self._acquire_credit(prefer_small=prefer_small)
         if slot_offset is None:
@@ -870,7 +851,15 @@ class CudaIPCConnector(OmniConnectorBase):
                 if slot_offset >= self._pool_size:
                     # Small slot underestimated (alignment/metadata) — retry with a big slot.
                     return self._put_pool(
-                        from_stage, to_stage, put_key, composite_key, data, kh, compute_event, force_big=True
+                        from_stage,
+                        to_stage,
+                        put_key,
+                        composite_key,
+                        data,
+                        kh,
+                        compute_event,
+                        est_nbytes,
+                        force_big=True,
                     )
                 return self._put_cpu_fallback(
                     from_stage,
@@ -954,8 +943,7 @@ class CudaIPCConnector(OmniConnectorBase):
 
         meta = self._atomic_shm_write(payload, name=put_key)
         # Track for TTL cleanup in case the receiver aborts and never reads/unlinks it.
-        if getattr(self, "_fallback_segs", None) is not None:
-            self._fallback_segs[put_key] = _time_mod.monotonic()
+        self._fallback_segs[put_key] = _time_mod.monotonic()
 
         self._metrics["puts"] += 1
         self._metrics["bytes_transferred"] += size
