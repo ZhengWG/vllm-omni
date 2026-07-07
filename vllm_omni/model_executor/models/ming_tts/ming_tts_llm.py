@@ -326,18 +326,19 @@ class MingLLMModel(nn.Module):
         try:
             from .fm.cfm_cudagraph import CFMGraphExecutor, CFMSampler
 
-            # Optional (opt-in) inductor fusion of the DiT blocks, captured by the
-            # outer CFM CUDA graph. Inductor cudagraphs are disabled so they don't
-            # fight the hand-written graph. Compile is triggered by the executor's
-            # warmup passes before capture. Near-exact (bf16 fp reordering), so it
-            # is gated off by default; validate audio quality before enabling.
-            if os.environ.get("MING_CFM_COMPILE", "0") == "1":
-                dit_model = self.flowloss.cfm.model
-                if not getattr(dit_model, "_ming_compiled", False):
+            # TODO(perf):
+            #   (1) compile per-block (dit_model.blocks) instead of the
+            #   whole forward for tighter fusion / fewer graph breaks;
+            #   (2) move the compile + a synthetic warmup forward to a post-weight-load hook
+            dit_model = self.flowloss.cfm.model
+            if not getattr(dit_model, "_ming_compiled", False):
+                try:
                     torch._inductor.config.triton.cudagraphs = False
                     dit_model.forward = torch.compile(dit_model.forward, fullgraph=False, dynamic=False)
                     dit_model._ming_compiled = True
                     logger.info("Ming CFM DiT torch.compile enabled (inductor cudagraphs off).")
+                except Exception as exc:
+                    logger.warning("Ming CFM torch.compile failed (%s); using uncompiled DiT.", exc)
 
             sampler = CFMSampler(self.flowloss.cfm.model, steps=_CFM_STEPS)
             self._cfm_graph = CFMGraphExecutor(
