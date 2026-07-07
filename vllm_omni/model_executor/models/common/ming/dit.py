@@ -6,6 +6,24 @@ from torch import nn
 from x_transformers.x_transformers import apply_rotary_pos_emb
 
 
+def _apply_rope_cached(t, cos, sin):
+    """Cat-free RoPE apply, bit-exact to x_transformers ``apply_rotary_pos_emb``
+    for the ``scale==1`` / interleaved-half case (validated max-abs-diff 0.0).
+
+    ``cos``/``sin`` are precomputed per seq_len (see ``Attention._rope_cos_sin``)
+    so ``freqs.cos()``/``freqs.sin()`` are not recomputed every block/ODE-step,
+    and the ``cat((t, t_unrotated))`` (empty when rot_dim==head_dim) is skipped.
+    """
+    rot_dim = cos.shape[-1]
+    tr = t[..., :rot_dim]
+    x = tr.reshape(*tr.shape[:-1], -1, 2)
+    rot_half = torch.stack((-x[..., 1], x[..., 0]), dim=-1).reshape_as(tr)
+    out = tr * cos + rot_half * sin
+    if rot_dim < t.shape[-1]:  # partial rotary (unused by ming heads); keep general
+        out = torch.cat((out, t[..., rot_dim:]), dim=-1)
+    return out.type(t.dtype)
+
+
 class RMSNorm(nn.Module):
     def __init__(self, dim, eps=1e-6):
         super().__init__()
@@ -66,6 +84,17 @@ class Attention(nn.Module):
         self.to_out.append(nn.Dropout(dropout))
         self.pe_attn_head = pe_attn_head
         self.attn_mask_enabled = attn_mask_enabled
+        # cos/sin cache keyed by seq_len (freqs are deterministic in seq_len).
+        self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _rope_cos_sin(self, freqs):
+        seq_len = freqs.shape[-2]
+        cached = self._rope_cache.get(seq_len)
+        if cached is None:
+            f = freqs.unsqueeze(1) if freqs.ndim == 3 else freqs  # b n d -> b 1 n d for 4D q/k
+            cached = (f.cos(), f.sin())
+            self._rope_cache[seq_len] = cached
+        return cached
 
     def forward(self, x, mask=None, rope=None):
         batch_size = x.shape[0]
@@ -86,14 +115,21 @@ class Attention(nn.Module):
 
         if rope is not None:
             freqs, xpos_scale = rope
-            q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
-            if self.pe_attn_head is not None:
-                on = self.pe_attn_head
-                query[:, :on, :, :] = apply_rotary_pos_emb(query[:, :on, :, :], freqs, q_xpos_scale)
-                key[:, :on, :, :] = apply_rotary_pos_emb(key[:, :on, :, :], freqs, k_xpos_scale)
+            scale_is_one = xpos_scale is None or (not torch.is_tensor(xpos_scale) and xpos_scale == 1.0)
+            if scale_is_one and self.pe_attn_head is None:
+                # Fast path: cached, cat-free RoPE (bit-exact for scale==1, full rotary).
+                cos, sin = self._rope_cos_sin(freqs)
+                query = _apply_rope_cached(query, cos, sin)
+                key = _apply_rope_cached(key, cos, sin)
             else:
-                query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
-                key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
+                q_xpos_scale, k_xpos_scale = (xpos_scale, xpos_scale**-1.0) if xpos_scale is not None else (1.0, 1.0)
+                if self.pe_attn_head is not None:
+                    on = self.pe_attn_head
+                    query[:, :on, :, :] = apply_rotary_pos_emb(query[:, :on, :, :], freqs, q_xpos_scale)
+                    key[:, :on, :, :] = apply_rotary_pos_emb(key[:, :on, :, :], freqs, k_xpos_scale)
+                else:
+                    query = apply_rotary_pos_emb(query, freqs, q_xpos_scale)
+                    key = apply_rotary_pos_emb(key, freqs, k_xpos_scale)
 
         if self.attn_mask_enabled and mask is not None:
             valid_sample_indices = mask.any(dim=1)
