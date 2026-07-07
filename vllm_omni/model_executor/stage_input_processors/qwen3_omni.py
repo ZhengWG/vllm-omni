@@ -110,45 +110,6 @@ def _ensure_list(x):
     return list(x)
 
 
-def _reconcile_decode_rows(
-    transfer_manager: Any,
-    request_id: str,
-    emb: torch.Tensor,
-    num_output_tokens: int,
-    finished: bool = False,
-) -> torch.Tensor | None:
-    """Slice a thinker decode chunk down to the rows not yet sent to the talker.
-
-    A coalesced chunk (payload builder lagged the runner by N steps) carries N
-    fresh rows and must be emitted whole — dropping it starves the talker's
-    cached_decode cursor and truncates audio via an early tts_eos.  A
-    preemption recompute replays rows that were already sent and must be cut.
-    Anchor: rows-sent counter vs ``len(output_token_ids)``, calibrated on the
-    first decode chunk of each request.
-    """
-    state = getattr(transfer_manager, "_t2t_decode_rows_sent", None)
-    if state is None:
-        state = {}
-        transfer_manager._t2t_decode_rows_sent = state
-    sent = state.get(request_id)
-    if sent is None:
-        # First decode chunk: assume its rows are fresh; absorbs any offset
-        # from prefill-step token accounting.
-        sent = num_output_tokens - emb.shape[0]
-    fresh = num_output_tokens - sent
-    if fresh <= 0:
-        if finished:
-            state.pop(request_id, None)
-        return None
-    if emb.shape[0] > fresh:
-        emb = emb[-fresh:]
-    if finished:
-        state.pop(request_id, None)
-    else:
-        state[request_id] = sent + emb.shape[0]
-    return emb
-
-
 def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | None:
     t: torch.Tensor | None = None
     if isinstance(value, torch.Tensor):
@@ -558,15 +519,15 @@ def thinker2talker_async_chunk(
             return _construct_thinker2talker_streaming_input_async_chunk(
                 is_finished, request, thinker_emb, thinker_hid, transfer_manager, keep_on_gpu=_keep_on_gpu
             )
-        thinker_emb = _reconcile_decode_rows(
-            transfer_manager,
-            request_id,
-            thinker_emb,
-            len(_ensure_list(request.output_token_ids)),
-            finished=is_finished,
-        )
-        if thinker_emb is None:
-            # All rows were already sent (preemption recompute replay).
+        if thinker_emb.shape[0] > 1:
+            logger.warning(
+                "Unexpected multiple embeddings in thinker2talker_async_chunk for chunk_id %d: "
+                "request_id %s, num_computed_tokens%d %s. Expected shape [1, D].",
+                chunk_id,
+                request_id,
+                request.num_computed_tokens,
+                thinker_emb.shape,
+            )
             return None
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
