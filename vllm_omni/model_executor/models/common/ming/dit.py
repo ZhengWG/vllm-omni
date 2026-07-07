@@ -86,6 +86,19 @@ class Attention(nn.Module):
         self.attn_mask_enabled = attn_mask_enabled
         # cos/sin cache keyed by seq_len (freqs are deterministic in seq_len).
         self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+        # Lazily-built fused QKV weight (bit-exact: concat of to_q/k/v). One GEMM
+        # + one HBM weight read instead of three — the win at tiny M is bytes,
+        # not FLOPs. Built on first forward (after weights load), reused after.
+        self._qkv_w: torch.Tensor | None = None
+        self._qkv_b: torch.Tensor | None = None
+
+    def _qkv(self, x):
+        if self._qkv_w is None:
+            self._qkv_w = torch.cat([self.to_q.weight, self.to_k.weight, self.to_v.weight], dim=0)
+            if self.to_q.bias is not None:
+                self._qkv_b = torch.cat([self.to_q.bias, self.to_k.bias, self.to_v.bias], dim=0)
+        qkv = F.linear(x, self._qkv_w, self._qkv_b)
+        return qkv.split(self.inner_dim, dim=-1)
 
     def _rope_cos_sin(self, freqs):
         seq_len = freqs.shape[-2]
@@ -98,9 +111,7 @@ class Attention(nn.Module):
 
     def forward(self, x, mask=None, rope=None):
         batch_size = x.shape[0]
-        query = self.to_q(x)
-        key = self.to_k(x)
-        value = self.to_v(x)
+        query, key, value = self._qkv(x)
 
         inner_dim = key.shape[-1]
         head_dim = inner_dim // self.heads
