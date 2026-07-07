@@ -7,13 +7,8 @@ from x_transformers.x_transformers import apply_rotary_pos_emb
 
 
 def _apply_rope_cached(t, cos, sin):
-    """Cat-free RoPE apply, bit-exact to x_transformers ``apply_rotary_pos_emb``
-    for the ``scale==1`` / interleaved-half case (validated max-abs-diff 0.0).
-
-    ``cos``/``sin`` are precomputed per seq_len (see ``Attention._rope_cos_sin``)
-    so ``freqs.cos()``/``freqs.sin()`` are not recomputed every block/ODE-step,
-    and the ``cat((t, t_unrotated))`` (empty when rot_dim==head_dim) is skipped.
-    """
+    """Bit-exact RoPE for ``scale==1`` / interleaved-half.
+    Uses precomputed ``cos``/``sin`` per seq_len to skip per-step trig and cat."""
     rot_dim = cos.shape[-1]
     tr = t[..., :rot_dim]
     x = tr.reshape(*tr.shape[:-1], -1, 2)
@@ -86,9 +81,7 @@ class Attention(nn.Module):
         self.attn_mask_enabled = attn_mask_enabled
         # cos/sin cache keyed by seq_len (freqs are deterministic in seq_len).
         self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        # Lazily-built fused QKV weight (bit-exact: concat of to_q/k/v). One GEMM
-        # + one HBM weight read instead of three — the win at tiny M is bytes,
-        # not FLOPs. Built on first forward (after weights load), reused after.
+        # Lazily-built fused QKV weight (concat of to_q/k/v).
         self._qkv_w: torch.Tensor | None = None
         self._qkv_b: torch.Tensor | None = None
 

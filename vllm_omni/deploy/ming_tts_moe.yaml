@@ -22,11 +22,7 @@ connectors:
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:
-      # Chunk unit is patches (~80ms audio each); 25 => ~2s/chunk delays the
-      # first streamed packet to ~end of generation (TTFP~=E2EL). 3 => ~240ms
-      # first-chunk latency, ~-42% TTFP; stage-1 decodes per-patch so any >=1 is
-      # safe. Use 1 for lowest TTFP at the cost of more inter-stage transfers.
-      latent_chunk_size: 3
+      latent_chunk_size: 25
       latent_left_context: 0
 
 stages:
@@ -34,11 +30,6 @@ stages:
     max_num_seqs: 1
     tensor_parallel_size: 1
     gpu_memory_utilization: 0.60
-    # PIECEWISE decode cudagraph (not enforce_eager): graphs the non-attention
-    # backbone while keeping attention eager. FULL cudagraph (enforce_eager:false
-    # default) truncates output on this MoE (backbone attn metadata across a
-    # growing seq_len); PIECEWISE is correct and removes the eager MoE CPU
-    # dispatch overhead. ~-17% E2EL vs enforce_eager, audio-validated.
     enforce_eager: false
     compilation_config:
       cudagraph_mode: PIECEWISE
