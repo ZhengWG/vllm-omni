@@ -187,6 +187,14 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
 ):
     """Override to fix use_audio_in_video detection when mm cache returns None."""
 
+    def _cached_apply_hf_processor(self, inputs, timing_ctx):
+        # If use_audio_in_video, process video and audio together; otherwise,
+        # skip cache to avoid errors.
+        # Prevents partial cache hits from causing processing failures.
+        if inputs.hf_processor_mm_kwargs.get("use_audio_in_video"):
+            return self._apply_hf_processor(inputs, timing_ctx)
+        return super()._cached_apply_hf_processor(inputs, timing_ctx)
+
     def _call_hf_processor(
         self,
         prompt: str,

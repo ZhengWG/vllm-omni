@@ -74,7 +74,6 @@ from vllm.model_executor.models.module_mapping import MultiModelKeys
 from vllm.model_executor.models.qwen2_5_omni_thinker import (
     Qwen2_5OmniAudioFeatureInputs,
     Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
     check_interleaved_audio_video,
     merge_interleaved_embeddings,
 )
@@ -121,6 +120,7 @@ from vllm.transformers_utils.processor import cached_processor_from_config
 from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniConditionalGenerationMixin,
     Qwen2_5OmniThinkerMultiModalDataParser,
+    Qwen2_5OmniThinkerMultiModalProcessor,
     _presampled_videos_hf_kwargs,
 )
 from vllm_omni.quantization.component_config import (
