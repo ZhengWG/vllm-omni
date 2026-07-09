@@ -112,9 +112,17 @@ def _presampled_videos_hf_kwargs(
     # An explicit user-provided fps takes precedence.
     if "fps" not in videos_kwargs:
         fps_values = [_compute_sampled_video_fps(m) for m in video_metadata]
-        # The HF processor accepts a single fps per call.
-        if None not in fps_values and len(set(fps_values)) == 1:
-            videos_kwargs["fps"] = fps_values[0]
+        # HF accepts a single fps per call and uses it for every video's
+        # video_second_per_grid.
+        known_fps = [fps for fps in fps_values if fps is not None]
+        unique_fps = set(known_fps)
+        if len(unique_fps) == 1:
+            videos_kwargs["fps"] = known_fps[0]
+        elif len(unique_fps) > 1:
+            logger.warning(
+                f"Mixed sampled FPS {sorted(unique_fps)} in one request; HF accepts a single fps, using {known_fps[0]}."
+            )
+            videos_kwargs["fps"] = known_fps[0]
 
     mm_kwargs["videos_kwargs"] = videos_kwargs
     return mm_kwargs
