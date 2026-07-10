@@ -81,7 +81,8 @@ class Attention(nn.Module):
         self.attn_mask_enabled = attn_mask_enabled
         # cos/sin cache keyed by seq_len (freqs are deterministic in seq_len).
         self._rope_cache: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
-        # Lazily-built fused QKV weight (concat of to_q/k/v).
+        # TODO: materialize fused weights eagerly outside any torch.compile
+        # scope (e.g. post-weight-load);
         self._qkv_w: torch.Tensor | None = None
         self._qkv_b: torch.Tensor | None = None
 

@@ -333,8 +333,16 @@ class MingLLMModel(nn.Module):
             dit_model = self.flowloss.cfm.model
             if not getattr(dit_model, "_ming_compiled", False):
                 try:
-                    torch._inductor.config.triton.cudagraphs = False
-                    dit_model.forward = torch.compile(dit_model.forward, fullgraph=False, dynamic=False)
+                    # Scoped options (avoid mutating global inductor config).
+                    dit_model.forward = torch.compile(
+                        dit_model.forward,
+                        fullgraph=False,
+                        dynamic=False,
+                        options={
+                            "triton.cudagraphs": False,
+                            "triton.cudagraph_trees": False,
+                        },
+                    )
                     dit_model._ming_compiled = True
                     logger.info("Ming CFM DiT torch.compile enabled (inductor cudagraphs off).")
                 except Exception as exc:
