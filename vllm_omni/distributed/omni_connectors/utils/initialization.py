@@ -412,6 +412,42 @@ def get_stage_connector_config(
         return {}
 
 
+def resolve_stage_connector_spec(stage_connectors_cfg: dict[str, Any]) -> dict[str, Any]:
+    """Pick the stage's worker connector spec from from_stage_*/to_stage_* edges.
+
+    Returns ``{"input": spec, "output": spec}`` (either side optional; the
+    lowest-numbered edge wins per direction), or ``{}`` when no edge carries a
+    spec. Consumed by ``build_stage_connector_config`` (config.py) via the
+    engine's ``get_stage_connector_spec`` wrapper.
+    """
+    if not stage_connectors_cfg:
+        return {}
+
+    input_specs: list[tuple[int, dict[str, Any]]] = []
+    output_specs: list[tuple[int, dict[str, Any]]] = []
+    for key, cfg in stage_connectors_cfg.items():
+        spec = dict(cfg.get("spec", {}))
+        if not spec:
+            continue
+        if key.startswith("from_stage_"):
+            from_stage = key.replace("from_stage_", "")
+            order = int(from_stage) if from_stage.isdigit() else 10**9
+            input_specs.append((order, spec))
+        elif key.startswith("to_stage_"):
+            to_stage = key.replace("to_stage_", "")
+            order = int(to_stage) if to_stage.isdigit() else 10**9
+            output_specs.append((order, spec))
+
+    result: dict[str, Any] = {}
+    if input_specs:
+        input_specs.sort(key=lambda x: x[0])
+        result["input"] = input_specs[0][1]
+    if output_specs:
+        output_specs.sort(key=lambda x: x[0])
+        result["output"] = output_specs[0][1]
+    return result
+
+
 def build_stage_connectors(
     stage_id: int,
     connectors_config: dict[str, Any],

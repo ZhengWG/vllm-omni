@@ -194,10 +194,7 @@ def test_create_connector_dual_routes_by_edge(monkeypatch):
     }
     conn = OmniChunkTransferAdapter.create_connector(SimpleNamespace(stage_connector_config=cfg))
 
-    assert conn.can_send and conn.can_recv
     assert conn.supports_gpu_tensor  # send-edge capability comes from the output backend
-    assert conn.supports_gpu_tensor_for("1", "2") is True  # output edge
-    assert conn.supports_gpu_tensor_for("0", "1") is False  # input edge (SHM)
     assert int(conn.stage_id) == 1
     # merged config view: send-edge extra visible to codec-config readers
     assert conn.config["pool_size_mb"] == 256
@@ -210,7 +207,7 @@ def test_create_connector_dual_routes_by_edge(monkeypatch):
 
 def test_create_connector_single_direction_degrades(monkeypatch):
     """A direction that is not configured no-ops: put() reports failure and
-    can_send is False, so send paths skip work instead of crashing."""
+    get() returns None, so send/recv paths skip work instead of crashing."""
     monkeypatch.setattr(
         "vllm_omni.distributed.omni_connectors.factory.OmniConnectorFactory.create_connector",
         lambda spec: _StubBackend(spec),
@@ -219,7 +216,6 @@ def test_create_connector_single_direction_degrades(monkeypatch):
     cfg = {"input": {"name": "SharedMemoryConnector", "extra": {"stage_id": 2}}}
     conn = OmniChunkTransferAdapter.create_connector(SimpleNamespace(stage_connector_config=cfg))
 
-    assert conn.can_recv and not conn.can_send
     assert conn.supports_gpu_tensor is False
     assert conn.put("2", "3", "key", {}) == (False, 0, None)
     assert conn.get("1", "2", "key") is None  # routes to input backend, stub returns None

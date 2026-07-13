@@ -4,7 +4,7 @@
 
 Two layers, gated independently:
 
-1. ``CudaIpcControlRing`` (the lock-free SPSC keyed-mailbox control plane in ``cuda_ipc_control_ring.py``):
+1. ``CudaIpcControlRing`` (the lock-free SPSC keyed-mailbox control plane in ``cuda_ipc_connector.py``):
    pure-Python (struct + POSIX shm), CPU-only CI.
 
 2. ``CudaIPCConnector`` functional put/get: requires a real GPU. CUDA IPC handles cannot be
@@ -26,7 +26,7 @@ import torch
 # ════════════════════════════════════════════════════════════════════
 #
 # Single-mapping publish/poll protocol tests.
-from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_control_ring import (
+from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_connector import (
     RING_PCLASS_INLINE,
     RING_PCLASS_POOL,
     CudaIpcControlRing,

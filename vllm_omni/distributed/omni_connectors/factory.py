@@ -61,22 +61,15 @@ class OmniConnectorFactory:
         *,
         is_transfer_rank: bool = True,
     ) -> OmniConnectorBase | None:
-        """Single entry point for stage-level connector creation.
+        """Create a stage-level connector.
+        Supports all historical `stage_connector_config` formats:
 
-        Returns ONE connector per stage; direction routing is a connector
-        implementation detail (EdgeRoutedConnector), not a framework concern.
-        Accepts every historical ``stage_connector_config`` shape:
+          - `None`                                         -> no connector
+          - object with `.name`/`.extra`                   -> single connector
+          - `{"name": ..., "extra": ...}`                  -> single connector (shared)
+          - `{"input": {...}, "output": {...}}`            -> EdgeRoutedConnector, can specify either side
 
-          - ``None``                          -> ``None`` (stage has no connector)
-          - object with ``.name``/``.extra``  -> legacy single connector
-          - ``{"name": ..., "extra": ...}``   -> legacy single connector
-                                                 (shared by both directions)
-          - ``{"input": {...}, "output": {...}}`` -> EdgeRoutedConnector; either
-                                                 direction may be omitted
-
-        ``is_transfer_rank`` is injected into each backend's extra so a
-        GPU-direct connector (CudaIPC) only owns per-edge resources on the
-        rank that actually transmits; an explicit config value still wins.
+        Automatically injects `is_transfer_rank` into extra unless already configured.
         """
         config = stage_connector_config
         if config is None:
@@ -175,13 +168,8 @@ def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
 
 
 def _create_cuda_ipc_connector(config: dict[str, Any]) -> OmniConnectorBase:
-    try:
-        from .connectors.cuda_ipc_connector import CudaIPCConnector
-    except ImportError:
-        import sys
+    from .connectors.cuda_ipc_connector import CudaIPCConnector
 
-        sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
-        from omni_connectors.connectors.cuda_ipc_connector import CudaIPCConnector
     return CudaIPCConnector(config)
 
 

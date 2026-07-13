@@ -26,7 +26,7 @@ class EdgeRoutedConnector(OmniConnectorBase):
     ``{"input": {...}, "output": {...}}`` config shape.  Either side may be
     ``None`` (edge not configured): ``put`` then reports failure and ``get``
     returns None, mirroring the no-connector no-op behaviour callers already
-    handle via ``can_send`` / ``can_recv``.
+    handle.
     """
 
     def __init__(
@@ -40,7 +40,8 @@ class EdgeRoutedConnector(OmniConnectorBase):
         in_cfg = getattr(input_connector, "config", None) or {}
         out_cfg = getattr(output_connector, "config", None) or {}
         self.config: dict[str, Any] = {**in_cfg, **out_cfg}
-        self.stage_id = getattr(output_connector or input_connector, "stage_id", -1)
+        # int-coerce once so adapter comparisons/arithmetic never see a str.
+        self.stage_id = int(getattr(output_connector or input_connector, "stage_id", -1))
 
     def __repr__(self) -> str:
         inp = type(self._input).__name__ if self._input is not None else None
@@ -48,14 +49,6 @@ class EdgeRoutedConnector(OmniConnectorBase):
         return f"EdgeRoutedConnector(input={inp}, output={out})"
 
     # --- Capabilities ---
-
-    @property
-    def can_send(self) -> bool:
-        return self._output is not None
-
-    @property
-    def can_recv(self) -> bool:
-        return self._input is not None
 
     @property
     def supports_gpu_tensor(self) -> bool:  # type: ignore[override]
@@ -68,24 +61,6 @@ class EdgeRoutedConnector(OmniConnectorBase):
         if self._output is None:
             return None
         return getattr(self._output, "gpu_tensor_keys", None)
-
-    def supports_gpu_tensor_for(self, from_stage: str, to_stage: str) -> bool:
-        backend = self._route(from_stage, to_stage)
-        return bool(backend is not None and backend.supports_gpu_tensor)
-
-    def _route(self, from_stage: str, to_stage: str) -> OmniConnectorBase | None:
-        """Output edge when this stage is the source, else input edge."""
-        if str(from_stage) == str(self.stage_id):
-            return self._output
-        if str(to_stage) == str(self.stage_id):
-            return self._input
-        logger.warning(
-            "EdgeRoutedConnector(stage=%s): edge (%s -> %s) matches neither direction",
-            self.stage_id,
-            from_stage,
-            to_stage,
-        )
-        return None
 
     # --- Data plane ---
 
@@ -115,8 +90,7 @@ class EdgeRoutedConnector(OmniConnectorBase):
         return any(getattr(b, "request_scoped_cleanup", False) for b in self._backends())
 
     def cleanup(self, request_id: str) -> None:
-        # Opt-in fan-out only: SHM's cleanup unlinks real segments and must not
-        # fire on streaming transitions (would starve the downstream stage).
+        # Fan out only to backends that opted into request-scoped cleanup.
         for backend in self._backends():
             if getattr(backend, "request_scoped_cleanup", False):
                 backend.cleanup(request_id)

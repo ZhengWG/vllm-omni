@@ -1073,44 +1073,16 @@ def get_stage_connector_spec(
 
     Returns ``{"input": spec, "output": spec}`` (either side optional), or
     ``{}`` when the stage does not use the worker connector data plane
-    (see ``stage_uses_worker_connector``).
+    (see ``stage_uses_worker_connector``). Edge resolution itself is
+    connector-owned (``resolve_stage_connector_spec``).
     """
     if not stage_uses_worker_connector(stage_config):
         return {}
 
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_spec
 
-    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-    if not stage_connectors_cfg:
-        return {}
-
-    input_specs: list[tuple[int, dict[str, Any]]] = []
-    output_specs: list[tuple[int, dict[str, Any]]] = []
-    for key, cfg in stage_connectors_cfg.items():
-        spec = dict(cfg.get("spec", {}))
-        if not spec:
-            continue
-        if key.startswith("from_stage_"):
-            from_stage = key.replace("from_stage_", "")
-            order = int(from_stage) if from_stage.isdigit() else 10**9
-            input_specs.append((order, spec))
-        elif key.startswith("to_stage_"):
-            to_stage = key.replace("to_stage_", "")
-            order = int(to_stage) if to_stage.isdigit() else 10**9
-            output_specs.append((order, spec))
-
-    # Prefer dual connector shape when either direction exists.
-    if input_specs or output_specs:
-        result: dict[str, Any] = {}
-        if input_specs:
-            input_specs.sort(key=lambda x: x[0])
-            result["input"] = input_specs[0][1]
-        if output_specs:
-            output_specs.sort(key=lambda x: x[0])
-            result["output"] = output_specs[0][1]
-        return result
-
-    return {}
+    return resolve_stage_connector_spec(get_stage_connector_config(omni_transfer_config, stage_id))
 
 
 def build_diffusion_config(

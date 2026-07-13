@@ -1,67 +1,39 @@
-# Qwen3-Omni-MoE — CudaIPCConnector (one stage per GPU, all cross-GPU CudaIPC).
+# Qwen3-Omni-MoE — CudaIPCConnector (same-host cross-GPU D2D on every edge).
 #
-# The connector routes put()/get() through the per-edge SPSC mailbox (CudaIpcControlRing)
-# instead of a per-transfer /dev/shm round-trip. Small payloads (< inline_threshold_bytes)
-# ride inline in the ring; big ones use the pool + D2D (descriptor in the ring); overflow /
-# ring-full / abort fall back to /dev/shm (read via _try_get_shm_compat).
-#
-# Memory: the GPU pool (pool_size_mb) is OUTSIDE gpu_memory_utilization, so real usage ~= gmu + pool.
-# /dev/shm: rings need ~ring_entries * ring_body_max host shm (~1GB s0->s1 + ~256MB s1->s2); raise the 64MB
-# container default (e.g. `docker run --shm-size=4g`) or CudaIpcControlRing.create fails with OSError.
+# All transport knobs are defaulted or derived; the only capacity decision
+# left to the user is the per-edge GPU pool budget (pool_size_mb, allocated
+# OUTSIDE gpu_memory_utilization — real usage ~= gmu + pool). Payloads that
+# exceed a pool slot or a full ring degrade to the /dev/shm CPU fallback
+# instead of failing. The expert-tuning surface (max_transfer_mb, ring_*,
+# small_slot_*, inline_threshold_bytes, ...) is documented in
+# docs/configuration/stage_configs.md.
 #
 # Usage:
-#   CUDA_VISIBLE_DEVICES=0,1,2 vllm serve <model> --omni \
+#   CUDA_VISIBLE_DEVICES=0,1 vllm serve <model> --omni \
 #       --deploy-config vllm_omni/deploy/qwen3_omni_moe_cuda_ipc.yaml
 #
 async_chunk: true
 
 connectors:
-  # Prefill handoff edge (thinker -> talker): ~33MB/req payloads -> big slots.
-  # Shared knobs are anchored here; the stream edge below only overrides pool
-  # sizing — capacity is a per-edge property (like per-stage gmu), so the two
-  # definitions deliberately stay separate.
+  # Prefill handoff edge (thinker -> talker): defaults fit chat-sized
+  # prompts (4GB pool, 128MB max single transfer ~= 14k-token handoff).
   connector_of_cuda_ipc:
     name: CudaIPCConnector
-    extra: &cuda_ipc_extra
-      tensor_lifetime_sec: 30.0
-      pool_size_mb: 4096
-      # slot = pool/credits; prefill payload ~= prompt_tokens x 8KB (2 bf16
-      # layers x 2048 dims), so 128MB slots hold ~14k-token prompts. 64MB
-      # slots overflowed at 8k inputs -> every prefill took the CPU fallback.
-      pool_credits: 32               # slot = 4096/32 = 128MB
-      small_slot_kb: 256             # decode-step small payloads
-      small_slot_count: 128          # +32MB
-      inline_threshold_bytes: 16384  # < 16KB -> inline
-      ring_body_max: 524288
-      ring_entries: 2048
+    extra:
+      # Codec streaming params (stage-input pipeline, not transport knobs).
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
-  # Codec stream edge (talker -> code2wav): many small chunks -> the small-slot
-  # pool carries the traffic; a few big slots absorb oversize outliers.
-  # Ring: 512 x 512KB ~ 256MB host shm for this edge.
+  # Codec stream edge (talker -> code2wav): many small chunks ride the
+  # small-slot pool; hidden_states stays on GPU every chunk
   connector_of_cuda_ipc_stream:
     name: CudaIPCConnector
     extra:
-      <<: *cuda_ipc_extra
-      # Placement: listed key roots stay on GPU every chunk (stable per-key —
-      # per-instance size decisions flap devices and break stream cat);
-      # everything else rides CPU/ring. L1 fallback: keep_on_gpu: false.
-      keep_on_gpu: true
-      keep_on_gpu_keys: ["hidden_states"]
-      # zero_copy_recv: true  # L4: consume slots as DLPack views (A/B knob)
-      pool_size_mb: 512
-      pool_credits: 8                # slot = 64MB (outliers)
-      small_slot_count: 256          # +64MB; big-enough chunk tensors live here
-      ring_entries: 512
-  # Kept for A/B triage: flip the two *_stream edge refs below to this to
-  # compare the codec edge over host SHM vs D2D.
-  connector_of_shared_memory:
-    name: SharedMemoryConnector
-    extra:
       initial_codec_chunk_frames: 4
       codec_chunk_frames: 25
       codec_left_context_frames: 25
+      keep_on_gpu_keys: ["hidden_states"]
+      pool_size_mb: 512
 
 stages:
   - stage_id: 0

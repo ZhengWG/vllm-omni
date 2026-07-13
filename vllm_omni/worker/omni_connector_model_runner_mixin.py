@@ -97,10 +97,7 @@ class OmniConnectorModelRunnerMixin:
             model_config: Stage-level model config with connector settings.
             kv_transfer_manager: Existing KV transfer manager to delegate to.
         """
-        self._omni_connector: OmniConnectorBase | None = OmniConnectorFactory.create_stage_connector(
-            getattr(model_config, "stage_connector_config", None),
-            is_transfer_rank=self.is_data_transfer_rank(),
-        )
+        self._omni_connector: OmniConnectorBase | None = self._create_connector(model_config)
         self._kv_transfer_manager = kv_transfer_manager
 
         self._async_chunk: bool = getattr(model_config, "async_chunk", False)
@@ -2161,6 +2158,18 @@ class OmniConnectorModelRunnerMixin:
         snapshot = SimpleNamespace(**attrs)
         snapshot.is_finished = lambda: finished
         return snapshot
+
+    def _create_connector(self, model_config: Any) -> OmniConnectorBase | None:
+        """Create the stage connector from model_config, or None if unconfigured.
+
+        Dual ``{"input","output"}`` configs resolve to one routed connector via
+        the factory single entry point; ``is_transfer_rank`` keeps per-edge
+        resources on the transmitting rank only (TP>1).
+        """
+        return OmniConnectorFactory.create_stage_connector(
+            getattr(model_config, "stage_connector_config", None),
+            is_transfer_rank=self.is_data_transfer_rank(),
+        )
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:

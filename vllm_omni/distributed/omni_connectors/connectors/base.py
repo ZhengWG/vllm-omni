@@ -24,37 +24,9 @@ class OmniConnectorBase(ABC):
     supports_gpu_tensor: bool = False
 
     # Opt-in: framework calls cleanup(request_id) at request end. Default off —
-    # SHM's cleanup unlinks unconsumed segments and firing it on receiver-side
-    # transitions starves the downstream stage (silent pipeline hang).
+    # an eager cleanup could reclaim payloads the downstream stage has not
+    # consumed yet.
     request_scoped_cleanup: bool = False
-
-    # Direction capabilities: a routed connector overrides these so callers
-    # gate send/recv work on capability, not per-direction instances.
-
-    @property
-    def can_send(self) -> bool:
-        """Whether this connector has a send (output) edge."""
-        return True
-
-    @property
-    def can_recv(self) -> bool:
-        """Whether this connector has a receive (input) edge."""
-        return True
-
-    def supports_gpu_tensor_for(self, from_stage: str, to_stage: str) -> bool:
-        """Per-edge GPU-direct capability; defaults to the class-level flag.
-
-        A routed connector answers per edge (e.g. CudaIPC in, SHM out).
-        """
-        return self.supports_gpu_tensor
-
-    @property
-    def gpu_tensor_keys(self) -> "frozenset | None":
-        """Stable per-key GPU placement filter, matched on flattened-key roots
-        (None = keep every tensor's device decision to ``supports_gpu_tensor``).
-        Listed keys stay on GPU for EVERY chunk — streamed tensors get
-        concatenated downstream, so placement must not flap across chunks."""
-        return None
 
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:

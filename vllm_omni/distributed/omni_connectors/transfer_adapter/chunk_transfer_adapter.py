@@ -12,6 +12,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_payload
 
 from ..adapter import construct_next_stage_streaming_input_prompt
+from ..connectors.cuda_ipc_placement import connector_keeps_gpu, strip_gpu_tensors_for_engine_output
 from ..factory import OmniConnectorFactory
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
@@ -115,6 +116,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         connector_config = getattr(model_config, "stage_connector_config", None)
         return OmniConnectorFactory.create_stage_connector(connector_config if connector_config is not None else {})
 
+    def to_wire_mm(self, mm_output: Any) -> Any:
+        """Build the wire-side mm payload for the engine-core -> API hop.
+
+        On a GPU-tensor send edge the real data travels via the connector, so
+        CUDA tensors are stripped from the wire copy (avoids a redundant D2H
+        during msgpack encoding). No-op for CPU-payload deployments.
+        """
+        if mm_output is None or not connector_keeps_gpu(self.connector):
+            return mm_output
+        return strip_gpu_tensors_for_engine_output(mm_output)
+
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
 
@@ -127,7 +139,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         Args:
             request: The request object needing data.
         """
-        stage_id = int(self.connector.stage_id)
+        stage_id = self.connector.stage_id
 
         if stage_id == 0:
             return
@@ -187,7 +199,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
             self._save_cond.notify()
 
     def _poll_single_request(self, request: Request):
-        stage_id = int(self.connector.stage_id)
+        stage_id = self.connector.stage_id
         target_stage_id = stage_id - 1
         req_id = request.request_id
         chunk_id = self.get_req_chunk[req_id]
@@ -196,8 +208,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         # Use timeout=0 for non-blocking poll
         try:
-            if not self.connector.can_recv:
-                return False
             result = self.connector.get(
                 str(target_stage_id),
                 str(stage_id),
@@ -293,7 +303,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         request = task["request"]
         is_finished = task["is_finished"]
         is_segment_finished = task["is_segment_finished"]
-        stage_id = int(self.connector.stage_id)
+        stage_id = self.connector.stage_id
         next_stage_id = stage_id + 1
         external_req_id = request.external_req_id
         chunk_id = self.put_req_chunk[external_req_id]
@@ -324,8 +334,6 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         payload_data.meta.finished = torch.tensor(is_finished, dtype=torch.bool)
         payload_data.meta.is_segment_finished = torch.tensor(is_segment_finished, dtype=torch.bool)
 
-        if not self.connector.can_send:
-            return
         success, size, metadata = self.connector.put(
             from_stage=str(stage_id),
             to_stage=str(next_stage_id),
@@ -392,8 +400,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self.requests_with_ready_chunks.discard(request_id)
         self.request_ids_mapping.pop(request_id, None)
         self.requests_origin_status.pop(request_id, None)
-        # Opt-in only (CudaIPC zero-copy leases); SHM segments must survive
-        # receiver-side transitions or the downstream stage starves.
+        # request_scoped_cleanup is opt-in: only connectors holding per-request
+        # resources (e.g. zero-copy slot leases) participate.
         try:
             if self.connector is not None and getattr(self.connector, "request_scoped_cleanup", False):
                 self.connector.cleanup(request_id)
@@ -469,7 +477,7 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         callers that don't track aborts may omit it to keep the prior
         (unguarded) behaviour.
         """
-        if int(self.connector.stage_id) == 0:
+        if self.connector.stage_id == 0:
             return
 
         # Purge deque entries whose request was freed mid-flight (abort →

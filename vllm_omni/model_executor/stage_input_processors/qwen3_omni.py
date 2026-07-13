@@ -21,6 +21,10 @@ from vllm_omni.data_entry_keys import (
     OmniPayloadStruct,
     to_dict,
 )
+from vllm_omni.distributed.omni_connectors.connectors.cuda_ipc_placement import (
+    connector_keeps_gpu,
+    place_payload_tensor,
+)
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
 from vllm_omni.model_executor.stage_input_processors.tts_utils import (
@@ -113,9 +117,7 @@ def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | 
         t = value
     elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
         t = value[0]
-    if t is None:
-        return None
-    return t.detach() if (keep_on_gpu and t.is_cuda) else t.detach().cpu()
+    return place_payload_tensor(t, keep_on_gpu)
 
 
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
@@ -285,9 +287,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    # Keep on GPU for a GPU-direct connector (D2D); else drop to CPU.
-    emb_cpu = thinker_emb.detach() if (keep_on_gpu and thinker_emb.is_cuda) else thinker_emb.detach().cpu()
-    hid_cpu = thinker_hid.detach() if (keep_on_gpu and thinker_hid.is_cuda) else thinker_hid.detach().cpu()
+    emb_cpu = place_payload_tensor(thinker_emb, keep_on_gpu)
+    hid_cpu = place_payload_tensor(thinker_hid, keep_on_gpu)
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
@@ -448,8 +449,7 @@ def thinker2talker_async_chunk(
     """
 
     # Send-edge capability: a routed connector answers for its output edge.
-    _connector = getattr(transfer_manager, "connector", None)
-    _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
+    _keep_on_gpu = connector_keeps_gpu(getattr(transfer_manager, "connector", None))
 
     request_id = request.external_req_id
     chunk_id = transfer_manager.put_req_chunk[request_id]
@@ -475,9 +475,7 @@ def thinker2talker_async_chunk(
     language = extract_language_from_request(request)
 
     def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        if not isinstance(t, torch.Tensor):
-            return None
-        return t.detach() if (_keep_on_gpu and t.is_cuda) else t.detach().cpu()
+        return place_payload_tensor(t, _keep_on_gpu) if isinstance(t, torch.Tensor) else None
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
@@ -603,11 +601,10 @@ def thinker2talker_full_payload(
         return None
 
     # Send-edge capability: a GPU-direct connector keeps tensors on device.
-    _connector = getattr(transfer_manager, "connector", None)
-    _keep_on_gpu = getattr(_connector, "supports_gpu_tensor", False)
+    _keep_on_gpu = connector_keeps_gpu(getattr(transfer_manager, "connector", None))
 
     def _place(t: torch.Tensor) -> torch.Tensor:
-        return t.detach() if (_keep_on_gpu and t.is_cuda) else t.detach().cpu()
+        return place_payload_tensor(t, _keep_on_gpu)
 
     payload: OmniPayload = {
         "embed": {

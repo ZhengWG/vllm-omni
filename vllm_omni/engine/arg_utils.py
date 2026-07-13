@@ -241,41 +241,6 @@ class OmniEngineArgs(EngineArgs):
         self._temp_config_dir = temp_dir
         logger.info("Patched empty HF config with model_type=%s at %s", model_type, temp_dir)
 
-    @staticmethod
-    def _build_connector_config(spec: dict[str, Any], stage_id: int) -> dict[str, Any]:
-        """Normalise a stage_connector_spec into stage_connector_config.
-
-        Accepts two formats:
-          - Legacy:  ``{"name": "...", "extra": {...}}``
-          - Dual:    ``{"input": {"name": ..}, "output": {"name": ..}}``
-
-        Returns a dict consumable by ``create_connector()``.
-        """
-
-        def _with_stage_id(s: dict) -> dict:
-            extra = s.get("extra", {}).copy()
-            extra["stage_id"] = stage_id
-            return {"name": s.get("name", "SharedMemoryConnector"), "extra": extra}
-
-        if "input" in spec or "output" in spec:
-            cfg: dict[str, Any] = {}
-            for direction in ("input", "output"):
-                sub = spec.get(direction)
-                if isinstance(sub, dict) and sub:
-                    cfg[direction] = _with_stage_id(sub)
-            if not cfg:
-                return {"name": "SharedMemoryConnector", "extra": {"stage_id": stage_id}}
-            # Backward-compat: legacy readers do connector_cfg.get("extra"); expose a merged
-            # top-level name/extra so they keep working on the dual shape (no per-model change).
-            from vllm_omni.distributed.omni_connectors.utils.config import stage_connector_extra
-
-            cfg["extra"] = stage_connector_extra(cfg)
-            cfg["name"] = (cfg.get("output") or cfg.get("input")).get("name", "SharedMemoryConnector")
-            return cfg
-
-        cfg = _with_stage_id(spec)
-        return cfg
-
     def create_model_config(self) -> OmniModelConfig:
         """Create an OmniModelConfig from these engine arguments.
         Returns:
@@ -284,13 +249,11 @@ class OmniEngineArgs(EngineArgs):
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
-        # Build stage_connector_config from stage_connector_spec.
-        # Spec may be a list of dicts with "direction" field, or a legacy
-        # single dict (direction=None → shared for both input & output).
-        stage_connector_config = self._build_connector_config(
-            self.stage_connector_spec,
-            self.stage_id,
-        )
+        # Build stage_connector_config from stage_connector_spec (legacy single
+        # or dual {"input","output"} shape — normalisation is connector-owned).
+        from vllm_omni.distributed.omni_connectors.utils.config import build_stage_connector_config
+
+        stage_connector_config = build_stage_connector_config(self.stage_connector_spec, self.stage_id)
 
         # If model_arch is specified, inject it into hf_overrides so vLLM can
         # resolve the architecture even when config.json lacks 'architectures'.
