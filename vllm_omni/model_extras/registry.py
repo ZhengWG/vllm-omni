@@ -34,6 +34,10 @@ from vllm_omni.model_extras.helios import (
     HELIOS_EXTRA_BODY_PARAMS,
     HELIOS_EXTRA_OUTPUT_PARAMS,
 )
+from vllm_omni.model_extras.lingbot_world import (
+    LINGBOT_WORLD_EXTRA_BODY_PARAMS,
+    LINGBOT_WORLD_EXTRA_OUTPUT_PARAMS,
+)
 from vllm_omni.model_extras.magi_human import (
     MAGI_HUMAN_EXTRA_BODY_PARAMS,
     MAGI_HUMAN_EXTRA_OUTPUT_PARAMS,
@@ -160,6 +164,10 @@ _EXTRA_SPECS: dict[str, dict[str, Any]] = {
     "HeliosPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,
         "extra_output_params": HELIOS_EXTRA_OUTPUT_PARAMS,
+    },
+    "LingBotWorldCausalDMDPipeline": {
+        "extra_body_params": LINGBOT_WORLD_EXTRA_BODY_PARAMS,
+        "extra_output_params": LINGBOT_WORLD_EXTRA_OUTPUT_PARAMS,
     },
     "HeliosPyramidPipeline": {
         "extra_body_params": HELIOS_EXTRA_BODY_PARAMS,

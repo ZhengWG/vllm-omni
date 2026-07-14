@@ -333,6 +333,9 @@ _NO_CACHE_ACCELERATION = {
     # Pipelines that do not support cache acceleration (cache_dit / tea_cache).
     "NextStep11Pipeline",
     "AudioXPipeline",
+    # Causal world model: generic step caching would corrupt the self-managed
+    # causal KV cache (update_cache refill + sink/window semantics).
+    "LingBotWorldCausalDMDPipeline",
 }
 
 

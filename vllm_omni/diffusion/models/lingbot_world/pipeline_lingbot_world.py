@@ -20,6 +20,7 @@ import torch
 from diffusers.utils.torch_utils import randn_tensor
 from torch import nn
 from transformers import AutoTokenizer, UMT5EncoderModel
+from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
@@ -29,16 +30,19 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
-from vllm_omni.diffusion.models.lingbot_world.camera import camera_chunk_condition, parse_action_string
+from vllm_omni.diffusion.models.lingbot_world.camera import camera_condition, parse_action_string
 from vllm_omni.diffusion.models.lingbot_world.lingbot_world_transformer import CausalLingBotWorldTransformer3DModel
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
 from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
-# LingBot-World fast (v1) DMD distillation timesteps and flow shift; the v2
-# checkpoint uses [1000, 750, 500, 250] with flow_shift=5.0 (see extra_args).
+logger = init_logger(__name__)
+
+# DMD distillation timesteps (reference warp indices, un-shifted values):
+# v1 fast = indices [0, 179, 358, 679]; v2 uses a uniform 4-step schedule.
 DMD_TIMESTEPS = (1000, 821, 642, 321)
+DMD_TIMESTEPS_V2 = (1000, 750, 500, 250)
 FLOW_SHIFT = 10.0
 TEXT_LEN = 512
 
@@ -129,8 +133,26 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
         except (OSError, ValueError):
             scheduler_config = {}
         self.flow_shift = float(scheduler_config.get("flow_shift", scheduler_config.get("shift", FLOW_SHIFT)))
+        self.dmd_timesteps = self._resolve_dmd_timesteps(model, scheduler_config)
         self.vae_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
+
+    def _resolve_dmd_timesteps(self, model: str, scheduler_config: dict[str, Any]) -> tuple[int, ...]:
+        """Pick the DMD distillation schedule for this checkpoint.
+
+        Priority: an explicit ``dmd_denoising_steps`` entry in the checkpoint's
+        scheduler config, then a v2 model-name heuristic, then the v1 default.
+        Per-request ``extra_args.dmd_timesteps`` still overrides the result.
+        """
+        configured = scheduler_config.get("dmd_denoising_steps")
+        if configured:
+            steps = tuple(int(t) for t in configured)
+        elif "v2" in os.path.basename(str(model)).lower():
+            steps = DMD_TIMESTEPS_V2
+        else:
+            steps = DMD_TIMESTEPS
+        logger.info("LingBot-World DMD schedule: %s (flow_shift=%s)", steps, self.flow_shift)
+        return steps
 
     # ------------------------------------------------------------------ inputs
     def _parse_request(self, req: DiffusionRequestBatch) -> dict[str, Any]:
@@ -171,9 +193,10 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             raise ValueError(
                 f"num_frames={num_frames} maps to {latent_frames} latent frames, must be a multiple of {block}"
             )
-        # One action per latent frame; pad by holding the last action.
-        actions = [list(a) for a in actions[:latent_frames]]
-        actions += [list(actions[-1]) for _ in range(latent_frames - len(actions))]
+        # One action per *pixel* frame (official semantics); pad by holding the
+        # last action, truncate extras.
+        actions = [list(a) for a in actions[:num_frames]]
+        actions += [list(actions[-1]) for _ in range(num_frames - len(actions))]
 
         return dict(
             prompt=" ".join(prompt.split()),
@@ -184,7 +207,7 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             num_frames=num_frames,
             latent_frames=latent_frames,
             flow_shift=float(extra.get("flow_shift", self.flow_shift)),
-            dmd_timesteps=tuple(extra.get("dmd_timesteps", DMD_TIMESTEPS)),
+            dmd_timesteps=tuple(extra.get("dmd_timesteps", self.dmd_timesteps)),
             output_type=getattr(sampling, "output_type", None) or "np",
             generator=sampling.generator if not isinstance(sampling.generator, list) else sampling.generator[0],
         )
@@ -287,24 +310,28 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             dtype=condition.dtype,
         )
 
+        # Official offline semantics: build the full-trajectory camera condition
+        # once (interpolated to the latent grid, max-norm over the whole
+        # sequence), then slice per chunk.
+        camera = camera_condition(
+            inputs["actions"],
+            num_latent_frames=inputs["latent_frames"],
+            height=inputs["height"],
+            width=inputs["width"],
+            spatial_scale=self.vae_spatial,
+            device=self.device,
+            dtype=condition.dtype,
+        )
+
         chunks = []
         num_blocks = inputs["latent_frames"] // block
         with self.progress_bar(total=num_blocks * len(inputs["dmd_timesteps"])) as progress_bar:
             for index in range(num_blocks):
                 start = index * block
-                camera = camera_chunk_condition(
-                    inputs["actions"][: start + block],
-                    chunk_size=block,
-                    height=inputs["height"],
-                    width=inputs["width"],
-                    spatial_scale=self.vae_spatial,
-                    device=self.device,
-                    dtype=condition.dtype,
-                )
                 chunks.append(
                     self._generate_chunk(
                         condition[:, :, start : start + block],
-                        camera,
+                        camera[:, :, start : start + block],
                         prompt_embeds,
                         cache,
                         start,

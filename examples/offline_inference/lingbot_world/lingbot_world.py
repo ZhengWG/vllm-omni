@@ -10,12 +10,12 @@ Example:
         --model robbyant/lingbot-world-fast-diffusers \
         --image scene.png \
         --prompt "A first-person walk through a sunlit forest" \
-        --actions "w-9,lw-6,w-6" \
+        --actions "w-36,lw-24,w-21" \
         --output lingbot_world.mp4
 
-Actions are per latent frame (3 latent frames per generated chunk):
-w/a/s/d move, i/k pitch, j/l yaw, none = idle; "w-9" holds w for 9 frames.
-81 output frames = 21 latent frames = 7 chunks.
+Actions are per video frame (interpolated to the latent grid internally):
+w/a/s/d move, i/k pitch (2°), j/l yaw (2°), none = idle; "w-36" holds w for
+36 frames. 81 output frames = 21 latent frames = 7 chunks.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="robbyant/lingbot-world-fast-diffusers")
     parser.add_argument("--image", required=True, help="first-frame image path")
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--actions", required=True, help="e.g. 'w-9,lw-6,w-6' (one key set per latent frame)")
+    parser.add_argument("--actions", required=True, help="e.g. 'w-36,lw-24,w-21' (one key set per video frame)")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--num-frames", type=int, default=81, help="(n-1) %% 4 == 0 and latent frames %% 3 == 0")

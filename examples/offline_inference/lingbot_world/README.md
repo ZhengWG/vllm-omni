@@ -16,25 +16,25 @@ python lingbot_world.py \
     --model robbyant/lingbot-world-fast-diffusers \
     --image scene.png \
     --prompt "A first-person walk through a sunlit forest" \
-    --actions "w-9,lw-6,w-6" \
+    --actions "w-36,lw-24,w-21" \
     --num-frames 81 \
     --output lingbot_world.mp4
 ```
 
 ## Keyboard actions
 
-`--actions` is a comma-separated script with one key set per **latent frame**
-(4 pixel frames each, 3 latent frames per chunk):
+`--actions` is a comma-separated script with one key set per **video frame**
+(official semantics; poses are interpolated onto the latent grid internally):
 
 | Keys | Effect |
 |------|--------|
 | `w` / `s` | move forward / backward |
 | `a` / `d` | strafe left / right |
-| `i` / `k` | pitch up / down (4°/frame, clamped ±85°) |
-| `j` / `l` | yaw left / right (6°/frame) |
+| `i` / `k` | pitch up / down (2°/frame, clamped ±85°) |
+| `j` / `l` | yaw left / right (2°/frame) |
 | `none` | idle |
 
-`w-9` holds `w` for 9 latent frames; `lw-6` combines yaw-right + forward.
+`w-36` holds `w` for 36 video frames; `lw-24` combines yaw-right + forward.
 If the script is shorter than the video, the last action is held. 81 output
 frames = 21 latent frames = 7 chunks.
 
