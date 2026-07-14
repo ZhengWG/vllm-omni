@@ -226,6 +226,11 @@ _DIFFUSION_MODELS = {
         "pipeline_helios",
         "HeliosPipeline",
     ),
+    "LingBotWorldCausalDMDPipeline": (
+        "lingbot_world",
+        "pipeline_lingbot_world",
+        "LingBotWorldCausalDMDPipeline",
+    ),
     "Flux2Pipeline": (
         "flux2",
         "pipeline_flux2",
@@ -528,6 +533,7 @@ _DIFFUSION_POST_PROCESS_FUNCS = {
     "OmniGen2Pipeline": "get_omnigen2_post_process_func",
     "HeliosPipeline": "get_helios_post_process_func",
     "HeliosPyramidPipeline": "get_helios_post_process_func",
+    "LingBotWorldCausalDMDPipeline": "get_lingbot_world_post_process_func",
     "Flux2Pipeline": "get_flux2_post_process_func",
     "HunyuanVideo15Pipeline": "get_hunyuan_video_15_post_process_func",
     "HunyuanVideo15ImageToVideoPipeline": "get_hunyuan_video_15_i2v_post_process_func",
