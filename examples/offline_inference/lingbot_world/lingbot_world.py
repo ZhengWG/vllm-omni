@@ -93,12 +93,17 @@ def main() -> None:
     if isinstance(output, list):
         output = output[0]
     assert isinstance(output, OmniRequestOutput), f"unexpected output type {type(output)}"
-    video = output.images[0]["video"]  # np.ndarray [B, F, H, W, C] in [0, 1]
+    video = output.images[0]
+    if isinstance(video, dict):  # post-process may wrap as {"video": ...}
+        video = video.get("video") or video.get("frames")
+    video = np.asarray(video)
+    if video.ndim == 5:  # [B, F, H, W, C] -> [F, H, W, C]
+        video = video[0]
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     # NB: diffusers.export_to_video mangles colors in this environment (large
     # colorspace/range shift); write with imageio directly to preserve them.
-    frames = (np.clip(np.asarray(video[0]), 0, 1) * 255).astype(np.uint8)
+    frames = (np.clip(video, 0, 1) * 255).astype(np.uint8)
     imageio.mimwrite(
         str(out_path),
         list(frames),

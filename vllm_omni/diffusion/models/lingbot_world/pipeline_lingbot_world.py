@@ -39,10 +39,10 @@ from vllm_omni.diffusion.models.lingbot_world.lingbot_world_transformer import C
 from vllm_omni.diffusion.models.lingbot_world.raw_loader import (
     V2_DMD_TIMESTEPS,
     V2_FLOW_SHIFT,
+    build_raw_transformer,
     is_raw_lingbot_checkpoint,
     load_raw_text_encoder,
     load_raw_tokenizer,
-    load_raw_transformer,
     load_raw_vae,
 )
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
@@ -111,13 +111,22 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
 
     def _init_raw_checkpoint(self, model: str, dtype: torch.dtype) -> None:
         """Load the original (non-diffusers) LingBot-World v2 layout in place."""
-        # Weights are loaded here directly, so the engine's weight-loading pass
-        # (driven by weights_sources) is a no-op.
-        self.weights_sources = []
+        # The DiT weights live in the raw layout's ``transformers/`` safetensors
+        # and load through the engine's weight pass (TP-aware); the remaining
+        # components are converted/loaded here.
+        self.weights_sources = [
+            DiffusersPipelineLoader.ComponentSource(
+                model_or_path=model,
+                subfolder="transformers",
+                revision=None,
+                prefix="transformer.",
+                fall_back_to_pt=True,
+            )
+        ]
         self.tokenizer = load_raw_tokenizer(model)
         self.text_encoder = load_raw_text_encoder(model, device=self.device, dtype=dtype)
         self.vae = load_raw_vae(model, device=self.device, dtype=dtype)
-        self.transformer = load_raw_transformer(model, device=self.device, dtype=dtype)
+        self.transformer = build_raw_transformer(model)
         self.flow_shift = V2_FLOW_SHIFT
         self.dmd_timesteps = V2_DMD_TIMESTEPS
         self.vae_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))

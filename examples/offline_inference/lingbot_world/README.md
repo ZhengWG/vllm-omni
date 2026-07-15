@@ -70,3 +70,20 @@ extra_args={"camera_actions": "...", "dmd_timesteps": [1000, 750, 500, 250], "fl
 
 (The generic `shift` key in diffusers scheduler configs is ignored — it is
 usually the FlowUniPC export default (3.0), not the official training value.)
+
+## Regression test
+
+`tests/e2e/offline_inference/test_lingbot_world.py` is an opt-in GPU E2E: a
+seeded 21-frame (2-chunk) run through the full engine path with sanity and
+temporal-continuity checks. See its docstring for all options (poses input,
+golden/PSNR comparison via `LINGBOT_REFERENCE`).
+
+```bash
+LINGBOT_E2E=1 LINGBOT_MODEL=/path/to/model LINGBOT_IMAGE=first_frame.png \
+    pytest tests/e2e/offline_inference/test_lingbot_world.py -s
+```
+
+On air-gapped machines: `pytest-asyncio` must be installed (the repo's
+`--strict-config` otherwise aborts silently after collection), and plugin
+autoload may hang at exit without network — run with
+`PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 pytest -p asyncio ...`.

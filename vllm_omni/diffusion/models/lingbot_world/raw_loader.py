@@ -122,22 +122,24 @@ def load_raw_tokenizer(model_path: str) -> Any:
     return AutoTokenizer.from_pretrained(os.path.join(model_path, "google", "umt5-xxl"))
 
 
-def load_raw_transformer(
+def build_raw_transformer(
     model_path: str,
     *,
-    device: torch.device,
-    dtype: torch.dtype,
     sink_size: int = V2_SINK_SIZE,
     local_attn_size: int = V2_LOCAL_ATTN_SIZE,
 ) -> Any:
-    from safetensors.torch import load_file
+    """Construct the DiT from the raw ``config.json`` without loading weights.
 
+    In the engine path the weights are loaded by ``DiffusersPipelineLoader``
+    from the raw layout's ``transformers/`` safetensors (declared via a
+    ``ComponentSource``), which also handles TP sharding.
+    """
     from vllm_omni.diffusion.models.lingbot_world.lingbot_world_transformer import (
         CausalLingBotWorldTransformer3DModel,
     )
 
     raw_config = json.load(open(os.path.join(model_path, "config.json")))
-    model = CausalLingBotWorldTransformer3DModel(
+    return CausalLingBotWorldTransformer3DModel(
         num_attention_heads=raw_config["num_heads"],
         attention_head_dim=raw_config["dim"] // raw_config["num_heads"],
         in_channels=raw_config["in_dim"],
@@ -149,7 +151,22 @@ def load_raw_transformer(
         sink_size=sink_size,
         local_attn_size=local_attn_size,
         prefix="transformer",
-    ).to(device=device, dtype=dtype)
+    )
+
+
+def load_raw_transformer(
+    model_path: str,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    sink_size: int = V2_SINK_SIZE,
+    local_attn_size: int = V2_LOCAL_ATTN_SIZE,
+) -> Any:
+    """Standalone helper: build the DiT and eagerly load weights (no engine)."""
+    from safetensors.torch import load_file
+
+    model = build_raw_transformer(model_path, sink_size=sink_size, local_attn_size=local_attn_size)
+    model = model.to(device=device, dtype=dtype)
     ckpt: dict[str, torch.Tensor] = {}
     for shard in sorted(glob.glob(os.path.join(model_path, "transformers", "*.safetensors"))):
         ckpt.update(load_file(shard, device="cpu"))
