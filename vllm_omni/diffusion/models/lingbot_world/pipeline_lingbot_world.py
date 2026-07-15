@@ -346,6 +346,7 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
     # ---------------------------------------------------------------- denoising
     def _generate_chunk(
         self,
+        initial_latents: torch.Tensor,  # [1, 16, block, h, w] noise slice
         condition: torch.Tensor,  # [1, 20, block, h, w]
         camera: torch.Tensor,  # [1, 384, block, h, w]
         prompt_embeds: torch.Tensor,
@@ -354,8 +355,7 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
         inputs: dict[str, Any],
         progress_bar: Any,
     ) -> torch.Tensor:
-        shape = (1, self.transformer.config.out_channels, *condition.shape[2:])
-        latents = randn_tensor(shape, generator=inputs["generator"], device=self.device, dtype=condition.dtype)
+        latents = initial_latents.to(condition.dtype)
         sigmas = [_dmd_sigma(t, inputs["flow_shift"]) for t in inputs["dmd_timesteps"]]
 
         for step, sigma in enumerate(sigmas):
@@ -369,10 +369,14 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
                 start_frame=start_frame,
                 update_cache=False,
             )
-            x0 = latents - sigma * flow_pred
+            # Official semantics: x0 in float64, renoise drawn channel-first
+            # without a batch dim so the RNG stream matches the reference.
+            x0 = (latents.double() - sigma * flow_pred.double()).to(latents.dtype)
             if step + 1 < len(sigmas):  # self-forcing: renoise x0 to the next level
-                noise = randn_tensor(shape, generator=inputs["generator"], device=self.device, dtype=latents.dtype)
-                latents = (1.0 - sigmas[step + 1]) * x0 + sigmas[step + 1] * noise
+                noise = randn_tensor(
+                    x0.shape[1:], generator=inputs["generator"], device=self.device, dtype=latents.dtype
+                )[None]
+                latents = ((1.0 - sigmas[step + 1]) * x0.double() + sigmas[step + 1] * noise.double()).to(latents.dtype)
             else:
                 latents = x0
             progress_bar.update()
@@ -421,6 +425,16 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
         else:
             camera = camera_condition(inputs["actions"], **common)
 
+        # Initial noise is drawn once for the whole video (fp32, channel-first,
+        # no batch dim) and sliced per chunk — the reference implementation's
+        # RNG order, so the same seed consumes the same stream.
+        noise_all = randn_tensor(
+            (self.transformer.config.out_channels, inputs["latent_frames"], condition.shape[-2], condition.shape[-1]),
+            generator=inputs["generator"],
+            device=self.device,
+            dtype=torch.float32,
+        )
+
         chunks = []
         num_blocks = inputs["latent_frames"] // block
         with self.progress_bar(total=num_blocks * len(inputs["dmd_timesteps"])) as progress_bar:
@@ -428,6 +442,7 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
                 start = index * block
                 chunks.append(
                     self._generate_chunk(
+                        noise_all[None, :, start : start + block],
                         condition[:, :, start : start + block],
                         camera[:, :, start : start + block],
                         prompt_embeds,

@@ -85,6 +85,18 @@ def test_lingbot_world_short_generation():
     assert video.shape == (NUM_FRAMES, 480, 832, 3), video.shape
     assert np.isfinite(video).all()
     assert 0.02 < float(video.std()) < 0.6, f"degenerate output, std={video.std():.4f}"
+    # the first frame must reconstruct the conditioning image (I2V condition);
+    # semantic-level regressions (e.g. wrong text-context convention) show up
+    # here as a global washout long before the loose std bound trips
+    import PIL.Image
+
+    conditioning = (
+        np.asarray(PIL.Image.open(first_frame).convert("RGB").resize((832, 480), PIL.Image.Resampling.LANCZOS)) / 255.0
+    )
+    recon_mse = float(((video[0] - conditioning) ** 2).mean())
+    recon_psnr = 10 * np.log10(1.0 / max(recon_mse, 1e-12))
+    print(f"frame0 reconstruction PSNR: {recon_psnr:.2f} dB")
+    assert recon_psnr > 18.0, f"first-frame reconstruction degraded: {recon_psnr:.2f} dB"
     # temporal continuity: adjacent frames should be similar but not frozen
     frame_deltas = np.abs(np.diff(video, axis=0)).mean(axis=(1, 2, 3))
     assert float(frame_deltas.max()) < 0.25, "temporal discontinuity across chunks"
