@@ -30,8 +30,21 @@ from vllm_omni.diffusion.forward_context import set_forward_context_denoise_step
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.model_loader.hub_prefetch import from_pretrained_with_prefetch, prefetch_subfolders
 from vllm_omni.diffusion.models.interface import SupportImageInput, SupportsComponentDiscovery
-from vllm_omni.diffusion.models.lingbot_world.camera import camera_condition, parse_action_string
+from vllm_omni.diffusion.models.lingbot_world.camera import (
+    camera_condition,
+    camera_condition_from_poses,
+    parse_action_string,
+)
 from vllm_omni.diffusion.models.lingbot_world.lingbot_world_transformer import CausalLingBotWorldTransformer3DModel
+from vllm_omni.diffusion.models.lingbot_world.raw_loader import (
+    V2_DMD_TIMESTEPS,
+    V2_FLOW_SHIFT,
+    is_raw_lingbot_checkpoint,
+    load_raw_text_encoder,
+    load_raw_tokenizer,
+    load_raw_transformer,
+    load_raw_vae,
+)
 from vllm_omni.diffusion.models.progress_bar import ProgressBarMixin
 from vllm_omni.diffusion.models.utils import _load_json
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import load_transformer_config, retrieve_latents
@@ -39,10 +52,10 @@ from vllm_omni.diffusion.worker.request_batch import DiffusionRequestBatch
 
 logger = init_logger(__name__)
 
-# DMD distillation timesteps (reference warp indices, un-shifted values):
-# v1 fast = indices [0, 179, 358, 679]; v2 uses a uniform 4-step schedule.
+# v1-fast DMD distillation defaults (reference warp indices [0, 179, 358, 679]
+# and wan_i2v_A14B.py sample_shift). The raw v2 layout carries its own values
+# in raw_loader; diffusers checkpoint config or extra_args may override these.
 DMD_TIMESTEPS = (1000, 821, 642, 321)
-DMD_TIMESTEPS_V2 = (1000, 750, 500, 250)
 FLOW_SHIFT = 10.0
 TEXT_LEN = 512
 
@@ -90,6 +103,34 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
         model = od_config.model
         local_only = os.path.exists(model)
 
+        self.is_raw_checkpoint = is_raw_lingbot_checkpoint(model)
+        if self.is_raw_checkpoint:
+            self._init_raw_checkpoint(model, dtype)
+            return
+        self._init_diffusers_checkpoint(model, dtype, local_only)
+
+    def _init_raw_checkpoint(self, model: str, dtype: torch.dtype) -> None:
+        """Load the original (non-diffusers) LingBot-World v2 layout in place."""
+        # Weights are loaded here directly, so the engine's weight-loading pass
+        # (driven by weights_sources) is a no-op.
+        self.weights_sources = []
+        self.tokenizer = load_raw_tokenizer(model)
+        self.text_encoder = load_raw_text_encoder(model, device=self.device, dtype=dtype)
+        self.vae = load_raw_vae(model, device=self.device, dtype=dtype)
+        self.transformer = load_raw_transformer(model, device=self.device, dtype=dtype)
+        self.flow_shift = V2_FLOW_SHIFT
+        self.dmd_timesteps = V2_DMD_TIMESTEPS
+        self.vae_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
+        self.vae_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
+        logger.info(
+            "LingBot-World raw v2 checkpoint loaded: sink=%s window=%s DMD=%s flow_shift=%s",
+            self.transformer.config.sink_size,
+            self.transformer.config.sliding_window_num_frames,
+            self.dmd_timesteps,
+            self.flow_shift,
+        )
+
+    def _init_diffusers_checkpoint(self, model: str, dtype: torch.dtype, local_only: bool) -> None:
         self.weights_sources = [
             DiffusersPipelineLoader.ComponentSource(
                 model_or_path=model,
@@ -132,27 +173,15 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             scheduler_config = _load_json(model, "scheduler/scheduler_config.json", local_only)
         except (OSError, ValueError):
             scheduler_config = {}
-        self.flow_shift = float(scheduler_config.get("flow_shift", scheduler_config.get("shift", FLOW_SHIFT)))
-        self.dmd_timesteps = self._resolve_dmd_timesteps(model, scheduler_config)
+        # DMD schedule comes from explicit checkpoint config entries, else the
+        # v1-fast defaults; per-request extra_args can override either. The
+        # generic "shift" key is deliberately ignored — it is usually the
+        # FlowUniPC export default (3.0), not the training value.
+        self.flow_shift = float(scheduler_config.get("flow_shift", FLOW_SHIFT))
+        self.dmd_timesteps = tuple(int(t) for t in scheduler_config.get("dmd_denoising_steps", DMD_TIMESTEPS))
+        logger.info("LingBot-World DMD schedule: %s (flow_shift=%s)", self.dmd_timesteps, self.flow_shift)
         self.vae_temporal = int(getattr(self.vae.config, "scale_factor_temporal", 4))
         self.vae_spatial = int(getattr(self.vae.config, "scale_factor_spatial", 8))
-
-    def _resolve_dmd_timesteps(self, model: str, scheduler_config: dict[str, Any]) -> tuple[int, ...]:
-        """Pick the DMD distillation schedule for this checkpoint.
-
-        Priority: an explicit ``dmd_denoising_steps`` entry in the checkpoint's
-        scheduler config, then a v2 model-name heuristic, then the v1 default.
-        Per-request ``extra_args.dmd_timesteps`` still overrides the result.
-        """
-        configured = scheduler_config.get("dmd_denoising_steps")
-        if configured:
-            steps = tuple(int(t) for t in configured)
-        elif "v2" in os.path.basename(str(model)).lower():
-            steps = DMD_TIMESTEPS_V2
-        else:
-            steps = DMD_TIMESTEPS
-        logger.info("LingBot-World DMD schedule: %s (flow_shift=%s)", steps, self.flow_shift)
-        return steps
 
     # ------------------------------------------------------------------ inputs
     def _parse_request(self, req: DiffusionRequestBatch) -> dict[str, Any]:
@@ -172,11 +201,22 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             raise ValueError("LingBot-World requires a first-frame image in multi_modal_data.image")
 
         extra = sampling.extra_args or {}
+        camera = None
+        if isinstance(prompt_value, dict):
+            camera = (prompt_value.get("multi_modal_data") or {}).get("camera")
         actions = extra.get("camera_actions")
-        if isinstance(actions, str):
-            actions = parse_action_string(actions)
-        if not actions:
-            raise ValueError("extra_args.camera_actions is required, e.g. 'w-12,iw-6,l-6,none-6'")
+        if camera is not None and actions is not None:
+            raise ValueError("provide either multi_modal_data.camera (poses) or extra_args.camera_actions, not both")
+        if camera is not None:
+            camera = self._load_camera_trajectory(camera)
+        else:
+            if isinstance(actions, str):
+                actions = parse_action_string(actions)
+            if not actions:
+                raise ValueError(
+                    "camera control is required: multi_modal_data.camera={'poses': ..., 'intrinsics': ...} "
+                    "or extra_args.camera_actions, e.g. 'w-36,iw-24,l-21'"
+                )
 
         height = int(sampling.height or 480)
         width = int(sampling.width or 832)
@@ -193,15 +233,24 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             raise ValueError(
                 f"num_frames={num_frames} maps to {latent_frames} latent frames, must be a multiple of {block}"
             )
-        # One action per *pixel* frame (official semantics); pad by holding the
-        # last action, truncate extras.
-        actions = [list(a) for a in actions[:num_frames]]
-        actions += [list(actions[-1]) for _ in range(num_frames - len(actions))]
+        if camera is not None:
+            if camera["poses"].shape[0] < num_frames:
+                raise ValueError(f"camera poses cover {camera['poses'].shape[0]} frames but num_frames={num_frames}")
+            camera = {
+                "poses": camera["poses"][:num_frames],
+                "intrinsics": None if camera["intrinsics"] is None else camera["intrinsics"][:num_frames],
+            }
+        else:
+            # One action per *pixel* frame (official semantics); pad by holding
+            # the last action, truncate extras.
+            actions = [list(a) for a in actions[:num_frames]]
+            actions += [list(actions[-1]) for _ in range(num_frames - len(actions))]
 
         return dict(
             prompt=" ".join(prompt.split()),
             image=image.convert("RGB"),
             actions=actions,
+            camera=camera,
             height=height,
             width=width,
             num_frames=num_frames,
@@ -211,6 +260,43 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             output_type=getattr(sampling, "output_type", None) or "np",
             generator=sampling.generator if not isinstance(sampling.generator, list) else sampling.generator[0],
         )
+
+    @staticmethod
+    def _load_camera_trajectory(camera: Any) -> dict[str, torch.Tensor | None]:
+        """Normalize ``multi_modal_data.camera`` into pose/intrinsics tensors.
+
+        Accepts a directory containing ``poses.npy``/``intrinsics.npy`` (the
+        official action-path layout) or a mapping with ``poses`` and optional
+        ``intrinsics`` given as tensors, arrays, or ``.npy`` paths.
+        """
+        if isinstance(camera, str | os.PathLike):
+            camera = {
+                "poses": os.path.join(camera, "poses.npy"),
+                "intrinsics": os.path.join(camera, "intrinsics.npy"),
+            }
+        if not isinstance(camera, dict) or "poses" not in camera:
+            raise ValueError("multi_modal_data.camera must be an action dir or a dict with 'poses' [N,4,4]")
+
+        def to_tensor(value: Any, optional: bool = False) -> torch.Tensor | None:
+            if value is None or (optional and isinstance(value, str | os.PathLike) and not os.path.isfile(value)):
+                return None
+            if isinstance(value, str | os.PathLike):
+                value = np.load(value, allow_pickle=False)
+            if isinstance(value, np.ndarray):
+                value = torch.from_numpy(np.asarray(value, dtype=np.float64))
+            if not isinstance(value, torch.Tensor) or not torch.isfinite(value).all():
+                raise ValueError("camera poses/intrinsics must be finite tensors, arrays, or .npy paths")
+            return value
+
+        poses = to_tensor(camera["poses"])
+        intrinsics = to_tensor(camera.get("intrinsics"), optional=True)
+        if poses.ndim != 3 or poses.shape[1:] != (4, 4):
+            raise ValueError(f"camera poses must have shape [N, 4, 4], got {tuple(poses.shape)}")
+        if intrinsics is not None and (
+            intrinsics.ndim != 2 or intrinsics.shape[1] != 4 or len(intrinsics) != len(poses)
+        ):
+            raise ValueError(f"camera intrinsics must have shape [N, 4] matching poses, got {tuple(intrinsics.shape)}")
+        return {"poses": poses, "intrinsics": intrinsics}
 
     def _encode_prompt(self, prompt: str) -> torch.Tensor:
         inputs = self.tokenizer(
@@ -313,8 +399,7 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
         # Official offline semantics: build the full-trajectory camera condition
         # once (interpolated to the latent grid, max-norm over the whole
         # sequence), then slice per chunk.
-        camera = camera_condition(
-            inputs["actions"],
+        common = dict(
             num_latent_frames=inputs["latent_frames"],
             height=inputs["height"],
             width=inputs["width"],
@@ -322,6 +407,10 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             device=self.device,
             dtype=condition.dtype,
         )
+        if inputs["camera"] is not None:
+            camera = camera_condition_from_poses(inputs["camera"]["poses"], inputs["camera"]["intrinsics"], **common)
+        else:
+            camera = camera_condition(inputs["actions"], **common)
 
         chunks = []
         num_blocks = inputs["latent_frames"] // block

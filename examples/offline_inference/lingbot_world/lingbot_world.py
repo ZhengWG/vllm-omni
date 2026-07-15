@@ -6,11 +6,20 @@ The LingBot-World checkpoint is licensed CC BY-NC-SA (non-commercial); this
 integration code stays Apache-2.0.
 
 Example:
+    # keyboard actions
     python lingbot_world.py \
         --model robbyant/lingbot-world-fast-diffusers \
         --image scene.png \
         --prompt "A first-person walk through a sunlit forest" \
         --actions "w-36,lw-24,w-21" \
+        --output lingbot_world.mp4
+
+    # official camera trajectory (e.g. lingbot-world examples/04/)
+    python lingbot_world.py \
+        --model robbyant/lingbot-world-fast-diffusers \
+        --image examples/04/image.jpg \
+        --prompt "..." \
+        --action-dir examples/04 \
         --output lingbot_world.mp4
 
 Actions are per video frame (interpolated to the latent grid internally):
@@ -24,8 +33,9 @@ import argparse
 import time
 from pathlib import Path
 
+import imageio
+import numpy as np
 import torch
-from diffusers.utils import export_to_video
 
 from vllm_omni.entrypoints.omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -37,7 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", default="robbyant/lingbot-world-fast-diffusers")
     parser.add_argument("--image", required=True, help="first-frame image path")
     parser.add_argument("--prompt", required=True)
-    parser.add_argument("--actions", required=True, help="e.g. 'w-36,lw-24,w-21' (one key set per video frame)")
+    parser.add_argument("--actions", help="e.g. 'w-36,lw-24,w-21' (one key set per video frame)")
+    parser.add_argument("--action-dir", help="official action dir with poses.npy (+ intrinsics.npy)")
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--width", type=int, default=832)
     parser.add_argument("--num-frames", type=int, default=81, help="(n-1) %% 4 == 0 and latent frames %% 3 == 0")
@@ -55,16 +66,24 @@ def main() -> None:
         model_class_name="LingBotWorldCausalDMDPipeline",
         tensor_parallel_size=args.tensor_parallel_size,
     )
+    if bool(args.actions) == bool(args.action_dir):
+        raise SystemExit("provide exactly one of --actions or --action-dir")
+    multi_modal_data = {"image": args.image}
+    extra_args = {}
+    if args.action_dir:
+        multi_modal_data["camera"] = args.action_dir  # poses.npy (+ intrinsics.npy)
+    else:
+        extra_args["camera_actions"] = args.actions
     prompt_dict = {
         "prompt": args.prompt,
-        "multi_modal_data": {"image": args.image},
+        "multi_modal_data": multi_modal_data,
     }
     sampling_params = OmniDiffusionSamplingParams(
         height=args.height,
         width=args.width,
         num_frames=args.num_frames,
         generator=torch.Generator("cuda").manual_seed(args.seed),
-        extra_args={"camera_actions": args.actions},
+        extra_args=extra_args,
     )
 
     start = time.perf_counter()
@@ -77,7 +96,18 @@ def main() -> None:
     video = output.images[0]["video"]  # np.ndarray [B, F, H, W, C] in [0, 1]
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    export_to_video(list(video[0]), str(out_path), fps=args.fps)
+    # NB: diffusers.export_to_video mangles colors in this environment (large
+    # colorspace/range shift); write with imageio directly to preserve them.
+    frames = (np.clip(np.asarray(video[0]), 0, 1) * 255).astype(np.uint8)
+    imageio.mimwrite(
+        str(out_path),
+        list(frames),
+        fps=args.fps,
+        codec="libx264",
+        quality=10,
+        macro_block_size=1,
+        output_params=["-pix_fmt", "yuv420p"],
+    )
     print(f"Saved {out_path}")
 
 

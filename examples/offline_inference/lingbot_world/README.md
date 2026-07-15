@@ -21,6 +21,17 @@ python lingbot_world.py \
     --output lingbot_world.mp4
 ```
 
+## Camera control
+
+Two mutually exclusive inputs:
+
+- `--actions "w-36,lw-24,w-21"` — keyboard script (below);
+- `--action-dir path/` — official camera trajectory: `poses.npy` `[N,4,4]`
+  c2w poses (+ optional `intrinsics.npy` `[N,4]` fx,fy,cx,cy at 832x480
+  reference), e.g. the `examples/NN/` dirs from Robbyant/lingbot-world.
+  Programmatically: `multi_modal_data["camera"] = {"poses": ..., "intrinsics": ...}`
+  (tensors, arrays, or `.npy` paths).
+
 ## Keyboard actions
 
 `--actions` is a comma-separated script with one key set per **video frame**
@@ -45,14 +56,17 @@ frames = 21 latent frames = 7 chunks.
 - One request at a time (world-model session semantics); `--tensor-parallel-size`
   2/4 splits the 14B DiT and the KV cache across GPUs.
 
-## v2 checkpoint
+## Checkpoints
 
-`robbyant/lingbot-world-v2-diffusers` shares this pipeline; its DMD schedule is
-selected via sampling `extra_args`:
+The official raw v2 layout (`robbyant/lingbot-world-v2`, with `config.json` +
+`transformers/` + `Wan2.1_VAE.pth`) is auto-detected and loaded with the v2
+schedule built in. For diffusers-layout checkpoints, the DMD schedule comes
+from the checkpoint's `scheduler_config.json` (`flow_shift` /
+`dmd_denoising_steps`) and can be overridden per request:
 
 ```python
 extra_args={"camera_actions": "...", "dmd_timesteps": [1000, 750, 500, 250], "flow_shift": 5.0}
 ```
 
-(When the checkpoint's `scheduler_config.json` declares `flow_shift`, it is
-picked up automatically.)
+(The generic `shift` key in diffusers scheduler configs is ignored — it is
+usually the FlowUniPC export default (3.0), not the official training value.)
