@@ -355,13 +355,15 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
         inputs: dict[str, Any],
         progress_bar: Any,
     ) -> torch.Tensor:
-        latents = initial_latents.to(condition.dtype)
+        # Official numerics: the latent trajectory (noise, x0, renoise) is
+        # carried in float32 end to end; only the DiT input is cast down.
+        latents = initial_latents
         sigmas = [_dmd_sigma(t, inputs["flow_shift"]) for t in inputs["dmd_timesteps"]]
 
         for step, sigma in enumerate(sigmas):
             set_forward_context_denoise_step_idx(step)
             flow_pred = self.transformer(
-                torch.cat([latents, condition], dim=1),
+                torch.cat([latents.to(condition.dtype), condition], dim=1),
                 torch.tensor(sigma * 1000.0, device=self.device),
                 prompt_embeds,
                 camera,
@@ -371,19 +373,19 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
             )
             # Official semantics: x0 in float64, renoise drawn channel-first
             # without a batch dim so the RNG stream matches the reference.
-            x0 = (latents.double() - sigma * flow_pred.double()).to(latents.dtype)
+            x0 = (latents.double() - sigma * flow_pred.double()).float()
             if step + 1 < len(sigmas):  # self-forcing: renoise x0 to the next level
                 noise = randn_tensor(
-                    x0.shape[1:], generator=inputs["generator"], device=self.device, dtype=latents.dtype
+                    x0.shape[1:], generator=inputs["generator"], device=self.device, dtype=torch.float32
                 )[None]
-                latents = ((1.0 - sigmas[step + 1]) * x0.double() + sigmas[step + 1] * noise.double()).to(latents.dtype)
+                latents = (1.0 - sigmas[step + 1]) * x0 + sigmas[step + 1] * noise
             else:
                 latents = x0
             progress_bar.update()
 
         # Context refill: commit this chunk's clean K/V as history for the next chunk.
         self.transformer(
-            torch.cat([latents, condition], dim=1),
+            torch.cat([latents.to(condition.dtype), condition], dim=1),
             torch.tensor(0.0, device=self.device),
             prompt_embeds,
             camera,
