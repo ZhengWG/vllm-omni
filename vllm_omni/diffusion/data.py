@@ -1113,7 +1113,11 @@ class OmniDiffusionConfig:
                 model_type = cfg.get("model_type")
                 architectures = cfg.get("architectures") or []
 
-                if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                if self.model_class_name is not None:
+                    # The caller pinned the pipeline class explicitly (e.g.
+                    # --model-class-name); no inference from config.json needed.
+                    self.update_multimodal_support()
+                elif model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
                     self.model_class_name = "BagelPipeline"
                     self.set_tf_model_config(TransformerConfig())
                     self.update_multimodal_support()
