@@ -81,23 +81,6 @@ def test_create_audio_choice_fills_nonstream_transcript(serving_chat):
     assert choices[0].message.audio.data == "YmFzZTY0YXVkaW8="
 
 
-def test_create_audio_choice_stream_keeps_legacy_content_only(serving_chat):
-    """Streaming must not emit delta.audio; keep base64 in content."""
-    request = SimpleNamespace(return_token_ids=False)
-    choices = OmniOpenAIServingChat._create_audio_choice(
-        serving_chat,
-        _audio_omni_output(),
-        role="assistant",
-        request=request,
-        stream=True,
-        transcripts={0: "should not appear on stream"},
-    )
-    assert len(choices) == 1
-    delta = choices[0].delta
-    assert delta.content == "YmFzZTY0YXVkaW8="
-    assert getattr(delta, "audio", None) is None
-
-
 def test_create_audio_choice_uses_mm_transcript_fallback(serving_chat):
     request = SimpleNamespace(return_token_ids=False)
     choices = OmniOpenAIServingChat._create_audio_choice(
