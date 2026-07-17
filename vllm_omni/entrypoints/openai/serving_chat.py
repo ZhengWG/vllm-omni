@@ -1257,19 +1257,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
-        # Accumulate thinker text even when "text" is not in request.modalities,
-        # so audio chunks can populate OpenAI ChatCompletionAudio.transcript.
-        # Keep raw cumulative text for reasoning re-parse; expose only
-        # user-visible content via audio_transcripts.
-        audio_transcripts_raw: dict[int, str] = {i: "" for i in range(num_choices)}
-        audio_transcripts: dict[int, str] = {i: "" for i in range(num_choices)}
-        # Stable per-choice audio id / expires_at / already-sent transcript
-        # across streaming audio chunks (OpenAI aggregates by id + transcript deltas).
-        audio_stream_state: dict[str, Any] = {
-            "ids": {},
-            "expires_at": {},
-            "transcripts_sent": {},
-        }
 
         # Only one of these will be used, thus previous_texts and
         # all_previous_token_ids will not be used twice in the same iteration.
@@ -1310,20 +1297,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             async for omni_res in result_generator:
                 final_output_type = omni_res.final_output_type
                 res = omni_res.request_output
-                # Harvest thinker text for audio.transcript before modality filtering.
-                # Strip reasoning so hidden thinking never leaks into transcript.
-                if final_output_type == "text" and res is not None:
-                    for output in res.outputs:
-                        delta_text = output.text or ""
-                        if not delta_text:
-                            continue
-                        idx = output.index
-                        audio_transcripts_raw[idx] = audio_transcripts_raw.get(idx, "") + delta_text
-                        audio_transcripts[idx] = self._visible_content_for_transcript(
-                            audio_transcripts_raw[idx],
-                            request,
-                            reasoning_parser,
-                        )
                 if final_output_type not in first_iteration_dict:
                     logger.warning(f"final output type: {final_output_type} is not needed by the request")
                     continue
@@ -1951,14 +1924,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         )
 
                     role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(
-                        omni_res,
-                        role,
-                        request,
-                        stream=True,
-                        transcripts=audio_transcripts,
-                        stream_state=audio_stream_state,
-                    )
+                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
                     # Only emit finish_reason on the last modality to
                     # comply with OpenAI streaming spec.
                     for choice in choices_data:
@@ -2627,16 +2593,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         return joined
         return ""
 
-    @staticmethod
-    def _transcript_stream_delta(full_transcript: str, previously_sent: str) -> str:
-        """Compute OpenAI-style incremental transcript for one audio chunk."""
-        if not full_transcript:
-            return ""
-        if full_transcript.startswith(previously_sent):
-            return full_transcript[len(previously_sent) :]
-        # Non-prefix update (rare): send full text so clients can replace.
-        return full_transcript
-
     def _create_audio_choice(
         self,
         omni_outputs: OmniRequestOutput,
@@ -2644,7 +2600,6 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         request: ChatCompletionRequest,
         stream: bool = False,
         transcripts: dict[int, str] | None = None,
-        stream_state: dict[str, Any] | None = None,
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
@@ -2693,51 +2648,28 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         audio_response: AudioResponse = self.create_audio(audio_obj)
         audio_base64 = audio_response.audio_data
 
-        # Non-stream: one-shot id. Stream: reuse stable id/expires_at from stream_state.
-        default_expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
+        # Generate unique ID for the audio
+        audio_id = f"audio-{uuid.uuid4().hex[:16]}"
+
+        # Set expiration time (e.g., 24 hours from now) as Unix timestamp
+        expires_at = int((datetime.now(timezone.utc) + timedelta(hours=24)).timestamp())
 
         for output in final_res.outputs:
-            full_transcript = self._resolve_audio_transcript(transcripts, output.index, mm_output)
-            if stream and stream_state is not None:
-                ids: dict[int, str] = stream_state.setdefault("ids", {})
-                expires_map: dict[int, int] = stream_state.setdefault("expires_at", {})
-                sent_map: dict[int, str] = stream_state.setdefault("transcripts_sent", {})
-                audio_id = ids.setdefault(output.index, f"audio-{uuid.uuid4().hex[:16]}")
-                expires_at = expires_map.setdefault(output.index, default_expires_at)
-                previously_sent = sent_map.get(output.index, "")
-                transcript_delta = self._transcript_stream_delta(full_transcript, previously_sent)
-                sent_map[output.index] = full_transcript
-            else:
-                audio_id = f"audio-{uuid.uuid4().hex[:16]}"
-                expires_at = default_expires_at
-                transcript_delta = full_transcript
-
-            # Create OpenAIChatCompletionAudio object with all required fields
+            # Non-stream only: fill reasoning-stripped transcript (or mm fallback).
+            # Streaming keeps legacy delta.content=base64; OpenAI-style delta.audio
+            # is intentionally not added here (needs a separate streaming design).
+            transcript = "" if stream else self._resolve_audio_transcript(transcripts, output.index, mm_output)
             completion_audio = OpenAIChatCompletionAudio(
                 id=audio_id,
                 data=audio_base64,
                 expires_at=expires_at,
-                transcript=full_transcript,
+                transcript=transcript,
             )
 
             if stream:
-                # Keep content=base64 for existing Omni clients; also emit
-                # OpenAI-style delta.audio so SDKs can read data/transcript.
-                # transcript here is an incremental delta (may be empty).
                 choice_data = ChatCompletionResponseStreamChoice(
                     index=output.index,
-                    delta=DeltaMessage.model_validate(
-                        {
-                            "role": role,
-                            "content": audio_base64,
-                            "audio": {
-                                "id": audio_id,
-                                "data": audio_base64,
-                                "transcript": transcript_delta,
-                                "expires_at": expires_at,
-                            },
-                        }
-                    ),
+                    delta=DeltaMessage(role=role, content=audio_base64),
                     logprobs=None,
                     finish_reason=output.finish_reason,
                     stop_reason=output.stop_reason,
