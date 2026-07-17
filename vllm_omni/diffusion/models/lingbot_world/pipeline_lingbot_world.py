@@ -330,8 +330,13 @@ class LingBotWorldCausalDMDPipeline(nn.Module, SupportImageInput, SupportsCompon
 
     def _encode_condition(self, inputs: dict[str, Any]) -> torch.Tensor:
         """I2V condition [1, 20, latent_frames, h, w]: 4ch temporal mask + 16ch latent."""
-        image = inputs["image"].resize((inputs["width"], inputs["height"]), PIL.Image.Resampling.LANCZOS)
-        pixels = torch.from_numpy(np.asarray(image, dtype=np.float32)).permute(2, 0, 1) / 127.5 - 1.0
+        # Official preprocessing (wan/image2video.py)
+        image = inputs["image"].convert("RGB")
+        pixels = torch.from_numpy(np.array(image, dtype=np.uint8)).permute(2, 0, 1).to(torch.float32).div_(255)
+        pixels = pixels.sub_(0.5).div_(0.5)
+        pixels = torch.nn.functional.interpolate(
+            pixels[None], size=(inputs["height"], inputs["width"]), mode="bicubic"
+        )[0]
         video = pixels.new_zeros(1, 3, inputs["num_frames"], inputs["height"], inputs["width"])
         video[:, :, 0] = pixels
         latent = retrieve_latents(
