@@ -566,6 +566,22 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
         if cache is None or passthrough_data:
             return self._apply_hf_processor(inputs, timing_ctx)
 
+        # use_audio_in_video interleaves audio into the video, so the two items
+        # form one processing unit. The per-modality processor cache can still
+        # return a partial hit (audio cached, video miss — e.g. same audio track
+        # after different media_io video sampling), and the HF processor then
+        # runs on video alone with use_audio_in_video=True → StopIteration /
+        # HTTP 400. Skip the processor cache whenever any video needs audio.
+        # See https://github.com/vllm-project/vllm-omni/issues/5248.
+        num_videos = inputs.mm_data_items.get_count("video", strict=False)
+        if num_videos > 0 and any(
+            _get_request_video_use_audio_in_video(
+                inputs.hf_processor_mm_kwargs,
+                num_videos,
+            )
+        ):
+            return self._apply_hf_processor(inputs, timing_ctx)
+
         with timing_ctx.record("get_mm_hashes"):
             mm_hashes = inputs.get_mm_hashes(self.info.model_id)
 

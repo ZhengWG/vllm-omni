@@ -207,12 +207,111 @@ def test_filter_video_use_audio_in_video_for_uncached_items_aligns_partial_cache
     assert result["second_per_grid_ts"] == [1.0, 1.5]
 
 
+def test_filter_video_use_audio_in_video_for_uncached_items_keeps_global_bool():
+    """Global bool is intentionally not rewritten for partial cache hits.
+
+    That means the HF processor can still see use_audio_in_video=True while
+    only the uncached video is passed — so ``_cached_apply_hf_processor`` must
+    skip the processor cache whenever any video uses audio (issue #5248).
+    """
+    kwargs = {"use_audio_in_video": True, "other": 1}
+    result = _filter_video_use_audio_in_video_for_uncached_items(kwargs, [True, False])
+    assert result is kwargs
+    assert result["use_audio_in_video"] is True
+
+
 def test_filter_video_use_audio_in_video_for_uncached_items_validates_request_mask_length():
     with pytest.raises(ValueError, match="one boolean per video"):
         _filter_video_use_audio_in_video_for_uncached_items(
             {"use_audio_in_video": [True]},
             [False, False],
         )
+
+
+def _make_cached_apply_inputs(use_audio_in_video, num_videos: int):
+    from unittest.mock import MagicMock
+
+    mm_data_items = MagicMock()
+    mm_data_items.get_count.return_value = num_videos
+    mm_data_items.values.return_value = []
+
+    inputs = MagicMock()
+    inputs.mm_data_items = mm_data_items
+    inputs.hf_processor_mm_kwargs = {"use_audio_in_video": use_audio_in_video}
+    inputs.tokenization_kwargs = {}
+    inputs.prompt = [1, 2, 3]
+    inputs.get_mm_hashes = MagicMock(return_value={"video": [f"h{i}" for i in range(num_videos)]})
+    return inputs
+
+
+@pytest.mark.parametrize(
+    ("use_audio_in_video", "num_videos"),
+    [
+        (True, 1),
+        ([True], 1),
+        ([True, False], 2),
+    ],
+)
+def test_cached_apply_hf_processor_skips_cache_when_any_video_uses_audio(
+    use_audio_in_video,
+    num_videos,
+):
+    """Regression for https://github.com/vllm-project/vllm-omni/issues/5248.
+
+    Global or per-video ``use_audio_in_video`` must bypass the per-modality
+    processor cache so an audio cache hit cannot be paired with a video miss
+    (e.g. same audio after different ``media_io_kwargs`` video sampling).
+    """
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    inputs = _make_cached_apply_inputs(use_audio_in_video, num_videos)
+    timing_ctx = object()
+
+    fake_self = SimpleNamespace(cache=object())
+    fake_self._get_hf_mm_data = MagicMock(return_value=({}, {}))
+    fake_self._apply_hf_processor = MagicMock(return_value=([1], object(), False))
+    fake_self._get_cache_missing_items = MagicMock(
+        side_effect=AssertionError("processor cache must be skipped for use_audio_in_video")
+    )
+
+    result = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+        fake_self,
+        inputs,
+        timing_ctx,
+    )
+
+    fake_self._apply_hf_processor.assert_called_once_with(inputs, timing_ctx)
+    fake_self._get_cache_missing_items.assert_not_called()
+    assert result[0] == [1]
+
+
+def test_cached_apply_hf_processor_uses_cache_when_no_video_uses_audio():
+    """When every video has use_audio_in_video=False, keep the normal cache path."""
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    inputs = _make_cached_apply_inputs([False, False], num_videos=2)
+    timing_ctx = MagicMock()
+    timing_ctx.record.return_value.__enter__ = MagicMock(return_value=None)
+    timing_ctx.record.return_value.__exit__ = MagicMock(return_value=False)
+
+    fake_self = SimpleNamespace(cache=object(), info=SimpleNamespace(model_id="m"))
+    fake_self._get_hf_mm_data = MagicMock(return_value=({}, {}))
+    fake_self._apply_hf_processor = MagicMock(
+        side_effect=AssertionError("should use cache path when use_audio_in_video is false")
+    )
+    fake_self._get_cache_missing_items = MagicMock(side_effect=RuntimeError("reached-cache-path"))
+
+    with pytest.raises(RuntimeError, match="reached-cache-path"):
+        Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+            fake_self,
+            inputs,
+            timing_ctx,
+        )
+
+    fake_self._get_cache_missing_items.assert_called_once()
+    fake_self._apply_hf_processor.assert_not_called()
 
 
 def test_mm_fields_config_keeps_global_use_audio_in_video_shared():
