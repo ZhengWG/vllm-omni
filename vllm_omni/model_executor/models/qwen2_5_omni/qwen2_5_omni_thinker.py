@@ -658,12 +658,8 @@ class Qwen2_5OmniThinkerMultiModalProcessor(
                     mm_is_cached["video"][video_idx] = False
                     mm_is_cached["audio"][audio_idx] = False
 
-            # TODO: This inlines the missing-items build loop from the base
-            # BaseMultiModalProcessor._get_cache_missing_items because pair
-            # expansion must run between is_cached() and building missing
-            # items. Keep in sync with upstream vLLM changes to that method,
-            # or drop this copy if upstream exposes a hook for adjusting
-            # mm_is_cached before the missing items are collected.
+            # TODO: Inlined from BaseMultiModalProcessor._get_cache_missing_items
+            # (pair expansion must run after is_cached); keep in sync with vLLM.
             mm_missing_data = {}
             for modality, items_is_cached in mm_is_cached.items():
                 missing_modality_data = []
