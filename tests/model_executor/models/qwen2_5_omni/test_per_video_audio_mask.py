@@ -215,7 +215,7 @@ def test_filter_video_use_audio_in_video_for_uncached_items_validates_request_ma
         )
 
 
-def test_get_audio_in_video_coupled_groups_respects_per_video_mask():
+def test_get_audio_in_video_pairs_respects_per_video_mask():
     from unittest.mock import MagicMock
 
     mm_data_items = MagicMock()
@@ -224,33 +224,33 @@ def test_get_audio_in_video_coupled_groups_respects_per_video_mask():
         "audio": 1,
     }[modality]
 
-    groups = Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_coupled_groups(
+    pairs = Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_pairs(
         SimpleNamespace(),
         mm_data_items,
         {"use_audio_in_video": [False, True]},
     )
 
     # Second video uses audio and pairs with audio[0], not audio[1].
-    assert groups == [[("video", 1), ("audio", 0)]]
+    assert pairs == [(1, 0)]
 
 
-def test_coupled_cache_keys_change_when_paired_video_changes():
+def test_paired_cache_keys_change_when_paired_video_changes():
     """Same audio + different video must not reuse the audio cache entry."""
-    groups = [[("video", 0), ("audio", 0)]]
-    keys_a = Qwen2_5OmniThinkerMultiModalProcessor._coupled_cache_keys(
+    pairs = [(0, 0)]
+    keys_a = Qwen2_5OmniThinkerMultiModalProcessor._paired_cache_keys(
         {"video": ["video-a"], "audio": ["audio-same"]},
-        groups,
+        pairs,
     )
-    keys_b = Qwen2_5OmniThinkerMultiModalProcessor._coupled_cache_keys(
+    keys_b = Qwen2_5OmniThinkerMultiModalProcessor._paired_cache_keys(
         {"video": ["video-b"], "audio": ["audio-same"]},
-        groups,
+        pairs,
     )
 
     assert keys_a["audio"][0] != keys_b["audio"][0]
     assert keys_a["video"][0] != keys_b["video"][0]
 
 
-def test_cached_apply_hf_processor_expands_group_miss_for_audio_hit_video_miss():
+def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     """Same audio + different video must reprocess both items together even when
     the audio content hash alone would be a cache hit.
     """
@@ -277,13 +277,14 @@ def test_cached_apply_hf_processor_expands_group_miss_for_audio_hit_video_miss()
     timing_ctx.record.return_value.__exit__ = MagicMock(return_value=False)
 
     cache = MagicMock()
-    # Video miss, audio hit under group-aware keys — expansion must force audio.
+    # Video miss, audio hit under pair-aware keys — expansion must force audio.
     cache.is_cached.side_effect = lambda keys: [False] if keys[0].startswith("v") else [True]
 
     captured = {}
 
     def capture_merge(cache_arg, **kwargs):
-        captured["mm_needs_processing"] = kwargs["mm_needs_processing"]
+        captured["mm_is_cached"] = kwargs["mm_is_cached"]
+        captured["mm_cache_keys"] = kwargs["mm_hashes"]
         return MagicMock(name="mm_kwargs"), {"video": [[]], "audio": [[]]}
 
     fake_self = SimpleNamespace(cache=cache, info=SimpleNamespace(model_id="m"))
@@ -296,7 +297,7 @@ def test_cached_apply_hf_processor_expands_group_miss_for_audio_hit_video_miss()
     fake_self._get_mm_prompt_updates = MagicMock(
         return_value={"video": [[object()]], "audio": [[object()]]}
     )
-    fake_self._merge_coupled_mm_kwargs = capture_merge
+    fake_self._merge_mm_kwargs = capture_merge
 
     with patch(
         "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker."
@@ -312,11 +313,16 @@ def test_cached_apply_hf_processor_expands_group_miss_for_audio_hit_video_miss()
         )
 
     assert prompt_ids == [9]
+    # Both modalities were reprocessed as one unit after pair-miss expansion.
     assert fake_self.info.parse_mm_data.call_args.args[0] == {
         "video": ["video-0"],
         "audio": ["audio-0"],
     }
-    assert captured["mm_needs_processing"] == {"video": [True], "audio": [True]}
+    assert captured["mm_is_cached"] == {"video": [False], "audio": [False]}
+    # Cache entries are stored under pair-aware keys...
+    assert captured["mm_cache_keys"]["video"][0].startswith("v0-aiv-")
+    assert captured["mm_cache_keys"]["audio"][0].startswith("a0-aiv-")
+    # ...while semantic hashes are exposed downstream.
     assert mm_info.hashes == {"video": ["v0"], "audio": ["a0"]}
 
 
