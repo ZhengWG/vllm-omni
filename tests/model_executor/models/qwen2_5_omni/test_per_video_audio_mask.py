@@ -261,9 +261,7 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
         "video": 1,
         "audio": 1,
     }[modality]
-    mm_data_items.__getitem__ = MagicMock(
-        side_effect=lambda modality: [f"{modality}-0"]
-    )
+    mm_data_items.__getitem__ = MagicMock(side_effect=lambda modality: [f"{modality}-0"])
 
     inputs = MagicMock()
     inputs.mm_data_items = mm_data_items
@@ -290,26 +288,19 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
     fake_self = SimpleNamespace(cache=cache, info=SimpleNamespace(model_id="m"))
     fake_self._get_hf_mm_data = MagicMock(return_value=({}, {}))
     fake_self.info.parse_mm_data = MagicMock(return_value=SimpleNamespace(name="missing"))
-    fake_self._apply_hf_processor_main = MagicMock(
-        return_value=([9], {"video_grid_thw": object()}, False)
-    )
+    fake_self._apply_hf_processor_main = MagicMock(return_value=([9], {"video_grid_thw": object()}, False))
     fake_self._get_mm_fields_config = MagicMock(return_value={})
-    fake_self._get_mm_prompt_updates = MagicMock(
-        return_value={"video": [[object()]], "audio": [[object()]]}
-    )
+    fake_self._get_mm_prompt_updates = MagicMock(return_value={"video": [[object()]], "audio": [[object()]]})
     fake_self._merge_mm_kwargs = capture_merge
 
     with patch(
-        "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker."
-        "MultiModalKwargsItems.from_hf_inputs",
+        "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker.MultiModalKwargsItems.from_hf_inputs",
         return_value={"video": [object()], "audio": [object()]},
     ):
-        prompt_ids, mm_info, _ = (
-            Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
-                fake_self,
-                inputs,
-                timing_ctx,
-            )
+        prompt_ids, mm_info, _ = Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+            fake_self,
+            inputs,
+            timing_ctx,
         )
 
     assert prompt_ids == [9]
