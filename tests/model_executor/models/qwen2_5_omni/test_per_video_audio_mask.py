@@ -287,6 +287,15 @@ def test_cached_apply_hf_processor_expands_pair_miss_for_audio_hit_video_miss():
 
     fake_self = SimpleNamespace(cache=cache, info=SimpleNamespace(model_id="m"))
     fake_self._get_hf_mm_data = MagicMock(return_value=({}, {}))
+    # Bound methods called via self inside _cached_apply_hf_processor.
+    fake_self._get_audio_in_video_pairs = lambda mm_data_items, hf_processor_mm_kwargs: (
+        Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_pairs(
+            fake_self,
+            mm_data_items,
+            hf_processor_mm_kwargs,
+        )
+    )
+    fake_self._paired_cache_keys = Qwen2_5OmniThinkerMultiModalProcessor._paired_cache_keys
     fake_self.info.parse_mm_data = MagicMock(return_value=SimpleNamespace(name="missing"))
     fake_self._apply_hf_processor_main = MagicMock(return_value=([9], {"video_grid_thw": object()}, False))
     fake_self._get_mm_fields_config = MagicMock(return_value={})
