@@ -373,14 +373,25 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
         already_projected = False
 
         voice_name = additional_info.get("voice_name", None)
-        if voice_name and spk_emb is None and voice_name in self.voice_presets:
-            preset = self.voice_presets.get(voice_name) or {}
-            prompt_wav_lat = preset.get("prompt_wav_lat")
-            prompt_wav_emb = preset.get("prompt_wav_emb")
-            spk_emb = preset.get("spk_emb")
-            already_projected = True
-            if prompt_text is None:
-                prompt_text = preset.get("prompt_text")
+        if voice_name and spk_emb is None:
+            if voice_name in self.voice_presets:
+                preset = self.voice_presets.get(voice_name) or {}
+                prompt_wav_lat = preset.get("prompt_wav_lat")
+                prompt_wav_emb = preset.get("prompt_wav_emb")
+                spk_emb = preset.get("spk_emb")
+                already_projected = True
+                if prompt_text is None:
+                    prompt_text = preset.get("prompt_text")
+            elif prompt_wav_emb is None:
+                # Nothing conditions the voice, so _project_spk_emb will fall back
+                # to a zero speaker vector and synthesize in some arbitrary voice.
+                # Say so rather than letting it look like the request was honoured.
+                logger.warning(
+                    "Ming talker: voice '%s' is not a registered preset (available: %s); "
+                    "synthesizing without speaker conditioning.",
+                    voice_name,
+                    sorted(self.voice_presets.registered) or "none",
+                )
 
         return _VoiceContext(
             spk_emb=spk_emb,
