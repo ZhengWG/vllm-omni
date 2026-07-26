@@ -197,53 +197,45 @@ class CFMGraphExecutor:
         sigma: float = 0.25,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        bat_size, his_patch_size, z_dim = his_lat.shape
-        randn_tensor = torch.randn(
-            (bat_size, self.config.patch_size, z_dim), device=input_tensor.device, dtype=input_tensor.dtype
-        )
-        t = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
-        sde_rnd = torch.randn(
-            (self.config.steps, *randn_tensor.shape), device=input_tensor.device, dtype=input_tensor.dtype
-        )
-
         if not self.initialized:
-            self._initialize_graph(input_tensor, his_lat, randn_tensor, sde_rnd)
+            self._initialize_graph(input_tensor, his_lat)
 
         self.last_hidden_state_placeholder.copy_(input_tensor)
         self.his_lat_placeholder.copy_(his_lat)
-        self.randn_like_placeholder.copy_(randn_tensor)
-        self.t_placeholder.copy_(t)
+        # Draw straight into the captured buffers; a separate torch.randn plus
+        # copy_ would allocate and blit the same values once per decode step.
+        # t_placeholder holds the fixed get_epss_timesteps schedule and the graph
+        # reads it in place, so it needs no per-step refresh.
+        self.randn_like_placeholder.normal_()
+        self.sde_rnd_placeholder.normal_()
         self.sde_args_placeholder[0] = cfg_strength
         self.sde_args_placeholder[1] = sigma
         self.sde_args_placeholder[2] = temperature
-        self.sde_rnd_placeholder.copy_(sde_rnd)
 
         self.graph.replay()
 
-        gen_lat = torch.empty_like(self.gen_lat_placeholder)
-        gen_lat.copy_(self.gen_lat_placeholder)
+        # Graph outputs are static buffers the next replay overwrites, so the
+        # caller gets copies.
+        return (
+            self.gen_lat_placeholder.clone(),
+            self.inputs_embeds_placeholder.clone(),
+            self.stop_out_placeholder.clone(),
+        )
 
-        inputs_embeds = torch.empty_like(self.inputs_embeds_placeholder)
-        inputs_embeds.copy_(self.inputs_embeds_placeholder)
-
-        stop_out = torch.empty_like(self.stop_out_placeholder)
-        stop_out.copy_(self.stop_out_placeholder)
-
-        return gen_lat, inputs_embeds, stop_out
-
-    def _initialize_graph(
-        self,
-        input_tensor: torch.Tensor,
-        his_lat: torch.Tensor,
-        randn_tensor: torch.Tensor,
-        sde_rnd: torch.Tensor,
-    ) -> None:
+    def _initialize_graph(self, input_tensor: torch.Tensor, his_lat: torch.Tensor) -> None:
+        bat_size, _, z_dim = his_lat.shape
         self.last_hidden_state_placeholder = torch.empty_like(input_tensor)
         self.his_lat_placeholder = torch.empty_like(his_lat)
-        self.randn_like_placeholder = torch.empty_like(randn_tensor)
+        self.randn_like_placeholder = torch.empty(
+            (bat_size, self.config.patch_size, z_dim), device=input_tensor.device, dtype=input_tensor.dtype
+        )
         self.t_placeholder = get_epss_timesteps(self.config.steps, device=input_tensor.device, dtype=input_tensor.dtype)
         self.sde_args_placeholder = torch.empty(3, device=input_tensor.device, dtype=input_tensor.dtype)
-        self.sde_rnd_placeholder = torch.empty_like(sde_rnd)
+        self.sde_rnd_placeholder = torch.empty(
+            (self.config.steps, *self.randn_like_placeholder.shape),
+            device=input_tensor.device,
+            dtype=input_tensor.dtype,
+        )
 
         self.graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(self.graph, pool=current_platform.get_global_graph_pool()):
@@ -656,6 +648,18 @@ class MingAudioGenerator:
         # trailing latent frames prepended on each decode call
         self._vae_decode_pad_frames = 32
 
+        # get_epss_timesteps is a pure function of (steps, device, dtype); the
+        # eager flow head would otherwise rebuild it on every decode step.
+        self._epss_timesteps_cache: dict[tuple[torch.device, torch.dtype], torch.Tensor] = {}
+
+    def _epss_timesteps(self, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+        key = (device, dtype)
+        cached = self._epss_timesteps_cache.get(key)
+        if cached is None:
+            cached = get_epss_timesteps(self._config.steps, device=device, dtype=dtype)
+            self._epss_timesteps_cache[key] = cached
+        return cached
+
     @cached_property
     def _sampler_pool(self) -> CFMGraphExecutorPool | None:
         device = next(self._model.parameters()).device
@@ -717,7 +721,9 @@ class MingAudioGenerator:
             his_lat = self._update_his_lat(his_lat, gen_lat)
             all_latents.append(gen_lat)
 
-            stop_prob = stop_out.cpu()[0, 1].item()
+            # Index on device: .cpu() would ship the whole softmax tensor to the
+            # host once per decode step just to read one element.
+            stop_prob = stop_out[0, 1].item()
 
             if logger.isEnabledFor(logging.DEBUG):
                 if step % 50 == 0 or step < 5:
@@ -761,7 +767,7 @@ class MingAudioGenerator:
             device=last_hidden_state.device,
             dtype=last_hidden_state.dtype,
         )
-        t = get_epss_timesteps(self._config.steps, device=last_hidden_state.device, dtype=last_hidden_state.dtype)
+        t = self._epss_timesteps(last_hidden_state.device, last_hidden_state.dtype)
         sde_rnd = torch.randn(
             (self._config.steps, *randn_tensor.shape),
             device=last_hidden_state.device,

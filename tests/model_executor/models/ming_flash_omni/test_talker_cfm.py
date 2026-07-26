@@ -19,6 +19,7 @@ pytest.importorskip("x_transformers")
 
 pytestmark = [
     pytest.mark.core_model,
+    pytest.mark.cuda,
     pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA for graph capture"),
 ]
 
@@ -128,6 +129,58 @@ class TestCFMGraphExecutor:
         torch.accelerator.synchronize()
         assert torch.equal(input_tensor, snapshot_input)
         assert torch.equal(his_lat, snapshot_his)
+
+    def test_timestep_placeholder_survives_replays(self) -> None:
+        """The schedule is written once at capture; replays must not disturb it."""
+        config, cfm, aggregator, stop_head, device = _build_pipeline()
+        executor = CFMGraphExecutor(config, cfm, aggregator, stop_head)
+
+        input_tensor = torch.randn(1, 1, _LLM_HIDDEN, device=device, dtype=_DTYPE)
+        his_lat = torch.randn(1, _HIS_PATCH_SIZE, _LATENT_DIM, device=device, dtype=_DTYPE)
+
+        executor.execute(input_tensor, his_lat)
+        torch.accelerator.synchronize()
+        snapshot_t = executor.t_placeholder.clone()
+
+        executor.execute(input_tensor, his_lat)
+        torch.accelerator.synchronize()
+
+        assert torch.equal(executor.t_placeholder, snapshot_t)
+
+    def test_replay_draws_fresh_noise(self) -> None:
+        """Noise is drawn straight into the captured buffers, so it must change."""
+        config, cfm, aggregator, stop_head, device = _build_pipeline()
+        executor = CFMGraphExecutor(config, cfm, aggregator, stop_head)
+
+        input_tensor = torch.randn(1, 1, _LLM_HIDDEN, device=device, dtype=_DTYPE)
+        his_lat = torch.randn(1, _HIS_PATCH_SIZE, _LATENT_DIM, device=device, dtype=_DTYPE)
+
+        first, _, _ = executor.execute(input_tensor, his_lat)
+        torch.accelerator.synchronize()
+        second, _, _ = executor.execute(input_tensor, his_lat)
+        torch.accelerator.synchronize()
+
+        # Same conditioning, different noise draw.
+        assert not torch.equal(first, second)
+
+    def test_outputs_are_not_views_of_the_static_buffers(self) -> None:
+        config, cfm, aggregator, stop_head, device = _build_pipeline()
+        executor = CFMGraphExecutor(config, cfm, aggregator, stop_head)
+
+        input_tensor = torch.randn(1, 1, _LLM_HIDDEN, device=device, dtype=_DTYPE)
+        his_lat = torch.randn(1, _HIS_PATCH_SIZE, _LATENT_DIM, device=device, dtype=_DTYPE)
+
+        gen_lat, inputs_embeds, stop_out = executor.execute(input_tensor, his_lat)
+        torch.accelerator.synchronize()
+        retained = gen_lat.clone()
+
+        executor.execute(torch.randn_like(input_tensor), torch.randn_like(his_lat))
+        torch.accelerator.synchronize()
+
+        assert gen_lat.data_ptr() != executor.gen_lat_placeholder.data_ptr()
+        assert inputs_embeds.data_ptr() != executor.inputs_embeds_placeholder.data_ptr()
+        assert stop_out.data_ptr() != executor.stop_out_placeholder.data_ptr()
+        assert torch.equal(gen_lat, retained)
 
 
 class TestCFMGraphExecutorPool:
