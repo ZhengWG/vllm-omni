@@ -3,12 +3,17 @@
 # Adopted from https://github.com/inclusionAI/Ming-omni-tts/blob/main/modeling_bailingmm.py
 from __future__ import annotations
 
+import math
+import os
 from typing import Any
 
 import torch
 from vllm.forward_context import get_forward_context, is_forward_context_available
 
 from .config_ming_tts import KEY_MAX_DECODE_STEPS, KEY_MIN_DECODE_STEPS, KEY_REQUEST_ID, KEY_TEXT_MODE, MingTTSConfig
+
+MING_TTS_DEBUG_CHECKS_ENV = "VLLM_OMNI_MING_TTS_DEBUG_CHECKS"
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
 
 MING_STOP_REASON_CONTINUE = "continue"
 MING_STOP_REASON_STOP_HEAD = "stop_head"
@@ -19,6 +24,18 @@ MING_STOP_REASON_CODES = {
     MING_STOP_REASON_STOP_HEAD: 1,
     MING_STOP_REASON_MAX_DECODE_STEPS: 2,
 }
+
+
+def ming_tts_debug_checks_enabled() -> bool:
+    """Whether to run the opt-in tensor sanity guards on the Stage-0 decode path.
+
+    ``torch.isfinite(x).all()`` in a boolean context copies a scalar back to the
+    host, which drains the CUDA queue and blocks CPU run-ahead once per guard per
+    decode step. Ming Stage-0 keeps NaN detection on the stop probability, which
+    is already read on the host to make the stop decision, so these extra guards
+    only shorten the distance between a NaN appearing and being reported.
+    """
+    return os.environ.get(MING_TTS_DEBUG_CHECKS_ENV, "").strip().lower() in _TRUTHY
 
 
 def _normalize_request_infos(model_intermediate_buffer: object) -> list[dict[str, Any]]:
@@ -148,6 +165,8 @@ def _resolve_ming_stop_decision(
     audio_dummy_token_id: int,
     text_eos_token_id: int,
 ) -> tuple[str, bool, bool, int, int]:
+    if not math.isfinite(stop_prob):
+        raise RuntimeError(f"Non-finite stop_probs in Ming decode step: {stop_prob!r}")
     min_required_decode_steps = max(min_stop_step + 2, min_decode_steps)
     if max_decode_steps < min_required_decode_steps:
         raise RuntimeError(

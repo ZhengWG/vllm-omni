@@ -49,6 +49,7 @@ from .patch_emission import (
     _resolve_runtime_float,
     _resolve_runtime_int,
     _validate_ming_decode_window,
+    ming_tts_debug_checks_enabled,
 )
 
 logger = init_logger(__name__)
@@ -221,6 +222,11 @@ class MingLLMModel(nn.Module):
             new_history_tokens[output_index : output_index + 1] = new_history
             decode_step_tokens[output_index : output_index + 1] = decode_step
             has_patch[output_index : output_index + 1] = True
+            # ``stop_probs`` is read on the host anyway to make the stop decision,
+            # so _resolve_ming_stop_decision rejects a non-finite value there
+            # instead of paying for a separate device sync. A NaN anywhere in the
+            # backbone or in the previous step's flow output reaches the stop head
+            # within one decode step.
             stop_reason, _, _, _, next_token_id = _resolve_ming_stop_decision(
                 step=decode_step,
                 stop_prob=float(stop_probs.reshape(-1)[0].item()),
@@ -386,7 +392,8 @@ class MingLLMModel(nn.Module):
             )
         # [Batch, Hidden] -> [Batch, Time, Hidden] = [B, 1, H] for FlowLoss conditioning.
         z_diff_cond = hidden_states.to(dtype=self.fm_dtype).unsqueeze(1)
-        if not torch.isfinite(z_diff_cond).all():
+        debug_checks = ming_tts_debug_checks_enabled()
+        if debug_checks and not torch.isfinite(z_diff_cond).all():
             raise RuntimeError("Non-finite z_diff_cond before FlowLoss.sample().")
 
         # Fast path: CUDAGraph-captured flow head (CFM sampling + Aggregator +
@@ -427,12 +434,13 @@ class MingLLMModel(nn.Module):
                 f"FlowLoss output shape mismatch: got {tuple(sampled_token_latent.shape)}, expected {expected_shape}"
             )
         new_history = torch.cat([latent_history[:, self.ming_config.patch_size :, :], sampled_token_latent], dim=1)
-        if not torch.isfinite(sampled_token_latent).all():
-            raise RuntimeError("Non-finite sampled_token_latent in Ming decode step.")
-        if not torch.isfinite(next_embeds).all():
-            raise RuntimeError("Non-finite next_embeds in Ming decode step.")
-        if not torch.isfinite(stop_probs).all():
-            raise RuntimeError("Non-finite stop_probs in Ming decode step.")
+        if debug_checks:
+            if not torch.isfinite(sampled_token_latent).all():
+                raise RuntimeError("Non-finite sampled_token_latent in Ming decode step.")
+            if not torch.isfinite(next_embeds).all():
+                raise RuntimeError("Non-finite next_embeds in Ming decode step.")
+            if not torch.isfinite(stop_probs).all():
+                raise RuntimeError("Non-finite stop_probs in Ming decode step.")
         return sampled_token_latent, next_embeds, new_history, stop_probs
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

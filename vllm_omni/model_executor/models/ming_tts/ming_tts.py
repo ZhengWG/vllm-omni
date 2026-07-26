@@ -38,7 +38,7 @@ from .config_ming_tts import (
     KEY_TEXT_MODE,
     MingTTSConfig,
 )
-from .patch_emission import MING_STOP_REASON_KEY
+from .patch_emission import MING_STOP_REASON_KEY, ming_tts_debug_checks_enabled
 from .prompt_encoder import _resolve_prompt_latents
 
 
@@ -230,7 +230,8 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
 
         next_embeds = info_dict.get(KEY_NEXT_EMBEDS)
         if isinstance(next_embeds, torch.Tensor) and input_ids.numel() == 1:
-            if not torch.isfinite(next_embeds).all():
+            debug_checks = ming_tts_debug_checks_enabled()
+            if debug_checks and not torch.isfinite(next_embeds).all():
                 raise RuntimeError("Non-finite next_embeds before decode preprocess write.")
             input_embeds[0] = (
                 next_embeds.detach()
@@ -240,7 +241,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
                     dtype=input_embeds.dtype,
                 )
             )
-            if not torch.isfinite(input_embeds[0]).all():
+            if debug_checks and not torch.isfinite(input_embeds[0]).all():
                 raise RuntimeError("Non-finite backbone input_embeds after decode preprocess write.")
 
         request_id = info_dict.get(KEY_REQUEST_ID, info_dict.get("request_id"))
