@@ -166,6 +166,42 @@ ROCm and XPU), PD disaggregation, the unified quantization framework across stag
 Code2Wav graph capture matrix described above. sglang-omni has no equivalent of the deploy-config
 layer and does not use `torch.compile` anywhere in either model family.
 
+## Defects found while writing this
+
+Distinct from the roadmap below: these are concrete bugs in the current tree, each small enough to
+fix and unit-test on its own. They are recorded here because the pattern is more interesting than any
+individual fix — five of the seven are places where two layers disagreed about a contract, and none
+of them fail loudly.
+
+**Ming-omni-tts**
+
+- `audio_prep.py::coerce_prompt_waveform` flattened `(channels, samples)` reference audio with
+  `reshape(1, -1)`, splicing the channels end to end rather than downmixing. Duration doubles, so
+  `count_prompt_waveform_patches` also over-budgets the `<audioPatch>` placeholders. The `bytes`
+  path already downmixed with `waveform[:1]`; the raw-tensor, tuple and dict paths did not.
+- `prompt_assembly.py::resolve_effective_runtime_controls` discarded a prompt's `Duration: Ns` hint
+  whenever the caller supplied *either* decode bound, so `max_new_tokens` plus a duration hint left
+  the min at 0 and let the stop head finish at the 5-step floor.
+- `tts_adapters/ming_tts.py` inherited `max_new_tokens_min = 1`, but the value becomes
+  `ming_max_decode_steps` and Stage-0 rejects anything below `stop_head_min_steps + 2`. Values 1–4
+  were admitted and then failed inside the engine.
+- `stage_input_processors/ming_tts.py::llm2audio_vae_async_chunk` initialised its bookkeeping by
+  assigning over `transfer_manager.request_payload[req_id]`, which the connector owns.
+- Six `torch.isfinite(x).all()` guards ran per decode step on the Stage-0 hot path, each one a
+  device sync (see the *Open items* discussion of host syncs below).
+
+**Ming-flash-omni-2.0**
+
+- The talker pinned `torch.bfloat16` for segment prompt embeddings and for AudioVAE prompt encoding,
+  while `self.dtype` was threaded everywhere else. Invisible on the released bf16 checkpoint.
+- `_resolve_voice` silently fell through on an unregistered `voice_name`, after which
+  `use_zero_spk_emb` substituted a zero speaker vector — plausible audio in an arbitrary voice, with
+  no diagnostic. Reachable without a bad request, because presets are registered best-effort during
+  `load_weights` and the thinker→talker bridge defaults `voice_name` to `DB30`.
+- `CFMGraphExecutor.execute` rebuilt the constant `get_epss_timesteps` schedule and re-copied it into
+  a captured placeholder on every step, and allocated its two noise tensors before blitting them into
+  the static buffers.
+
 ## Open items
 
 Ranked by expected impact per unit of invasiveness. None of these are blocking correctness today.
