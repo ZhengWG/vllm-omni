@@ -116,14 +116,22 @@ def resolve_effective_runtime_controls(
     controls = {} if runtime_controls is None else dict(runtime_controls)
     has_explicit_min = KEY_MIN_DECODE_STEPS in controls and controls[KEY_MIN_DECODE_STEPS] is not None
     has_explicit_max = KEY_MAX_DECODE_STEPS in controls and controls[KEY_MAX_DECODE_STEPS] is not None
-    if has_explicit_min or has_explicit_max:
+    if has_explicit_min and has_explicit_max:
         return controls
     duration_seconds = parse_duration_seconds(text)
     if duration_seconds is None:
         return controls
     min_decode_steps, max_decode_steps = estimate_decode_step_window_for_duration(duration_seconds)
-    controls[KEY_MIN_DECODE_STEPS] = min_decode_steps
-    controls[KEY_MAX_DECODE_STEPS] = max_decode_steps
+
+    # Fill in only the bound the caller left open, and keep the window valid:
+    # Stage-0 rejects the request outright when max_decode_steps is below
+    # max(stop_head_min_steps + 2, min_decode_steps).
+    if not has_explicit_max:
+        controls[KEY_MAX_DECODE_STEPS] = (
+            max(max_decode_steps, int(controls[KEY_MIN_DECODE_STEPS])) if has_explicit_min else max_decode_steps
+        )
+    if not has_explicit_min:
+        controls[KEY_MIN_DECODE_STEPS] = min(min_decode_steps, int(controls[KEY_MAX_DECODE_STEPS]))
     return controls
 
 
