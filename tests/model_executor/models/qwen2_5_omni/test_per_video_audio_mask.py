@@ -13,6 +13,7 @@ from vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker import (
     Qwen2_5OmniThinkerMultiModalProcessor,
     _coerce_use_audio_in_video_for_hf_processor,
     _filter_video_use_audio_in_video_for_uncached_items,
+    _get_request_video_use_audio_in_video,
     _normalize_use_audio_in_video,
 )
 from vllm_omni.model_executor.models.qwen3_omni.qwen3_omni_moe_thinker import (
@@ -207,12 +208,268 @@ def test_filter_video_use_audio_in_video_for_uncached_items_aligns_partial_cache
     assert result["second_per_grid_ts"] == [1.0, 1.5]
 
 
+def test_filter_video_use_audio_in_video_for_uncached_items_keeps_global_bool():
+    """Global bool is intentionally not rewritten for partial cache hits.
+
+    Coupling in ``_cached_apply_hf_processor`` keeps audio+video processed
+    together so the HF processor never sees video-only inputs with
+    ``use_audio_in_video=True`` (issue #5248 / vLLM #44538).
+    """
+    kwargs = {"use_audio_in_video": True, "other": 1}
+    result = _filter_video_use_audio_in_video_for_uncached_items(kwargs, [True, False])
+    assert result is kwargs
+    assert result["use_audio_in_video"] is True
+
+
 def test_filter_video_use_audio_in_video_for_uncached_items_validates_request_mask_length():
     with pytest.raises(ValueError, match="one boolean per video"):
         _filter_video_use_audio_in_video_for_uncached_items(
             {"use_audio_in_video": [True]},
             [False, False],
         )
+
+
+def test_get_audio_in_video_coupled_groups_pairs_global_bool():
+    from unittest.mock import MagicMock
+
+    mm_data_items = MagicMock()
+    mm_data_items.get_count.side_effect = lambda modality, strict=False: {
+        "video": 2,
+        "audio": 2,
+    }[modality]
+
+    groups = Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_coupled_groups(
+        SimpleNamespace(),
+        mm_data_items,
+        {"use_audio_in_video": True},
+    )
+
+    assert groups == [
+        [("video", 0), ("audio", 0)],
+        [("video", 1), ("audio", 1)],
+    ]
+
+
+def test_get_audio_in_video_coupled_groups_respects_per_video_mask():
+    from unittest.mock import MagicMock
+
+    mm_data_items = MagicMock()
+    mm_data_items.get_count.side_effect = lambda modality, strict=False: {
+        "video": 2,
+        "audio": 1,
+    }[modality]
+
+    groups = Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_coupled_groups(
+        SimpleNamespace(),
+        mm_data_items,
+        {"use_audio_in_video": [False, True]},
+    )
+
+    # Second video uses audio and pairs with audio[0], not audio[1].
+    assert groups == [[("video", 1), ("audio", 0)]]
+
+
+def test_get_audio_in_video_coupled_groups_empty_when_no_video_uses_audio():
+    from unittest.mock import MagicMock
+
+    mm_data_items = MagicMock()
+    mm_data_items.get_count.side_effect = lambda modality, strict=False: {
+        "video": 2,
+        "audio": 2,
+    }[modality]
+
+    groups = Qwen2_5OmniThinkerMultiModalProcessor._get_audio_in_video_coupled_groups(
+        SimpleNamespace(),
+        mm_data_items,
+        {"use_audio_in_video": [False, False]},
+    )
+
+    assert groups == []
+
+
+def test_coupled_cache_keys_incorporate_group_member_hashes():
+    mm_hashes = {
+        "video": ["v0", "v1"],
+        "audio": ["a0", "a1"],
+    }
+    groups = [
+        [("video", 0), ("audio", 0)],
+        [("video", 1), ("audio", 1)],
+    ]
+
+    keys = Qwen2_5OmniThinkerMultiModalProcessor._coupled_cache_keys(mm_hashes, groups)
+
+    assert keys["video"][0] != "v0"
+    assert keys["audio"][0] != "a0"
+    assert keys["video"][0].startswith("v0-aiv-")
+    assert keys["audio"][0].startswith("a0-aiv-")
+    # Same group shares the group token suffix.
+    assert keys["video"][0].split("-aiv-")[1] == keys["audio"][0].split("-aiv-")[1]
+    assert keys["video"][1].split("-aiv-")[1] == keys["audio"][1].split("-aiv-")[1]
+    # Different pairs get different group tokens.
+    assert keys["video"][0].split("-aiv-")[1] != keys["video"][1].split("-aiv-")[1]
+    # Semantic hashes left unchanged.
+    assert mm_hashes == {"video": ["v0", "v1"], "audio": ["a0", "a1"]}
+
+
+def test_coupled_cache_keys_change_when_paired_video_changes():
+    """Same audio + different video must not reuse the audio cache entry."""
+    groups = [[("video", 0), ("audio", 0)]]
+    keys_a = Qwen2_5OmniThinkerMultiModalProcessor._coupled_cache_keys(
+        {"video": ["video-a"], "audio": ["audio-same"]},
+        groups,
+    )
+    keys_b = Qwen2_5OmniThinkerMultiModalProcessor._coupled_cache_keys(
+        {"video": ["video-b"], "audio": ["audio-same"]},
+        groups,
+    )
+
+    assert keys_a["audio"][0] != keys_b["audio"][0]
+    assert keys_a["video"][0] != keys_b["video"][0]
+
+
+def _make_cached_apply_inputs(
+    use_audio_in_video,
+    num_videos: int,
+    num_audios: int | None = None,
+):
+    from unittest.mock import MagicMock
+
+    if num_audios is None:
+        num_audios = num_videos
+
+    def get_count(modality, strict=False):
+        return {"video": num_videos, "audio": num_audios}.get(modality, 0)
+
+    mm_data_items = MagicMock()
+    mm_data_items.get_count.side_effect = get_count
+    mm_data_items.values.return_value = []
+    mm_data_items.__getitem__ = MagicMock(
+        side_effect=lambda modality: [f"{modality}-{i}" for i in range(get_count(modality))]
+    )
+
+    inputs = MagicMock()
+    inputs.mm_data_items = mm_data_items
+    inputs.hf_processor_mm_kwargs = {"use_audio_in_video": use_audio_in_video}
+    inputs.tokenization_kwargs = {}
+    inputs.prompt = [1, 2, 3]
+    inputs.get_mm_hashes = MagicMock(
+        return_value={
+            "video": [f"v{i}" for i in range(num_videos)],
+            "audio": [f"a{i}" for i in range(num_audios)],
+        }
+    )
+    return inputs
+
+
+def test_cached_apply_hf_processor_uses_uncoupled_cache_when_no_video_uses_audio():
+    """When every video has use_audio_in_video=False, keep the normal cache path."""
+    from unittest.mock import MagicMock
+
+    inputs = _make_cached_apply_inputs([False, False], num_videos=2)
+    timing_ctx = MagicMock()
+    timing_ctx.record.return_value.__enter__ = MagicMock(return_value=None)
+    timing_ctx.record.return_value.__exit__ = MagicMock(return_value=False)
+
+    fake_self = SimpleNamespace(cache=object(), info=SimpleNamespace(model_id="m"))
+    fake_self._get_hf_mm_data = MagicMock(return_value=({}, {}))
+    fake_self._apply_hf_processor = MagicMock(
+        side_effect=AssertionError("should use cache path when use_audio_in_video is false")
+    )
+    fake_self._get_cache_missing_items = MagicMock(side_effect=RuntimeError("reached-cache-path"))
+
+    with pytest.raises(RuntimeError, match="reached-cache-path"):
+        Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+            fake_self,
+            inputs,
+            timing_ctx,
+        )
+
+    fake_self._get_cache_missing_items.assert_called_once()
+    fake_self._apply_hf_processor.assert_not_called()
+
+
+def test_cached_apply_hf_processor_expands_group_miss_for_audio_hit_video_miss():
+    """Regression for https://github.com/vllm-project/vllm-omni/issues/5248.
+
+    Same audio + different video must reprocess both items together even when
+    the audio content hash alone would be a cache hit.
+    """
+    from unittest.mock import MagicMock
+
+    inputs = _make_cached_apply_inputs(True, num_videos=1, num_audios=1)
+    timing_ctx = MagicMock()
+    timing_ctx.record.return_value.__enter__ = MagicMock(return_value=None)
+    timing_ctx.record.return_value.__exit__ = MagicMock(return_value=False)
+
+    cache = MagicMock()
+    # Video miss, audio hit under group-aware keys — expansion must force audio.
+    cache.is_cached.side_effect = lambda keys: [False] if keys[0].startswith("v") else [True]
+
+    captured = {}
+
+    def capture_merge(cache_arg, **kwargs):
+        captured["mm_needs_processing"] = kwargs["mm_needs_processing"]
+        captured["mm_cache_keys"] = kwargs["mm_cache_keys"]
+        return MagicMock(name="mm_kwargs"), {"video": [[]], "audio": [[]]}
+
+    fake_self = SimpleNamespace(cache=cache, info=SimpleNamespace(model_id="m"))
+    fake_self._get_hf_mm_data = MagicMock(return_value=({}, {}))
+    fake_self._apply_hf_processor = MagicMock(
+        side_effect=AssertionError("coupled path must not skip to full apply")
+    )
+    fake_self._get_cache_missing_items = MagicMock(
+        side_effect=AssertionError("coupled path builds missing items itself")
+    )
+    fake_self.info.parse_mm_data = MagicMock(return_value=SimpleNamespace(name="missing"))
+    fake_self._apply_hf_processor_main = MagicMock(
+        return_value=([9], {"video_grid_thw": object()}, False)
+    )
+    fake_self._get_mm_fields_config = MagicMock(return_value={})
+    fake_self._get_mm_prompt_updates = MagicMock(
+        return_value={"video": [[object()]], "audio": [[object()]]}
+    )
+    fake_self._merge_coupled_mm_kwargs = capture_merge
+    fake_self._merge_mm_kwargs = MagicMock(
+        side_effect=AssertionError("coupled path uses _merge_coupled_mm_kwargs")
+    )
+
+    from unittest.mock import patch
+
+    with patch(
+        "vllm_omni.model_executor.models.qwen2_5_omni.qwen2_5_omni_thinker."
+        "MultiModalKwargsItems.from_hf_inputs",
+        return_value={"video": [object()], "audio": [object()]},
+    ):
+        prompt_ids, mm_info, is_update_applied = (
+            Qwen2_5OmniThinkerMultiModalProcessor._cached_apply_hf_processor(
+                fake_self,
+                inputs,
+                timing_ctx,
+            )
+        )
+
+    assert prompt_ids == [9]
+    assert is_update_applied is False
+    # Both modalities were passed to HF after group-miss expansion.
+    parse_kwargs = fake_self.info.parse_mm_data.call_args.args[0]
+    assert parse_kwargs == {"video": ["video-0"], "audio": ["audio-0"]}
+    assert captured["mm_needs_processing"] == {"video": [True], "audio": [True]}
+    assert captured["mm_cache_keys"]["video"][0].startswith("v0-aiv-")
+    assert captured["mm_cache_keys"]["audio"][0].startswith("a0-aiv-")
+    # Semantic hashes (not group keys) are exposed downstream.
+    assert mm_info.hashes == {"video": ["v0"], "audio": ["a0"]}
+
+
+def test_request_video_use_audio_in_video_matches_coupling_inputs():
+    assert _get_request_video_use_audio_in_video({"use_audio_in_video": True}, 2) == [
+        True,
+        True,
+    ]
+    assert _get_request_video_use_audio_in_video(
+        {"use_audio_in_video": [True, False]},
+        2,
+    ) == [True, False]
 
 
 def test_mm_fields_config_keeps_global_use_audio_in_video_shared():
