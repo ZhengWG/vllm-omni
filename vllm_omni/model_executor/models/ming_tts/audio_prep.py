@@ -48,10 +48,16 @@ def coerce_prompt_waveform(value: Any) -> torch.Tensor:
             if tensor.shape[1] == 1:
                 # (samples, 1) column vector is still mono.
                 return tensor.reshape(1, -1).to(torch.float32)
-            # (channels, samples): keep channel 0, matching the torchaudio decode
-            # path in _normalize_prompt_waveform. Flattening would splice the
-            # channels end to end and double the apparent duration.
-            return tensor[:1].to(torch.float32)
+            # Multi-channel audio arrives in both layouts: torchaudio.load
+            # yields (channels, samples), soundfile.read yields (samples,
+            # channels). Any real clip has far more samples than channels, so
+            # the smaller dim is the channel dim. Keep channel 0, matching the
+            # torchaudio decode path in _normalize_prompt_waveform; flattening
+            # would splice the channels end to end and multiply the apparent
+            # duration by the channel count.
+            if tensor.shape[0] > tensor.shape[1]:
+                tensor = tensor.transpose(0, 1)
+            return tensor[:1].contiguous().to(torch.float32)
         raise ValueError(f"Unsupported Ming prompt waveform rank: {tuple(tensor.shape)}")
     if isinstance(value, (list, tuple)):
         parts = [coerce_prompt_waveform(item) for item in value if item is not None]

@@ -52,6 +52,19 @@ def test_stereo_keeps_one_channel_instead_of_splicing():
     torch.testing.assert_close(out, left.reshape(1, 8))
 
 
+def test_samples_first_stereo_is_recognized_by_shape():
+    """soundfile.read yields (samples, channels); it must not be truncated to
+    channel-count samples by assuming a channels-first layout."""
+    left = torch.arange(100, dtype=torch.float32)
+    right = -left
+    waveform = torch.stack([left, right], dim=1)  # (100, 2)
+
+    out = coerce_prompt_waveform(waveform)
+
+    assert out.shape == (1, 100)
+    torch.testing.assert_close(out, left.reshape(1, 100))
+
+
 def test_multi_channel_duration_is_not_inflated():
     """Patch accounting is derived from sample count, so channel splicing doubles it."""
     samples = 44100
