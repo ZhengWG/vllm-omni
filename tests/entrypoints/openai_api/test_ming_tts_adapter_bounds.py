@@ -9,7 +9,10 @@ import pytest
 
 from vllm_omni.entrypoints.openai.tts_adapters.ming_tts import MingTTSAdapter
 from vllm_omni.model_executor.models.ming_tts.config_ming_tts import KEY_MAX_DECODE_STEPS
-from vllm_omni.model_executor.models.ming_tts.constants import STOP_HEAD_MIN_STEPS
+from vllm_omni.model_executor.models.ming_tts.constants import (
+    MIN_SERVABLE_DECODE_STEPS,
+    STOP_HEAD_MIN_STEPS,
+)
 from vllm_omni.model_executor.models.ming_tts.patch_emission import _validate_ming_decode_window
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu, pytest.mark.tts]
@@ -21,6 +24,10 @@ def _validate_engine_side(max_decode_steps: int) -> None:
         min_stop_step=STOP_HEAD_MIN_STEPS,
         default_max_decode_steps=200,
     )
+
+
+def test_adapter_floor_is_the_shared_constant():
+    assert MingTTSAdapter.max_new_tokens_min == MIN_SERVABLE_DECODE_STEPS
 
 
 def test_adapter_floor_is_accepted_by_stage_0():
