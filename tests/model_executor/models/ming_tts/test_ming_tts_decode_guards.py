@@ -58,6 +58,9 @@ class _StubDecoder:
         self.flowloss = _StubFlowLoss(latent)
         self.linear_proj_audio = lambda patch: patch.new_zeros((patch.shape[0], 1, HIDDEN_SIZE))
         self.stop_head = lambda _hidden: stop_logits
+        # Mirrors MingLLMModel.__init__: the flag is resolved once at
+        # construction, not re-read from the environment per decode step.
+        self._debug_checks = ming_tts_debug_checks_enabled()
 
     def _maybe_build_cfm_graph(self, _z_diff_cond: torch.Tensor) -> None:
         return None
@@ -104,6 +107,22 @@ def test_decode_step_skips_finite_guards_by_default(monkeypatch: pytest.MonkeyPa
     _run_decode_step(torch.zeros((1, PATCH_SIZE, LATENT_DIM)))
 
     assert isfinite_calls == 0
+
+
+def test_debug_flag_is_resolved_at_construction_not_per_step(monkeypatch: pytest.MonkeyPatch):
+    """The env var is read once at model init; the decode loop must not consult it."""
+    monkeypatch.delenv(MING_TTS_DEBUG_CHECKS_ENV, raising=False)
+    decoder = _StubDecoder(torch.full((1, PATCH_SIZE, LATENT_DIM), float("nan")), torch.tensor([[0.0, 0.0]]))
+    monkeypatch.setenv(MING_TTS_DEBUG_CHECKS_ENV, "1")
+
+    # Guards stay off for a decoder constructed while the flag was unset.
+    decoder._decode_one_step(
+        hidden_states=torch.zeros((1, HIDDEN_SIZE)),
+        latent_history=torch.zeros((1, HISTORY_PATCH_SIZE, LATENT_DIM)),
+        cfg_scale=2.0,
+        sigma=0.25,
+        temperature=0.0,
+    )
 
 
 def test_decode_step_tolerates_non_finite_latent_by_default(monkeypatch: pytest.MonkeyPatch):

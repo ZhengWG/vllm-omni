@@ -64,6 +64,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
         self.requires_raw_input_tokens = False
         self.model_stage = vllm_config.model_config.model_stage
         self._prompt_encoder = None
+        self._debug_checks = ming_tts_debug_checks_enabled()
 
         if self.model_stage == "llm":
             self.model = init_vllm_registered_model(vllm_config=vllm_config, architectures=["MingLLMModel"])
@@ -230,7 +231,7 @@ class MingTTSForConditionalGeneration(nn.Module, SupportsPP, CustomProcessMixin)
 
         next_embeds = info_dict.get(KEY_NEXT_EMBEDS)
         if isinstance(next_embeds, torch.Tensor) and input_ids.numel() == 1:
-            debug_checks = ming_tts_debug_checks_enabled()
+            debug_checks = self._debug_checks
             if debug_checks and not torch.isfinite(next_embeds).all():
                 raise RuntimeError("Non-finite next_embeds before decode preprocess write.")
             input_embeds[0] = (

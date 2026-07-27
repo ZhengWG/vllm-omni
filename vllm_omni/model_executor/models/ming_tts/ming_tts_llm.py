@@ -106,6 +106,9 @@ class MingLLMModel(nn.Module):
         # MING_CFM_CUDAGRAPH=0 to force the eager flow head.
         self._cfm_graph = None
         self._cfm_graph_enabled = os.environ.get("MING_CFM_CUDAGRAPH", "1") == "1"
+        # Resolved once, like MING_CFM_CUDAGRAPH above: the guards sit on the
+        # per-decode-step path, and flipping them mid-serving is not a use case.
+        self._debug_checks = ming_tts_debug_checks_enabled()
 
     def embed_input_ids(
         self, input_ids: torch.Tensor, inputs_embeds: torch.Tensor | None = None, **_: Any
@@ -392,7 +395,7 @@ class MingLLMModel(nn.Module):
             )
         # [Batch, Hidden] -> [Batch, Time, Hidden] = [B, 1, H] for FlowLoss conditioning.
         z_diff_cond = hidden_states.to(dtype=self.fm_dtype).unsqueeze(1)
-        debug_checks = ming_tts_debug_checks_enabled()
+        debug_checks = self._debug_checks
         if debug_checks and not torch.isfinite(z_diff_cond).all():
             raise RuntimeError("Non-finite z_diff_cond before FlowLoss.sample().")
 
