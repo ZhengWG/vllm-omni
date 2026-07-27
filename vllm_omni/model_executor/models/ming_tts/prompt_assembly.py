@@ -28,6 +28,7 @@ from .config_ming_tts import (
     SAMPLE_RATE,
     VAE_PATCH_SIZE,
 )
+from .constants import MIN_SERVABLE_DECODE_STEPS
 
 DEFAULT_PROMPT = "Please generate speech based on the following description.\n"
 BASE_CAPTION_TEMPLATE: dict[str, Any] = {
@@ -104,7 +105,10 @@ def estimate_decode_steps_for_duration(
 def estimate_decode_step_window_for_duration(duration_seconds: float) -> tuple[int, int]:
     target_steps = estimate_decode_steps_for_duration(duration_seconds)
     min_steps = max(1, target_steps - 3)
-    max_steps = max(min_steps, target_steps + 3)
+    # Never derive a max the engine refuses to serve: a sub-second Duration
+    # hint would otherwise produce max_decode_steps < MIN_SERVABLE_DECODE_STEPS
+    # and fail Stage-0 validation instead of generating short audio.
+    max_steps = max(min_steps, target_steps + 3, MIN_SERVABLE_DECODE_STEPS)
     return min_steps, max_steps
 
 
@@ -121,17 +125,17 @@ def resolve_effective_runtime_controls(
     duration_seconds = parse_duration_seconds(text)
     if duration_seconds is None:
         return controls
-    min_decode_steps, max_decode_steps = estimate_decode_step_window_for_duration(duration_seconds)
+    derived_min, derived_max = estimate_decode_step_window_for_duration(duration_seconds)
 
     # Fill in only the bound the caller left open, and keep the window valid:
     # Stage-0 rejects the request outright when max_decode_steps is below
     # max(stop_head_min_steps + 2, min_decode_steps).
     if not has_explicit_max:
-        controls[KEY_MAX_DECODE_STEPS] = (
-            max(max_decode_steps, int(controls[KEY_MIN_DECODE_STEPS])) if has_explicit_min else max_decode_steps
-        )
+        if has_explicit_min:
+            derived_max = max(derived_max, int(controls[KEY_MIN_DECODE_STEPS]))
+        controls[KEY_MAX_DECODE_STEPS] = derived_max
     if not has_explicit_min:
-        controls[KEY_MIN_DECODE_STEPS] = min(min_decode_steps, int(controls[KEY_MAX_DECODE_STEPS]))
+        controls[KEY_MIN_DECODE_STEPS] = min(derived_min, int(controls[KEY_MAX_DECODE_STEPS]))
     return controls
 
 

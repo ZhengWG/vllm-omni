@@ -51,6 +51,9 @@ AUDIO_FRAME_HOP = 882  # enc input_dim / hop_size / dec output_dim
 # stop_head defaults
 STOP_HEAD_MIN_STEPS = 3
 STOP_HEAD_THRESHOLD = 0.5
+# Smallest ming_max_decode_steps Stage-0 accepts under the default stop-head
+# config: _validate_ming_decode_window rejects max < min_stop_step + 2.
+MIN_SERVABLE_DECODE_STEPS = STOP_HEAD_MIN_STEPS + 2
 
 # FlowLoss sampling defaults
 DEFAULT_CFG = 2.0

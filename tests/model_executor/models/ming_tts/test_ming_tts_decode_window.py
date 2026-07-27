@@ -38,6 +38,18 @@ def test_duration_is_parsed_case_insensitively():
     assert parse_duration_seconds("no hint here") is None
 
 
+@pytest.mark.parametrize("duration_s", [0.05, 0.3, 0.6, 1.0])
+def test_short_duration_hints_still_produce_a_servable_window(duration_s: float):
+    """A sub-second Duration hint must generate short audio, not a ValueError."""
+    controls = resolve_effective_runtime_controls(
+        text=f"Duration: {duration_s}s",
+        runtime_controls=None,
+    )
+
+    assert controls[KEY_MIN_DECODE_STEPS] <= controls[KEY_MAX_DECODE_STEPS]
+    _assert_window_is_servable(controls)
+
+
 def test_both_bounds_derived_when_caller_supplies_neither():
     expected_min, expected_max = estimate_decode_step_window_for_duration(30.0)
 
