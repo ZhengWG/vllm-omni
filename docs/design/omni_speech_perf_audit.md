@@ -206,6 +206,16 @@ of them fail loudly.
 
 Ranked by expected impact per unit of invasiveness. None of these are blocking correctness today.
 
+**Check upstream before starting any of these.** As of late July 2026 the upstream tracker already
+has work in flight that covers parts of this list: an async-chunk / streaming handoff for
+Ming-flash-omni omni-speech (WIP, upstream #4037), a large high-concurrency serving fast-path for
+the Ming-flash-omni talker including CFM-graph restructuring, an admission gate and batched step
+execution (upstream #4060), a port of that talker from its custom `StaticCache` loop to the
+vLLM-native paged path (upstream #4284), and GPU-resident decode state for Ming-omni-tts Stage-0
+(WIP, upstream #4764). Items 1 and 2 below should be read as "review and land the in-flight work"
+rather than "start from scratch"; anything touching `talker_module.py` or
+`ming_flash_omni_talker.py` should expect to rebase over #4060/#4284.
+
 ### 1. Streaming thinker → talker for Ming-flash-omni omni-speech
 
 Currently the largest latency gap in the repo. The work is not a micro-optimization; it needs a
