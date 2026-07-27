@@ -35,6 +35,7 @@ class _StubTalker:
 
     def __init__(self, presets: _StubPresets) -> None:
         self.voice_presets = presets
+        self._warned_missing_voices: set[str] = set()
 
 
 def _preset(**overrides):
@@ -75,6 +76,20 @@ def test_unknown_preset_is_reported(caplog: pytest.LogCaptureFixture):
     assert voice.spk_emb is None
     assert voice.already_projected is False
     assert any("nope" in record.getMessage() for record in caplog.records)
+
+
+def test_unknown_preset_is_reported_once_per_voice(caplog: pytest.LogCaptureFixture):
+    """A missing manifest must not turn into one warning per request."""
+    talker = _StubTalker(_StubPresets({}))
+
+    with caplog.at_level(logging.WARNING):
+        talker._resolve_voice({"voice_name": "nope"})
+        talker._resolve_voice({"voice_name": "nope"})
+        talker._resolve_voice({"voice_name": "also-missing"})
+
+    messages = [record.getMessage() for record in caplog.records]
+    assert sum("nope" in message for message in messages) == 1
+    assert sum("also-missing" in message for message in messages) == 1
 
 
 def test_empty_registry_is_reported(caplog: pytest.LogCaptureFixture):

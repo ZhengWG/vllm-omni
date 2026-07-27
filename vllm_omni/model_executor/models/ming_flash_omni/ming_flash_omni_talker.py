@@ -151,6 +151,9 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
             spk_head=self.spk_head,
             patch_size=self.patch_size,
         )
+        # Voice names already reported as unresolved; one warning per name,
+        # not one per request.
+        self._warned_missing_voices: set[str] = set()
 
     @property
     def device(self) -> torch.device:
@@ -382,10 +385,13 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 already_projected = True
                 if prompt_text is None:
                     prompt_text = preset.get("prompt_text")
-            elif prompt_wav_emb is None:
+            elif prompt_wav_emb is None and voice_name not in self._warned_missing_voices:
                 # Nothing conditions the voice, so _project_spk_emb will fall back
                 # to a zero speaker vector and synthesize in some arbitrary voice.
-                # Say so rather than letting it look like the request was honoured.
+                # Say so rather than letting it look like the request was honoured
+                # — but once per voice name, not once per request: a deployment
+                # whose manifest failed to load would otherwise warn on every call.
+                self._warned_missing_voices.add(voice_name)
                 logger.warning(
                     "Ming talker: voice '%s' is not a registered preset (available: %s); "
                     "synthesizing without speaker conditioning.",
