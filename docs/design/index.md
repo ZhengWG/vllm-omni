@@ -14,6 +14,11 @@ This section contains design documents and architecture specifications for vLLM-
 - [Request-Level Batching for Diffusion](feature/diffusion_request_level_batching.md)
 - [Continuous Batching for Step-Wise Diffusion](feature/diffusion_continuous_batching.md)
 
+## Performance Documents
+
+- [Speech Generation on vLLM-Omni: Performance Optimizations for Qwen3-Omni and Qwen3-TTS](qwen3_omni_tts_performance_optimization.md)
+- [Speech Pipeline Audit: Qwen3-Omni, Ming-flash-omni-2.0, Ming-omni-tts](omni_speech_perf_audit.md)
+
 ## Infrastructure Design Documents
 
 - [Prometheus Metrics](metrics.md)
