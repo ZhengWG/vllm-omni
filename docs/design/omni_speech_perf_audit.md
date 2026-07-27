@@ -187,8 +187,13 @@ of them fail loudly.
   were admitted and then failed inside the engine.
 - `stage_input_processors/ming_tts.py::llm2audio_vae_async_chunk` initialised its bookkeeping by
   assigning over `transfer_manager.request_payload[req_id]`, which the connector owns.
-- Six `torch.isfinite(x).all()` guards ran per decode step on the Stage-0 hot path, each one a
-  device sync (see the *Open items* discussion of host syncs below).
+- Six `torch.isfinite(x).all()` guards run per decode step on the Stage-0 hot path, each one a
+  device sync. Noted for completeness, but deliberately *not* worth fixing on its own: the loop is
+  host-serialised per step anyway (the stop decision reads a scalar back with `.item()`, and the
+  latent history / next-embeds state makes a CPU round-trip between steps), so the marginal cost of
+  the extra syncs is microseconds against a millisecond-scale step. The real fix is making the
+  decode state GPU-resident, which removes the round-trips themselves — upstream has that in
+  flight (#4764).
 
 **Ming-flash-omni-2.0**
 
