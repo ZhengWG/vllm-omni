@@ -9,6 +9,7 @@ This section contains design documents and architecture specifications for vLLM-
 ## Feature Design Documents
 
 - [Disaggregated Inference](feature/disaggregated_inference.md)
+- [Stage Transfer Refactor Plan](feature/stage_transfer_refactor.md)
 - [Ray-based Execution](feature/ray_based_execution.md)
 - [Adding Step Execution Support for Diffusion Pipelines](feature/diffusion_step_execution.md)
 - [Request-Level Batching for Diffusion](feature/diffusion_request_level_batching.md)
