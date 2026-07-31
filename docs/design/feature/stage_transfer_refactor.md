@@ -3,6 +3,8 @@
 > Status: **Proposal** — derived from a deep review of inter-stage cache /
 > payload / KV transfer paths. Incremental consolidation; **not** a rewrite of
 > the Orchestrator / Connector / stage-processor layering.
+>
+> 中文版：[stage_transfer_refactor.zh.md](stage_transfer_refactor.zh.md)
 
 ## Table of Contents
 
