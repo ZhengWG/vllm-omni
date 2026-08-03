@@ -15,6 +15,7 @@ nav:
       - Streaming Video Input: serving/video_stream_api.md
       - Realtime API Comparison: serving/realtime_api_comparison.md
       - Realtime API 对比（中文）: serving/realtime_api_comparison.zh.md
+      - Qwen3-Omni Realtime 现状（中文）: serving/qwen3_omni_realtime_status.zh.md
   - Examples:
     - examples/README.md
     - Offline Inference:
