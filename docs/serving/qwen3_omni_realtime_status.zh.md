@@ -185,50 +185,39 @@ python examples/online_serving/qwen3_omni/streaming_video_client.py \
 - tools / 图像输入（Realtime 路径 function calling、`input_image` item）；
 - WebRTC / SIP / `client_secrets` 传输与鉴权——如有浏览器需求，先以「浏览器 → 网关 → Omni WS」参考架构文档化替代。
 
-### 3.2 全双工：栈本身的能力/缺口 + Qwen3-Omni 的 Gap
+### 3.2 全双工：栈自身缺口 + Qwen3-Omni 的 Gap
 
-半双工路径上的「连续输入 runtime」「barge-in 打断」不再单独补齐——这两项本质是全双工能力，统一放到本节。
+半双工路径上的「连续输入」「barge-in」本质是全双工能力，统一放到本节。
 
-#### 3.2.1 全双工栈本身：已有能力与自身缺口
+#### 3.2.1 栈自身缺口（按影响分级）
 
-框架侧通用能力已就位（约 4:1 的通用/模型专属代码比）：WS actor 单信箱、`DuplexSession` 聚合根、Realtime 投影、resume/takeover、engine control plane + fence、`ServingRuntimeAdapter` 协议注入点。当前唯一 native 接入是 MiniCPM-o 4.5（`minicpmo45/`，约 3k 行适配器），另有独立的 JoyVL 栈。
+通用层已就位（WS actor、`DuplexSession`、Realtime 投影、resume、control plane + fence、adapter 注入点；通用/专属代码约 4:1），当前接入 MiniCPM-o 4.5 与 JoyVL。缺口按「是否卡住关键能力」分级：
 
-栈自身缺口（DESIGN.md「不宣称」清单）：
+**关键（卡「有无」）：**
 
-| # | DESIGN.md 明确未完成 | 含义 |
-| --- | --- | --- |
-| 1 | scheduler-native KV append | 流式追加仍走 resumable request 方案，未进调度器原生路径 |
-| 2 | 确定性 VAD 触发打断 | 打断依赖模型 listen/speak，无 VAD 驱动的确定性打断（硬 barge-in 缺口在此补） |
-| 3 | 生产级多会话 admission/fairness/failure recovery | 仅验证 `max_sessions=2`（H20）；无容量预算与公平性 |
-| 4 | 有界长会话 KV | 长会话 KV 无上界管理 |
-| 5 | 视频输入 / A/V 同步 | duplex Realtime 无视频模态 |
-| 6 | 版本化 plugin descriptor | 接入第二个 native duplex 模型前需先补：目前 MiniCPM 通过两个显式字段选择 engine extension + serving adapter，无开放握手 |
-| 7 | 类型化 session/input-chunk 契约 | 扩展边界仍是 generic mapping，「especially before adding video」 |
+| 缺口 | 为什么关键 |
+| --- | --- |
+| 确定性 VAD 触发打断 | 直接卡 **Qwen 路线 B** 的 barge-in：当前打断只能靠模型 listen/speak 采样，无法保证「用户插话即停」 |
+| 生产级多会话 admission/容量 | 仅验证 `max_sessions=2`，直接卡生产部署规模 |
+| plugin descriptor + 类型化契约 | 直接卡第二个模型接入（DESIGN.md 明确为前置条件） |
 
-#### 3.2.2 Qwen3-Omni 若要支持全双工：Gap 拆解
+**次要（实现路径/扩展，不卡有无）：**
 
-先分清两个命题——**原生全双工**与**全双工体验**不是一条路：
+| 缺口 | 评估 |
+| --- | --- |
+| scheduler-native KV append | **不影响 cache 命中率**——现方案 resumable request 段间保 KV（RUNNING → 段停 → WAITING 保 KV → append 恢复），会话内上下文不重算。真实代价是 parked 请求常驻占 KV 且不可抢占，本质是上面「多会话容量」问题的实现侧原因，不必单独立项 |
+| 有界长会话 KV / 视频输入与 A/V 同步 | 既有能力上的扩展，暂缓 |
 
-| 路线 | 决策来源 | Qwen3-Omni 可行性 |
-| --- | --- | --- |
-| **原生全双工**（MiniCPM 式） | 模型采样 `<|listen|>`/`<|speak|>`/`<|turn_eos|>` 控制 token | ❌ **第一性 Gap 在模型**：Qwen3-Omni 是 turn-based 训练，词表/训练目标里没有 listen/speak 时分复用机制，框架适配无法凭空造出该能力 |
-| **VAD 驱动的全双工体验**（OpenAI gpt-realtime 式） | 服务端 VAD 判停 → 自动 commit/response → VAD interrupt 打断 | ✅ 现实路径，即 3.1 #1 做深 |
+#### 3.2.2 Qwen3-Omni 的 Gap
 
-**路线 A（原生）** 的 Gap 链，按依赖顺序：
+原生全双工走不通：Qwen3-Omni 是 turn-based 训练，无 listen/speak 控制 token，框架适配造不出模型能力。**现实路径是 VAD 驱动的全双工体验**（与 OpenAI gpt-realtime 同构），Gap 链：
 
-1. **模型能力（前提，非框架工作）**：需要 duplex 训练目标的 Qwen 变体——listen/speak 控制 token + unit 化流式输入训练。此项不存在，后续都无从谈起；
-2. 框架前置债：3.2.1 #6/#7（plugin descriptor + 类型化契约），DESIGN.md 明确要求在第二个 native 模型接入前完成；
-3. Qwen 版适配器（对照 `minicpmo45/` 约 3k 行）：帧率契约 policy、Stage0 流式 prefill（unit 拼装 + KV 连续 + terminator 重注入）、data plane 输出判定（listen/speak/turn_eos 识别）、engine runtime extension、输入规整；
-4. 对等测试 + 实机 E2E 验证（参照 MiniCPM 的 H20 验证记录，成本不低）。
+1. 服务端 VAD / `turn_detection`（即 3.1 #1）：判停 → 自动 commit + 自动 response；
+2. 连续输入会话：播放期间持续收音（协议改造，可复用 duplex 栈流式 append）；
+3. VAD interrupt barge-in：插话 → cancel 回合 + 截断音频——依赖 3.2.1 的「确定性 VAD 打断」；
+4. 局限：接话时机是 VAD 规则，非模型语义决策。
 
-**路线 B（VAD 体验）** 的 Gap 链（不依赖模型改造）：
-
-1. 服务端 VAD / `turn_detection`（3.1 #1）：语音起止检测 + 自动 commit + 自动 response；
-2. 连续输入会话：播放期间持续收音（半双工协议改造，可借鉴 duplex 栈的流式 append，不必等 scheduler-native KV）；
-3. VAD interrupt barge-in：检测到用户插话 → cancel 当前回合 + 截断音频输出；
-4. 局限须明示：接话/打断时机是 VAD 规则而非模型语义决策，无法做到「听懂了再决定接不接话」。
-
-**结论**：Qwen3-Omni 的全双工短期走 **路线 B**（纯框架工程，体验对齐 OpenAI 默认形态）；路线 A 取决于模型侧是否推出 duplex 训练版本，框架侧仅需提前还掉 3.2.1 #6/#7 的债。duplex 栈的直接适用对象是 MiniCPM 之外的下一个 native duplex 模型（如 Moshi/PersonaPlex 系，注意其「并行音频流」范式与 MiniCPM「1s unit」差异较大，适配器需按新范式重写）。
+原生路线挂起，等模型侧 duplex 训练版本；届时框架只需先还掉 plugin descriptor/类型化契约的债，再写 Qwen 适配器（对照 `minicpmo45/` 约 3k 行）。
 
 ### 3.3 `/v1/video/chat/stream` 功能补齐确认
 
