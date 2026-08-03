@@ -172,32 +172,36 @@ python examples/online_serving/qwen3_omni/streaming_video_client.py \
 
 ### 3.1 `/v1/realtime`（Qwen 语音）待补齐
 
+收敛为三项核心工作（半双工体验增强、打断等归入 3.2 全双工统一实现）：
+
 | # | 现状证据 | 需要补齐 |
 | --- | --- | --- |
 | 1 | 客户端必须 `commit(final=true)` 才结束输入；无 `speech_started/stopped` | **服务端 VAD / `turn_detection`**（server_vad 起步，semantic 进阶），支持自动 commit + 自动 response |
-| 2 | 事件面只有 `transcription.*` + `response.audio.*` | **Conversation/Response 生命周期投影**：`conversation.item.*`、`response.created/done`、content part 事件 |
-| 3 | 事件名为旧形态 `response.audio.delta` | **GA 命名对齐**：`response.output_audio.delta`、`response.output_audio_transcript.delta`、嵌套 `session.audio.input/output` 配置 |
-| 4 | `recipes/Qwen/Qwen3-Omni.md`：`/v1/realtime` 在 `async_chunk` 开启时不可用，需 `--no-async-chunk` | **兼容 async_chunk** 或在服务端自动降级，而不是要求用户改部署 |
-| 5 | 半双工：输入关闭后才有完整输出回合 | **连续输入 runtime**（参照 duplex 栈的流式 append / KV 连续思路）供 Qwen 使用 |
-| 6 | 无打断语义 | **Barge-in**：至少支持客户端显式 cancel 现有回合并截断音频 |
-| 7 | 无 tools / 图像 | Realtime 路径的 **function calling 执行** 与 `input_image` item |
-| 8 | 无 WebRTC/SIP/`client_secrets` | 传输与鉴权补齐（或官方文档化「浏览器 → 网关 → Omni WS」参考架构） |
+| 2 | `recipes/Qwen/Qwen3-Omni.md`：`/v1/realtime` 在 `async_chunk` 开启时不可用，需 `--no-async-chunk` | **兼容 async_chunk** 或在服务端自动降级，而不是要求用户改部署 |
+| 3 | 事件面只有 `transcription.*` + `response.audio.*`，且事件名为旧形态（`response.audio.delta`） | **协议对齐（一揽子）**：Conversation/Response 生命周期投影（`conversation.item.*`、`response.created/done`、content part 事件）+ GA 命名（`response.output_audio.delta`、`response.output_audio_transcript.delta`）+ 嵌套 `session.audio.input/output` 配置。事件面与事件名同属协议册内容，应作为一个协议版本一次性对齐，避免两次破坏性变更 |
+
+低优先（当前不投入）：
+
+- tools / 图像输入（Realtime 路径 function calling、`input_image` item）；
+- WebRTC / SIP / `client_secrets` 传输与鉴权——如有浏览器需求，先以「浏览器 → 网关 → Omni WS」参考架构文档化替代。
 
 ### 3.2 全双工（若目标是 Qwen 全双工）
+
+半双工路径上的「连续输入 runtime」「barge-in 打断」不再单独补齐——这两项本质是全双工能力，统一放到本节实现（Qwen 接入 duplex 栈后自然获得连续 append 与软打断）。
 
 全双工栈当前绑定 MiniCPM，DESIGN.md「不宣称」清单即差距清单：
 
 | # | DESIGN.md 明确未完成 | 含义 |
 | --- | --- | --- |
 | 1 | scheduler-native KV append | 流式追加仍走 resumable request 方案，未进调度器原生路径 |
-| 2 | 确定性 VAD 触发打断 | 打断依赖模型 listen/speak，无 VAD 驱动的确定性打断 |
+| 2 | 确定性 VAD 触发打断 | 打断依赖模型 listen/speak，无 VAD 驱动的确定性打断（硬 barge-in 缺口在此补） |
 | 3 | 生产级多会话 admission/fairness/failure recovery | 仅验证 `max_sessions=2`（H20）；无容量预算与公平性 |
 | 4 | 有界长会话 KV | 长会话 KV 无上界管理 |
 | 5 | 视频输入 / A/V 同步 | duplex Realtime 无视频模态 |
 | 6 | 版本化 plugin descriptor | 接入第二个 native duplex 模型（**如 Qwen**）前需先补：目前 MiniCPM 通过两个显式字段选择 engine extension + serving adapter，无开放握手 |
 | 7 | 类型化 session/input-chunk 契约 | 扩展边界仍是 generic mapping，「especially before adding video」 |
 
-对 Qwen 的直接含义：**「Qwen 全双工」不是开关，而是新适配器**——需要实现 Qwen 版 `ServingRuntimeAdapter` + engine extension（对应 MiniCPM 的 `minicpmo45/` 目录），并优先补上第 6/7 项的插件与类型化契约。
+对 Qwen 的直接含义：**「Qwen 全双工」不是开关，而是新适配器**——需要实现 Qwen 版 `ServingRuntimeAdapter` + engine extension（对应 MiniCPM 的 `minicpmo45/` 目录），并优先补上第 6/7 项的插件与类型化契约；连续输入（流式 append / KV 连续）与打断语义随适配器接入一并落地。
 
 ### 3.3 `/v1/video/chat/stream` 功能补齐确认
 
@@ -221,8 +225,8 @@ python examples/online_serving/qwen3_omni/streaming_video_client.py \
 
 ### 3.4 建议优先级（Qwen 视角）
 
-1. **`/v1/realtime` 加服务端 VAD + async_chunk 兼容**（3.1 #1/#4）：不改架构即可显著接近 OpenAI 默认体验；
-2. **GA 事件/配置对齐**（3.1 #2/#3）：让 OpenAI 生态客户端低成本迁移；
+1. **`/v1/realtime` 加服务端 VAD + async_chunk 兼容**（3.1 #1/#2）：不改架构即可显著接近 OpenAI 默认体验；
+2. **协议一揽子对齐**（3.1 #3）：事件面 + GA 命名 + session 配置结构一次性升级，让 OpenAI 生态客户端低成本迁移；
 3. **`/v1/video/chat/stream` 的 KV 复用与自动触发**（3.3 #1/#2）：这是「视频流理解」从 demo 到实用的关键；
-4. **Duplex 插件化 + Qwen 适配器**（3.2 #6/#7 → 新 adapter）：Qwen 全双工的前置工程；
-5. WebRTC/鉴权（3.1 #8）：可后置，先文档化网关参考架构。
+4. **Duplex 插件化 + Qwen 适配器**（3.2 #6/#7 → 新 adapter，含连续输入与打断）：Qwen 全双工的主体工程；
+5. 低优先搁置：tools / 图像 / WebRTC / SIP / `client_secrets`（如有浏览器需求先文档化网关参考架构）。
