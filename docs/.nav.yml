@@ -14,6 +14,7 @@ nav:
       - Audio Generation: serving/audio_generate_api.md
       - Streaming Video Input: serving/video_stream_api.md
       - Realtime API Comparison: serving/realtime_api_comparison.md
+      - Realtime API 对比（中文）: serving/realtime_api_comparison.zh.md
   - Examples:
     - examples/README.md
     - Offline Inference:
