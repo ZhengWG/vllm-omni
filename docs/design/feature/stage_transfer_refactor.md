@@ -327,3 +327,61 @@ roles) fail at config load.
 5. `refactor(stage-transfer): P2 StageTransferFacade + module split`
 6. `refactor(stage-transfer): P2 StageEdgeSpec + legacy derive`
 7. Follow-ups: D2D / metrics / processor helper extraction as separate tracks
+
+---
+
+## Appendix A: AR gaps and major incomplete features
+
+Complements Phases 0–3: the body focuses on transfer correctness/consolidation;
+this appendix catalogs broader AR capability gaps for scheduling.
+
+### A.1 Framework-level AR issues
+
+| Issue | Today | Track |
+| --- | --- | --- |
+| Omni Prefix single kv-group only | Multi-group warns but still uses `block_table[0]` | Phase 0 disable → later real support |
+| Prefix × async output / speculative mutex | `_should_use_async_omni_output` disables on either | F2 Prefix safety profile |
+| D2H2D transport | All connectors host-bounce | Phase 3 / F3 |
+| Fragile async_chunk abort state | Scheduler realign/purge patches; adapter ≠ coordinator | F4 |
+| Offline may exit before transfer done | `_free_request` TODO | F4 |
+| Generation stages ignore Omni Prefix | code2wav etc. | Keep; do not force-unify |
+| Non-AR async_chunk audio-code filter | Chunks without codes may drop silently | F4 |
+
+### A.2 Model onboarding friction
+
+1. Talkers that need only last-token must opt out of full-hidden merge (Qwen3-TTS / Higgs pattern).
+2. Deferred mm keys (e.g. `codes.audio`) required to avoid batching regressions.
+3. Most deploys keep `enable_prefix_caching: false` — enabling needs per-model validation.
+4. Private glue: three processor entry styles; Phase 2 helper extraction.
+5. Uneven capabilities (`batch=1` paths; talker-specific MTP graphs).
+
+### A.3 Major features (priority order)
+
+| ID | Feature | Depends on | Invasiveness |
+| --- | --- | --- | --- |
+| F1 | Stage Transfer consolidation (Phases 0–2) | — | Med (in flight) |
+| F2 | Omni Prefix safety profile + multi-group policy | F1 P0 | Med |
+| F3 | D2D transport | F1 P1 cleanup | Med–High |
+| F4 | Generalize async_chunk (non-audio edges, adapter unify, offline drain) | F1 P1–P2 | Med–High |
+| F5 | Omni-semantic AR PD (kv_ready vs PD, multimodal PD) | F1 P1 | Med |
+| F6 | AR-Diffusion session KV productization (`max_num_seqs>1`, multi-session; #5244) | Weak / parallel; cross-stage after F1 | High |
+| F7 | Cross-AR-stage unified cache policy (what is reusable / when invalid) | F1 EdgeSpec + F2 | High, long-term |
+
+### A.4 Sequencing
+
+```text
+F1 P0 → F1 P1 → F1 P2
+          ├→ F2 Prefix profile
+          ├→ F5 Omni PD
+          └→ F3 D2D (can overlap late F2)
+                 └→ F4 async_chunk generalization
+                        └→ F7 unified cache policy (long-term)
+
+F6 AR-Diffusion ‖ F1; cross-stage KV after F1 façade is stable
+```
+
+### A.5 Out of scope here
+
+- Reusing KV/hidden/prefix **contents** across different models.
+- Folding Diffusion step caches into AR stage transfer.
+- Forcing OmniTensorPrefixCache onto code2wav/generation stages.

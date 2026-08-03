@@ -310,3 +310,104 @@ stage_args:
 5. `refactor(stage-transfer): P2 StageTransferFacade + module split`
 6. `refactor(stage-transfer): P2 StageEdgeSpec + legacy derive`
 7. Follow-ups：D2D / metrics / processor helper 抽取作为独立轨道
+
+---
+
+## 附录 A：AR 侧问题与待补全大特性
+
+本附录把「Prefix / Stage Transfer 之外，AR 类模型还缺什么」收成可排期清单。
+与正文 Phase 0–3 互补：正文偏传输正确性与收束；此处偏 AR 能力缺口。
+
+### A.1 框架层问题（一类 AR 共性）
+
+| 问题 | 现状 | 建议归属 |
+| --- | --- | --- |
+| Omni Prefix 仅单 kv-group | 多 group 只 warning，仍用 `block_table[0]` | Phase 0（先禁用 merge）→ 后续真支持另开特性 |
+| Prefix × async output / speculative 互斥 | `_should_use_async_omni_output` 遇 prefix 或 speculative 直接关 | Prefix 安全 profile（附录 A.3-F2） |
+| 传输 D2H2D | Connector 全路径 host 中转 | Phase 3 / A.3-F3 |
+| async_chunk abort 状态脆 | scheduler realign/purge 已打补丁，adapter 与 coordinator 未统一 | A.3-F4 |
+| Offline 结束早于传完 | `_free_request` 有 TODO | A.3-F4 |
+| Generation 下游不吃 Omni Prefix | code2wav 等走 generation runner | 保持；勿强行统一 |
+| 非 AR async_chunk 过滤假设 | 无音频码 chunk 可能被静默丢 | A.3-F4 |
+
+### A.2 模型接入摩擦（接新 AR 时常踩）
+
+1. **语义 opt-out**：只要 last-token 的 talker 必须关 full-hidden merge（Qwen3-TTS / Higgs 模式），否则 D2H 回归。
+2. **deferred mm keys**：`codes.audio` 等需请求结束再写 prefix，否则挡 batching。
+3. **默认关**：多数 deploy `enable_prefix_caching: false`；开 = 要单独测。
+4. **胶水私有**：`stage_input_processors` 三套入口（token_only / full_payload / async_chunk），新模型成本高 → Phase 2 helper 抽取。
+5. **能力参差**：部分路径 `batch=1`；MTP/CUDA graph 偏 talker 特化，非通用 AR 能力。
+
+### A.3 待补全大特性（按建议优先级）
+
+#### F1 — Stage Transfer 收束（进行中）
+
+- **范围**：正文 Phase 0–2（正确性 → 生命周期 → Facade + EdgeSpec）。
+- **依赖**：无。
+- **为何第一**：不修完，后面 Prefix/D2D/PD 都会踩同一批竞态与 cleanup 坑。
+
+#### F2 — Omni Prefix 安全 profile + 能力补全
+
+- **范围**：
+  - 文档化「何时可开」矩阵：单 kv-group / 无 speculative / 模型 opt-out 标志齐全。
+  - multi-kv-group：短期硬禁用 merge；中期真支持或明确 unsupported。
+  - 与 async scheduling / speculative 的共存策略（今日互斥可保留，但要配置期 fail-fast）。
+  - 可选：更深 async write ring（profiling 证明瓶颈后再做）。
+- **依赖**：F1 Phase 0（slot 竞态、multi-group 禁用）先合。
+- **侵入性**：中（runner + prefix_cache + 配置校验）；不改 Orchestrator 拓扑。
+
+#### F3 — D2D 传输
+
+- **范围**：大 KV / hidden 的 NCCL、UCX 或 IPC connector；保留 `put`/`get` 外观。
+- **依赖**：F1 Phase 1 cleanup 语义稳定后再接，避免 D2D buffer 泄漏难查。
+- **侵入性**：中高（新 connector + 设备内存生命周期）；与正文 Phase 3-1 同一轨道。
+
+#### F4 — async_chunk 通用化
+
+- **范围**：
+  - chunk adapter 与 input_coordinator 统一（scheduler TODO）。
+  - abort / offline「传完再退出」闭环。
+  - 非音频 AR 边：去掉「无 audio codes 就丢」的硬编码，改为 edge/payload schema 驱动。
+  - 多副本与 prewarm 幂等（与正文 P1/P2 Orchestrator 项重叠）。
+- **依赖**：F1 Phase 1–2（edge role、cleanup）。
+- **侵入性**：中高（scheduler + mixin/facade + 多模型 processor）。
+
+#### F5 — Omni 语义下的 AR Prefill–Decode 分离
+
+- **范围**：PD 与 omni `kv_ready` / mm 输出交接互斥策略；多模态 PD 可用路径。
+- **依赖**：F1 Phase 1（PD vs kv_ready 策略）+ 稳定 KV cleanup。
+- **侵入性**：中（Orchestrator 策略 + 少量 runner）；不先做跨模型 cache 共享。
+
+#### F6 — AR-Diffusion 会话 KV（实验 → 可产品化）
+
+- **范围**：今日 `max_num_seqs=1`、单 session 驻留；后续 batch/step、多 session、与多 stage KV manager（#5244）对齐。
+- **依赖**：与 F1 弱相关；可并行，但跨 stage KV 部分应等 F1 Facade 稳定。
+- **侵入性**：高（独立 runner/能力面）；保持实验边界，勿并进 OmniTensorPrefixCache。
+
+#### F7 — 跨 AR stage 的统一 cache 策略（产品级）
+
+- **范围**：声明「哪些中间态可复用、何时失效」（KV / prefix tensor / payload），而不仅是每 stage 私有池 + connector 搬运。
+- **依赖**：F1 EdgeSpec + F2 Prefix profile；否则策略无法表达。
+- **侵入性**：高；属中长期，不阻塞 F1–F4。
+
+### A.4 推荐排期（技术依赖序）
+
+```text
+F1 Phase0 ──► F1 Phase1 ──► F1 Phase2
+                 │              │
+                 ├─► F2 Prefix profile
+                 ├─► F5 Omni PD
+                 └─► F3 D2D（可与 F2 后期并行）
+                        │
+                        └─► F4 async_chunk 通用化（需 EdgeSpec）
+                               │
+                               └─► F7 统一 cache 策略（中长期）
+
+F6 AR-Diffusion ── 与 F1 并行；跨 stage 部分挂 F1 之后
+```
+
+### A.5 明确不做（本附录边界）
+
+- 跨不同模型复用 KV / hidden / prefix **内容**。
+- 把 Diffusion step cache（Cache-DiT 等）并进 AR stage transfer。
+- 为「看起来对称」强行让 code2wav 使用 OmniTensorPrefixCache。
