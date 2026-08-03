@@ -221,29 +221,20 @@ python examples/online_serving/qwen3_omni/streaming_video_client.py \
 
 ### 3.3 `/v1/video/chat/stream` 功能补齐确认
 
-结论：**核心链路可用，但以下缺口未补齐**（来源：`docs/serving/video_stream_api.md` Known Limitations + 代码）：
+结论：**核心链路可用，需要补齐的关键能力两项**（来源：`docs/serving/video_stream_api.md` Known Limitations + 代码）：
 
-| # | 现状证据 | 状态 | 需要补齐 |
-| --- | --- | --- | --- |
-| 1 | 文档：Session KV reuse / incremental prefill「not implemented in this PR」；每次 `video.query` 从缓冲重建 prompt | ❌ 未补 | 会话级 KV 复用 / 增量 prefill，把「推帧」变成真正的增量上下文而非重复编码 |
-| 2 | `QwenOmniStreamingVideoHandler.should_trigger_turn` 恒 `False` | ❌ 未补 | 自动轮次触发（帧数/时间/语音触发），基类 hook 已预留 |
-| 3 | `create_streaming_video_handler` 注释：「Additional pipelines can be selected here in follow-up PRs」 | ❌ 未补 | 多 pipeline 选择（当前只返回 Qwen handler） |
-| 4 | 文档：连续短回合可能触发 engine 调度竞态，建议轮间 ≥200ms | ❌ 未修 | 修复调度竞态，移除客户端侧规避 |
-| 5 | 音频缓冲溢出即报错并**清空**当前音频 | ⚠️ 行为粗糙 | 环形音频缓冲或背压，而不是整体丢弃 |
-| 6 | 历史仅取最近 2 条且文本化 | ⚠️ 设计取舍 | 可配置历史深度 / 多模态历史（依赖 #1 的 KV 能力才划算） |
-| 7 | 文档：接口面向 Qwen3-Omni，其他模型 mm processor 参数不保证 | ⚠️ 范围限制 | 模型能力探测或显式 capability 声明 |
-| 8 | 输入只支持 JPEG/PNG 帧 + PCM16 音频 | ⚠️ 范围限制 | 如需真视频流（H.264/fMP4 输入、帧时间戳对齐）需扩协议 |
+| # | 现状证据 | 需要补齐 |
+| --- | --- | --- |
+| 1 | Session KV reuse / incremental prefill 未实现；每次 `video.query` 从缓冲重建多模态 prompt，重复编码全部帧 | **会话级 KV 复用 / 增量 prefill**：把「推帧」变成真正的增量上下文，这是从 demo 到实用的性能关键 |
+| 2 | `QwenOmniStreamingVideoHandler.should_trigger_turn` 恒 `False`：每帧入缓冲后基类会询问该钩子是否自动起一轮推理，Qwen 实现固定不触发，**只支持手动 `video.query`** | **自动轮次触发**（按帧数/时间/语音触发，支撑 proactive 场景），基类 hook 已预留，补齐成本低 |
 
-另外两处易混淆点确认：
-
-- `session.prompt_update` 「not supported yet」属于 **`/v1/realtime/video`（视频生成输出）**，不是 `/v1/video/chat/stream`；
-- `/v1/realtime/video` 当前仅 text-only 输入、`m4s` 单格式，image/reference 输入未纳入（README 明确）。
+不列入本轮范围：仅支持 Qwen pipeline 属预期（无多模型诉求）；调度竞态（轮间 ≥200ms 规避）、音频缓冲溢出行为、历史深度、输入格式扩展等 bug-fix/行为优化项暂不跟进。
 
 ### 3.4 建议优先级（Qwen 视角）
 
-1. **`/v1/realtime` 加服务端 VAD + async_chunk 兼容**（3.1 #1/#2）：不改架构即可显著接近 OpenAI 默认体验，也是 3.2.2 路线 B 的第一步；
+1. **`/v1/realtime` 加服务端 VAD + async_chunk 兼容**（3.1 #1/#2）：不改架构即可显著接近 OpenAI 默认体验，也是 3.2.2 的第一步；
 2. **协议一揽子对齐**（3.1 #3）：事件面 + GA 命名 + session 配置结构一次性升级，让 OpenAI 生态客户端低成本迁移；
-3. **VAD 双工体验闭环**（3.2.2 路线 B #2/#3）：连续输入会话 + VAD interrupt 打断，Qwen 全双工体验的落地路径；
+3. **VAD 双工体验闭环**（3.2.2 #2/#3，依赖 3.2.1「确定性 VAD 打断」）：连续输入会话 + VAD interrupt，Qwen 全双工体验落地路径；
 4. **`/v1/video/chat/stream` 的 KV 复用与自动触发**（3.3 #1/#2）：这是「视频流理解」从 demo 到实用的关键；
-5. **Duplex 栈插件化**（3.2.1 #6/#7）：为下一个 native duplex 模型接入还债；Qwen 原生全双工（路线 A）挂起，等模型侧 duplex 训练版本；
+5. **Duplex 栈关键缺口**（3.2.1：多会话容量、插件化契约）：生产化与第二模型接入的前置；Qwen 原生全双工挂起，等模型侧 duplex 训练版本；
 6. 低优先搁置：tools / 图像 / WebRTC / SIP / `client_secrets`（如有浏览器需求先文档化网关参考架构）。
