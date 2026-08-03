@@ -221,12 +221,13 @@ python examples/online_serving/qwen3_omni/streaming_video_client.py \
 
 ### 3.3 `/v1/video/chat/stream` 功能补齐确认
 
-结论：**核心链路可用，需要补齐的关键能力两项**（来源：`docs/serving/video_stream_api.md` Known Limitations + 代码）：
+结论：**核心链路可用，关键缺口一项**（来源：`docs/serving/video_stream_api.md` Known Limitations + 代码）：
 
 | # | 现状证据 | 需要补齐 |
 | --- | --- | --- |
 | 1 | Session KV reuse / incremental prefill 未实现；每次 `video.query` 从缓冲重建多模态 prompt，重复编码全部帧 | **会话级 KV 复用 / 增量 prefill**：把「推帧」变成真正的增量上下文，这是从 demo 到实用的性能关键 |
-| 2 | `QwenOmniStreamingVideoHandler.should_trigger_turn` 恒 `False`：每帧入缓冲后基类会询问该钩子是否自动起一轮推理，Qwen 实现固定不触发，**只支持手动 `video.query`** | **自动轮次触发**（按帧数/时间/语音触发，支撑 proactive 场景），基类 hook 已预留，补齐成本低 |
+
+低优先：自动轮次触发（`should_trigger_turn` 恒 `False`，当前只支持手动 `video.query`；hook 已预留，如后续有 proactive 场景诉求再补，且规则触发的「开口时机」并非模型智能，价值有限）。
 
 不列入本轮范围：仅支持 Qwen pipeline 属预期（无多模型诉求）；调度竞态（轮间 ≥200ms 规避）、音频缓冲溢出行为、历史深度、输入格式扩展等 bug-fix/行为优化项暂不跟进。
 
@@ -235,6 +236,6 @@ python examples/online_serving/qwen3_omni/streaming_video_client.py \
 1. **`/v1/realtime` 加服务端 VAD + async_chunk 兼容**（3.1 #1/#2）：不改架构即可显著接近 OpenAI 默认体验，也是 3.2.2 的第一步；
 2. **协议一揽子对齐**（3.1 #3）：事件面 + GA 命名 + session 配置结构一次性升级，让 OpenAI 生态客户端低成本迁移；
 3. **VAD 双工体验闭环**（3.2.2 #2/#3，依赖 3.2.1「确定性 VAD 打断」）：连续输入会话 + VAD interrupt，Qwen 全双工体验落地路径；
-4. **`/v1/video/chat/stream` 的 KV 复用与自动触发**（3.3 #1/#2）：这是「视频流理解」从 demo 到实用的关键；
+4. **`/v1/video/chat/stream` 的 KV 复用**（3.3 #1）：这是「视频流理解」从 demo 到实用的关键；
 5. **Duplex 栈关键缺口**（3.2.1：多会话容量、插件化契约）：生产化与第二模型接入的前置；Qwen 原生全双工挂起，等模型侧 duplex 训练版本；
-6. 低优先搁置：tools / 图像 / WebRTC / SIP / `client_secrets`（如有浏览器需求先文档化网关参考架构）。
+6. 低优先搁置：自动轮次触发（proactive）、tools / 图像 / WebRTC / SIP / `client_secrets`（如有浏览器需求先文档化网关参考架构）。
