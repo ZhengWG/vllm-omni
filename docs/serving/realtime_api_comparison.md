@@ -1,5 +1,7 @@
 # Realtime APIs: OpenAI vs vLLM-Omni
 
+> 中文版：[Realtime API 对比：OpenAI 与 vLLM-Omni](realtime_api_comparison.zh.md)
+
 This guide explains how [OpenAI Realtime](https://developers.openai.com/api/docs/guides/realtime) works (transports, session model, events, concrete usage), then maps that design onto the realtime-related surfaces in vLLM-Omni. Use it to choose the right endpoint and to understand what is compatible versus deliberately different.
 
 !!! note "Scope"
