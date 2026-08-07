@@ -52,6 +52,48 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
         return False
 
+    @staticmethod
+    def _build_frame_image_parts(
+        frames: list[str],
+        prewarmed_frames: dict[str, tuple[Any, str]] | None,
+    ) -> list[dict[str, Any]]:
+        """Frame parts with arrival-time uuids so warmup and query prompts
+        hash every frame identically (a hash mismatch would void the warmed
+        prefix from that frame onward)."""
+        prewarmed = prewarmed_frames or {}
+        parts: list[dict[str, Any]] = []
+        for frame_b64 in frames:
+            cached = prewarmed.get(frame_b64)
+            if cached is _BAD_FRAME:
+                continue
+            if cached is not None:
+                pil, mm_uuid = cached
+                if pil is not None:
+                    parts.append(
+                        {
+                            "type": "image_pil",
+                            "image_pil": pil,
+                            "uuid": mm_uuid,
+                        }
+                    )
+                    continue
+                # PIL prewarm not finished: same uuid over the base64 payload.
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+                        "uuid": mm_uuid,
+                    }
+                )
+                continue
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+                }
+            )
+        return parts
+
     def build_engine_prompt(
         self,
         config: StreamingVideoSessionConfig,
@@ -61,36 +103,21 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         query_text: str,
         prewarmed_frames: dict[str, tuple[Any, str]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        n_buf = len(frame_buffer)
-        if n_buf <= config.num_frames:
+        if self._incremental_prefill_active(config):
+            # Every retained frame joins the context in arrival order — the
+            # same sequence the warmup prefilled, so the prefix cache covers
+            # it. Query-time subsampling would break that correspondence.
             frames = list(frame_buffer)
         else:
-            stride = max(1, n_buf // config.num_frames)
-            idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-            frames = [frame_buffer[i] for i in idx]
-
-        prewarmed = prewarmed_frames or {}
-        user_content: list[dict] = []
-        for frame_b64 in frames:
-            cached = prewarmed.get(frame_b64)
-            if cached is _BAD_FRAME:
-                continue
-            if cached is not None:
-                pil, pil_uuid = cached
-                user_content.append(
-                    {
-                        "type": "image_pil",
-                        "image_pil": pil,
-                        "uuid": pil_uuid,
-                    }
-                )
+            n_buf = len(frame_buffer)
+            if n_buf <= config.num_frames:
+                frames = list(frame_buffer)
             else:
-                user_content.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                    }
-                )
+                stride = max(1, n_buf // config.num_frames)
+                idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
+                frames = [frame_buffer[i] for i in idx]
+
+        user_content: list[dict] = self._build_frame_image_parts(frames, prewarmed_frames)
 
         if len(audio_buffer) > 0:
             wav_b64 = self._pcm_to_wav_b64(bytes(audio_buffer))
@@ -113,9 +140,16 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         if config.system_prompt:
             messages.append({"role": "system", "content": config.system_prompt})
 
-        recent_history = message_history[-2:] if len(message_history) > 2 else message_history
-        for hist_msg in recent_history:
-            messages.append(self._text_only_message(hist_msg))
+        if self._incremental_prefill_active(config):
+            # Append-only multimodal history: committed turns are replayed
+            # verbatim (same PIL objects / uuids), so the rendered prompt is a
+            # strict extension of the previous turn and the engine's prefix
+            # cache reuses their KV instead of re-encoding every frame.
+            messages.extend(message_history)
+        else:
+            recent_history = message_history[-2:] if len(message_history) > 2 else message_history
+            for hist_msg in recent_history:
+                messages.append(self._text_only_message(hist_msg))
 
         messages.append(user_message)
 
@@ -129,6 +163,26 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     ) -> None:
         message_history.append(user_message)
         message_history.append({"role": "assistant", "content": response_text})
+
+    def build_warmup_messages(
+        self,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        message_history: list[dict[str, Any]],
+        prewarmed_frames: dict[str, tuple[Any, str]],
+    ) -> list[dict[str, Any]] | None:
+        """History + a frames-only user turn: a strict prefix (up to the last
+        vision token) of the prompt the next query will submit."""
+        frame_parts = self._build_frame_image_parts(frame_buffer, prewarmed_frames)
+        if not frame_parts:
+            return None
+
+        messages: list[dict[str, Any]] = []
+        if config.system_prompt:
+            messages.append({"role": "system", "content": config.system_prompt})
+        messages.extend(message_history)
+        messages.append({"role": "user", "content": frame_parts})
+        return messages
 
     _build_messages = build_engine_prompt
 
