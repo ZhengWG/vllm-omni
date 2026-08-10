@@ -1224,11 +1224,10 @@ class OmniStreamingVideoHandler:
         upcoming query prompt: vision encode + prefill happen at frame-arrival
         time, so the query only pays for its own text suffix.
         """
+        from vllm import SamplingParams
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
         )
-
-        from vllm import SamplingParams
 
         request_kwargs: dict[str, Any] = {
             "model": config.model or "default",
