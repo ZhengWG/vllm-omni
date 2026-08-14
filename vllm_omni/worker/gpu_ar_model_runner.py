@@ -790,6 +790,73 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states_cpu=hidden_states_cpu,
             )
 
+    def _hit_blocks_written_this_step(self, num_scheduled_tokens: dict[str, int]) -> bool:
+        """True when one request fills a block this step and another hits it.
+
+        That pair is the only case needing the pending write landed before the
+        merge: vLLM commits block hashes optimistically at allocation, so a
+        request scheduled later in the same step can hit blocks the earlier one
+        has not written yet. Hits on blocks filled in earlier steps are already
+        in the mirror, and a block only partly written this step carries no
+        hash, so neither can collide. Block granularity is exact here — a slot
+        never straddles blocks.
+
+        The checks below are ordered cheapest-first; the deciding one is the
+        final intersection of hit blocks with blocks completed this step.
+        """
+        cache = self.omni_prefix_cache
+        hit_ids = cache.new_req_cache_hit_ids()
+        if not hit_ids or not cache.has_pending_write():
+            return False
+
+        block_size = self.cache_config.block_size
+        computed = self.input_batch.num_computed_tokens_cpu
+
+        # Blocks completed this step, per request. `last < first` means the
+        # step crossed no block boundary, so nothing hashable was produced and
+        # nothing here can be hit — that case skips the block table entirely,
+        # which is what keeps the dominant decode steps cheap.
+        #
+        # Sound only because a pending write always belongs to THIS step:
+        # schedule_async_write() consumes the previous one before scheduling
+        # its own, and runs after the forward but before this merge, so an
+        # earlier step's rows are already in the mirror.
+        written = []
+        block_table = None
+        max_blocks = 0
+        for req_id in self.input_batch.req_ids:
+            scheduled = int(num_scheduled_tokens.get(req_id, 0))
+            if scheduled <= 0:
+                continue
+            idx = self.input_batch.req_id_to_index[req_id]
+            start = int(computed[idx])
+            first = start // block_size
+            last = (start + scheduled) // block_size - 1
+            if last < first:
+                continue
+            if block_table is None:
+                block_table = self.input_batch.block_table[0].block_table.cpu
+                max_blocks = int(block_table.shape[1])
+            last = min(last, max_blocks - 1)
+            if last >= first:
+                written.append(block_table[idx, first : last + 1])
+        if not written:
+            return False
+        written_blocks = torch.cat(written)
+
+        hit_blocks = []
+        for req_id in hit_ids:
+            idx = self.input_batch.req_id_to_index.get(req_id)
+            if idx is None:
+                continue
+            # vLLM only serves hits on full blocks.
+            num_hit_blocks = min(int(computed[idx]) // block_size, max_blocks)
+            if num_hit_blocks > 0:
+                hit_blocks.append(block_table[idx, :num_hit_blocks])
+        if not hit_blocks:
+            return False
+        return bool(torch.isin(torch.cat(hit_blocks), written_blocks).any())
+
     def _maybe_get_combined_prefix_cache_tensors(
         self,
         hidden_states: torch.Tensor,
@@ -814,6 +881,19 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 and not self.omni_prefix_cache.has_prefix_cached_new_req_ids()
             ):
                 return None, None
+            _same_step = self._hit_blocks_written_this_step(num_scheduled_tokens)
+            if self.omni_prefix_cache.new_req_cache_hit_ids():
+                logger.info(
+                    "[same-step-probe] hits=%d same_step_conflict=%s",
+                    len(self.omni_prefix_cache.new_req_cache_hit_ids()),
+                    _same_step,
+                )
+            if _same_step:
+                # The hit rows are still in this step's pending async write.
+                # Land them before merging, or the merge reads never-written
+                # rows. Only same-step hits pay this: hits on blocks committed
+                # in earlier steps are already in the mirror.
+                self.omni_prefix_cache.force_drain_pending_writes()
             if self._model_needs_full_prefix_hidden_states():
                 combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
                     query_start_loc=self.query_start_loc.cpu,

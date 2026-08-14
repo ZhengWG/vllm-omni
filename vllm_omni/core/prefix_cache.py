@@ -249,6 +249,17 @@ class OmniTensorPrefixCache:
             mm_cpu=mm_cpu,
         )
 
+    def force_drain_pending_writes(self) -> None:
+        """Blocking consume of the in-flight write.
+
+        vLLM caches block hashes optimistically at allocation, so a request
+        scheduled later in the same step can hit blocks whose omni rows are
+        still in the pending (one-step-late since #4106) async write. Callers
+        must force the pending write into the CPU mirror before merging for
+        such hits, or the merge reads never-written rows (zeros/stale).
+        """
+        self._consume_pending_write()
+
     def drain_ready_async_writes(self) -> int:
         """Consume one in-flight write if it has finished (non-blocking).
 
@@ -295,6 +306,19 @@ class OmniTensorPrefixCache:
                 continue
             flat = mm_cache.view(-1, mm_cache.shape[-1])
             flat.index_copy_(0, slots, src_cpu)
+
+    def has_pending_write(self) -> bool:
+        """Whether a scheduled async write has not been applied yet.
+
+        Callers may assume any pending write was scheduled in the current
+        step: ``schedule_async_write`` consumes the previous one before
+        scheduling its own, so at most one step's rows are ever in flight.
+        """
+        return self._pending_write is not None
+
+    def new_req_cache_hit_ids(self) -> set[str]:
+        """Request IDs that hit the prefix cache when first scheduled."""
+        return self._new_req_cache_hit_ids
 
     def add_prefix_cached_new_req_id(self, req_id: str):
         """Adds a new request ID to the set of prefix cache hits on the batch."""
