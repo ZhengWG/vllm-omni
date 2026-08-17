@@ -31,6 +31,12 @@ from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
 from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
+from vllm_omni.core.tensor_cache import (
+    ModelCachePolicy,
+    OmniTensorCacheManager,
+    TensorCacheConfig,
+    get_tensor_cache_group_view,
+)
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
 from vllm_omni.model_executor.models.output_templates import OmniOutput
@@ -83,6 +89,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         # The Omni tensor prefix cache will be allocated
         # when we initialize the metadata builders if enabled
         self.omni_prefix_cache = None
+        # v2 tensor cache (CUDA): config staged at metadata-builder init,
+        # manager built lazily on first step (input_batch must exist).
+        self.omni_tensor_cache = None
+        self._omni_tensor_cache_cfg = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
 
@@ -168,12 +178,53 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Initialize the wrapper for both multimodal output tensors
         # and for hidden states to be passed between stages
         if self.cache_config.enable_prefix_caching:
+            import os
+
+            from vllm.platforms import current_platform
+
+            # Escape hatch for rollback / A-B comparison against the legacy cache.
+            use_v2 = os.environ.get("VLLM_OMNI_TENSOR_CACHE_V2", "1") != "0"
+            if current_platform.is_cuda() and use_v2:
+                # v2 slot/entry tensor cache; manager built lazily on the
+                # first step so input_batch is guaranteed to exist.
+                self._omni_tensor_cache_cfg = TensorCacheConfig(
+                    num_blocks=kv_cache_config.num_blocks,
+                    block_size=self.cache_config.block_size,
+                    hidden_size=self.model_config.get_hidden_size(),
+                    hs_dtype=self.dtype,
+                )
+            else:
+                # NPU and other platforms stay on the legacy sync cache
+                # until the Controller eager mode is validated there.
+                self.omni_prefix_cache = OmniTensorPrefixCache(
+                    num_blocks=kv_cache_config.num_blocks,
+                    block_size=self.cache_config.block_size,
+                    hidden_size=self.model_config.get_hidden_size(),
+                    hs_dtype=self.dtype,
+                )
+
+    def _ensure_omni_tensor_cache(self) -> None:
+        if getattr(self, "omni_tensor_cache", None) is not None:
+            return
+        cfg = getattr(self, "_omni_tensor_cache_cfg", None)
+        if cfg is None:
+            return
+        view = get_tensor_cache_group_view(self.input_batch, cfg.block_size, cfg.num_blocks)
+        if view is None:
+            # No usable full-attention group: fall back to the legacy cache
+            # rather than silently serving un-merged hidden states.
+            logger.warning("Omni tensor cache unavailable (no kv-cache group view); falling back to legacy cache.")
+            self._omni_tensor_cache_cfg = None
             self.omni_prefix_cache = OmniTensorPrefixCache(
-                num_blocks=kv_cache_config.num_blocks,
-                block_size=self.cache_config.block_size,
-                hidden_size=self.model_config.get_hidden_size(),
-                hs_dtype=self.dtype,
+                num_blocks=cfg.num_blocks,
+                block_size=cfg.block_size,
+                hidden_size=cfg.hidden_size,
+                hs_dtype=cfg.hs_dtype,
             )
+            return
+        manager = OmniTensorCacheManager(cfg, view)
+        manager.register_policy(ModelCachePolicy.from_model(getattr(self, "model", None)))
+        self.omni_tensor_cache = manager
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:

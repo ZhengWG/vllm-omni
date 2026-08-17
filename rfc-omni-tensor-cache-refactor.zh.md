@@ -4,175 +4,189 @@
 
 ## 1. Overview
 
-vLLM-Omni 的 hidden-state prefix cache（`OmniTensorPrefixCache`，引入于 #2164）镜像 vLLM KV-cache 的 block/slot 映射，把 stage 输出（hidden states 与 per-token 多模态张量）缓存在 CPU 上，使 prefix-cache hit 同时跳过 KV 重算**与**跨 stage 张量重算。
+vLLM-Omni 的 hidden-state prefix cache（`OmniTensorPrefixCache`，#2164）镜像 vLLM KV-cache 的 block/slot 映射，把 stage 输出（hidden states 与 per-token 多模态张量）缓存在 CPU 上，使 prefix hit 同时跳过 KV 重算与跨 stage 张量重算。历经 #4106/#3734/#3665 演进后存在四个结构性问题：
 
-自首版合入后，实现又有机演进（#4106 异步写、#3734 staging 去重、#3665 正确性修复、deferred mm-chunk commit），目前存在四个结构性问题：
+1. **性能**：写路径半异步——CPU scatter 仍在主线程每步执行；deferred mm chunks 在 GPU 无界增长并在请求结束时造成 commit 尖峰；读路径全同步。
+2. **正确性**：vLLM 乐观缓存 block hash（分配时提交 `computed + num_new_tokens`），同 step 跨请求 hit 会读到晚一步才落 CPU 的未写行（全 0/陈旧）并静默下发；abort 请求的 deferred chunks 被丢弃但其 blocks 仍可命中；异步 D2H 直读 forward 输出且无 `record_stream`（静态 buffer 复写 / allocator 复用两个竞争面）。
+3. **耦合**：~12 方法 + 裸属性 + runner 侧 ~6 条隐式顺序契约 + `getattr` 探测模型策略；导致与 async omni output 互斥（#4476 guard）、`async_chunk` 下静默降级（continuation 跳过 hit marking）。
+4. **可扩展性**：`block_table[0]` 写死单 KV group；L2 offload/connector 下 slot 索引静默失效。
 
-1. **性能**：写路径只做到半异步。CPU scatter（`index_copy_`）仍在 runner 主线程每步执行；decode 侧 deferred mm chunks 在 GPU 上无界增长，并在请求结束时造成同步 commit 尖峰；读/merge 路径完全同步，且带阻塞式 `.cpu()` 回退。
-2. **正确性**：vLLM 在分配时**乐观地**缓存 block hash（`kv_cache_manager.py`：提交 `computed + num_new_tokens`），因此同一步中稍后调度的请求可能 hit 到本步才正在计算的 block。自 #4106 起，omni 写入要晚一步才落到 CPU mirror，同一步跨请求 hit 会 merge 到从未写入的行（全 0 / 陈旧数据）并无声转发给下游——并发到达的重复 prompt 可复现。#4106 之前的同步写没有这个窗口。此外，按 request 键控的 deferred mm chunks 在 abort 请求已不在 input batch 时会被丢弃（`prefix_cache.py`），但其 hashed blocks 仍可从 free queue 被 hit，导致从未写入的 mm 行仍可达。
-3. **耦合**：cache 暴露约 12 个方法外加裸属性访问；runner 承载约 6 条*隐式顺序契约*（drain-before-merge、commit-before-batch-removal、consume-before-merge 等），并用 `getattr` 探测模型策略。正因如此，prefix caching 目前与 async omni output **互斥**（#4476 以安全 guard 硬关闭，`gpu_ar_model_runner.py`），并在 `async_chunk` 下静默降级（streaming continuation 跳过 hit marking，`gpu_model_runner.py`）。
-4. **可扩展性**：`block_table[0]`（单一 KV-cache group）被写死，阻塞混合注意力模型（如 Qwen3.5 式 full+linear attention）；在 vLLM L2 KV offload / KV-connector restore 下，按 slot 索引的有效性会静默失效。
+本 RFC 重构为**以 slot/entry 状态机为核心的两层结构**：`OmniTensorCacheManager`（facade，block/slot 语义域）+ `OmniTensorCacheController`（entry 搬运域），命名对齐 vLLM `v1/core`。
 
-本 RFC 提议重构为 `OmniTensorCacheManager`：4 方法对外表面、后台 commit 流水线，命名与结构对齐 vLLM 的 `v1/core` KV-cache 设计。
-
-相关：#1184（原始 prefix caching issue）、#2164、#4106、#3734、#3665、#4442/#4476（async omni output）。
+相关：#1184、#2164、#4106、#3734、#3665、#4442/#4476。
 
 ## 2. Scope & Objectives
 
 ### Goals
 
-- **G1 — 主线程零 cache 开销。** 所有 D2H 与 CPU scatter 迁到后台 committer 线程。目标：`execute_model` 中与 prefix-cache 相关的 CPU 时间从每步毫秒级降到 ≈0（仅 bookkeeping）；请求结束时无 ITL 尖峰。
-- **G2 — 保持 cache 数据一致。** 在 save/read 全过程中，cache 读写与 vLLM 的 KV 状态保持一致；一旦发现 omni 缓存行与 vLLM KV 数据分叉，请求走 fallback（加 salt 重跑），而不是冒险损失精度。
-- **G3 — 窄 API，契约内化。** Runner 常态只碰 3 个调用点（`new_step_starts` / `save_outputs` / `materialize`），外加一次性 `register_policy`。除一条外，所有顺序契约都变为内部不变量。
-- **G4 — 特性兼容。** `async_scheduling + async_chunk + prefix caching` 全开可通过 e2e；删除 `gpu_ar_model_runner.py` 中 #4476 guard；streaming（`async_chunk`）请求通过 span-based hit tracking 获得正确 merge 语义。
-- **G5 — 多 KV-group 扩展缝。** 用单一 `KVCacheGroupView` 协议隔离全部 vLLM block-table 访问；混合模型通过提供 view 实现接入；无 full-attention group ⇒ 特性干净自关闭。
+- **G1** — 尽可能降低主线程 cache 开销：D2H/scatter 移后台，主线程保留必要同步点 join（常态 ≈0）；请求结束降低 ITL 尖峰。
+- **G2** — cache 与 vLLM KV 状态一致：entry 原子迁移保证同req下 slot 状态一致；unmatch（partial/absent）即 **fail-fast**（bug 级日志 + dump 后进程退出），不静默/自愈。
+- **G3** — 窄 API：对外减少api。
+- **G4** — `async_scheduling + async_chunk + prefix caching` 全开。
+- **G5** — `KVCacheGroupView` 隔离 block-table 访问，多 KV-group 可扩展。
 
 ### Non-Goals
 
-- **vLLM L2 KV offload 互操作。** 留给后续阶段。本 RFC 仅增加：(a) 启动期 guard，使 L2/offload connector 与 omni tensor caching 在每个 stage 互斥；(b) per-block generation tags，使任何无效读大声失败，而非静默返回陈旧数据。长期方向（omni 行搭载同一 offload connector payload，生命周期天然共享）不在本次范围。
-- **Content-addressed（以 block-hash 为键）存储层。** 等到 L2/multi-group 需求具体后再做。
-- Speculative-decode 交互（正交；现有 guards 不变）。
+- vLLM L2 KV offload 互操作（仅加启动期互斥 guard；长期应搭 connector payload）。
+- Content-addressed 存储层；speculative-decode 交互（正交）。
 
 ## 3. Design
 
 ### Architecture
 
-命名与模块布局镜像 vLLM `v1/core` KV-cache 设计：
-
 | 本 RFC | vLLM 对照 |
 |---|---|
-| `OmniTensorCacheManager`（facade） | `KVCacheManager`（`v1/core/kv_cache_manager.py`） |
-| `new_step_starts(scheduler_output)` | `KVCacheManager.new_step_starts()` |
-| `save_outputs(...)` | connector 侧 `save_kv_layer` 一类动词 |
-| `TensorBlockPool`（CPU block mirror + per-block generations） | `BlockPool`（`v1/core/block_pool.py`） |
-| `KVCacheGroupView` / `FullAttentionGroupView` | `KVCacheGroupSpec` / `FullAttentionSpec` + `FullAttentionManager` |
+| `OmniTensorCacheManager`（facade，block/slot 语义域） | `KVCacheManager` |
+| `OmniTensorCacheController`（entry 搬运task控制） | 无（近似 connector worker 侧） |
+| `TensorBlockPool`（pinned CPU block mirror） | `BlockPool` |
+| `KVCacheGroupView` / `FullAttentionGroupView` | `KVCacheGroupSpec` / `FullAttentionSpec` |
 | `TensorCacheConfig` | `KVCacheConfig` |
 
 ```
 vllm_omni/core/tensor_cache/
-├── interface.py      # TensorCacheConfig / ModelCachePolicy / StageCacheOutputs / InflightStageOutputs
-├── manager.py        # OmniTensorCacheManager（含后台线程上的 AsyncTensorCommitter）
-├── block_pool.py     # TensorBlockPool（+ per-block generation）
-└── group_view.py     # KVCacheGroupView protocol / FullAttentionGroupView / factory
+├── interface.py      # TensorCacheConfig / ModelCachePolicy / StageCacheOutputs
+├── manager.py        # OmniTensorCacheManager（slot 状态控制、span/hit、merge）
+├── controller.py     # OmniTensorCacheController（EntryWriteTask 执行、队列、cap管理）
+├── block_pool.py     # TensorBlockPool
+└── group_view.py     # KVCacheGroupView / FullAttentionGroupView / factory
 ```
 
-![Class diagram](rfc-omni-tensor-cache-assets/class-diagram.svg)
+**Manager / Controller 边界**——req 层级一致性归 Manager：slot 状态唯一控制在 Manager，Controller 执行搬运并上报完成，Manager 在固定点（save 内 join / materialize / cap flush）drain 事件并做 entry 级原子批量迁移；跨 task 一致性不依赖锁。
 
-**逐步流程（重构前）：**
+| | Manager（block/slot 语义域） | Controller（entry/搬运域） |
+|---|---|---|
+| 职责 | 解析 slots（group view）；slot→entry 映射与状态迁移； | 两段队列：**copy queue**（D2H 发射，Class 优先级、分块传输、cap 管理）+ **scatter queue**（只装 copy 已完成任务，不保序）；req-end 提优；背压 flush |
+| 引擎耦合 | 知道 req_id / scheduler_output | 只见 entry/slots/priority；|
 
-![image-20260810225427318](/Users/guanxiangtian/Library/Application Support/typora-user-images/image-20260810225427318.png)
+Manager通过 `Controller.fetch_host(entry, rows)` 获取数据，分几种状态：
 
-**逐步流程（重构后）：**
++ committed → mirror 零拷贝视图 已拷贝结束，直接返回tensor_cpu_view即可；
 
-![Per-step sequence](rfc-omni-tensor-cache-assets/per-step-sequence.svg)
++ in-transit → read stream 切片 D2H + sync；
 
-### 多请求交错 — committer 写与 builder 读同时作用于 block pool
++ pre-staged → D2H完成，host buffer 直读。
 
-三个请求跨越三步：**A** 在 step N prefill，**B** 在 step N+1 到达并 prefix-hit A 的 blocks，**C** 每步 decode 一个 token。committer（写 mirror）与 builder（为另一个请求读 mirror）并发运行——下面四条编号保证使该竞争无数据竞争。
+*（class diagram / 时序图待按 v2 重绘）*
 
-![image-20260810225639762](/Users/guanxiangtian/Library/Application Support/typora-user-images/image-20260810225639762.png)
+### 存储模型：slot 状态机 + entry 写任务
+
+slot（= vLLM KV slot）三态：
+
+- **absent**：从未登记写入。命中即 unmatch。
+- **in-transit**：本步登记后（save 冻结 / deferred stage）即进入；数据在 GPU 暂存，搬运中。同 step 的命中读走这里，不算 absent。
+- **committed**：当前 owner **entry 携带的全部 key** 已落 pinned mirror，GPU 暂存已释放（该 entry 未携带的 key 不受此状态约束）。
+
+状态以 **entry**（一次 `save_outputs` 的全部 slots）为粒度**原子批量**迁移。**块重新分配是状态机的一条正式转移**：新 entry 登记时，slot 无论处于 in-transit 还是 committed 都回到 in-transit 且 owner 换新，旧 entry 的完成不再作用于该 slot（见「preemption 复用」）。
+
+`EntryWriteTask` 持有：
+- **D2D 冻结拷贝**（save 时在 compute stream 上，记录 freeze event）——forward 输出可能是 CUDA-graph 静态 buffer 且现网 D2H 无 `record_stream`，冻结同时关闭两个竞争面；兼任 #4476 快照（两拷贝合一）。
+- **save 时确定的 slot 列表**——commit 不依赖 `input_batch`，现网 abort bug 按构造消失。
+- D2H event 与完成上报。
+
+### 同步与流控
+
+- **同步（一步滞后）**：`save_outputs`（forward 后）内 consume-then-schedule——先 join 上一 step 的 Class B 任务，再提交本 step。正确性不依赖 join 位置（committed 行不再被写、未 committed 行不读 mirror）；join 只是**有界等待点**，控制在途任务深度（Class B 深度 1），不负责资源回收——GPU 暂存的引用在拷贝完成时即释放。
+- **写入分层**：分两类，**Class A**（批量一次性：prefill hidden、deferred codes；cache 副本只被未来命中一次性重建消费）→ lazy 后台分批写入，req 结束可提优 + 下一次forward join 收尾（减少尖峰）；**Class B**（每步增量：decode hidden）→ 每步写、next-forward join。
+- **cap 流控**：GPU 暂存设字节预算，超限阻塞 flush 最老 entry（D2H 大概率已完成）。
+- **abort：仍然写，不回退**——abort 的满块 hash 仍可命中，回退会让合法命中误报 unmatch。
+- **preemption 复用**：请求被抢占时，它的块会被 free 并分给新请求，但旧请求没 finish、在途写还没落盘——同一个 slot 短暂存在新旧两份数据。新 entry 提交时若发现 slot 上还挂着没写完的旧 entry，做三件事：① 让旧写**立刻开始搬**（否则 deferred 的旧写要等旧请求结束才动，新 entry 会被它拖住）；② 记一条「旧的先落盘」的顺序约束，保证 mirror 最终留下的是新数据；③ slot 归属当场改成新 entry——之后的读只会拿到新数据，旧写就算后来完成也改不动这个 slot 的状态。正常 finish 的复用走不到这里：finish 的写在同一个 save 里先被等完，新写才提交。
+
+### 读路径：materialize 按 slot 状态解析
+
+- 全部 **committed** → 读 mirror（merge 数学不变）。
+- 含 **in-transit** → 等 freeze event → 读 GPU snapshot 切片 sync D2H → 拷贝线程已发布 host 副本时回退直读 host buffer。**同 step 跨 req 命中由此天然正确**——设计不变量，消除乐观 hash 空读窗口。deferred keys finish 前长期 in-transit，同路径覆盖。
+- 含 **absent** → unmatch，fail-fast。
+
+materialize 的全部输入（slot 列表、hit 块表、调度快照）在 `new_step_starts`/`save_outputs` 时物化，**不读 live input_batch**——builder 晚一步跑时 input_batch 可能已变，快照化使 materialize 与 runner 状态解耦。
+
+大 entry 首次消费（build_payload）**直读 snapshot 不等 mirror**，D2H 产物回灌 Controller 作 pre-staged host copy（PCIe 1×，重建 #3734 去重收益）。eager 时 sync D2H 在主线程 sample/build 窗口（替换今天同位置的阻塞 `.cpu()`）；async output 时在 builder 线程。
 
 ### API & Interface Changes
 
-**新的公开表面**（取代 `OmniTensorPrefixCache` 上约 12 个方法 + 3 个裸属性）：
-
 ```python
 class OmniTensorCacheManager:
-    def register_policy(self, policy: ModelCachePolicy) -> None: ...     # 一次，在 load_model
+    def register_policy(self, policy: ModelCachePolicy) -> None: ...     # load_model，一次
     def new_step_starts(self, scheduler_output: SchedulerOutput) -> None: ...
     def save_outputs(self, hidden_states, mm_outputs, *,
-                     num_tokens_unpadded: int, num_tokens_padded: int) -> InflightStageOutputs: ...
-    def shutdown(self) -> None: ...
-
-class InflightStageOutputs:
-    """对本步尚未 commit 的输出的引用计数 handle。
-
-    有意与 StageCacheOutputs 分开：本对象拥有资源（frozen-entry 引用、
-    retire 生命周期、cap-K 记账），而 StageCacheOutputs 是纯值；
-    若用 state flag 把二者合并，会把资源寿命耦合到数据容器上。
-    """
+                     num_tokens_unpadded: int, num_tokens_padded: int) -> None: ...
     def materialize(self, req_ids: list[str]) -> StageCacheOutputs: ...  # 任意线程
+    def shutdown(self) -> None: ...
 
 class StageCacheOutputs(NamedTuple):
     hidden_states: dict[str, torch.Tensor] | None   # req_id → full-prompt tensor（policy 门控）
-    mm_outputs: dict[str, dict[str, Any]]           # req_id → per-request payload（req-major）
+    mm_outputs: dict[str, dict[str, Any]]           # req_id → per-request payload
 
 @dataclass(frozen=True)
-class ModelCachePolicy:                              # 取代对模型的 getattr 探测
+class ModelCachePolicy:                              # 取代 getattr 探测
     needs_full_hidden_states: bool = True
     merge_consumed_by_postprocess: bool = False      # 强制 eager materialize
-    deferred_keys: frozenset[str] = frozenset()      # strip 聚合的 decode mm keys
+    deferred_keys: frozenset[str] = frozenset()      # Class A-deferred：GPU staged 至 finish
     skip_keys: frozenset[str] = frozenset()
-    default_placement: Placement = Placement.CPU     # GPU assembly 预留，未实现
 
 class KVCacheGroupView(Protocol):                    # 唯一访问 vLLM 内部的路径
     block_size: int
     num_blocks: int
     def slot_mapping_gpu(self, num_tokens: int) -> torch.Tensor: ...
     def slots_for(self, req_id: str, token_start: int, token_end: int) -> torch.Tensor: ...
-    def block_generations(self, slots: torch.Tensor) -> torch.Tensor: ...
+    def cached_block_ids(self, req_id: str) -> torch.Tensor: ...
 ```
 
-**Runner 交互，重构前 → 重构后：**
+**Runner 交互（重构后，3 调用点 + 1 注册）：**
 
 ```python
-# ── 重构前：2 个文件约 10 个调用点，约 6 条隐式顺序契约 ──
-# gpu_model_runner.py::_update_states
-omni_prefix_cache.reset_prefix_cached_new_req_ids()
-omni_prefix_cache.discard_deferred_mm_outputs(req_id)          # 每个 finished req
-omni_prefix_cache.add_prefix_cached_new_req_id(req_id)         # hit marking；streaming 会跳过
-# gpu_ar_model_runner.py::execute_model
-omni_prefix_cache.drain_ready_async_writes()
-omni_prefix_cache.commit_deferred_mm_outputs(finished, input_batch)   # 必须在 batch 移除前
+cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
+cache.new_step_starts(scheduler_output)   # execute_model 顶部，_update_states 之前
+#   内部：hit/span 注册、生命周期事件（finished/abort → 提优 flush）
 # ...forward...
-slot_mapping_gpu = input_batch.block_table[0].slot_mapping.gpu        # 调用点上的 .gpu workaround
-omni_prefix_cache.schedule_async_write(hs, mm, slot_mapping_gpu, n, n_pad, skip_keys)
-# sample_tokens / output build
-self._stage_deferred_prefix_cache_mm_outputs(...)                     # 按 request 的 Python 循环
-combined_hs = omni_prefix_cache.get_merged_hidden_states(...)         # consume 之后，主线程
-combined_mm = omni_prefix_cache.get_merged_multimodal_states(...)
-# + runner 侧 policy 探测：_model_needs_full_prefix_hidden_states()、
-#   _deferred_prefix_cache_mm_keys()、payload gating、staging 特例
-
-# ── 重构后：3 个调用点 + 1 次注册 ──
-cache.register_policy(ModelCachePolicy.from_model(model))      # load_model，一次
-cache.new_step_starts(scheduler_output)                        # execute_model 顶部
-inflight = cache.save_outputs(hidden, mm_flat,
-                              num_tokens_unpadded=n, num_tokens_padded=n_pad)
-outs = inflight.materialize(req_ids)                           # 主线程 eager 或 #4476 builder
+cache.save_outputs(hidden, mm_flat, num_tokens_unpadded=n, num_tokens_padded=n_pad)
+#   内部：join { 上一 step Class B + 本步 new_step_starts 标记的 finished-req 提优任务 }
+#         → D2D 冻结 + 物化 slots → 提交 EntryWriteTask
+outs = cache.materialize(req_ids)         # sample_tokens/output build，主线程或 builder 线程
+#   内部：按 slot 状态解析；async_output/async_chunk 的 slice 读同一路径
 ```
 
-`vllm_omni/core/prefix_cache.py` 由 `vllm_omni/core/tensor_cache/` 取代。当前设置 `requires_full_prefix_cached_hidden_states` / `deferred_prefix_cache_mm_keys` 的模型（qwen3-tts、higgs-v3、personaplex）在弃用窗口内继续通过 `ModelCachePolicy.from_model()` shim 工作。
+替代 `vllm_omni/core/prefix_cache.py`；旧模型旗标经 `ModelCachePolicy.from_model()` shim 过渡；NPU runners 迁到 Controller eager 实现。
 
-**Invariants（内化后的契约）：**
+**Invariants：**
 
-1. *Value freeze*：`save_outputs` 在 compute stream 上对预分配 slab 做一次 D2D copy；同时兼任 #4476 CUDA-graph 复用快照（今天的两次拷贝变一次）。此后 entry 内容不可变，仅存储层级迁移（slab → ping-pong → mirror）。
-2. *Single-writer mirror + FIFO + inflight barrier*：committer 线程是 mirror 的唯一 writer（写-写竞争不可能），并严格按序 scatter，且不越过尚未 retire 的 `InflightStageOutputs`；reader 按最新可达层解析，优先取 queued entry 而非半发布的 mirror 行（scatter 后按 entry 原子发布），因此并发的 committer 写与 builder 读——包括跨不同请求——无数据竞争。
-3. *Refcount + finalizer + cap*：entry 有引用计数；由 `materialize`（或 GC finalizer，带 warning）retire inflight handle；未完成 handle 上限为 K（超出则 fallback 到 eager materialize），使泄漏表现为可见背压，而非内存无限增长。
-4. *Generation check*：每个 mirror 行在写入时打上 block generation；读取时与当前 generation 比对，不匹配视为 detected miss（bug 级日志），绝不静默返回陈旧数据。
-5. *Block-alignment dependency（外部）*：merge 数学依赖 vLLM 保证 prefix hit 的 `num_computed_tokens` 按 block 对齐（full-hit 整块回滚；`vllm/v1/core/kv_cache_manager.py:249`）。用 assertion 守住。
-6. *唯一留给 runner 的契约*：`new_step_starts` 必须在 `_update_states` 移除 finished requests **之前**运行（仍需要它们的 block table）。在 call site 文档化。
-7. *Consistency fallback（支撑 G2）*：hit-span 校验（generation/presence）在 `new_step_starts` 中、forward 之前运行，并在 `materialize` 内再跑一次。不匹配时：请求被 poison，本步输出丢弃，并以新的 `cache_salt` 重新提交（all-miss → 全量重算，绕开被 poison 的 blocks）；窗口内反复不匹配则升级为 full reset（所有 generation 递增 + vLLM `reset_prefix_cache()`）并告警。每次触发都有 metric + bug 级日志——绝不静默自愈。
+1. *Value freeze*：save 时一次 D2D 冻结（记 freeze event，兼任 #4476 快照）；entry 内容不可变，仅存储层级迁移。
+2. *Entry 原子性 + 单写者*：Manager 原子批量迁移 slot 状态；committer 线程是 mirror 唯一 writer。同一 slot 有新旧两笔写时：旧的先落盘、且立刻开始搬；slot 状态只认最新那笔写的完成（旧写完成不改状态）。Class B 与 finished-req 任务在下一次 save 里先等完，再提交新写。
+3. *状态解析读*：committed→mirror；in-transit→snapshot 切片 D2H；absent→unmatch（fail-fast）。
+4. *Cap 背压*：GPU 暂存字节预算，超限阻塞 flush 最老 entry。
+5. *Block 对齐（外部依赖）*：vLLM 保证 prefix hit 的 `num_computed_tokens` 块对齐；assert 守住。
+6. *唯一 runner 契约*：`new_step_starts` 在 `_update_states` 移除 finished 之前；scheduler_output **恰好一次、按序**（warmup/dummy 不喂）。
+7. *Unmatch = fail-fast*：bug 级日志（dump span/slot/entry 状态）+ metric 后进程退出，与 vLLM 上游 fail-fast 习惯一致；无 salted-rerun/poison/reset 自愈阶梯——检测不完备时继续运行不诚实，恢复交给编排层重启；generation 校验降级 debug assert。
 
 ### Key Technical Decisions
 
 | ID | 决策 | 原因 |
 |---|---|---|
-| **D1** | D2H 仍走 copy stream；将 `event` wait + `index_copy_` 移到后台线程（pinned ping-pong buffer，2 槽） | H20 上 D2H 已与下一步 forward 重叠；主线程成本是 scatter（~4–10 ms / 96 MB），不是 PCIe |
-| **D2** | `materialize` 按 slab → ping-pong → mirror 解析段（读不等待 scatter） | 去掉 consume-before-merge 契约，解锁 #4476 builder 线程 materialize，并堵住 same-step 空读窗口 |
-| **D3** | 固定大小 GPU strip 聚合适配 decode mm 行；取代 per-request `deferred_prefix_cache_mm_keys` | O(1) GPU 驻留、无 finish-time commit 尖峰；discard/commit 生命周期消失 |
-| **D4** | Facade 自建 span 注册表 + 来自 `scheduler_output` 的 `delivered_upto` 水位 | 修复 `async_chunk` continuation 跳过 hit marking；不重发下游已累积的 spans |
-| **D5** | 保留 slot-indexed mirror；用启动期 guard + generation tags 排除 L2/connector | 单一一致性域；真正的 L2 支持应搭载 connector payload（本次不做） |
-
-否决的备选：更深 ring 仍主线程 poll；GPU-resident cache；双 cache 跨进程同步；hash-addressed tier（需求未实再做）。
+| **D1** | save 内 consume-then-schedule（一步滞后）+ 后台搬运，弃被动管理： free-committer + refcount/finalizer | 正确性由状态解析保证，join 只管资源；换大幅简单性 |
+| **D2** | materialize 按 slot 状态解析 | 读不等 scatter；同 step 跨 req 命中天然正确；解锁 builder 线程 materialize |
+| **D3** | entry save 时物化 slots；req-end 提优 + next-save join；abort 照常写完 | commit 不依赖 input_batch ⇒ abort bug 消失；释放确定性 ≤1 step 且无尖峰 |
+| **D4** | span 注册表 + `delivered_upto` 水位 | 修 async_chunk 跳过 hit marking；不重发已下发 spans |
+| **D5** | Class A/B 分层 + GPU 暂存字节 cap | 大 block 读者只有未来命中重建 ⇒ lazy；小 block 线性增长 ⇒ 每步 join；cap 硬兜底 |
+| **D6** | 大 entry 首次消费直读 snapshot，D2H 产物回灌作 pre-staged | payload 反正要 D2H；PCIe 1×，重建 #3734 去重收益 |
+| **D7** | 保留 slot-indexed mirror；启动期 guard 排除 L2/connector | 单一一致性域；L2 应搭 connector payload |
 
 ## 4. Correctness & Testing Plans
 
-**定义：** 对任意请求集合与调度顺序，`StageCacheOutputs` 必须与 no-prefix-cache 路径逐元素一致（相同 dtype/数值——cache 是传输优化，绝不是数值优化），且 §3 七条 invariants 成立。
+**定义：** 任意请求集合与调度顺序下，`StageCacheOutputs` 与 no-prefix-cache 路径逐元素一致，且七条 invariants 成立。
 
 | Level | Gate |
 |---|---|
-| **L1** | pool / committer / hit-registry 单测；将 `tests/core/test_prefix_cache.py` 迁到新 API 且期望值不变（Phase 0） |
-| **L2** | same-step 双重复 prompt hit（merged HS == producer 的行）；eager ≡ background ≡ cache-off（merged 输出）；builder 线程抛错 → finalizer warning、不挂死；generation-mismatch → 走 salted-retry fallback |
-| **L3** | 现有 `test_qwen3_omni` prefix case 保持绿（Phase 0）；去掉 #4476 guard 后，`async_scheduling + async_chunk + prefix caching` 全开且输出对齐（Phase 2） |
-| **Smoke / Perf** | 第二次请求 `cache_hit_pct > 0` 且输出 == miss 路径；#2164 bench + 请求结束边界的 decode-ITL P99 相对 cache-off 无尖峰 |
+| **L1** | pool / controller（状态机、cap、abort 写完）/ hit-registry 单测；`tests/core/test_prefix_cache.py` 迁新 API 期望值不变 |
+| **L2** | same-step 重复 prompt hit（走 in-transit 读）；eager ≡ background ≡ cache-off；abort 满块命中数据有效；块被抢占复用后，不管新旧请求谁先结束，命中读到的和 mirror 最终留下的都是新请求的数据；人为 partial → fail-fast；cap 触顶背压数值不变；pre-staged 回灌 ≡ 直接 D2H |
+| **L3** | 现有 `test_qwen3_omni` prefix case 通过；删 #4476 guard 后三特性全开输出对齐 |
+| **Smoke / Perf** | 二次请求 hit>0 且输出 == miss 路径；性能无回退 |
+
+## 5. 分期与退出标准
+
+| Phase | 内容 | 退出标准 |
+|---|---|---|
+| **Phase 0**（可独立合入） | legacy 路径热修：命中步 merge 前强制落盘 pending 异步写 | 复现同 step 空读的单测通过；现有 prefix cache 测试不变；不依赖本重构 |
+| **P0 重构** | tensor_cache 模块 + runner 接线（CUDA 走新路径，其他平台留 legacy） | 单测全绿；qwen3-omni e2e 文本/音频输出与 cache-off 一致；抢占压力下 unmatch=0、引擎存活 |
+| **P1 性能** | Class A 滴灌调优、cap 默认值标定、主线程开销测量 | 命中步主线程 cache CPU 时间显著下降；请求结束边界 ITL P99 无尖峰；GPU 暂存稳态 ≤ cap |
+| **P2 兼容** | 删 #4476 guard、D4 span/`delivered_upto`、NPU eager 迁移、多 KV group | 三特性全开 e2e 输出对齐；streaming continuation 命中不漏不重；NPU 回归通过 |
+
+反馈窗口：Phase 0 与 P0 分别独立提 PR，各留一轮 review 后再进入下一期。
