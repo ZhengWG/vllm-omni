@@ -692,10 +692,10 @@ def test_full_payload_output_accumulation_hook_matrix():
         assert not runner._should_accumulate_full_payload_output()
 
 
-def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
+def _make_request_end_payload_runner(*, enabled=True, tensor_cache=None):
     runner = object.__new__(GPUARModelRunner)
     runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
-    runner.omni_prefix_cache = prefix_cache
+    runner.omni_tensor_cache = tensor_cache
     runner.model_config = SimpleNamespace(
         model_arch="IndexTTS25TalkerForConditionalGeneration",
         model_stage="indextts2_5_talker",
@@ -710,10 +710,10 @@ def _make_request_end_payload_runner(*, enabled=True, prefix_cache=None):
     return runner
 
 
-def test_request_end_payload_d2h_gate_requires_opt_in_and_no_prefix_cache():
+def test_request_end_payload_d2h_gate_requires_opt_in_and_no_tensor_cache():
     assert _make_request_end_payload_runner()._should_defer_full_payload_d2h()
     assert not _make_request_end_payload_runner(enabled=False)._should_defer_full_payload_d2h()
-    assert not _make_request_end_payload_runner(prefix_cache=object())._should_defer_full_payload_d2h()
+    assert not _make_request_end_payload_runner(tensor_cache=object())._should_defer_full_payload_d2h()
 
 
 def test_request_end_payload_suppresses_per_step_multimodal_outputs():

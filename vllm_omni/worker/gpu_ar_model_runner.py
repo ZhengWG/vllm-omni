@@ -663,8 +663,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _model_needs_full_prefix_hidden_states(self) -> bool:
         """Opt-out hook for models whose postprocess only consumes the tail.
 
-        When False, we skip both the per-step GPU->CPU hidden-state write into
-        OmniTensorPrefixCache and the merged-tensor reconstruction on hits;
+        When False, we skip both the per-step hidden-state write into the
+        omni tensor cache and the merged-tensor reconstruction on hits;
         postprocess receives the normal scheduled-token slice instead. Models
         that need the full cached_prefix + new_tail span (default) are not
         affected.
@@ -759,110 +759,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
         return True
 
-    def _deferred_prefix_cache_mm_keys(self) -> set[str]:
-        """Model-declared multimodal keys whose prefix-cache writes are deferred."""
-        model = getattr(self, "model", None)
-        keys = getattr(model, "deferred_prefix_cache_mm_keys", ())
-        return set(keys or ())
-
-    def _maybe_update_prefix_cache(
-        self,
-        hidden_states: torch.Tensor,
-        hidden_states_cpu: torch.Tensor | None,
-        multimodal_outputs: dict,
-        num_tokens_unpadded: int,
-        num_tokens_padded: int,
-    ):
-        """If prefix caching is enabled and it's the last pipeline parallelism rank,
-        retrieve the hidden states & multimodal outputs from the prefix cache based
-        on our batch slot mappings.
-        """
-        # Cache hidden states if we've enabled hidden state prefix caching
-        # unless this isn't the last pipeline parallelism rank.
-        is_last_pp_rank = get_pp_group().is_last_rank
-        if hidden_states_cpu is not None and not is_last_pp_rank:
-            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
-        if self.omni_prefix_cache is not None and is_last_pp_rank:
-            # If this happens, it generally means the model is not following the correct
-            # interface yet and is therefore currently not compatible with prefix cache.
-            hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
-            # FIX: The .cpu attribute of slot_mapping is stale (not updated by the Triton
-            # _compute_slot_mapping_kernel which only writes to .gpu). We must use .gpu and
-            # sync back to CPU to get the correctly computed slot mapping.
-            slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
-            slot_mapping_cpu = slot_mapping_gpu[:num_tokens_padded].cpu()
-            self.omni_prefix_cache.update_omni_tensor_prefix_cache(
-                hidden_states=hs_for_cache,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_tokens_unpadded=num_tokens_unpadded,
-                slot_mapping=slot_mapping_cpu,
-                num_tokens_padded=num_tokens_padded,
-                skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
-                hidden_states_cpu=hidden_states_cpu,
-            )
-
-    def _maybe_get_combined_prefix_cache_tensors(
-        self,
-        hidden_states: torch.Tensor,
-        hidden_states_cpu: torch.Tensor | None,
-        multimodal_outputs: dict,
-        num_scheduled_tokens: dict[str, int],
-    ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
-        """If prefix caching is enabled, extract the merged hidden states and multimodal outputs for
-        all requests in the batch (including those that aren't a hit on Prefix cache).
-        """
-        # Prior to applying the post-processing func, extract
-        # the prefix cached hidden states and multimodal states.
-        combined_hidden_states, combined_multimodal_outputs = None, None
-        is_last_pp_rank = get_pp_group().is_last_rank
-        if hidden_states_cpu is not None and not is_last_pp_rank:
-            raise RuntimeError("hidden_states_cpu staging is only valid on the last pipeline parallel rank.")
-        if self.omni_prefix_cache is not None:
-            if not is_last_pp_rank:
-                raise RuntimeError("Omni prefix-cache tensor merge is only valid on the last pipeline parallel rank.")
-            if (
-                not self._model_needs_full_prefix_hidden_states()
-                and not self.omni_prefix_cache.has_prefix_cached_new_req_ids()
-            ):
-                return None, None
-            if self._model_needs_full_prefix_hidden_states():
-                combined_hidden_states = self.omni_prefix_cache.get_merged_hidden_states(
-                    query_start_loc=self.query_start_loc.cpu,
-                    input_batch=self.input_batch,
-                    hidden_states=hidden_states,
-                    hidden_states_cpu=hidden_states_cpu,
-                    num_scheduled_tokens=num_scheduled_tokens,
-                )
-            combined_multimodal_outputs = self.omni_prefix_cache.get_merged_multimodal_states(
-                query_start_loc=self.query_start_loc.cpu,
-                input_batch=self.input_batch,
-                multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-                num_scheduled_tokens=num_scheduled_tokens,
-            )
-        return combined_hidden_states, combined_multimodal_outputs
-
-    def _stage_deferred_prefix_cache_mm_outputs(
-        self,
-        *,
-        scheduler_output: SchedulerOutput,
-        multimodal_outputs: Any,
-        query_start_loc_cpu: Any,
-    ) -> None:
-        if self.omni_prefix_cache is None:
-            return
-
-        deferred_mm_cache_keys = self._deferred_prefix_cache_mm_keys()
-        if not deferred_mm_cache_keys:
-            return
-
-        self.omni_prefix_cache.stage_deferred_mm_outputs(
-            query_start_loc=query_start_loc_cpu,
-            input_batch=self.input_batch,
-            multimodal_outputs=flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs,
-            num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
-            deferred_mm_cache_keys=deferred_mm_cache_keys,
-        )
-
     def _prepare_tensor_cache_payload_sources(
         self,
         *,
@@ -897,29 +793,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         # debug-asserts that contract.
         outs = self.omni_tensor_cache.materialize(step_id, list(req_ids))
         return hidden_states_cpu, outs.hidden_states, (outs.mm_outputs or None)
-
-    def _prepare_prefix_cache_pooler_payload_sources(
-        self,
-        *,
-        hidden_states: torch.Tensor,
-        staged_hidden_states_cpu: torch.Tensor | None,
-        multimodal_outputs: Any,
-        scheduler_output: SchedulerOutput,
-        needs_scheduled_hidden_payload: bool,
-    ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
-        hidden_states_cpu = None
-        if needs_scheduled_hidden_payload:
-            if staged_hidden_states_cpu is None:
-                raise RuntimeError("Prefix-cache hidden-state payload requires staged CPU hidden states.")
-            hidden_states_cpu = staged_hidden_states_cpu
-
-        combined_hidden_states, combined_multimodal_outputs = self._maybe_get_combined_prefix_cache_tensors(
-            hidden_states,
-            staged_hidden_states_cpu,
-            multimodal_outputs,
-            scheduler_output.num_scheduled_tokens,
-        )
-        return hidden_states_cpu, combined_hidden_states, combined_multimodal_outputs
 
     @staticmethod
     def _build_combined_prefix_cache_mm_payload(
@@ -1058,16 +931,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
 
-        # Async-write pipeline: apply any pending GPU->CPU prefix-cache writes
-        # whose copy event has already fired. Non-blocking — entries whose D2H
-        # is still in flight stay queued and will be picked up on the next
-        # step's drain. This guarantees any downstream read of
-        # ``omni_prefix_cache.hidden_states_cache`` /
-        # ``omni_prefix_cache.mm_outputs_cache`` in this step sees the
-        # state produced no later than the previous forward step.
-        if self.omni_prefix_cache is not None:
-            self.omni_prefix_cache.drain_ready_async_writes()
-
         # v2 tensor cache lifecycle entry. Contract: must run before
         # _update_states removes finished requests, exactly once per real
         # scheduler_output (dummy/warmup runs never reach execute_model).
@@ -1113,12 +976,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                 flush_ids.update({rid for rid in self._pending_full_payload_send if rid not in self.requests})
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
-
-        if self.omni_prefix_cache is not None and scheduler_output.finished_req_ids:
-            self.omni_prefix_cache.commit_deferred_mm_outputs(
-                set(scheduler_output.finished_req_ids),
-                self.input_batch,
-            )
 
         if self.routed_experts_initialized:
             capturer = self.routed_experts_capturer
@@ -1422,30 +1279,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             hidden_states_cpu = None
             tensor_cache_step_id = None
 
-            # Async-write pipeline (replaces the per-step blocking
-            # ``.to("cpu")`` + ``aten::index_put_`` on pageable host memory).
-            # Schedules non-blocking GPU->CPU copies on a dedicated stream;
-            # the actual CPU scatter into ``hidden_states_cache`` /
-            # ``mm_outputs_cache`` happens in ``drain_ready_async_writes``
-            # at the top of subsequent execute_model() calls.
-            if not self.is_pooling_model and self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-                hs_for_cache = hidden_states if self._model_needs_full_prefix_hidden_states() else None
-                # Some models (e.g. qwen3-tts-talker) opt out of full-hidden-state
-                # prefix caching but the downstream pooler payload path still
-                # needs a CPU hidden-states view. Materialize it synchronously
-                # in that case; the legacy behavior is preserved.
-                if hs_for_cache is None and self._model_omni_pooler_payload_include_hidden():
-                    hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
-                slot_mapping_gpu = self.input_batch.block_table[0].slot_mapping.gpu
-                self.omni_prefix_cache.schedule_async_write(
-                    hidden_states_gpu=hs_for_cache,
-                    multimodal_outputs_gpu=(flatten_payload(multimodal_outputs) if multimodal_outputs else None),
-                    slot_mapping_gpu=slot_mapping_gpu,
-                    num_tokens_unpadded=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded,
-                    skip_mm_cache_keys=self._deferred_prefix_cache_mm_keys(),
-                )
-            elif (
+            if (
                 not self.is_pooling_model
                 and getattr(self, "omni_tensor_cache", None) is not None
                 and get_pp_group().is_last_rank
@@ -1803,8 +1637,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _should_defer_full_payload_d2h(self) -> bool:
         """Keep opted-in full payloads on device until request completion."""
         return (
-            getattr(self, "omni_prefix_cache", None) is None
-            and getattr(self, "omni_tensor_cache", None) is None
+            getattr(self, "omni_tensor_cache", None) is None
             and self._runner_model_omni_flag("omni_payload_at_request_end")
             and self._should_accumulate_full_payload_output()
         )
@@ -1832,12 +1665,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
-            return False
-        # The legacy cache still cannot ride the async output builder (#4476):
-        # its merge reads runner state that has already advanced by then. The
-        # v2 tensor cache snapshots every merge input at save time, so it is
-        # safe to run all-on.
-        if self.omni_prefix_cache is not None:
             return False
         if getattr(self, "omni_tensor_cache", None) is not None and os.environ.get("VLLM_OMNI_TC_ASYNC_MAT") != "1":
             # v2 tensor cache defaults to eager (main-thread) materialize:
@@ -2013,25 +1840,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         needs_scheduled_hidden_payload = (
             include_hidden_payload
             and needs_pooler_payload
-            and (
-                (self.omni_prefix_cache is None and getattr(self, "omni_tensor_cache", None) is None)
-                or not self._model_needs_full_prefix_hidden_states()
-            )
+            and (getattr(self, "omni_tensor_cache", None) is None or not self._model_needs_full_prefix_hidden_states())
         )
         if not needs_pooler_payload and tensor_cache_step_id is not None:
             # No consumer for this step's merge: consume the step context by
             # id (exactly-once contract). The cache write still lands.
             self.omni_tensor_cache.discard_step(tensor_cache_step_id)
             tensor_cache_step_id = None
-        self._stage_deferred_prefix_cache_mm_outputs(
-            scheduler_output=scheduler_output,
-            multimodal_outputs=multimodal_outputs,
-            query_start_loc_cpu=query_start_loc_cpu,
-        )
-
         if (
-            self.omni_prefix_cache is None
-            and getattr(self, "omni_tensor_cache", None) is None
+            getattr(self, "omni_tensor_cache", None) is None
             and needs_scheduled_hidden_payload
             and not audio_sparse_output
         ):
@@ -2061,19 +1878,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
             hidden_seq_len = int(hidden_states.shape[0])
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
-            if self.omni_prefix_cache is not None:
-                (
-                    hidden_states_cpu,
-                    combined_hidden_states,
-                    combined_multimodal_outputs,
-                ) = self._prepare_prefix_cache_pooler_payload_sources(
-                    hidden_states=hidden_states,
-                    staged_hidden_states_cpu=staged_hidden_states_cpu,
-                    multimodal_outputs=multimodal_outputs,
-                    scheduler_output=scheduler_output,
-                    needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
-                )
-            elif getattr(self, "omni_tensor_cache", None) is not None:
+            if getattr(self, "omni_tensor_cache", None) is not None:
                 (
                     hidden_states_cpu,
                     combined_hidden_states,

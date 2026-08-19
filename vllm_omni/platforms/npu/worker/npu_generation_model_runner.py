@@ -480,6 +480,7 @@ class NPUGenerationModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin
             cudagraph_stats,
             _batch_desc,
             multimodal_outputs_raw,  # Omni-Specific
+            _tensor_cache_step_id,  # generation stages never save to the tensor cache
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None

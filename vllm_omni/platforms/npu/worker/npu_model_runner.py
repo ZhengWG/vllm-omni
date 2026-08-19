@@ -20,7 +20,6 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
-from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -36,34 +35,29 @@ else:
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config) -> None:
-        """Create the omni tensor prefix cache.
-
-        The omni prefix cache is used to store the hidden states of the prefix tokens
-        """
+        """Stage the omni tensor cache config (hidden states of prefix tokens)."""
         NPUModelRunner.initialize_kv_cache(self, kv_cache_config)
-        if self.omni_prefix_cache is None and self.cache_config.enable_prefix_caching:
+        if getattr(self, "_omni_tensor_cache_cfg", None) is None and self.cache_config.enable_prefix_caching:
             # Read num_blocks back off self.kv_cache_config: vllm-ascend
             # deepcopies the config it was handed, so the value it stored is the
             # authoritative one, not our caller's argument.
             num_blocks = self.kv_cache_config.num_blocks
-            self.omni_prefix_cache = OmniTensorPrefixCache(
+            from vllm_omni.core.tensor_cache.interface import TensorCacheConfig
+
+            # v2 tensor cache in Controller eager mode (no CUDA streams:
+            # submit() completes the copy+scatter synchronously). Manager is
+            # built lazily on the first step via the inherited
+            # _ensure_omni_tensor_cache, once input_batch exists.
+            self._omni_tensor_cache_cfg = TensorCacheConfig(
                 num_blocks=num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),
                 hs_dtype=self.dtype,
             )
             logger.info(
-                "Initialized omni prefix cache on NPU (num_blocks=%d, block_size=%d, hidden_size=%d). "
-                "Hidden-state cache is pinned host memory of roughly %.1f GiB; each per-token "
-                "multimodal output key allocates another tensor of the same block shape.",
+                "Initialized omni tensor cache on NPU (eager mode, num_blocks=%d, block_size=%d).",
                 num_blocks,
                 self.cache_config.block_size,
-                self.model_config.get_hidden_size(),
-                num_blocks
-                * self.cache_config.block_size
-                * self.model_config.get_hidden_size()
-                * self.dtype.itemsize
-                / (1024**3),
             )
 
     def load_model(self, *args, **kwargs) -> None:

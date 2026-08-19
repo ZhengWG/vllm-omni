@@ -37,7 +37,7 @@ class FullAttentionGroupView:
     """View over the first (full-attention) KV-cache group.
 
     Behavior-preserving port of the block-table math previously inlined in
-    OmniTensorPrefixCache (_get_slot_ids_for_token_range /
+    the legacy prefix cache (_get_slot_ids_for_token_range /
     _get_cached_block_ids) plus the runner-side slot_mapping access.
     """
 
@@ -124,8 +124,9 @@ def get_tensor_cache_group_view(
     block_size: int,
     num_blocks: int,
 ) -> KVCacheGroupView | None:
-    """Build the group view for a runner's input batch, or None to make the
-    caller fall back to the legacy cache."""
+    """Build the group view for a runner's input batch; None means no
+    usable group (the caller fails fast rather than serving hits without
+    cached tensors)."""
     block_tables = getattr(input_batch.block_table, "block_tables", None)
     if not block_tables:
         return None
@@ -134,6 +135,6 @@ def get_tensor_cache_group_view(
         # per-group block table would make step_slots_cpu silently clamp —
         # surfacing later as a misleading save-time unmatch. Refuse until
         # multi-group support lands (G5, P2).
-        logger.warning("Omni tensor caching v2 does not support multiple kv-cache groups yet; using the legacy path.")
+        logger.warning("Omni tensor caching does not support multiple kv-cache groups yet (G5).")
         return None
     return FullAttentionGroupView(input_batch, block_size, num_blocks)

@@ -39,7 +39,7 @@ def _make_runner(monkeypatch, *, max_num_seqs: int, builders: list) -> OmniGPUMo
     monkeypatch.setattr(_UPSTREAM_RUNNER, "initialize_metadata_builders", lambda self, *a, **k: None)
     runner = object.__new__(OmniGPUModelRunner)
     runner.scheduler_config = SimpleNamespace(max_num_seqs=max_num_seqs)
-    runner.cache_config = SimpleNamespace(enable_prefix_caching=False)  # skip omni_prefix_cache branch
+    runner.cache_config = SimpleNamespace(enable_prefix_caching=False)  # skip omni tensor cache branch
     runner.attn_groups = [[SimpleNamespace(metadata_builders=builders)]]
     return runner
 

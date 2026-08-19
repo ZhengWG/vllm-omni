@@ -451,7 +451,7 @@ def _make_async_output_runner(engine_output_type: str = "audio"):
     runner.vllm_config = SimpleNamespace(model_config=model_config)
     runner.model_config = model_config
     runner._async_chunk = True
-    runner.omni_prefix_cache = None
+    runner.omni_tensor_cache = None
     runner.requests = {"r1": object(), "r2": object()}
     runner.supports_mm_inputs = False
     runner.routed_experts_initialized = False
@@ -611,7 +611,7 @@ def test_process_additional_information_uses_snapshot_request_order(monkeypatch)
     assert torch.equal(seen[1], torch.tensor([[2.0], [3.0]]))
 
 
-def test_async_omni_output_guard_requires_safe_conditions():
+def test_async_omni_output_guard_requires_safe_conditions(monkeypatch):
     runner = _make_async_output_runner()
     runner.use_async_scheduling = True
     runner.speculative_config = None
@@ -619,10 +619,15 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
-    runner.omni_prefix_cache = object()
+    # v2 tensor cache defaults to eager materialize (GIL contention on the
+    # builder thread); the env flag re-enables the builder path.
+    runner.omni_tensor_cache = object()
     assert not GPUARModelRunner._should_use_async_omni_output(runner)
+    monkeypatch.setenv("VLLM_OMNI_TC_ASYNC_MAT", "1")
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
+    monkeypatch.delenv("VLLM_OMNI_TC_ASYNC_MAT")
 
-    runner.omni_prefix_cache = None
+    runner.omni_tensor_cache = None
     runner.model.has_postprocess = True
     assert not GPUARModelRunner._should_use_async_omni_output(runner)
 
@@ -853,7 +858,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
         runner.query_start_loc = query_start_loc
     else:
         runner.query_start_loc = SimpleNamespace(cpu=query_start_loc)
-    runner.omni_prefix_cache = object()
+    runner.omni_tensor_cache = object()
     runner.speculative_config = None
     runner.routed_experts_initialized = False
     runner.requests = {}
@@ -884,12 +889,11 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     )
     monkeypatch.setattr(GPUARModelRunner, "eplb_step", lambda self: None)
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("audio", req_ids))
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: set())
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_maybe_get_combined_prefix_cache_tensors",
-        lambda *args, **kwargs: (None, None),
+        "_prepare_tensor_cache_payload_sources",
+        lambda self, **kwargs: (kwargs["staged_hidden_states_cpu"], None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
@@ -914,7 +918,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
 def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch):
     """Tail-only prefix-cache models still need per-step mm passthrough (e.g. codes.audio)."""
     runner = _make_async_output_runner(engine_output_type="latent")
-    runner.omni_prefix_cache = object()
+    runner.omni_tensor_cache = object()
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -922,11 +926,9 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
         lambda self, req_ids: ("latent", req_ids),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
-    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_pooler_payload_sources",
+        "_prepare_tensor_cache_payload_sources",
         lambda *args, **kwargs: (None, None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
@@ -1063,7 +1065,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
     a later request's slice onto the wrong index."""
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.requests = {"r1": object(), "r2": object(), "r3": object()}
-    runner.omni_prefix_cache = object()
+    runner.omni_tensor_cache = object()
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -1071,11 +1073,9 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
         lambda self, req_ids: ("latent", ["r1", "r3"]),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
-    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_pooler_payload_sources",
+        "_prepare_tensor_cache_payload_sources",
         lambda *args, **kwargs: (None, None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
@@ -1115,7 +1115,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
 
 def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_downstream_batch(monkeypatch):
     """When the prefix-cache merge path is engaged (i.e.
-    _prepare_prefix_cache_pooler_payload_sources returns a non-None
+    _prepare_tensor_cache_payload_sources returns a non-None
     combined_multimodal_outputs), _build_omni_mm_payload must take the
     _build_combined_prefix_cache_mm_payload branch -- keyed by req_id,
     not by row/slice -- rather than falling back to build_mm_cpu, and
@@ -1128,7 +1128,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     """
     runner = _make_async_output_runner(engine_output_type="latent")
     runner.requests = {"r1": object(), "r2": object(), "r3": object()}
-    runner.omni_prefix_cache = object()
+    runner.omni_tensor_cache = object()
 
     # codes.ref arrives whole for every request: the prefix-cache merge uses
     # pass_lists_through, so selecting this request's entry is _unwrap_lists'
@@ -1148,11 +1148,9 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
         lambda self, req_ids: ("latent", ["r1", "r3"]),
     )
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
-    monkeypatch.setattr(GPUARModelRunner, "_deferred_prefix_cache_mm_keys", lambda self: {"codes.audio"})
-    monkeypatch.setattr(GPUARModelRunner, "_stage_deferred_prefix_cache_mm_outputs", lambda *args, **kwargs: None)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_pooler_payload_sources",
+        "_prepare_tensor_cache_payload_sources",
         lambda *args, **kwargs: (None, None, combined_mm),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)

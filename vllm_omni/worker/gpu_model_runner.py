@@ -30,10 +30,10 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
-from vllm_omni.core.prefix_cache import OmniTensorPrefixCache
 from vllm_omni.core.tensor_cache import (
     ModelCachePolicy,
     OmniTensorCacheManager,
+    OmniTensorCacheUnmatchError,
     TensorCacheConfig,
     get_tensor_cache_group_view,
 )
@@ -86,10 +86,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
-        # The Omni tensor prefix cache will be allocated
-        # when we initialize the metadata builders if enabled
-        self.omni_prefix_cache = None
-        # v2 tensor cache (CUDA): config staged at metadata-builder init,
+        # Omni tensor cache: config staged at metadata-builder init,
         # manager built lazily on first step (input_batch must exist).
         self.omni_tensor_cache = None
         self._omni_tensor_cache_cfg = None
@@ -175,33 +172,16 @@ class OmniGPUModelRunner(GPUModelRunner):
                                 device=sm.device,
                             )
 
-        # Initialize the wrapper for both multimodal output tensors
-        # and for hidden states to be passed between stages
+        # Stage the omni tensor cache config; the manager is built lazily on
+        # the first step so input_batch is guaranteed to exist. Non-CUDA
+        # platforms run the Controller in eager mode (auto-selected).
         if self.cache_config.enable_prefix_caching:
-            import os
-
-            from vllm.platforms import current_platform
-
-            # Escape hatch for rollback / A-B comparison against the legacy cache.
-            use_v2 = os.environ.get("VLLM_OMNI_TENSOR_CACHE_V2", "1") != "0"
-            if current_platform.is_cuda() and use_v2:
-                # v2 slot/entry tensor cache; manager built lazily on the
-                # first step so input_batch is guaranteed to exist.
-                self._omni_tensor_cache_cfg = TensorCacheConfig(
-                    num_blocks=kv_cache_config.num_blocks,
-                    block_size=self.cache_config.block_size,
-                    hidden_size=self.model_config.get_hidden_size(),
-                    hs_dtype=self.dtype,
-                )
-            else:
-                # NPU and other platforms stay on the legacy sync cache
-                # until the Controller eager mode is validated there.
-                self.omni_prefix_cache = OmniTensorPrefixCache(
-                    num_blocks=kv_cache_config.num_blocks,
-                    block_size=self.cache_config.block_size,
-                    hidden_size=self.model_config.get_hidden_size(),
-                    hs_dtype=self.dtype,
-                )
+            self._omni_tensor_cache_cfg = TensorCacheConfig(
+                num_blocks=kv_cache_config.num_blocks,
+                block_size=self.cache_config.block_size,
+                hidden_size=self.model_config.get_hidden_size(),
+                hs_dtype=self.dtype,
+            )
 
     def _ensure_omni_tensor_cache(self) -> None:
         if getattr(self, "omni_tensor_cache", None) is not None:
@@ -211,17 +191,14 @@ class OmniGPUModelRunner(GPUModelRunner):
             return
         view = get_tensor_cache_group_view(self.input_batch, cfg.block_size, cfg.num_blocks)
         if view is None:
-            # No usable full-attention group: fall back to the legacy cache
-            # rather than silently serving un-merged hidden states.
-            logger.warning("Omni tensor cache unavailable (no kv-cache group view); falling back to legacy cache.")
-            self._omni_tensor_cache_cfg = None
-            self.omni_prefix_cache = OmniTensorPrefixCache(
-                num_blocks=cfg.num_blocks,
-                block_size=cfg.block_size,
-                hidden_size=cfg.hidden_size,
-                hs_dtype=cfg.hs_dtype,
+            # No usable full-attention group (hybrid/multi-group models, G5 is
+            # P2). Serving prefix hits without the omni cache would hand
+            # downstream stages truncated conditioning, so refuse loudly
+            # instead of degrading.
+            raise OmniTensorCacheUnmatchError(
+                "omni tensor caching requires a single full-attention kv-cache group; "
+                "disable enable_prefix_caching for this model or wait for multi-group support (G5)"
             )
-            return
         manager = OmniTensorCacheManager(cfg, view)
         manager.register_policy(ModelCachePolicy.from_model(getattr(self, "model", None)))
         self.omni_tensor_cache = manager
@@ -513,10 +490,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         The SamplingMetadata is updated and copied to the GPU if there is a
         new/resumed/paused/finished request in the batch.
         """
-        # Used for prefix cache
-        if self.omni_prefix_cache is not None:
-            self.omni_prefix_cache.reset_prefix_cached_new_req_ids()
-
         # Remove finished requests from the cached states.
         # cleanup_finished_request lives on OmniConnectorModelRunnerMixin and
         # is only safe to call once init_omni_connectors() has finished
@@ -533,8 +506,6 @@ class OmniGPUModelRunner(GPUModelRunner):
             self.requests.pop(req_id, None)
             self.model_intermediate_buffer.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
-            if self.omni_prefix_cache is not None:
-                self.omni_prefix_cache.discard_deferred_mm_outputs(req_id)
             if hasattr(self, "_downstream_payload_cache"):
                 self._downstream_payload_cache.pop(req_id, None)
             if hasattr(self, "_talker_mtp_generators"):
@@ -597,13 +568,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 req_state = self._update_streaming_request(req_id, new_req_data)
                 reqs_to_add.append(req_state)
                 continue
-
-            # Since this is the first time the request has been scheduled,
-            # num_computed_tokens > 0 means that we have a hit in prefix
-            # caching; mark it so that we can manage the hidden states
-            # later on as needed.
-            if self.omni_prefix_cache is not None and new_req_data.num_computed_tokens > 0:
-                self.omni_prefix_cache.add_prefix_cached_new_req_id(req_id)
 
             sampling_params = new_req_data.sampling_params
             pooling_params = new_req_data.pooling_params
