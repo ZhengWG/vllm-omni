@@ -223,7 +223,7 @@ class OmniTensorCacheManager:
         if join_ids:
             # Copy-completion wait only (RFC D1): scatter completion is the
             # committer's business, not the engine step's.
-            self._controller.join_copied(join_ids)
+            self._controller.join_host_ready(join_ids)
 
         n = num_tokens_unpadded
         req_order = self._view.batch_req_ids()

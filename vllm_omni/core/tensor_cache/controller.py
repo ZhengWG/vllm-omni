@@ -1,13 +1,15 @@
-"""OmniTensorCacheController: WriteTask execution.
+"""OmniTensorCacheController: Task execution Controller.
 
-Two-stage pipeline per the RFC: a copy queue (D2H issuance — class
+Two-stage pipeline per:
+
+1. A copy queue (D2H issuance — class
 priority, chunked Class A trickle, cap accounting) and a scatter stage
 (runs tasks whose copy finished). The committer thread is the mirror's
 single writer; slot-reuse needs no ordering edges — a reassigned
 (slot, key) is pushed into the old task's skip set, so old and new
 mirror writes are disjoint by construction.
 
-Eager mode (no background thread) serves CPU-only tests and non-CUDA
+2. Eager mode (no background thread) serves CPU-only tests and non-CUDA
 platforms: submit() completes the whole pipeline synchronously.
 """
 
@@ -212,12 +214,10 @@ class OmniTensorCacheController:
             if task is not None:
                 task.done.wait()
 
-    def join_copied(self, tids: list[int]) -> None:
-        """Bounded-depth wait per RFC D1: the join only has to bound the
-        in-flight GPU staging, and GPU references drop when the COPY
-        finishes — waiting for the scatter too (done) stalls the engine
-        behind the committer's queue for no correctness gain (the mirror's
-        final value is guaranteed by tid validation + skip sets)."""
+    def join_host_ready(self, tids: list[int]) -> None:
+        """Bounded-depth wait: waits only for in-flight GPU staging
+        to complete, i.e., for host buffer to be ready. Waiting for
+        the scatter phase as in join() is unnecessary for correctness."""
         for tid in tids:
             task = self._tasks.get(tid)
             if task is not None:
@@ -263,8 +263,7 @@ class OmniTensorCacheController:
         """
         if len(task.segments) == 1:
             # Fast path: one segment (every main entry) needs no regroup or
-            # reorder — resolve rows with a single tensor op. The general
-            # path below costs ~15 ms per 8k-token merge in pure Python.
+            # reorder — resolve rows with a single tensor op.
             rows = self._rows_single_segment(task, slots, key)
             seg = task.segments[0]
             if (
@@ -387,9 +386,9 @@ class OmniTensorCacheController:
         return cpu
 
     def publish_host(self, task: WriteTask, host: dict[str, torch.Tensor]) -> bool:
-        """Attach a ready host copy to a single-segment task (D6 feed-back,
-        per-request form): the background committer skips its own D2H and
-        just scatters. Loses the claim race -> False, caller's copy is
+        """Attach a ready host copy to a single-segment task:
+        the background committer skips its own D2H and just scatters.
+        Loses the claim race -> False, caller's copy is
         discarded (single-publisher rule)."""
         with task.lock:
             if task.d2h_claimed or task.done.is_set() or len(task.segments) != 1:
@@ -474,11 +473,10 @@ class OmniTensorCacheController:
             try:
                 with self._wake:
                     while not self._shutdown and not self._queue_hi and not self._queue_lo:
-                        # _blocked is not a wake condition: its tasks need a
-                        # dep to finish, which only happens via a new item.
-                        self._wake.wait(timeout=0.05)
                         if self._blocked:
                             break
+                        # submit / escalate / feed-back / shutdown all notify.
+                        self._wake.wait()
                     if self._shutdown and not self._queue_hi and not self._queue_lo and not self._blocked:
                         return
                     if self._queue_hi:
@@ -499,12 +497,16 @@ class OmniTensorCacheController:
 
     @torch.inference_mode()
     def _copy_task(self, task: WriteTask) -> None:
+        """
+        Asynchronously copy tensor data for a WriteTask from device (GPU) to host (CPU).
+        """
         with task.lock:
             if task.d2h_claimed:
                 return
             task.d2h_claimed = True
         assert self._copy_stream is not None
         chunk_bytes = self._config.copy_chunk_bytes
+        pending_cats: list[tuple[_Segment, str, list[torch.Tensor]]] = []
         with torch.cuda.stream(self._copy_stream):
             if task.freeze_event is not None:
                 self._copy_stream.wait_event(task.freeze_event)
@@ -512,23 +514,19 @@ class OmniTensorCacheController:
                 for k, src in seg.tensors.items():
                     if task.klass == CLASS_A and src.numel() * src.element_size() > chunk_bytes:
                         rows_per_chunk = max(1, chunk_bytes // max(1, src.shape[-1] * src.element_size()))
-                        parts = []
-                        for start in range(0, src.shape[0], rows_per_chunk):
-                            part = src[start : start + rows_per_chunk].to("cpu", non_blocking=True)
-                            parts.append(part)
-                            ev = torch.cuda.Event()
-                            ev.record()
-                            ev.synchronize()  # chunk boundary: lets hi-queue D2H interleave
-                        seg.host[k] = torch.cat(parts, dim=0)
+                        parts = [
+                            src[start : start + rows_per_chunk].to("cpu", non_blocking=True)
+                            for start in range(0, src.shape[0], rows_per_chunk)
+                        ]
+                        pending_cats.append((seg, k, parts))
                     else:
                         seg.host[k] = src.to("cpu", non_blocking=True)
             ev = torch.cuda.Event()
             ev.record()
         ev.synchronize()
-        # Publication order is load-bearing: host bufs complete + synced ->
-        # host_ready -> only then drop GPU refs. Concurrent fetch_host either
-        # holds a tensor ref (torch refcount keeps storage alive) or falls
-        # back to seg.host, which is guaranteed complete here. Do not reorder.
+        for seg, k, parts in pending_cats:
+            seg.host[k] = torch.cat(parts, dim=0)
+        # host bufs complete -> host_ready -> drop GPU refs. Do not reorder.
         task.host_ready.set()
         with self._wake:
             self._staged_bytes -= task.nbytes

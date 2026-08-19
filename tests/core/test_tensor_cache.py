@@ -610,12 +610,12 @@ def test_lock_never_covers_fetch_or_join():
     mgr, view = make_manager(policy=policy)
     calls = []
     real_fetch = mgr._controller.fetch_host
-    real_join = mgr._controller.join_copied
+    real_join = mgr._controller.join_host_ready
     mgr._controller.fetch_host = lambda *a, **kw: (
         calls.append(("fetch", mgr._state_lock.locked())),
         real_fetch(*a, **kw),
     )[1]
-    mgr._controller.join_copied = lambda ids: (calls.append(("join", mgr._state_lock.locked())), real_join(ids))[1]
+    mgr._controller.join_host_ready = lambda ids: (calls.append(("join", mgr._state_lock.locked())), real_join(ids))[1]
 
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
     mgr.materialize(s1, ["a"])

@@ -86,8 +86,6 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
-        # Omni tensor cache: config staged at metadata-builder init,
-        # manager built lazily on first step (input_batch must exist).
         self.omni_tensor_cache = None
         self._omni_tensor_cache_cfg = None
         self._sampled_token_ids_cpu_override = None
