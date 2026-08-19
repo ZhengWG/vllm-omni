@@ -2,176 +2,228 @@
 
 ## 1. Overview
 
-vLLM-Omni's hidden-state prefix cache (`OmniTensorPrefixCache`, introduced in #2164) mirrors vLLM's KV-cache block/slot mapping to cache stage outputs (hidden states and per-token multimodal tensors) on CPU, so that prefix-cache hits skip both KV recomputation *and* inter-stage tensor recomputation.
+vLLM-Omni's hidden-state prefix cache (`OmniTensorPrefixCache`, #2164) mirrors vLLM KV-cache block/slot mapping and keeps stage outputs (hidden states and per-token multimodal tensors) on CPU, so a prefix hit skips both KV recompute and inter-stage tensor recompute. After #4106 / #3734 / #3665 it has four structural problems:
 
-Since the initial merge the implementation has grown organically (#4106 async writes, #3734 staging dedup, #3665 correctness fixes, deferred mm-chunk commits) and now has four structural problems:
+1. **Performance**: the write path is only half-async — CPU scatter still runs on the main thread every step; deferred mm chunks grow unboundedly on GPU and spike at request finish; the read path is fully synchronous.
+2. **Correctness**: vLLM caches block hashes optimistically (commits `computed + num_new_tokens` at allocation). A same-step cross-request hit can read rows that land on CPU one step later (zeros / stale) and silently forward them. Aborted requests drop deferred chunks while their blocks remain hittable. Async D2H reads the live forward output with no `record_stream` (static-buffer overwrite and allocator reuse).
+3. **Coupling**: ~12 methods + raw attributes + ~6 implicit runner ordering contracts + `getattr` policy probing. This is why prefix caching is mutually exclusive with async omni output (#4476 guard) and silently degrades under `async_chunk` (continuations skip hit marking).
+4. **Extensibility**: `block_table[0]` hard-codes a single KV group. Slot indexes silently break under L2 offload / connector.
 
-1. **Performance**: the write pipeline is only half-async. The CPU scatter (`index_copy_`) still runs on the runner main thread every step, decode-side deferred mm chunks grow unboundedly on GPU and cause a synchronous commit spike at request finish, and the read/merge path is fully synchronous with a blocking `.cpu()` fallback.
-2. **Correctness**: vLLM caches block hashes *optimistically at allocation* (`kv_cache_manager.py` commits `computed + num_new_tokens`), so a request scheduled later in the same step can hit blocks whose tokens are computed in that very step. Since #4106 the omni write lands in the CPU mirror one step later, so a same-step cross-request hit merges never-written rows (zeros/stale) and silently forwards them downstream — reproducible with concurrently arriving duplicate prompts. The pre-#4106 synchronous write did not have this window. Additionally, request-keyed deferred mm chunks are dropped when an aborted request is no longer in the input batch (`prefix_cache.py`) while its hashed blocks remain hittable from the free queue, leaving never-written mm rows reachable.
-3. **Coupling**: the cache exposes ~12 methods plus raw attribute access, and the runner carries ~6 *implicit ordering contracts* (drain-before-merge, commit-before-batch-removal, consume-before-merge, ...) plus model-policy probing via `getattr`. This coupling is why prefix caching is currently **mutually exclusive** with async omni output (#4476 hard-disables it via a safety guard, `gpu_ar_model_runner.py`) and silently degrades under `async_chunk` (streaming continuation requests skip hit marking, `gpu_model_runner.py`).
-4. **Extensibility**: `block_table[0]` (single KV-cache group) is hard-coded, blocking hybrid-attention models (e.g. Qwen3.5-style full+linear attention); and slot-indexed validity silently breaks under vLLM L2 KV offload / KV-connector restores.
+This RFC splits the design into two layers. `OmniTensorCacheManager` owns `(slot, key)` state; `OmniTensorCacheController` only moves data. Names follow vLLM `v1/core`.
 
-This RFC proposes a refactor into an `OmniTensorCacheManager` with a 4-method surface, a background commit pipeline, and naming/structure aligned with vLLM's `v1/core` KV-cache design.
-
-Related: #1184 (original prefix caching issue), #2164, #4106, #3734, #3665, #4442/#4476 (async omni output).
+Related: #1184, #2164, #4106, #3734, #3665, #4442 / #4476.
 
 ## 2. Scope & Objectives
 
 ### Goals
 
-- **G1 — Zero main-thread cache cost.** All D2H copies and CPU scatters move to a background committer thread. Target: prefix-cache-related CPU time in `execute_model` drops from ms-level per step to ≈0 (bookkeeping only); no ITL spike at request finish.
-- **G2 — Keep cache data consistent.** Cache reads/writes stay consistent with vLLM's KV state throughout the save/read process; on any detected divergence between omni-cached rows and vLLM KV data, the request falls back (salted re-run) instead of risking accuracy.
-- **G3 — Narrow, contract-internalizing API.** Runner touches the cache at exactly 3 call sites (`new_step_starts` / `save_outputs` / `materialize`) plus a one-time `register_policy`. All ordering contracts except one become internal invariants.
-- **G4 — Feature compatibility.** `async_scheduling + async_chunk + prefix caching` all-on passes e2e; the #4476 guard in `gpu_ar_model_runner.py` is deleted; streaming (`async_chunk`) requests get correct merge semantics via span-based hit tracking.
-- **G5 — Extensibility seam for multi-KV-group.** A single `KVCacheGroupView` protocol isolates all vLLM block-table access; hybrid models plug in by providing a view implementation; no full-attention group ⇒ feature cleanly self-disables.
+- **G1** — Scatter and D2H run on a background thread. Almost everything is async. Only these sync points remain; each is small and bounded per step:
+
+  - D2D freeze: a small device-to-device kernel. Cost scales with batch size and is usually very cheap.
+  - Occasional CPU/GPU handshake so save and the next forward stay ordered. Essentially free.
+  - Rare: a prefix hit whose data is still in-transit needs a sync D2H. Almost never on the hot path.
+  - Cap flush of the oldest task when GPU staging is full. Degraded path; rare.
+
+- **G2** — Omni PrefixCache stays consistent with vLLM KV. Only fatal errors are errors; miss is not an error:
+
+  - **Fatal**: dump and exit. Bookkeeping on `(slot, key)` is wrong, `task_id` does not match, or a hit span is absent. On a prefix hit vLLM has already skipped those tokens; this step will not recompute them, so missing rows cannot be filled in. Do not silently degrade. Abort is the same rule: once a hash is in this step's batch, it must be written.
+  - **Ordinary miss (not an error)**: the request is in this step's snapshot but has no hit span (new prompt / no hit). `materialize` uses only this step's forward slice. **No warning, no degradation counter.** This is the main path.
+  - **`req_id` outside the snapshot**: `materialize` received an id that is not in this `step_id` snapshot — the runner passed the live batch. P0 forbids this (the async builder must pass the req list copied at save). Debug-assert only; no hot-path warning.
+- **G3** — Narrow public API.
+- **G4** — `async_scheduling + async_chunk + prefix caching` all on (**P2**).
+- **G5** — `KVCacheGroupView` isolates block-table access so multi-KV-group can plug in later (**P2**).
 
 ### Non-Goals
 
-- **vLLM L2 KV offload interop.** Deferred to a follow-up stage. This RFC only adds (a) a startup guard making L2/offload connectors and omni tensor caching mutually exclusive per stage, and (b) per-block generation tags so any invalid read fails loudly instead of silently returning stale data. The long-term direction (omni rows riding the same offload connector payload so lifecycle is shared by construction) is out of scope here.
-- **Content-addressed (block-hash-keyed) storage tier.** Not built until L2/multi-group demand is concrete.
-- Speculative-decode interaction (orthogonal; existing guards unchanged).
+- vLLM L2 KV offload interop (startup mutex only; long-term it should ride the connector payload).
+- Content-addressed storage; speculative-decode interaction (orthogonal).
 
 ## 3. Design
 
 ### Architecture
 
-Naming and module layout mirror vLLM `v1/core` KV-cache design:
-
-| This RFC | vLLM reference |
+| This RFC | vLLM counterpart |
 |---|---|
-| `OmniTensorCacheManager` (facade) | `KVCacheManager` (`v1/core/kv_cache_manager.py`) |
-| `new_step_starts(scheduler_output)` | `KVCacheManager.new_step_starts()` |
-| `save_outputs(...)` | connector-side `save_kv_layer` verb family |
-| `TensorBlockPool` (CPU block mirror + per-block generations) | `BlockPool` (`v1/core/block_pool.py`) |
-| `KVCacheGroupView` / `FullAttentionGroupView` | `KVCacheGroupSpec` / `FullAttentionSpec` + `FullAttentionManager` |
+| `OmniTensorCacheManager` (facade, block/slot domain) | `KVCacheManager` |
+| `OmniTensorCacheController` (WriteTask mover) | none (closest: connector worker side) |
+| `TensorBlockPool` (pinned CPU block mirror) | `BlockPool` |
+| `KVCacheGroupView` / `FullAttentionGroupView` | `KVCacheGroupSpec` / `FullAttentionSpec` |
 | `TensorCacheConfig` | `KVCacheConfig` |
 
 ```
 vllm_omni/core/tensor_cache/
-├── interface.py      # TensorCacheConfig / ModelCachePolicy / StageCacheOutputs / InflightStageOutputs
-├── manager.py        # OmniTensorCacheManager (with AsyncTensorCommitter on a background thread)
-├── block_pool.py     # TensorBlockPool (+ per-block generation)
-└── group_view.py     # KVCacheGroupView protocol / FullAttentionGroupView / factory
+├── interface.py      # TensorCacheConfig / ModelCachePolicy / StageCacheOutputs
+├── manager.py        # OmniTensorCacheManager (slot state, span/hit, merge)
+├── controller.py     # OmniTensorCacheController (WriteTask exec, queues, cap)
+├── block_pool.py     # TensorBlockPool
+└── group_view.py     # KVCacheGroupView / FullAttentionGroupView / factory
 ```
 
-![Class diagram](rfc-omni-tensor-cache-assets/class-diagram.svg)
+**Class relationships** (who owns whom, who is called on which path):
 
-**Per-step flow (before):**
+![Omni tensor cache class diagram](rfc-omni-tensor-cache-assets/class-diagram.svg)
 
-![image-20260810225427318](/Users/guanxiangtian/Library/Application Support/typora-user-images/image-20260810225427318.png)
+Manager owns `(slot, key)` state; Controller only moves data and reports completion. `KVCacheGroupView` is the only way to touch the vLLM block table, and only from `new_step_starts` / `save_outputs`. A `WriteTask` is one write, identified by `task_id`. A `(slot, key)` stores the current `task_id`; it is not the slot itself.
 
-**Per-step flow (after):**
+**One-step sequence** (`execute_model` → `sample`; two requests in the same batch):
 
-![Per-step sequence](rfc-omni-tensor-cache-assets/per-step-sequence.svg)
+- **P**: already decoding. Previous Class B `t1` is still moving in the background; `deferred_keys` such as codes sit on Class A until P finishes.
+- **Q**: new this step, prefix-hit P's already-committed first 32 tokens. This-step forward computes only Q's suffix.
 
-### Multi-request interleaving — committer writes vs builder reads on the block pool
+![Per-step sequence with requests P and Q](rfc-omni-tensor-cache-assets/per-step-sequence.svg)
 
-Three requests across three steps: **A** prefills at step N, **B** arrives at step N+1 and prefix-hits A's blocks, **C** decodes one token every step. The committer (writing the mirror) and the builder (reading it for a different request) run concurrently — the four numbered guarantees below make that race-free.
+Four public call sites: ① `new_step_starts` (register Q's hit, drain completed tasks); ② `save_outputs` (join P's previous Class B off the lock, freeze this-step hidden, submit one Class B task per request, return `sid=N`); ③ `materialize(N, [P,Q])`; ④ `discard_step(N)` when nobody will read this step (public API; Manager decides read vs discard from policy / whether this step has a hit — the runner does not expand that table). P is a miss and gets this-step slice only. Q's `[0,32)` is grouped by the **`task_id` recorded at save**: committed rows come from the mirror; still-writing rows come from `fetch_host`.
 
-![image-20260810225639762](/Users/guanxiangtian/Library/Application Support/typora-user-images/image-20260810225639762.png)
+**What `key` is.** One slot usually has two independent tensors:
+- `hidden_states`: written incrementally every step
+- names in `ModelCachePolicy.deferred_keys` (e.g. codes): staged until the request finishes
+
+`skip_keys` never enter the state machine. State must be keyed by `(slot, key)`, or hidden stays in-transit for the whole decode because of deferred mm, or unread mm is treated as already on disk.
+
+**(slot, key) and WriteTask**
+
+Each `(slot, key)` stores one `task_id`: who is writing it now.
+
+`task_id = (req_id, key, seq)`
+- `req_id`, `key`: which request, which tensor stream
+- `seq`: how many times this pair has opened a write (Class B +1 every decode step; deferred usually stays; remount +1)
+
+`task_id is None`: nobody is writing. Hidden and deferred have separate tables; the two keys on the same slot do not share state. `_req_tasks[req_id]` lists every task of a request.
+
+A completion event whose `task_id` is no longer current on that `(slot, key)` is dropped.
+
+After a write is registered, `(slot, key)` has two states:
+- **in-transit**: write in progress, not on the mirror yet; readable from the GPU snapshot
+- **committed**: already on the host mirror
+
+**absent** means never registered. It is not a state you go back to after a write. Seeing it inside a hit span is an implementation bug: dump and exit.
+
+**Reassigning a block = remount the task.** This happens only when P has not finished writing and the block is given to Q. Q's `save` remounts those `(slot, key)`s to Q's `task_id` and skips P's leftover writes on them. Slots Q did not take still belong to P and wait for finish / abort / cap; a later hit on them reads in-transit and does not wait for scatter. There is no separate “P was preempted” signal. Normal finish-then-reuse never reaches this path: the same `save` joins P first, then submits Q.
+
+Reads group by the **`task_id` recorded at save**, not by “the whole request is in-transit”. One hit often spans several tasks: the old prefix is committed, this step's new rows are still in-transit. Treating “any in-transit ⇒ read the whole request from the snapshot” would touch already-freed staging or D2H committed rows again.
+
+A `WriteTask` holds:
+- **D2D freeze copy** (on the compute stream at save, with a freeze event) — the forward output may be a CUDA-graph static buffer, and today's D2H has no `record_stream`. The freeze closes both races and doubles as the #4476 snapshot.
+- **Slot list fixed at save** — commit no longer looks at `input_batch`, so the current abort-drop-chunk bug disappears by construction.
+- D2H event and completion report.
+
+### Task synchronization
+
+- **Sync (one step behind)**: `save_outputs` (after forward) is consume-then-schedule — join the previous step's non-deferred tasks, then submit this step. Correctness does not depend on where join sits (committed rows are not rewritten; uncommitted rows are not read from the mirror). Join is only a **bounded wait** that caps in-flight depth. The GPU snapshot follows the task ref and is **released after the host copy is published** (not as soon as the copy finishes).
+- **Write classes**: **Class A** (one-shot: prefill hidden, deferred codes; the cache copy is consumed once by a future hit) → lazy background batches; finish can escalate + next-forward join to cut the spike. **Class B** (per-step decode hidden) → write every step, join at next forward.
+- **Cap**: GPU staging has a byte budget. Over budget, block and flush the oldest task (its D2H is usually almost done).
+- **Abort still writes; never roll back** — aborted full-block hashes remain hittable; rolling back would make a legal hit look unmatched. Rule: **once a hash is in this step's batch it must be saved, abort included**. When `new_step_starts` sees finished/abort, every already-registered task of that request is escalated and joined at the next save. There is **no “allocated then aborted before first save” exemption**: absent means a missed write or a missed registration — fail-fast.
+- **Preemption reuse**: see “Reassigning a block = remount the task” above. Finish-then-reuse never goes there.
+
+### Read path: materialize groups by save-time `task_id` of each `(slot, key)`
+
+A hit span is grouped by the **`task_id` recorded at save** (one hit often spans tasks: old prefix committed, this-step rows in-transit). Each group is read from its current tier, then stitched back into caller order:
+
+- **committed** → read the host mirror. Same bytes for every reader.
+- **in-transit** → wait for the freeze, then D2H from the GPU snapshot. If the copy thread already published a host copy, read that. Same-step readers see the same bytes; nobody observes a torn row. Deferred keys stay in this tier until finish.
+- **absent** → never registered. Inside a hit span this is bookkeeping corruption: dump and exit.
+
+**`materialize` uses only the snapshot hung at `save` for this `step_id`. It does not touch live `input_batch`.** When the async builder runs one step late, finished requests are already removed and a preempted block table is already rewritten, so:
+
+- **Inside the cache**: slots, hit blocks, and the save-time `task_id`s are stored on the step context at `new_step_starts` or `save_outputs`. `KVCacheGroupView` is used only at those two points, because it depends on this step's input.
+- **Runner `materialize` args / return**: `req_ids` must be a subset of that `sid` snapshot. **The return is already stitched per request; the runner does not stitch again.** Snapshot hit → `cache[0, hit) + this-step slice` (when policy wants full hidden); snapshot miss → **this-step slice only** (not empty, not a full prompt assembled from cache); id outside the snapshot → debug assert; missing row in a hit span → dump and exit. `StageCacheOutputs.hidden_states is None` means the policy does not want hidden, not a miss.
+
+A large task's first consume (`build_payload`) reads the snapshot and does not wait for the mirror. The D2H result is published onto that task as a host copy for later reuse. `d2h_claimed` lets only one thread publish the host result; losers drop their copy. The flag is Controller-internal and does not touch the `(slot, key)` tables. The GPU snapshot is released after the host copy is published. Eager mode does the sync D2H on the main thread at sample/build; async output does it on the builder thread.
 
 ### API & Interface Changes
-
-**New public surface** (replaces ~12 methods + 3 raw attributes on `OmniTensorPrefixCache`):
 
 ```python
 class OmniTensorCacheManager:
     def register_policy(self, policy: ModelCachePolicy) -> None: ...     # once, at load_model
     def new_step_starts(self, scheduler_output: SchedulerOutput) -> None: ...
     def save_outputs(self, hidden_states, mm_outputs, *,
-                     num_tokens_unpadded: int, num_tokens_padded: int) -> InflightStageOutputs: ...
+                     num_tokens_unpadded: int, num_tokens_padded: int) -> int: ...
+                                # returns step_id; the hung context is consumed exactly once
+                                # by materialize or discard_step
+    def materialize(self, step_id: int, req_ids: list[str]) -> StageCacheOutputs: ...  # any thread
+    def discard_step(self, step_id: int) -> None: ...  # drop the snapshot if nobody will read;
+                                                       # writes are unaffected. Manager decides
+                                                       # from policy / this-step hit.
     def shutdown(self) -> None: ...
 
-class InflightStageOutputs:
-    """Refcounted handle over this step's not-yet-committed outputs.
-
-    Kept separate from StageCacheOutputs on purpose: this object owns
-    resources (frozen-entry refs, retire lifecycle, cap-K accounting) while
-    StageCacheOutputs is a plain value; merging the two behind a state flag
-    would couple resource lifetime to a data container.
-    """
-    def materialize(self, req_ids: list[str]) -> StageCacheOutputs: ...  # any thread
-
 class StageCacheOutputs(NamedTuple):
-    hidden_states: dict[str, torch.Tensor] | None   # req_id → full-prompt tensor (policy-gated)
-    mm_outputs: dict[str, dict[str, Any]]           # req_id → per-request payload (req-major)
+    hidden_states: dict[str, torch.Tensor] | None   # req → already stitched: hit = cache+slice,
+                                                    # miss = this-step only; None = policy skips hidden
+    mm_outputs: dict[str, dict[str, Any]]           # likewise stitched per req;
+                                                    # missing hit-span row exits the process
 
 @dataclass(frozen=True)
-class ModelCachePolicy:                              # replaces getattr probing on models
+class ModelCachePolicy:                              # replaces getattr probing
     needs_full_hidden_states: bool = True
     merge_consumed_by_postprocess: bool = False      # forces eager materialize
-    deferred_keys: frozenset[str] = frozenset()      # strip-coalesced decode mm keys
+    deferred_keys: frozenset[str] = frozenset()      # Class A-deferred: GPU staged until finish
     skip_keys: frozenset[str] = frozenset()
-    default_placement: Placement = Placement.CPU     # GPU assembly reserved, not implemented
 
-class KVCacheGroupView(Protocol):                    # sole vLLM-internals access path
+class KVCacheGroupView(Protocol):                    # sole path into vLLM internals
     block_size: int
     num_blocks: int
     def slot_mapping_gpu(self, num_tokens: int) -> torch.Tensor: ...
     def slots_for(self, req_id: str, token_start: int, token_end: int) -> torch.Tensor: ...
-    def block_generations(self, slots: torch.Tensor) -> torch.Tensor: ...
+    def cached_block_ids(self, req_id: str) -> torch.Tensor: ...
 ```
 
-**Runner interaction, before → after:**
+**Runner interaction (after: 4 call sites + 1 registration):**
 
 ```python
-# ── Before: 10 call sites across 2 files, ~6 implicit ordering contracts ──
-# gpu_model_runner.py::_update_states
-omni_prefix_cache.reset_prefix_cached_new_req_ids()
-omni_prefix_cache.discard_deferred_mm_outputs(req_id)          # per finished req
-omni_prefix_cache.add_prefix_cached_new_req_id(req_id)         # hit marking; skipped for streaming
-# gpu_ar_model_runner.py::execute_model
-omni_prefix_cache.drain_ready_async_writes()
-omni_prefix_cache.commit_deferred_mm_outputs(finished, input_batch)   # before batch removal
-# ...forward...
-slot_mapping_gpu = input_batch.block_table[0].slot_mapping.gpu        # .gpu workaround at call site
-omni_prefix_cache.schedule_async_write(hs, mm, slot_mapping_gpu, n, n_pad, skip_keys)
-# sample_tokens / output build
-self._stage_deferred_prefix_cache_mm_outputs(...)                     # per-request Python loops
-combined_hs = omni_prefix_cache.get_merged_hidden_states(...)         # after consume, main thread
-combined_mm = omni_prefix_cache.get_merged_multimodal_states(...)
-# + runner-side policy probing: _model_needs_full_prefix_hidden_states(),
-#   _deferred_prefix_cache_mm_keys(), payload gating, staging special cases
+cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
 
-# ── After: 3 call sites + 1 registration ──
-cache.register_policy(ModelCachePolicy.from_model(model))      # load_model, once
-cache.new_step_starts(scheduler_output)                        # top of execute_model
-inflight = cache.save_outputs(hidden, mm_flat,
-                              num_tokens_unpadded=n, num_tokens_padded=n_pad)
-outs = inflight.materialize(req_ids)                           # main thread eager or #4476 builder
+cache.new_step_starts(scheduler_output)   # very start of execute_model, before _update_states
+#   registers hit spans (a span is a token range that prefix-hit) and handles
+#   finish / abort lifecycle (escalate already-registered tasks)
+# ...forward...
+sid = cache.save_outputs(hidden, mm_flat, num_tokens_unpadded=n, num_tokens_padded=n_pad)
+#   lock must not cover join / D2H:
+#     lock → list task_ids to join → unlock
+#     join(previous Class B + this-step finished Class A already escalated)   # off lock
+#     lock → drain completions → D2D freeze → submit this-step WriteTask → hang ctx → unlock → return sid
+
+outs = cache.materialize(sid, req_ids)    # sample_tokens or output build; main or builder thread
+#   resolves this step by (slot, key); async_output / async_chunk share this API
+#   missing row in a hit span → dump and exit. Nobody reading → discard_step(sid) (writes continue).
+#   Manager decides read vs discard from policy / whether this step has a hit.
+#   sid must reach the builder; step N+1 must not drop step N's still-waiting context.
 ```
 
-`vllm_omni/core/prefix_cache.py` is superseded by `vllm_omni/core/tensor_cache/`. Models currently setting `requires_full_prefix_cached_hidden_states` / `deferred_prefix_cache_mm_keys` (qwen3-tts, higgs-v3, personaplex) keep working through a `ModelCachePolicy.from_model()` shim during a deprecation window.
+This module replaces `vllm_omni/core/prefix_cache.py`. Old models keep working through `ModelCachePolicy.from_model()` with no model-side change. On NPU, runner-side cache work moves into the Controller and runs eager.
 
-**Invariants (internalized contracts):**
+**Invariants:**
 
-1. *Value freeze*: `save_outputs` performs one D2D copy on the compute stream into a preallocated slab; this doubles as the #4476 CUDA-graph-reuse snapshot (today's two copies become one). Entry content is immutable from that point; only its storage stage migrates (slab → ping-pong → mirror).
-2. *Single-writer mirror + FIFO + inflight barrier*: the committer thread is the mirror's only writer (write-write races impossible) and scatters strictly in order, never past an unretired `InflightStageOutputs`; readers resolve freshest-stage-first, taking a queued entry over a half-published mirror row (per-entry atomic publication after scatter), so concurrent committer writes and builder reads — including across different requests — are race-free.
-3. *Refcount + finalizer + cap*: entries are refcounted; `materialize` (or GC finalizer, with a warning) retires the inflight handle; outstanding handles are capped at K (excess falls back to eager materialize) so leaks surface as visible backpressure, not memory growth.
-4. *Generation check*: every mirror row is stamped with its block generation at write; reads compare against the current generation and treat mismatch as a detected miss (bug-level log), never a silent stale read.
-5. *Block-alignment dependency (external)*: merge math relies on vLLM guaranteeing block-aligned `num_computed_tokens` for prefix hits (full-hit rolls back a whole block; `vllm/v1/core/kv_cache_manager.py:249`). Guarded by an assertion.
-6. *The single remaining runner contract*: `new_step_starts` must run before `_update_states` removes finished requests (their block tables are still needed). Documented at the call site.
-7. *Consistency fallback (backs G2)*: hit-span validation (generation/presence) runs in `new_step_starts` — before the forward — and again inside `materialize`. On mismatch: the request is poisoned, its step output dropped, and it is resubmitted with a fresh `cache_salt` (all-miss → full recompute, bypassing poisoned blocks); repeated mismatches within a window escalate to a full reset (all generations bumped + vLLM `reset_prefix_cache()`) with an alert. Every trigger is a metric + bug-level log — never silent self-healing.
+1. *Value freeze*: one D2D freeze at save (freeze event; also the #4476 snapshot). Task contents are immutable; only the storage tier moves.
+2. *Task atomicity + single writer + task_id check*: one task covers a set of `(slot, key)`s; it is **not** uniquely identified by one pair. The mirror has one committer at a time. After a new request takes a `(slot, key)`, the old task skips those pairs and they remount to the new `task_id`. Only an old task that is **not skipped and still overlaps the new write** must be waited on. Completions apply only if they match the **current `task_id`** on that `(slot, key)`.
+3. *State-resolved read*: group by **save-time `task_id`**; committed → mirror view; in-transit → snapshot-slice D2H, or the task's host copy if already published; absent inside a hit span → dump and exit.
+4. *Cap backpressure*: GPU staging byte budget; over budget, block and flush the oldest task. **Degraded path** — needs a budget and a metric; not counted as steady-state cost.
+5. *Thread and snapshot contract*: one non-reentrant lock protects only the state tables. Both `save_outputs` and `materialize` are **lock → plan → unlock → join / D2H / cap flush → (if needed) lock again to submit or drain**, as in the snippet above. Do not `@locked` the whole `save_outputs`. Plans hold task refs only. `materialize` uses the step snapshot and never touches `KVCacheGroupView` / live `input_batch`.
+6. *Runner and ordering contract*: `new_step_starts` must run before `_update_states` drops finished requests; `scheduler_output` is applied once, in execution order (warmup / dummy ignored). In the same `execute_model`, `save_outputs` must run before `materialize`. The async builder reads only the snapshot left at this step's save (looked up by `step_id`); `materialize` req_ids are a subset of that snapshot. Each step context is consumed exactly once by `materialize` or `discard_step`. Ids outside the snapshot are debug-asserted, not warned into a degraded path.
 
 ### Key Technical Decisions
 
 | ID | Decision | Why |
 |---|---|---|
-| **D1** | Keep D2H on the copy stream; move `event` waits + `index_copy_` to a background thread (pinned ping-pong buffer, 2 slots) | On H20, D2H already overlaps the next forward; the main-thread cost is scatter (~4–10 ms / 96 MB), not PCIe |
-| **D2** | `materialize` resolves segments from slab → ping-pong → mirror (reads never wait for scatter) | Drops the consume-before-merge contract, unblocks #4476 builder-thread materialize, and closes the same-step empty-read window |
-| **D3** | Fixed-size GPU strips coalesce decode mm rows; subsumes per-request `deferred_prefix_cache_mm_keys` | O(1) GPU residency, no finish-time commit spike; discard/commit lifecycle disappears |
-| **D4** | Facade-owned span registry + `delivered_upto` watermark from `scheduler_output` | Fixes `async_chunk` continuation skipping hit marking; does not re-deliver spans the downstream already accumulated |
-| **D5** | Keep slot-indexed mirror; exclude L2/connector via startup guard + generation tags | One consistency domain; real L2 support should ride the connector payload (out of scope) |
-
-Rejected alternatives: deeper ring with main-thread polling; GPU-resident cache; dual-cache cross-process sync; hash-addressed tier (deferred until demand is concrete).
+| **D1** | At save, consume what is already done and schedule the rest in the background; no refcount / release ceremony | State resolution keeps correctness; resource management stays simple |
+| **D2** | `materialize` groups `(slot, key)` by save-time `task_id` | A hit often spans task states; each group reads only that task's data |
+| **D3** | WriteTask fixes the slots to materialize at save; finished requests go first; abort still finishes the write | Commit does not need `input_batch`; release is early and deterministic; no delayed free or finish spike |
+| **D4** | Span registry + `delivered_upto` watermark (**P2**) | Fixes `async_chunk` continuation miss-mark / double-send. P0 skips this; continuations do not mark |
+| **D5** | Class A/B split; GPU staging has a cap | Large payloads are read on demand; small ones merge every step; over cap, force flush |
+| **D6** | A large task's first consume reads the snapshot; the D2H result becomes that task's host copy | The D2H is required anyway; skip a second move |
 
 ## 4. Correctness & Testing Plans
 
-**Definition:** for any request set and scheduling order, `StageCacheOutputs` must be element-wise identical to the no-prefix-cache path (same dtype/values — the cache is a transport optimization, never a numerical one), and all seven §3 invariants hold.
+**Definition:** for any request set and scheduling order, `StageCacheOutputs` is element-wise identical to the no-prefix-cache path.
 
 | Level | Gate |
 |---|---|
-| **L1** | Unit tests for pool / committer / hit-registry; port `tests/core/test_prefix_cache.py` to the new API with unchanged expectations (Phase 0) |
-| **L2** | Same-step duplicate-prompt hit (merged HS == producer's rows); eager ≡ background ≡ cache-off on merged outputs; builder-thread throw → finalizer warning, no hang; generation-mismatch → salted-retry fallback exercised |
-| **L3** | Existing `test_qwen3_omni` prefix cases stay green (Phase 0); after removing the #4476 guard, `async_scheduling + async_chunk + prefix caching` all-on with output parity (Phase 2) |
-| **Smoke / Perf** | Second request `cache_hit_pct > 0` and output == miss path; #2164 bench + decode-ITL P99 at finish boundaries shows no spike vs cache-off |
+| **L1 basics** | Unit: pool / controller state machine, cap, abort completion, hit registration. Port `tests/core/test_prefix_cache.py` to the new API with the same expected outputs. |
+| **L2 details** | 1. A hit span that crosses task states (committed + in-transit) groups and reads correctly. 2. A same-step re-hit reads in-transit. 3. Different keys on the same slot resolve independently. 4. Eager, background write, and cache-off match. 5. Aborted hashed blocks remain valid hits. 6. After reuse, hits and the final mirror show the new request, regardless of who finishes first. 7. Injected illegal state fail-fasts. 8. **Missing row in a hit span dumps and exits (no silence, no degrade, no error return).** 9. Step context is consumed once by materialize / discard_step; it is not dropped while the builder is still waiting. 10. Cap backpressure numbers stay stable at the limit. |
+| **L3 e2e (P2)** | Existing `test_qwen3_omni` prefix-cache cases: `async_scheduling + async_chunk + prefix caching` all match the no-cache output. |
+| **Smoke / perf** | Repeated hits (`hit > 0`) match the all-miss path. No performance regression. |
+
+## 5. Phasing
+
+- **P0**: this RFC's main path — `(slot, key)` state machine, save-time `task_id` reads, unlock-then-join, abort still writes, hit-span absent fail-fast. Keep the #4476 guard. Continuations do not mark (no D4).
+- **P1**: background scatter / D2H lands; G1's sync points are measurable.
+- **P2**: G4 all-on (D4 `delivered_upto`), G5 multi-KV-group. L3 is accepted here.

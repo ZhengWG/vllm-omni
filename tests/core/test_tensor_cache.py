@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 from vllm_omni.core.tensor_cache.group_view import FullAttentionGroupView
 from vllm_omni.core.tensor_cache.interface import (
+    HIDDEN_KEY,
     ModelCachePolicy,
     OmniTensorCacheUnmatchError,
     TensorCacheConfig,
@@ -106,8 +107,11 @@ def make_manager(view=None, policy=None, **cfg_kwargs) -> tuple[OmniTensorCacheM
     return mgr, view
 
 
-def run_step(mgr, view, reqs: dict[str, tuple[list[int], int, int]], new_hits=None, finished=(), mm=None):
-    """One step: reqs = req_id -> (blocks, sched_start_pos, sched_tokens)."""
+def run_step(mgr, view, reqs: dict[str, tuple[list[int], int, int]], new_hits=None, finished=(), mm=None) -> int:
+    """One step: reqs = req_id -> (blocks, sched_start_pos, sched_tokens).
+
+    Returns the step id save_outputs issued (consume-exactly-once handle).
+    """
     view.order = list(reqs.keys())
     new_reqs = []
     num_sched = {}
@@ -128,8 +132,7 @@ def run_step(mgr, view, reqs: dict[str, tuple[list[int], int, int]], new_hits=No
     sched_out = FakeSchedOut(new_reqs=new_reqs, finished=finished, num_scheduled=num_sched)
     mgr.new_step_starts(sched_out)
     n = int(view.step_slot_mapping.numel())
-    mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=n)
-    return hidden
+    return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=n)
 
 
 def expected_rows(slots: torch.Tensor) -> torch.Tensor:
@@ -138,19 +141,19 @@ def expected_rows(slots: torch.Tensor) -> torch.Tensor:
 
 def test_no_hit_passthrough():
     mgr, view = make_manager()
-    run_step(mgr, view, {"a": ([0, 1], 0, 8)})
-    outs = mgr.materialize(["a"])
+    sid = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    outs = mgr.materialize(sid, ["a"])
     assert torch.equal(outs.hidden_states["a"], expected_rows(view.slots_for("a", 0, 8)))
 
 
 def test_hit_merge_from_mirror():
     mgr, view = make_manager()
     # Producer prefills 8 tokens on blocks [0, 1] and finishes.
-    run_step(mgr, view, {"a": ([0, 1], 0, 8)})
-    mgr.materialize(["a"])
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    mgr.materialize(s1, ["a"])
     # Consumer hits the full 8 tokens and computes 4 new on block 2.
-    run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"])
-    outs = mgr.materialize(["b"])
+    s2 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"])
+    outs = mgr.materialize(s2, ["b"])
     merged = outs.hidden_states["b"]
     assert merged.shape == (12, HIDDEN)
     assert torch.equal(merged[:8], expected_rows(view.slots_for("b", 0, 8)))
@@ -166,13 +169,13 @@ def test_same_step_hit_reads_in_transit():
     # assert the same-step read is correct through whatever tier serves it.
     mgr, view = make_manager()
     view.req_blocks["a"] = [0, 1]
-    run_step(
+    sid = run_step(
         mgr,
         view,
         {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)},
         new_hits={"b": 8},
     )
-    outs = mgr.materialize(["a", "b"])
+    outs = mgr.materialize(sid, ["a", "b"])
     merged = outs.hidden_states["b"]
     assert torch.equal(merged[:8], expected_rows(view.slots_for("b", 0, 8)))
 
@@ -180,29 +183,29 @@ def test_same_step_hit_reads_in_transit():
 def test_absent_hit_fails_fast():
     mgr, view = make_manager()
     view.req_blocks["c"] = [5, 6]
-    run_step(mgr, view, {"c": ([5, 6, 7], 8, 4)}, new_hits={"c": 8})
+    sid = run_step(mgr, view, {"c": ([5, 6, 7], 8, 4)}, new_hits={"c": 8})
     with pytest.raises(OmniTensorCacheUnmatchError):
-        mgr.materialize(["c"])
+        mgr.materialize(sid, ["c"])
 
 
 def test_hit_not_block_aligned_asserts():
     mgr, view = make_manager()
-    run_step(mgr, view, {"a": ([0, 1], 0, 8)})
-    mgr.materialize(["a"])
-    run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 6})
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 6})
     with pytest.raises(AssertionError):
-        mgr.materialize(["b"])
+        mgr.materialize(s2, ["b"])
 
 
 def test_mm_cached_key_merge():
     mgr, view = make_manager()
     feat = 3
     mm1 = {"talker.h": torch.arange(8 * feat, dtype=DTYPE).reshape(8, feat)}
-    run_step(mgr, view, {"a": ([0, 1], 0, 8)}, mm=mm1)
-    mgr.materialize(["a"])
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)}, mm=mm1)
+    mgr.materialize(s1, ["a"])
     mm2 = {"talker.h": torch.full((4, feat), 7.0)}
-    run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"], mm=mm2)
-    outs = mgr.materialize(["b"])
+    s2 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"], mm=mm2)
+    outs = mgr.materialize(s2, ["b"])
     merged = outs.mm_outputs["talker.h"]["b"]
     assert merged.shape == (12, feat)
     assert torch.equal(merged[:8], mm1["talker.h"])
@@ -217,20 +220,20 @@ def test_deferred_key_accumulates_and_flushes_on_finish():
     feat = 2
     # Two decode steps of one token each, then finish -> flush.
     for pos in range(2):
-        run_step(
+        sid = run_step(
             mgr,
             view,
             {"a": ([3], pos, 1)},
             mm={"codes.audio": torch.full((1, feat), float(pos + 1))},
         )
-        mgr.materialize(["a"])
+        mgr.materialize(sid, ["a"])
     # In-transit read before finish: deferred rows come from staged chunks.
     slots = view.slots_for("a", 0, 2)
-    rows = mgr._resolve_rows(slots, "codes.audio", strict=False, req_id="a", states=mgr._slot_state[slots])
+    rows = mgr._resolve_rows(slots, "codes.audio", strict=False, req_id="a")
     assert torch.equal(rows[:, 0], torch.tensor([1.0, 2.0]))
     # Finish (abort semantics identical): entry escalates and commits.
-    run_step(mgr, view, {"z": ([9], 0, 1)}, finished=["a"])
-    mgr.materialize(["z"])
+    sid = run_step(mgr, view, {"z": ([9], 0, 1)}, finished=["a"])
+    mgr.materialize(sid, ["z"])
     mirror = mgr._pool.rows("codes.audio", slots)
     assert torch.equal(mirror[:, 0], torch.tensor([1.0, 2.0]))
 
@@ -242,8 +245,8 @@ def test_cap_forces_flush_of_deferred():
     # float32 feat=4 row = 16 bytes; 48 forces a flush by step 4.
     mgr, view = make_manager(policy=policy, gpu_staging_bytes=48)
     for pos in range(4):
-        run_step(mgr, view, {"a": ([2, 3], pos, 1)}, mm={"k": torch.full((1, 4), float(pos))})
-        mgr.materialize(["a"])
+        sid = run_step(mgr, view, {"a": ([2, 3], pos, 1)}, mm={"k": torch.full((1, 4), float(pos))})
+        mgr.materialize(sid, ["a"])
     # Older rows must have been force-flushed to the mirror.
     early = view.slots_for("a", 0, 1)
     assert float(mgr._pool.rows("k", early)[0, 0]) == 0.0
@@ -300,28 +303,28 @@ def test_group_view_slot_math():
 
 def test_class_b_join_previous_step():
     mgr, view = make_manager()
-    run_step(mgr, view, {"a": ([0], 0, 2)})
-    task_id = mgr._prev_class_b
-    assert task_id is not None
-    mgr.materialize(["a"])
-    run_step(mgr, view, {"a": ([0], 2, 1)})
+    s1 = run_step(mgr, view, {"a": ([0], 0, 2)})
+    assert len(mgr._prev_class_b) == 1
+    task_id = mgr._prev_class_b[0]
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"a": ([0], 2, 1)})
     # Previous B entry joined & drained at the save above.
     assert mgr._controller.get_task(task_id) is None
-    assert int(mgr._slot_state[view.slots_for("a", 0, 2)].min()) == 2
-    mgr.materialize(["a"])
+    assert int(mgr._key_state[HIDDEN_KEY][view.slots_for("a", 0, 2)].min()) == 2
+    mgr.materialize(s2, ["a"])
 
 
 def test_tenant_succession_hit_reads_newest():
     # a occupies block 0, finishes; b reuses block 0 with new values;
     # c hits b's prefix -> must read b's rows, never a's.
     mgr, view = make_manager()
-    run_step(mgr, view, {"a": ([0], 0, 4)})
-    mgr.materialize(["a"])
-    run_step(mgr, view, {"b": ([0], 0, 4)}, finished=["a"])
-    mgr.materialize(["b"])
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"b": ([0], 0, 4)}, finished=["a"])
+    mgr.materialize(s2, ["b"])
     b_hidden = expected_rows(view.slots_for("b", 0, 4))
-    run_step(mgr, view, {"c": ([0, 1], 4, 2)}, new_hits={"c": 4}, finished=["b"])
-    outs = mgr.materialize(["c"])
+    s3 = run_step(mgr, view, {"c": ([0, 1], 4, 2)}, new_hits={"c": 4}, finished=["b"])
+    outs = mgr.materialize(s3, ["c"])
     assert torch.equal(outs.hidden_states["c"][:4], b_hidden)
 
 
@@ -333,40 +336,39 @@ def test_deferred_tenant_succession_no_stale_wins():
         needs_full_hidden_states=False, deferred_keys=frozenset({"k"}), skip_keys=frozenset({"k"})
     )
     mgr, view = make_manager(policy=policy)
-    run_step(mgr, view, {"a": ([2], 0, 2)}, mm={"k": torch.full((2, 2), 1.0)})
-    mgr.materialize(["a"])
+    s1 = run_step(mgr, view, {"a": ([2], 0, 2)}, mm={"k": torch.full((2, 2), 1.0)})
+    mgr.materialize(s1, ["a"])
     # b reuses block 2 while a's deferred entry is still staged (a preempted,
     # not finished). Conflict detection must escalate a's entry first.
-    run_step(mgr, view, {"b": ([2], 0, 2)}, mm={"k": torch.full((2, 2), 2.0)})
-    mgr.materialize(["b"])
+    s2 = run_step(mgr, view, {"b": ([2], 0, 2)}, mm={"k": torch.full((2, 2), 2.0)})
+    mgr.materialize(s2, ["b"])
     slots = view.slots_for("b", 0, 2)
     # Dangerous order: b finishes (flushes) BEFORE a does.
-    run_step(mgr, view, {"z1": ([9], 0, 1)}, finished=["b"])
-    mgr.materialize(["z1"])
-    run_step(mgr, view, {"z2": ([9], 1, 1)}, finished=["a"])
-    mgr.materialize(["z2"])
+    s3 = run_step(mgr, view, {"z1": ([9], 0, 1)}, finished=["b"])
+    mgr.materialize(s3, ["z1"])
+    s4 = run_step(mgr, view, {"z2": ([9], 1, 1)}, finished=["a"])
+    mgr.materialize(s4, ["z2"])
     assert torch.equal(mgr._pool.rows("k", slots), torch.full((2, 2), 2.0))
 
 
-def test_slot_reuse_records_dependency():
+def test_slot_reuse_pushes_skip_to_old_task():
+    """Reassignment = task swap: the old tenant's write skips the reassigned
+    (slot, key) rows instead of ordering behind a dependency edge."""
     mgr, view = make_manager()
     policy = ModelCachePolicy(
         needs_full_hidden_states=False, deferred_keys=frozenset({"k"}), skip_keys=frozenset({"k"})
     )
     mgr.register_policy(policy)
-    # Deferred entry holds slots of block 2 in-transit.
-    run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.ones(1, 2)})
-    mgr.materialize(["a"])
+    # Deferred task holds slots of block 2 in-transit for key "k".
+    s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.ones(1, 2)})
+    mgr.materialize(s1, ["a"])
     dtask = mgr._deferred_tasks["a"]
-    # New request reuses block 2 while the old entry is still staged.
-    mgr.register_policy(ModelCachePolicy())
-    run_step(mgr, view, {"b": ([2], 0, 2)})
-    ctx_entry = mgr._step_ctxs[-1].entry_id
-    # Dependency edge recorded (old deferred entry must land first). In
-    # eager mode the main entry already committed, so check the recorded
-    # deps on the drained-task metadata instead of live ordering.
-    assert dtask.entry_id != ctx_entry
-    mgr.materialize(["b"])
+    # New request reuses block 2 (same key) while the old task is staged.
+    s2 = run_step(mgr, view, {"b": ([2], 0, 2)}, mm={"k": torch.full((2, 2), 2.0)})
+    assert mgr._deferred_tasks["b"].tid != dtask.tid
+    reused = view.slots_for("b", 0, 1)
+    assert "k" in dtask.skip and bool(torch.isin(reused, dtask.skip["k"]).all())
+    mgr.materialize(s2, ["b"])
 
 
 def test_deferred_key_hit_reads_staged_rows_not_mirror():
@@ -382,10 +384,10 @@ def test_deferred_key_hit_reads_staged_rows_not_mirror():
     )
     mgr, view = make_manager(policy=policy)
     # a stages 4 deferred rows and stays live (entry never flushed).
-    run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
-    mgr.materialize(["a"])
-    run_step(mgr, view, {"b": ([0, 1], 4, 2)}, new_hits={"b": 4}, mm={"k": torch.full((2, 2), 9.0)})
-    rows = mgr.materialize(["b"]).mm_outputs["k"]["b"]
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"b": ([0, 1], 4, 2)}, new_hits={"b": 4}, mm={"k": torch.full((2, 2), 9.0)})
+    rows = mgr.materialize(s2, ["b"]).mm_outputs["k"]["b"]
     assert torch.equal(rows[:4], torch.full((4, 2), 1.0)), rows
     assert torch.equal(rows[4:], torch.full((2, 2), 9.0))
 
@@ -399,16 +401,16 @@ def test_append_to_closed_deferred_entry_opens_new_one():
         skip_keys=frozenset({"k"}),
     )
     mgr, view = make_manager(policy=policy)
-    run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 1.0)})
-    mgr.materialize(["a"])
+    s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 1.0)})
+    mgr.materialize(s1, ["a"])
     first = mgr._deferred_tasks["a"]
     # Force the entry closed the way a cap flush would.
-    mgr._controller.escalate([first.entry_id])
-    run_step(mgr, view, {"a": ([2], 1, 1)}, mm={"k": torch.full((1, 2), 2.0)})
-    mgr.materialize(["a"])
-    assert mgr._deferred_tasks["a"].entry_id != first.entry_id
+    mgr._controller.escalate([first.tid])
+    s2 = run_step(mgr, view, {"a": ([2], 1, 1)}, mm={"k": torch.full((1, 2), 2.0)})
+    mgr.materialize(s2, ["a"])
+    assert mgr._deferred_tasks["a"].tid != first.tid
     slots = view.slots_for("a", 0, 2)
-    rows = mgr._resolve_rows(slots, "k", strict=False, req_id="a", states=mgr._slot_state[slots])
+    rows = mgr._resolve_rows(slots, "k", strict=False, req_id="a")
     assert torch.equal(rows[:, 0], torch.tensor([1.0, 2.0]))
 
 
@@ -449,46 +451,76 @@ def test_step_slots_cpu_matches_block_table_math():
     assert torch.equal(view.step_slots_cpu(["r1", "r2"], {"r1": 3, "r2": 0}), view.slots_for("r1", 4, 7))
 
 
-def test_materialize_matches_context_by_identity_after_desync():
-    """A step that saves but is never materialized must not shift the FIFO.
+def test_step_context_consumed_by_id_not_order():
+    """Contexts are addressed by step id: a later step consumed first (the
+    async-builder N+1-early-return case) must not disturb step N's context.
 
-    Regression: popleft() blindly returned the stale context, so the merge
-    sliced the current batch's rows with the previous step's offsets (and,
-    once fail-fast landed, killed the engine under async output).
+    Regression: popleft() discarded "the oldest", so N+1's discard threw away
+    N's context while N's builder was still pending.
     """
     mgr, view = make_manager()
-    # Step 1 for "a" is saved but never consumed (no pooler payload path).
-    run_step(mgr, view, {"a": ([0], 0, 4)})
-    # Step 2 for a different request; materialize must pick THIS context.
-    run_step(mgr, view, {"b": ([1], 0, 4)})
-    outs = mgr.materialize(["b"])
-    assert torch.equal(outs.hidden_states["b"], expected_rows(view.slots_for("b", 0, 4)))
-    # The stale context was dropped, not silently reused.
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
+    s2 = run_step(mgr, view, {"b": ([1], 0, 4)})
+    # N+1 returns early (no consumer) while N's builder is still pending.
+    mgr.discard_step(s2)
+    outs = mgr.materialize(s1, ["a"])
+    assert torch.equal(outs.hidden_states["a"], expected_rows(view.slots_for("a", 0, 4)))
     assert len(mgr._step_ctxs) == 0
 
 
-def test_materialize_serves_overlapping_subset():
-    """The output builder's request set can exceed the saved one; the cache
-    must still merge the requests it owns instead of degrading the step."""
+def test_step_context_exactly_once():
+    """Each context is consumed exactly once; a second consume fails fast."""
     mgr, view = make_manager()
-    run_step(mgr, view, {"a": ([0, 1], 0, 8)})
-    mgr.materialize(["a"])
-    run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"])
-    outs = mgr.materialize(["b", "late_joiner"])
-    assert outs is not None
-    # b still gets the full cached-prefix + new-tail merge.
-    assert outs.hidden_states["b"].shape == (12, HIDDEN)
-    # The request the step never saw is left to the caller's fresh slice.
-    assert "late_joiner" not in outs.hidden_states
+    sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(sid, ["a"])
+    with pytest.raises(OmniTensorCacheUnmatchError):
+        mgr.materialize(sid, ["a"])
+    with pytest.raises(OmniTensorCacheUnmatchError):
+        mgr.discard_step(sid)
 
 
-def test_materialize_without_owning_context_returns_none():
-    """No context for these requests is a capability gap, not a data
-    inconsistency: degrade to the uncached path instead of killing the
-    engine (absent slots inside a hit span still fail fast)."""
+def test_unconsumed_contexts_overflow_fails_fast():
+    """A runner that leaks step contexts (never materialize/discard) must be
+    caught at save time, not silently dropped."""
     mgr, view = make_manager()
-    run_step(mgr, view, {"a": ([0], 0, 4)})
-    assert mgr.materialize(["ghost"]) is None
+    with pytest.raises(OmniTensorCacheUnmatchError):
+        for pos in range(8):
+            run_step(mgr, view, {"a": ([0, 1, 2, 3], pos, 1)})
+
+
+def test_save_slot_mismatch_fails_fast():
+    """A slot mapping that does not cover the scheduled tokens is a poisoned
+    save (hashes are already published); it must fail at the cause."""
+    mgr, view = make_manager()
+    view.order = ["a"]
+    view.req_blocks["a"] = [0]
+    view.computed["a"] = 0
+    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": 2}))
+    hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
+    with pytest.raises(OmniTensorCacheUnmatchError):
+        # num_scheduled says 2 tokens but we claim 4 were produced.
+        mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4)
+
+
+def test_materialize_rejects_out_of_snapshot_ids():
+    """req_ids must be a subset of the save-time snapshot; an outside id
+    means the runner is reading the live batch (debug assert, G2)."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"])
+    with pytest.raises(AssertionError, match="outside the save snapshot"):
+        mgr.materialize(s2, ["b", "late_joiner"])
+
+
+def test_materialize_unknown_step_id_fails_fast():
+    """An unknown step id is a bookkeeping error (the runner lost or reused
+    a sid), never a degrade path."""
+    mgr, view = make_manager()
+    sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+    with pytest.raises(OmniTensorCacheUnmatchError):
+        mgr.materialize(sid + 999, ["ghost"])
+    mgr.discard_step(sid)
 
 
 def test_fetch_host_fast_path_matches_general_path():
@@ -497,8 +529,8 @@ def test_fetch_host_fast_path_matches_general_path():
     from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
     from vllm_omni.core.tensor_cache.controller import (
         CLASS_B,
-        EntryWriteTask,
         OmniTensorCacheController,
+        WriteTask,
         _Segment,
     )
     from vllm_omni.core.tensor_cache.interface import HIDDEN_KEY
@@ -510,7 +542,9 @@ def test_fetch_host_fast_path_matches_general_path():
 
     slots = torch.tensor([12, 4, 7, 20, 1], dtype=torch.int64)
     rows = torch.arange(slots.numel() * HIDDEN, dtype=DTYPE).reshape(slots.numel(), HIDDEN)
-    task = EntryWriteTask(entry_id=1, klass=CLASS_B, segments=[_Segment(slots_cpu=slots, tensors={HIDDEN_KEY: rows})])
+    task = WriteTask(
+        tid=1, req_id="r", seq=1, klass=CLASS_B, segments=[_Segment(slots_cpu=slots, tensors={HIDDEN_KEY: rows})]
+    )
     ctrl.submit(task)
 
     for want in (slots, slots[[3, 0, 4]], slots[[2]]):
@@ -521,3 +555,110 @@ def test_fetch_host_fast_path_matches_general_path():
         # And it is the actual data for those slots.
         expect = torch.stack([rows[(slots == s).nonzero()[0, 0]] for s in want.tolist()])
         assert torch.equal(fast, expect)
+
+
+def test_mm_hit_span_never_registered_serves_mirror_baseline():
+    """(slot, key) semantics: a hit span slot on which a sparse mm key was
+    never registered is legitimate absence (e.g. a text position with no
+    codes) — served from the mirror baseline, not a crash."""
+    policy = ModelCachePolicy(
+        needs_full_hidden_states=True,
+        deferred_keys=frozenset({"k"}),
+        skip_keys=frozenset({"k"}),
+    )
+    mgr, view = make_manager(policy=policy)
+    # a stages k on block 0 only; c prefills block 1 with no mm at all.
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 5.0)})
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"c": ([1], 0, 4)})
+    mgr.materialize(s2, ["c"])
+    # b hits all 8 tokens (blocks 0+1): k exists on the first 4 slots only.
+    s3 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 2)}, new_hits={"b": 8}, mm={"k": torch.full((2, 2), 9.0)})
+    rows = mgr.materialize(s3, ["b"]).mm_outputs["k"]["b"]
+    assert torch.equal(rows[:4], torch.full((4, 2), 5.0))
+    assert torch.equal(rows[4:8], torch.zeros(4, 2))  # never registered -> baseline
+    assert torch.equal(rows[8:], torch.full((2, 2), 9.0))
+
+
+def test_mm_in_transit_unresolvable_fails_fast():
+    """Rows registered in-transit whose entry cannot serve them must raise,
+    never silently ship zeros (the pre-(slot,key) failure mode)."""
+    policy = ModelCachePolicy(
+        needs_full_hidden_states=True,
+        deferred_keys=frozenset({"k"}),
+        skip_keys=frozenset({"k"}),
+    )
+    mgr, view = make_manager(policy=policy)
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
+    mgr.materialize(s1, ["a"])
+    # Corrupt bookkeeping: drop the staged entry without draining it.
+    tid = mgr._deferred_tasks["a"].tid
+    mgr._controller._tasks.pop(tid)
+    s2 = run_step(mgr, view, {"b": ([0, 1], 4, 2)}, new_hits={"b": 4}, mm={"k": torch.full((2, 2), 9.0)})
+    with pytest.raises(OmniTensorCacheUnmatchError):
+        mgr.materialize(s2, ["b"])
+
+
+def test_lock_never_covers_fetch_or_join():
+    """Invariant 6: the state lock must not be held across blocking waits —
+    controller.join (save) and fetch_host / mirror reads (materialize)."""
+    policy = ModelCachePolicy(
+        needs_full_hidden_states=True,
+        deferred_keys=frozenset({"k"}),
+        skip_keys=frozenset({"k"}),
+    )
+    mgr, view = make_manager(policy=policy)
+    calls = []
+    real_fetch = mgr._controller.fetch_host
+    real_join = mgr._controller.join_copied
+    mgr._controller.fetch_host = lambda *a, **kw: (
+        calls.append(("fetch", mgr._state_lock.locked())),
+        real_fetch(*a, **kw),
+    )[1]
+    mgr._controller.join_copied = lambda ids: (calls.append(("join", mgr._state_lock.locked())), real_join(ids))[1]
+
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
+    mgr.materialize(s1, ["a"])
+    # Hit forces a staged fetch; the follow-up save forces a Class B join.
+    s2 = run_step(mgr, view, {"b": ([0, 1], 4, 2)}, new_hits={"b": 4}, mm={"k": torch.full((2, 2), 9.0)})
+    mgr.materialize(s2, ["b"])
+    assert any(kind == "fetch" for kind, _ in calls)
+    assert any(kind == "join" for kind, _ in calls)
+    assert all(not locked for _, locked in calls), calls
+
+
+def test_failed_write_fails_fast_at_next_facade_entry():
+    """A committer write failure means rows are lost behind published hashes:
+    the next facade call must raise once, at the cause — not poison every
+    future hit touching those slots (F2)."""
+    mgr, view = make_manager()
+    sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(sid, ["a"])
+    # Simulate a committer failure on a still-registered entry.
+    from vllm_omni.core.tensor_cache.controller import CLASS_B, WriteTask, _Segment
+
+    task = WriteTask(
+        tid=999, req_id="x", seq=1, klass=CLASS_B, segments=[_Segment(slots_cpu=torch.tensor([0]), tensors={})]
+    )
+    mgr._controller._tasks[999] = task
+    mgr._controller._fail_task(999)
+    with pytest.raises(OmniTensorCacheUnmatchError, match="write failed"):
+        run_step(mgr, view, {"a": ([0, 1], 4, 1)})
+
+
+def test_per_request_task_class_split():
+    """One save produces one WriteTask per request; class is per-request
+    (prefill rows -> Class A lazy, decode rows -> Class B per-step)."""
+    mgr, view = make_manager(class_a_min_tokens=4)
+    sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})
+    ctx = mgr._step_ctxs[sid]
+    tp = mgr._controller.get_task(ctx.task_ids["p"])
+    td = mgr._controller.get_task(ctx.task_ids["d"])
+    assert tp is not None and td is not None
+    assert (tp.klass, td.klass) == ("A", "B")
+    assert (tp.req_id, td.req_id) == ("p", "d")
+    # Only the Class B task is joined at the next save.
+    assert mgr._prev_class_b == [td.tid]
+    outs = mgr.materialize(sid, ["p", "d"])
+    assert torch.equal(outs.hidden_states["p"], expected_rows(view.slots_for("p", 0, 8)))
+    assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))

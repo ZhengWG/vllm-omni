@@ -124,16 +124,16 @@ def get_tensor_cache_group_view(
     block_size: int,
     num_blocks: int,
 ) -> KVCacheGroupView | None:
-    """Build the group view for a runner's input batch.
-
-    Multiple KV groups: only the first is served (legacy parity); hybrid
-    support arrives by extending this factory.
-    """
+    """Build the group view for a runner's input batch, or None to make the
+    caller fall back to the legacy cache."""
     block_tables = getattr(input_batch.block_table, "block_tables", None)
     if not block_tables:
         return None
     if len(block_tables) > 1:
-        logger.warning(
-            "Omni tensor caching sees multiple kv-cache groups; only the first (full-attention) group will be used."
-        )
+        # Hybrid models: group 0 may not be full-attention, and a narrower
+        # per-group block table would make step_slots_cpu silently clamp —
+        # surfacing later as a misleading save-time unmatch. Refuse until
+        # multi-group support lands (G5, P2).
+        logger.warning("Omni tensor caching v2 does not support multiple kv-cache groups yet; using the legacy path.")
+        return None
     return FullAttentionGroupView(input_batch, block_size, num_blocks)

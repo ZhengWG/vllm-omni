@@ -1,21 +1,25 @@
 """OmniTensorCacheManager: facade over the omni tensor cache.
 
-Owns the block/slot semantic domain: slot-state authority, hit/span
+Owns the block/slot semantic domain: (slot, key) state authority, hit/span
 registry, merge math, and the scheduler_output lifecycle stream. Data
-movement is delegated to OmniTensorCacheController; state transitions are
-applied here at fixed points (step join / materialize / drain), so req-level
-consistency never depends on locks.
+movement is delegated to OmniTensorCacheController.
 
-Runner contract (invariant 6): new_step_starts() before _update_states
+Threading (invariant 6): one non-reentrant state lock serializes the facade
+entry points, covering only state-table reads/writes — never a blocking
+wait. save_outputs joins/reserves unlocked; materialize plans under the
+lock and fetches/merges outside it.
+
+Runner contract (invariant 7): new_step_starts() before _update_states
 removes finished requests; every real scheduler_output exactly once, in
-order (warmup/dummy runs must not be fed).
+order (warmup/dummy runs must not be fed); every step context returned by
+save_outputs is consumed exactly once via materialize or discard_step.
 """
 
 from __future__ import annotations
 
 import logging
 import threading
-from collections import deque
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -25,8 +29,8 @@ from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
 from vllm_omni.core.tensor_cache.controller import (
     CLASS_A,
     CLASS_B,
-    EntryWriteTask,
     OmniTensorCacheController,
+    WriteTask,
     _Segment,
 )
 from vllm_omni.core.tensor_cache.group_view import KVCacheGroupView
@@ -60,8 +64,25 @@ def _locked(fn):
 
 
 @dataclass
+class _RowSource:
+    """Row sources resolved under the state lock, fetched outside it.
+
+    Holds pinned task references, never a storage tier: a task may commit
+    between plan and fetch, and fetch_host re-resolves where the rows live
+    at call time (host buffers survive commit).
+    """
+
+    slots: torch.Tensor
+    key: str
+    req_id: str
+    baseline_mirror: bool
+    staged: list[tuple[WriteTask, torch.Tensor]]  # (task, mask over slots)
+    staged_any: torch.Tensor | None = None  # union of staged masks (validation)
+
+
+@dataclass
 class _StepContext:
-    entry_id: int | None
+    task_ids: dict[str, int]  # req_id -> this step's WriteTask handle
     slots_cpu: torch.Tensor | None
     hits: dict[str, tuple[int, list[int] | None]]  # req_id -> (hit_upto, hit block ids)
     num_scheduled: dict[str, int]
@@ -70,6 +91,17 @@ class _StepContext:
     frozen_mm_keys: set[str]
     mm_flat_refs: dict[str, Any] = field(default_factory=dict)
     num_tokens_unpadded: int = 0
+    # Cached-key classification frozen at save time: recomputing it at
+    # materialize would race a later save's ensure_key and reclassify a
+    # passthrough key into an (all-absent) cached one mid-flight.
+    cached_keys: set[str] = field(default_factory=set)
+    # Whole-step frozen clones (the per-request tasks hold views of these).
+    # materialize reads them with ONE D2H per key and feeds the host copy
+    # back into the per-request tasks — without this, a cc8 decode step pays
+    # 8 separate slice-D2H syncs on the read path and 8 more on the copy
+    # thread (measured −25% cc8 tok/s).
+    step_tensors: dict[str, torch.Tensor] = field(default_factory=dict)
+    freeze_event: Any = None
 
 
 class OmniTensorCacheManager:
@@ -87,21 +119,31 @@ class OmniTensorCacheManager:
         self._policy = ModelCachePolicy()
         # materialize() runs on the async output builder thread while the
         # engine thread is already in the next step's new_step_starts /
-        # save_outputs, and all three mutate the slot tables.
-        self._state_lock = threading.RLock()
-        num_slots = config.num_blocks * config.block_size
-        self._slot_state = torch.zeros(num_slots, dtype=torch.int8)
-        self._slot_owner = torch.zeros(num_slots, dtype=torch.int64)
-        self._entry_slots: dict[int, torch.Tensor] = {}
-        self._req_entries: dict[str, set[int]] = {}
-        self._deferred_tasks: dict[str, EntryWriteTask] = {}  # req_id -> task
-        self._deferred_slot_owner: dict[str, dict[int, int]] = {}  # key -> slot -> eid
-        self._next_entry_id = 1
-        self._prev_class_b: int | None = None
+        # save_outputs, and all three mutate the slot tables. Non-reentrant
+        # on purpose: facade entry points never call each other, and the lock
+        # must never cover a blocking wait (join / cap flush / D2H).
+        self._state_lock = threading.Lock()
+        self._num_slots = config.num_blocks * config.block_size
+        # (slot, key) state: per-key tables, lazily created. hidden may be
+        # committed while a deferred key on the same slot is still in-transit;
+        # a slot-keyed table cannot represent that (and made "never had this
+        # key" indistinguishable from "write went missing").
+        self._key_state: dict[str, torch.Tensor] = {}  # key -> int8[num_slots]
+        self._key_owner: dict[str, torch.Tensor] = {}  # key -> int64[num_slots]
+        self._task_slots: dict[int, torch.Tensor] = {}
+        self._task_keys: dict[int, tuple[str, ...]] = {}
+        self._req_tasks: dict[str, set[int]] = {}
+        self._deferred_tasks: dict[str, WriteTask] = {}  # req_id -> task
+        self._next_tid = 1
+        self._prev_class_b: list[int] = []
+        self._seq: dict[str, int] = {}  # req_id -> physical-task counter
         self._finished_join: set[int] = set()
         self._pending_hits: dict[str, int] = {}
         self._live_reqs: set[str] = set()
-        self._step_ctxs: deque[_StepContext] = deque()
+        # step_id -> context; each entry is consumed exactly once, by
+        # materialize or discard_step (unknown/duplicate id = fail-fast).
+        self._next_step_id = 1
+        self._step_ctxs: dict[int, _StepContext] = {}
         self._cur_num_scheduled: dict[str, int] = {}
 
     # ------------------------------------------------------------- facade
@@ -118,10 +160,11 @@ class OmniTensorCacheManager:
         finished = getattr(scheduler_output, "finished_req_ids", None) or ()
         for req_id in finished:
             self._live_reqs.discard(req_id)
-            eids = self._req_entries.pop(req_id, set())
+            self._seq.pop(req_id, None)
+            eids = self._req_tasks.pop(req_id, set())
             dtask = self._deferred_tasks.pop(req_id, None)
             if dtask is not None:
-                eids.add(dtask.entry_id)
+                eids.add(dtask.tid)
             pending = [e for e in eids if self._controller.get_task(e) is not None]
             if pending:
                 # Abort included: complete the writes (never roll back) so
@@ -145,12 +188,18 @@ class OmniTensorCacheManager:
                 blocks = getattr(new_req, "block_ids", None)
                 if blocks is not None and len(blocks) > 0 and not isinstance(blocks[0], int):
                     blocks = blocks[0]
-                hit_blocks = list(blocks[: num_computed // self._config.block_size]) if blocks else None
+                if not blocks:
+                    # Fail at the cause: a hit we cannot snapshot now would
+                    # crash at materialize time with less context (invariant 6
+                    # forbids falling back to the live batch there).
+                    raise OmniTensorCacheUnmatchError(
+                        f"prefix hit for req {req_id} ({num_computed} tokens) carries no block_ids"
+                    )
+                hit_blocks = list(blocks[: num_computed // self._config.block_size])
                 self._pending_hits[req_id] = (num_computed, hit_blocks)
 
         self._cur_num_scheduled = dict(scheduler_output.num_scheduled_tokens)
 
-    @_locked
     @torch.inference_mode()
     def save_outputs(
         self,
@@ -159,17 +208,22 @@ class OmniTensorCacheManager:
         *,
         num_tokens_unpadded: int,
         num_tokens_padded: int,
-    ) -> None:
-        # Step-boundary join (consume-then-schedule): previous Class B task
-        # plus tasks escalated for requests that finished this step.
-        join_ids = list(self._finished_join)
-        if self._prev_class_b is not None:
-            join_ids.append(self._prev_class_b)
+    ) -> int:
+        """Lock discipline (invariant 6): the state lock never covers a
+        blocking wait. Join, D2D clone building, and the cap reservation
+        (which may flush) all run unlocked; only the state-table writes and
+        task registration take the lock."""
+        with self._state_lock:
+            # Step-boundary join (consume-then-schedule): previous Class B
+            # task plus tasks escalated for requests finished this step.
+            join_ids = list(self._finished_join)
+            join_ids.extend(self._prev_class_b)
+            self._finished_join.clear()
+            self._prev_class_b = []
         if join_ids:
-            self._controller.join(join_ids)
-        self._finished_join.clear()
-        self._prev_class_b = None
-        self._apply_completions()
+            # Copy-completion wait only (RFC D1): scatter completion is the
+            # committer's business, not the engine step's.
+            self._controller.join_copied(join_ids)
 
         n = num_tokens_unpadded
         req_order = self._view.batch_req_ids()
@@ -181,25 +235,24 @@ class OmniTensorCacheManager:
             acc += num_sched[r]
 
         slots_cpu: torch.Tensor | None = None
-        entry_id: int | None = None
         frozen_mm_keys: set[str] = set()
         mm_flat = mm_outputs or {}
+        tensors: dict[str, torch.Tensor] = {}
+        deferred_segs: list[tuple[str, _Segment]] = []
+        freeze_event = None
 
         if n > 0:
             # Derive the slot mapping on CPU: reading the device one back
             # would need a stream sync that waits on the whole forward.
             slots_cpu = self._view.step_slots_cpu(req_order, num_sched)
             if int(slots_cpu.numel()) != n:
-                # Padding/clamping mismatch: fall back rather than miss-map rows.
-                logger.warning("tensor_cache: slot mapping covers %d of %d tokens; skipping save", slots_cpu.numel(), n)
-                self._step_ctxs.append(
-                    _StepContext(
-                        None, None, dict(self._pending_hits), num_sched, req_order, query_start, set(), dict(mm_flat), n
-                    )
+                # Fail at the cause: skipping the save would leave rows absent
+                # behind hashes vLLM already published — a delayed crash at
+                # some future hit instead of a debuggable one here.
+                raise OmniTensorCacheUnmatchError(
+                    f"slot mapping covers {int(slots_cpu.numel())} of {n} scheduled tokens; "
+                    "CPU-side slot derivation out of sync with the batch"
                 )
-                self._pending_hits.clear()
-                return
-            tensors: dict[str, torch.Tensor] = {}
             if hidden_states is not None and self._policy.needs_full_hidden_states:
                 self._pool.ensure_key(HIDDEN_KEY, hidden_states.dtype, int(hidden_states.shape[-1]))
                 tensors[HIDDEN_KEY] = hidden_states[:n].clone()
@@ -214,37 +267,55 @@ class OmniTensorCacheManager:
                     continue
                 tensors[key] = val[:n].clone()
                 frozen_mm_keys.add(key)
+            deferred_segs = self._build_deferred_segments(mm_flat, slots_cpu, req_order, num_sched, query_start)
 
-            if tensors:
-                freeze_event = None
-                if torch.cuda.is_available() and any(t.is_cuda for t in tensors.values()):
+            staged = [t for t in tensors.values()] + [t for _, seg in deferred_segs for t in seg.tensors.values()]
+            if staged:
+                if torch.cuda.is_available() and any(t.is_cuda for t in staged):
                     freeze_event = torch.cuda.Event()
                     freeze_event.record()
-                entry_id = self._alloc_entry_id()
-                task = EntryWriteTask(
-                    entry_id=entry_id,
-                    klass=CLASS_A if n > self._config.class_a_min_tokens else CLASS_B,
-                    segments=[_Segment(slots_cpu=slots_cpu, tensors=tensors)],
-                    freeze_event=freeze_event,
-                )
-                task.deps = self._conflict_deps(slots_cpu, entry_id)
-                if task.deps:
-                    # Old tenant must land first AND must actually run: an
-                    # unqueued (deferred) or lazy dep would otherwise stall
-                    # this entry's join until its request finishes.
-                    self._controller.escalate(sorted(task.deps))
-                self._map_slots(slots_cpu, entry_id)
-                self._controller.submit(task)
+                # Cap reservation may block on a flush: outside the lock. The
+                # flush must not close the deferred entries we are about to
+                # append to (main-thread-only reads, safe unlocked).
+                exclude = {self._deferred_tasks[r].tid for r, _ in deferred_segs if r in self._deferred_tasks}
+                self._controller.reserve(sum(t.numel() * t.element_size() for t in staged), exclude=exclude)
+
+        with self._state_lock:
+            self._apply_completions()
+            task_ids: dict[str, int] = {}
+            if tensors:
+                # One WriteTask per request (task_id = (req_id, key, seq)):
+                # per-req views of the shared frozen clone, so the D2D freeze
+                # stays a single kernel while finish/abort escalation, skip
+                # masks, and completion validation are all req-scoped.
                 for r in req_order:
-                    self._req_entries.setdefault(r, set()).add(entry_id)
-                if task.klass == CLASS_B:
-                    self._prev_class_b = entry_id
+                    s = query_start[r]
+                    e = s + num_sched[r]
+                    if e == s:
+                        continue
+                    r_tensors = {k: v[s:e] for k, v in tensors.items()}
+                    tid = self._alloc_tid()
+                    task = WriteTask(
+                        tid=tid,
+                        req_id=r,
+                        seq=self._next_seq(r),
+                        klass=CLASS_A if (e - s) > self._config.class_a_min_tokens else CLASS_B,
+                        segments=[_Segment(slots_cpu=slots_cpu[s:e], tensors=r_tensors)],
+                        freeze_event=freeze_event,
+                    )
+                    self._map_slots(slots_cpu[s:e], tid, r_tensors.keys())
+                    self._controller.submit(task, reserved=True)
+                    self._req_tasks.setdefault(r, set()).add(tid)
+                    task_ids[r] = tid
+                    if task.klass == CLASS_B:
+                        self._prev_class_b.append(tid)
 
-            self._stage_deferred(mm_flat, slots_cpu, req_order, num_sched, query_start)
+            self._stage_deferred(deferred_segs, freeze_event)
 
-        self._step_ctxs.append(
-            _StepContext(
-                entry_id=entry_id,
+            step_id = self._next_step_id
+            self._next_step_id += 1
+            self._step_ctxs[step_id] = _StepContext(
+                task_ids=task_ids,
                 slots_cpu=slots_cpu,
                 hits=dict(self._pending_hits),
                 num_scheduled=num_sched,
@@ -253,78 +324,116 @@ class OmniTensorCacheManager:
                 frozen_mm_keys=frozen_mm_keys,
                 mm_flat_refs=dict(mm_flat),
                 num_tokens_unpadded=n,
+                cached_keys=(self._pool.keys() - {HIDDEN_KEY}) & set(mm_flat.keys()),
+                step_tensors=dict(tensors),
+                freeze_event=freeze_event,
             )
-        )
-        self._pending_hits.clear()
-        # Bounded per-step context FIFO: depth 2 covers the one-step-behind
-        # async builder; anything older means a step skipped materialize.
-        while len(self._step_ctxs) > 2:
-            stale = self._step_ctxs.popleft()
-            logger.warning("tensor_cache: dropping stale step context (entry=%s)", stale.entry_id)
+            self._pending_hits.clear()
+            if len(self._step_ctxs) > 4:
+                # The async builder runs at most one step behind; more
+                # unconsumed contexts means the runner is leaking them (a
+                # consume path skipping both materialize and discard_step).
+                raise OmniTensorCacheUnmatchError(
+                    f"{len(self._step_ctxs)} unconsumed step contexts (ids={sorted(self._step_ctxs)}); "
+                    "runner violated the consume-exactly-once contract"
+                )
+            return step_id
 
-    def _take_step_ctx(self, req_ids: list[str]) -> _StepContext | None:
-        """Pop the context these req_ids belong to, or None.
-
-        Steps that save but never materialize (no pooler payload, an early
-        return, an aborted step) would otherwise shift the FIFO and make the
-        next merge slice the wrong step's rows, so match on identity rather
-        than trusting the order. Returning None means "no cached view for
-        this step" — a capability gap the caller degrades around, unlike a
-        hit span with absent slots, which is a data inconsistency and stays
-        fail-fast.
-        """
-        want = set(req_ids)
-        while self._step_ctxs:
-            head = self._step_ctxs[0]
-            # The output builder's request set can be a superset of the one
-            # captured at save time (a request joins the batch between the
-            # forward and the payload build). Own the step as long as the
-            # contexts overlap; requests outside it simply have no cached
-            # rows this step and are filled from the fresh slice instead.
-            if want & set(head.req_order):
-                return self._step_ctxs.popleft()
-            stale = self._step_ctxs.popleft()
-            logger.warning(
-                "tensor_cache: dropping unrelated step context (entry=%s, ctx_reqs=%d, want=%d)",
-                stale.entry_id,
-                len(stale.req_order),
-                len(want),
-            )
-        logger.warning("tensor_cache: no step context for %d requests; using uncached outputs", len(want))
-        return None
-
-    @_locked
-    @torch.inference_mode()
-    def materialize(self, req_ids: list[str]) -> StageCacheOutputs | None:
-        """Merged outputs for this step, or None when no cached view covers
-        these requests (caller falls back to the uncached path)."""
-        ctx = self._take_step_ctx(req_ids)
+    def _take_step_ctx(self, step_id: int) -> _StepContext:
+        """Pop the context for this step id (consume-exactly-once)."""
+        ctx = self._step_ctxs.pop(step_id, None)
         if ctx is None:
-            return None
-        self._apply_completions()
+            raise OmniTensorCacheUnmatchError(
+                f"step context {step_id} missing (have {sorted(self._step_ctxs)}); already consumed or never saved"
+            )
+        return ctx
 
-        if not self._policy.needs_full_hidden_states and not ctx.hits:
-            return StageCacheOutputs(hidden_states=None, mm_outputs={})
+    @torch.inference_mode()
+    def materialize(self, step_id: int, req_ids: list[str]) -> StageCacheOutputs:
+        """Merged outputs for the step saved as `step_id`.
 
+        Two phases (invariant 6): under the lock, drain completions and
+        resolve every row source into a plan — pinned task refs plus slot
+        masks, with the absent checks done here; the storage tier is NOT
+        baked in. Unlocked, fetch and merge: fetch_host re-resolves the tier
+        at call time, and a pinned task stays readable after commit (host
+        buffers are never dropped), so the engine thread is never blocked
+        behind this thread's PCIe.
+        """
+        with self._state_lock:
+            ctx = self._take_step_ctx(step_id)
+            self._apply_completions()
+
+            # The builder must pass (a subset of) the req list captured at
+            # save time — an id outside the snapshot means it is reading the
+            # live batch, which the contract forbids (G2: debug assert, not
+            # a degrade path).
+            assert set(req_ids) <= set(ctx.query_start), (
+                f"materialize(step {step_id}) got req ids outside the save snapshot: "
+                f"{sorted(set(req_ids) - set(ctx.query_start))[:8]}"
+            )
+
+            if not self._policy.needs_full_hidden_states and not ctx.hits:
+                return StageCacheOutputs(hidden_states=None, mm_outputs={})
+
+            served = list(req_ids)
+            own_tasks = {r: self._controller.get_task(t) for r, t in ctx.task_ids.items()}
+            want_hidden = self._policy.needs_full_hidden_states
+            cached_keys = ctx.cached_keys
+
+            hit_sources: dict[tuple[str, str], _RowSource] = {}
+            for req_id in served:
+                hit = ctx.hits.get(req_id)
+                if not hit:
+                    continue
+                hit_upto, hit_blocks = hit
+                keys = ([HIDDEN_KEY] if want_hidden else []) + sorted(cached_keys)
+                for key in keys:
+                    hit_sources[(req_id, key)] = self._plan_hit_rows(
+                        req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY)
+                    )
+
+        # ---- unlocked: data movement + merge ----
         current: dict[str, torch.Tensor] = {}
-        if ctx.entry_id is not None and ctx.slots_cpu is not None:
+        if ctx.slots_cpu is not None and ctx.task_ids:
+            # Tier order matters: when the async builder runs a step late the
+            # committer has already copied every task (host bufs) — reading
+            # them is sync-free. snapshot_host is the SAME-STEP fallback
+            # (eager consumers) and must wait for this step's forward on the
+            # GPU, so preferring it on the builder would re-serialize the
+            # async pipeline (measured: +3.4ms/step, itl p90 24ms vs 15ms).
+            # Drained (None) means committed: the mirror read is sync-free too.
+            all_ready = all((t := own_tasks.get(r)) is None or t.host_ready.is_set() for r in ctx.task_ids)
             for key in [HIDDEN_KEY, *ctx.frozen_mm_keys]:
-                rows = self._entry_rows(ctx.entry_id, ctx.slots_cpu, key, mirror_fallback=True)
-                if rows is not None:
-                    current[key] = rows
-
-        # Requests the step context does not cover produced no rows this step;
-        # the caller fills those from the fresh slice.
-        served = [r for r in req_ids if r in ctx.query_start]
+                src = ctx.step_tensors.get(key)
+                if src is not None and not all_ready:
+                    # One D2H for the whole step (the per-req tasks hold
+                    # views of this same frozen clone).
+                    current[key] = self._controller.snapshot_host(src, ctx.freeze_event)
+                else:
+                    rows = self._step_rows(ctx, own_tasks, key)
+                    if rows is not None:
+                        current[key] = rows
+            if ctx.step_tensors and not all_ready:
+                # D6 feed-back, per-request form: hand each task its host
+                # rows so the committer skips its own D2H (PCIe once).
+                hosts = {k: current[k] for k in ctx.step_tensors if k in current}
+                if hosts:
+                    for r, _tid in ctx.task_ids.items():
+                        task = own_tasks.get(r)
+                        if task is None or task.host_ready.is_set():
+                            continue
+                        s = ctx.query_start[r]
+                        e = s + ctx.num_scheduled.get(r, 0)
+                        self._controller.publish_host(task, {k: v[s:e] for k, v in hosts.items()})
 
         hidden_out: dict[str, torch.Tensor] | None = None
-        if self._policy.needs_full_hidden_states and HIDDEN_KEY in current:
+        if want_hidden and HIDDEN_KEY in current:
             hidden_out = {}
             for req_id in served:
-                hidden_out[req_id] = self._merged_for_req(ctx, req_id, HIDDEN_KEY, current[HIDDEN_KEY], strict=True)
+                hidden_out[req_id] = self._merged_for_req(ctx, req_id, HIDDEN_KEY, current[HIDDEN_KEY], hit_sources)
 
         mm_out: dict[str, dict[str, Any]] = {}
-        cached_keys = (self._pool.keys() - {HIDDEN_KEY}) & set(ctx.mm_flat_refs.keys())
         for key in cached_keys:
             cur = current.get(key)
             if cur is None:
@@ -332,82 +441,115 @@ class OmniTensorCacheManager:
                 if not isinstance(val, torch.Tensor):
                     continue
                 cur = val[: ctx.num_tokens_unpadded].detach().cpu()
-            mm_out[key] = {req_id: self._merged_for_req(ctx, req_id, key, cur, strict=False) for req_id in served}
+            mm_out[key] = {req_id: self._merged_for_req(ctx, req_id, key, cur, hit_sources) for req_id in served}
 
         self._merge_passthrough(ctx, served, cached_keys, mm_out)
         return StageCacheOutputs(hidden_states=hidden_out, mm_outputs=mm_out)
 
     @_locked
-    def discard_step(self) -> None:
-        """Drop the oldest step context when no consumer will materialize it
-        (e.g. no pooler payload this step). The cache write still proceeds."""
-        if self._step_ctxs:
-            self._step_ctxs.popleft()
-
-    def has_new_req_hits(self) -> bool:
-        if self._step_ctxs:
-            return bool(self._step_ctxs[0].hits)
-        return bool(self._pending_hits)
+    def discard_step(self, step_id: int) -> None:
+        """Drop the read-side snapshot for `step_id` when no consumer will
+        materialize it (e.g. no pooler payload). The cache write still
+        proceeds; must target the id — dropping "the oldest" would discard
+        step N while its async builder is still pending and N+1 returns early.
+        """
+        self._take_step_ctx(step_id)
 
     def shutdown(self) -> None:
         self._controller.shutdown()
 
     # ------------------------------------------------------------ internals
 
-    def _alloc_entry_id(self) -> int:
-        eid = self._next_entry_id
-        self._next_entry_id += 1
-        return eid
+    def _alloc_tid(self) -> int:
+        tid = self._next_tid
+        self._next_tid += 1
+        return tid
 
-    def _conflict_deps(self, slots: torch.Tensor, entry_id: int) -> set[int]:
-        states = self._slot_state[slots]
-        mask = states == _IN_TRANSIT
-        if not bool(mask.any()):
-            return set()
-        owners = set(self._slot_owner[slots][mask].tolist())
-        owners.discard(entry_id)
-        # Block reuse while the previous tenant is still in flight: old
-        # entry must scatter first so the new rows win.
-        return {o for o in owners if self._controller.get_task(o) is not None}
+    def _next_seq(self, req_id: str) -> int:
+        seq = self._seq.get(req_id, 0) + 1
+        self._seq[req_id] = seq
+        return seq
 
-    def _map_slots(self, slots: torch.Tensor, entry_id: int) -> None:
-        self._slot_state[slots] = _IN_TRANSIT
-        self._slot_owner[slots] = entry_id
-        self._entry_slots[entry_id] = slots
+    def _tables(self, key: str) -> tuple[torch.Tensor, torch.Tensor]:
+        state = self._key_state.get(key)
+        if state is None:
+            state = self._key_state[key] = torch.zeros(self._num_slots, dtype=torch.int8)
+            self._key_owner[key] = torch.zeros(self._num_slots, dtype=torch.int64)
+        return state, self._key_owner[key]
+
+    def _map_slots(self, slots: torch.Tensor, tid: int, keys: Iterable[str]) -> None:
+        """Hang `tid` on these (slot, key); reassignment = task swap.
+
+        A (slot, key) still in-transit under another task means block reuse
+        (the old request was preempted/aborted): push those rows into the old
+        task's skip set — its mirror write skips them, ours lands, so the
+        writes are disjoint and need no ordering edge (invariant 2).
+        """
+        keys = tuple(keys)
+        for key in keys:
+            state, owner = self._tables(key)
+            cur = owner[slots]
+            stale = (state[slots] == _IN_TRANSIT) & (cur != tid) & (cur != 0)
+            if bool(stale.any()):
+                for old in {int(o) for o in cur[stale].tolist()}:
+                    old_task = self._controller.get_task(old)
+                    if old_task is not None:
+                        old_task.add_skip(key, slots[stale & (cur == old)])
+            state[slots] = _IN_TRANSIT
+            owner[slots] = tid
+        prev = self._task_slots.get(tid)
+        if prev is None:
+            self._task_slots[tid] = slots
+            self._task_keys[tid] = keys
+        else:
+            # Deferred tasks grow one segment per step.
+            self._task_slots[tid] = torch.cat([prev, slots])
+            self._task_keys[tid] = tuple(dict.fromkeys(self._task_keys[tid] + keys))
 
     def _apply_completions(self) -> None:
+        failed = self._controller.drain_failed()
+        if failed:
+            # A failed write leaves rows absent behind hashes vLLM already
+            # published — unservable and unrecoverable (G2 fatal). Raise here,
+            # once, at the earliest facade entry instead of poisoning every
+            # future hit that touches these slots.
+            raise OmniTensorCacheUnmatchError(
+                f"tensor cache write failed for task(s) {failed}; cached rows lost behind published hashes"
+            )
         drained = self._controller.drain_completed()
         for eid in drained:
-            slots = self._entry_slots.pop(eid, None)
+            slots = self._task_slots.pop(eid, None)
+            keys = self._task_keys.pop(eid, ())
             if slots is None:
                 continue
-            # Only publish slots we still own: a later entry may have taken
-            # them over (block reuse), and its write must win.
-            still_owned = self._slot_owner[slots] == eid
-            idx = slots[still_owned]
-            self._slot_state[idx] = _COMMITTED
-            self._slot_owner[idx] = 0
+            for key in keys:
+                state, owner = self._tables(key)
+                # Only publish slots we still own: a later entry may have
+                # taken them over (block reuse), and its write must win.
+                still_owned = owner[slots] == eid
+                idx = slots[still_owned]
+                state[idx] = _COMMITTED
+                owner[idx] = 0
         if drained:
             # Drop completed ids so per-request sets stay bounded over long
             # streaming requests.
             done = set(drained)
-            for req_id, eids in self._req_entries.items():
+            for req_id, eids in self._req_tasks.items():
                 eids -= done
-            for key, owner_map in self._deferred_slot_owner.items():
-                if any(e in done for e in owner_map.values()):
-                    self._deferred_slot_owner[key] = {s: e for s, e in owner_map.items() if e not in done}
 
-    def _stage_deferred(
+    def _build_deferred_segments(
         self,
         mm_flat: dict[str, Any],
         slots_cpu: torch.Tensor,
         req_order: list[str],
         num_sched: dict[str, int],
         query_start: dict[str, int],
-    ) -> None:
+    ) -> list[tuple[str, _Segment]]:
+        """Clone this step's deferred rows (build phase, no lock held)."""
         deferred_keys = [k for k in self._policy.deferred_keys if isinstance(mm_flat.get(k), torch.Tensor)]
         if not deferred_keys:
-            return
+            return []
+        segs: list[tuple[str, _Segment]] = []
         for req_id in req_order:
             sched = num_sched[req_id]
             if sched <= 0:
@@ -422,69 +564,95 @@ class OmniTensorCacheManager:
                 if not self._pool.has_key(key):
                     self._pool.ensure_key(key, val.dtype, int(val.shape[-1]))
                 tensors[key] = val[start:end].clone()
-            if not tensors:
-                continue
-            seg = _Segment(slots_cpu=slots_cpu[start:end], tensors=tensors)
+            if tensors:
+                segs.append((req_id, _Segment(slots_cpu=slots_cpu[start:end], tensors=tensors)))
+        return segs
+
+    def _stage_deferred(self, segs: list[tuple[str, _Segment]], freeze_event) -> None:
+        """Register pre-built deferred segments (locked phase; bytes already
+        reserved by save_outputs)."""
+        for req_id, seg in segs:
             task = self._deferred_tasks.get(req_id)
-            if task is not None and not self._controller.append_segment(task, seg):
+            if task is not None and not self._controller.append_segment(task, seg, reserved=True):
                 # Entry closed under us (cap flush / escalation): start a new one.
                 task = None
+            if task is not None and freeze_event is not None:
+                # Events on one compute stream are ordered: the newest freeze
+                # event also covers every earlier segment's clone, so the
+                # background copy never races this step's in-flight D2D.
+                task.freeze_event = freeze_event
             if task is None:
-                task = EntryWriteTask(entry_id=self._alloc_entry_id(), klass=CLASS_A, segments=[seg])
+                task = WriteTask(
+                    tid=self._alloc_tid(),
+                    req_id=req_id,
+                    seq=self._next_seq(req_id),
+                    klass=CLASS_A,
+                    segments=[seg],
+                    freeze_event=freeze_event,
+                )
                 self._deferred_tasks[req_id] = task
-                self._req_entries.setdefault(req_id, set()).add(task.entry_id)
-                self._controller.submit(task, queued=False)
-            for key in tensors:
-                owner = self._deferred_slot_owner.setdefault(key, {})
-                stale_owners: set[int] = set()
-                for s in seg.slots_cpu.tolist():
-                    prev = owner.get(s)
-                    if prev is not None and prev != task.entry_id and self._controller.get_task(prev) is not None:
-                        stale_owners.add(prev)
-                    owner[s] = task.entry_id
-                if stale_owners:
-                    # Block reuse across deferred tenants (preemption path):
-                    # old rows must scatter before ours so the mirror's final
-                    # value belongs to the newest tenant.
-                    task.deps.update(stale_owners)
-                    self._controller.escalate(sorted(stale_owners))
+                self._req_tasks.setdefault(req_id, set()).add(task.tid)
+                self._controller.submit(task, queued=False, reserved=True)
+            # Block reuse across deferred tenants (preemption path) is
+            # handled inside _map_slots: the old tenant's rows are skipped.
+            self._map_slots(seg.slots_cpu, task.tid, seg.tensors.keys())
 
-    def _entry_rows(
-        self, entry_id: int, slots: torch.Tensor, key: str, *, mirror_fallback: bool = False
+    def _step_rows(self, ctx: _StepContext, own_tasks: dict[str, WriteTask | None], key: str) -> torch.Tensor | None:
+        """Whole-step rows for `key`, assembled from the per-request tasks
+        (execute phase, no lock). Offsets match ctx.query_start."""
+        parts: list[torch.Tensor] = []
+        for r in ctx.req_order:
+            s = ctx.query_start[r]
+            e = s + ctx.num_scheduled.get(r, 0)
+            if e == s:
+                continue
+            rows = self._fetch_entry_rows(own_tasks.get(r), ctx.slots_cpu[s:e], key, ctx.task_ids.get(r))
+            if rows is None:
+                return None
+            parts.append(rows)
+        return torch.cat(parts, dim=0) if parts else None
+
+    def _fetch_entry_rows(
+        self, task: WriteTask | None, slots: torch.Tensor, key: str, tid: int | None
     ) -> torch.Tensor | None:
-        """Rows from a staged entry.
+        """This step's own rows (execute phase, no lock).
 
-        mirror_fallback: for reads of this step's own rows, a completed entry
-        must still resolve (via the mirror). Hit-span reads pass False so a
-        committed entry falls through to the caller's mirror baseline.
+        The pinned task stays readable after commit; a drained (or absent)
+        entry resolves via the mirror instead — validated against mid-read
+        block reuse (only our own entry may hold these rows in-transit).
         """
-        task = self._controller.get_task(entry_id)
         if task is not None:
             try:
                 return self._controller.fetch_host(task, slots, key)
             except KeyError:
-                return None
-        if mirror_fallback and self._pool.has_key(key):
-            return self._pool.rows(key, slots)
+                pass
+        if self._pool.has_key(key):
+            rows = self._pool.rows(key, slots)
+            self._ensure_not_reassigned(slots, key, allow_tid=tid)
+            return rows
         return None
 
-    def _hit_rows(
+    def _plan_hit_rows(
         self, req_id: str, hit_upto: int, hit_blocks: list[int] | None, key: str, strict: bool
-    ) -> torch.Tensor:
+    ) -> _RowSource:
+        """Resolve a hit span into a row-source plan (locked phase)."""
         bs = self._config.block_size
         assert hit_upto % bs == 0, (
             f"prefix hit not block aligned (req={req_id}, hit_upto={hit_upto}, block_size={bs}); "
             "vLLM invariant violated"
         )
-        if hit_blocks is not None:
-            block_ids = torch.tensor(hit_blocks, dtype=torch.int64)
-        else:
-            # Fallback for scheduler outputs without block_ids: only safe for
-            # same-step (eager) materialize.
-            block_ids = self._view.cached_block_ids(req_id).to(torch.int64)
+        if hit_blocks is None:
+            # The hit block table is snapshotted in new_step_starts precisely
+            # so materialize never reads the live batch (invariant 6); a
+            # missing snapshot is a registration bug, not a fallback case.
+            raise OmniTensorCacheUnmatchError(
+                f"no hit-block snapshot for req {req_id} (hit_upto={hit_upto}); hit registered without block_ids"
+            )
+        block_ids = torch.tensor(hit_blocks, dtype=torch.int64)
         slots = (block_ids.unsqueeze(1) * bs + torch.arange(bs)).reshape(-1)[:hit_upto]
 
-        states = self._slot_state[slots]
+        state = self._key_state.get(key)
+        states = state[slots] if state is not None else torch.zeros(int(slots.numel()), dtype=torch.int8)
         if strict and bool((states == _ABSENT).any()):
             absent = slots[states == _ABSENT]
             logger.critical(
@@ -499,7 +667,104 @@ class OmniTensorCacheManager:
                 f"hit span for req {req_id} resolved to {int((states == _ABSENT).sum())} absent slots"
             )
 
-        return self._resolve_rows(slots, key, strict, req_id, states)
+        return self._plan_rows(slots, key, strict, req_id, states)
+
+    def _plan_rows(
+        self,
+        slots: torch.Tensor,
+        key: str,
+        strict: bool,
+        req_id: str,
+        states: torch.Tensor | None = None,
+    ) -> _RowSource:
+        """Pin the row sources for `slots` (locked phase; no data movement).
+
+        In-transit rows win over the mirror: their rows may not have been
+        scattered yet, and a mirror read would return zero/stale values.
+        Per-key absent semantics: rows never registered for this key fall to
+        the mirror baseline (legitimate for sparse/deferred keys — the strict
+        caller has already rejected absent); rows registered in-transit whose
+        entry cannot serve them are a bookkeeping error, never silent zeros.
+        The plan holds task references, not storage tiers: fetch_host
+        re-resolves the tier when the fetch actually runs.
+        """
+        n = int(slots.numel())
+        if states is None:
+            state = self._key_state.get(key)
+            states = state[slots] if state is not None else torch.zeros(n, dtype=torch.int8)
+        owner_table = self._key_owner.get(key)
+        owners = owner_table[slots] if owner_table is not None else torch.zeros(n, dtype=torch.int64)
+        staged_mask = states == _IN_TRANSIT
+
+        staged: list[tuple[WriteTask, torch.Tensor]] = []
+        for owner in {int(o) for o in owners[staged_mask].tolist()}:
+            task = self._controller.get_task(owner) if owner != 0 else None
+            if task is None:
+                # in-transit implies a live owner entry (state flips to
+                # committed in the same locked drain that retires the task).
+                # Zeros here would ship silently downstream.
+                raise OmniTensorCacheUnmatchError(
+                    f"(slot, {key}) rows of req {req_id} are in-transit but entry {owner} cannot serve them"
+                )
+            staged.append((task, staged_mask & (owners == owner)))
+
+        baseline = self._pool.has_key(key)
+        if not baseline and not staged:
+            if strict:
+                raise OmniTensorCacheUnmatchError(f"no data source for hit span of req {req_id}, key {key}")
+            raise KeyError(f"key {key} has no cache mirror")
+        return _RowSource(
+            slots=slots, key=key, req_id=req_id, baseline_mirror=baseline, staged=staged, staged_any=staged_mask
+        )
+
+    def _fetch_source(self, src: _RowSource) -> torch.Tensor:
+        """Fetch a planned row source (execute phase, no lock)."""
+        n = int(src.slots.numel())
+        out: torch.Tensor | None = None
+        if src.baseline_mirror:
+            out = self._pool.rows(src.key, src.slots)
+        for task, mask in src.staged:
+            try:
+                rows = self._controller.fetch_host(task, src.slots[mask], src.key)
+            except KeyError:
+                raise OmniTensorCacheUnmatchError(
+                    f"(slot, {src.key}) rows of req {src.req_id} are staged in entry "
+                    f"{task.tid} (req {task.req_id}, seq {task.seq}) but the task cannot serve them"
+                ) from None
+            if out is None:
+                out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
+            out[mask] = rows
+        assert out is not None  # _plan_rows guarantees a source
+        self._ensure_not_reassigned(src.slots, src.key, planned_staged=src.staged_any, req_id=src.req_id)
+        return out
+
+    def _ensure_not_reassigned(
+        self,
+        slots: torch.Tensor,
+        key: str,
+        *,
+        planned_staged: torch.Tensor | None = None,
+        allow_tid: int | None = None,
+        req_id: str = "?",
+    ) -> None:
+        """Post-fetch validation: baseline (mirror) rows read without a lock
+        may have been re-registered by a new tenant mid-read (block reuse
+        after abort/preemption of the hit request) — the scatter races the
+        mirror read, so a torn read must fail loudly, never ship."""
+        with self._state_lock:
+            state = self._key_state.get(key)
+            if state is None:
+                return
+            violated = state[slots] == _IN_TRANSIT
+            if planned_staged is not None:
+                violated &= ~planned_staged
+            if allow_tid is not None and bool(violated.any()):
+                violated &= self._key_owner[key][slots] != allow_tid
+            if bool(violated.any()):
+                raise OmniTensorCacheUnmatchError(
+                    f"(slot, {key}) rows of req {req_id} were reassigned to a new entry during "
+                    f"materialize ({int(violated.sum())} slots; block reuse mid-read)"
+                )
 
     def _resolve_rows(
         self,
@@ -507,47 +772,12 @@ class OmniTensorCacheManager:
         key: str,
         strict: bool,
         req_id: str,
-        states: torch.Tensor,
+        states: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """Resolve rows for `slots`, freshest tier first.
-
-        Staged entries (in-transit main entries and deferred keys) win over
-        the mirror: their rows may not have been scattered yet, so a mirror
-        read would return zero/stale values.
-        """
-        n = int(slots.numel())
-        deferred_owner = self._deferred_slot_owner.get(key) or {}
-        # slot -> owning entry, preferring the staged tiers.
-        owners = self._slot_owner[slots].clone()
-        if deferred_owner:
-            for i, s in enumerate(slots.tolist()):
-                eid = deferred_owner.get(int(s))
-                if eid is not None and self._controller.get_task(eid) is not None:
-                    owners[i] = eid
-        staged_mask = (states == _IN_TRANSIT) | torch.tensor(
-            [bool(deferred_owner.get(int(s)) is not None) for s in slots.tolist()] if deferred_owner else [False] * n
-        )
-
-        out: torch.Tensor | None = None
-        if self._pool.has_key(key):
-            out = self._pool.rows(key, slots)
-
-        for owner in {int(o) for o in owners[staged_mask].tolist()}:
-            if owner == 0:
-                continue
-            own_mask = staged_mask & (owners == owner)
-            rows = self._entry_rows(owner, slots[own_mask], key)
-            if rows is None:
-                continue
-            if out is None:
-                out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
-            out[own_mask] = rows
-
-        if out is None:
-            if strict:
-                raise OmniTensorCacheUnmatchError(f"no data source for hit span of req {req_id}, key {key}")
-            raise KeyError(f"key {key} has no cache mirror")
-        return out
+        """Plan + fetch in one call (tests / debugging)."""
+        with self._state_lock:
+            src = self._plan_rows(slots, key, strict, req_id, states)
+        return self._fetch_source(src)
 
     def _merged_for_req(
         self,
@@ -555,7 +785,7 @@ class OmniTensorCacheManager:
         req_id: str,
         key: str,
         current_cpu: torch.Tensor,
-        strict: bool,
+        hit_sources: dict[tuple[str, str], _RowSource],
     ) -> torch.Tensor:
         if req_id not in ctx.query_start:
             # The caller passed a req the step context never saw: a silent
@@ -566,11 +796,10 @@ class OmniTensorCacheManager:
         start = ctx.query_start[req_id]
         end = start + ctx.num_scheduled.get(req_id, 0)
         new_rows = current_cpu[start:end]
-        hit = ctx.hits.get(req_id)
-        if not hit:
+        src = hit_sources.get((req_id, key))
+        if src is None:
             return new_rows
-        hit_upto, hit_blocks = hit
-        cached = self._hit_rows(req_id, hit_upto, hit_blocks, key, strict)
+        cached = self._fetch_source(src)
         return torch.cat([cached, new_rows], dim=0)
 
     def _merge_passthrough(
