@@ -132,7 +132,7 @@ class OmniTensorCacheManager:
         self._deferred_tasks: dict[str, WriteTask] = {}  # req_id -> task
         self._next_tid = 1
         self._join_next_step_tids: list[int] = []
-        self._seq: dict[str, int] = {}  # req_id -> physical-task counter
+        self._write_n: dict[str, int] = {}  # req_id -> last write_n issued
         self._finished_join: set[int] = set()
         self._pending_hits: dict[str, int] = {}
         self._live_reqs: set[str] = set()
@@ -163,7 +163,7 @@ class OmniTensorCacheManager:
         finished = getattr(scheduler_output, "finished_req_ids", None) or ()
         for req_id in finished:
             self._live_reqs.discard(req_id)
-            self._seq.pop(req_id, None)
+            self._write_n.pop(req_id, None)
             eids = self._req_tasks.pop(req_id, set())
             dtask = self._deferred_tasks.pop(req_id, None)
             if dtask is not None:
@@ -296,7 +296,7 @@ class OmniTensorCacheManager:
             self._apply_completions()
             task_ids: dict[str, int] = {}
             if tensors:
-                # One WriteTask per request (task_id = (req_id, key, seq)):
+                # One WriteTask per request (tid handle; req_id + write_n):
                 # per-req views of the shared frozen clone, so the D2D freeze
                 # stays a single kernel while finish/abort escalation, skip
                 # masks, and completion validation are all req-scoped.
@@ -310,7 +310,7 @@ class OmniTensorCacheManager:
                     task = WriteTask(
                         tid=tid,
                         req_id=r,
-                        seq=self._next_seq(r),
+                        write_n=self._next_write_n(r),
                         schedule=WriteSchedule.JOIN_ON_FINISH
                         if (e - s) > self._config.join_on_finish_min_tokens
                         else WriteSchedule.JOIN_NEXT_STEP,
@@ -318,7 +318,7 @@ class OmniTensorCacheManager:
                         freeze_event=freeze_event,
                     )
                     self._map_slots(slots_cpu[s:e], tid, r_tensors.keys())
-                    self._controller.submit(task, reserved=True)
+                    self._controller.submit(task)
                     self._req_tasks.setdefault(r, set()).add(tid)
                     task_ids[r] = tid
                     if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
@@ -486,10 +486,10 @@ class OmniTensorCacheManager:
         self._next_tid += 1
         return tid
 
-    def _next_seq(self, req_id: str) -> int:
-        seq = self._seq.get(req_id, 0) + 1
-        self._seq[req_id] = seq
-        return seq
+    def _next_write_n(self, req_id: str) -> int:
+        n = self._write_n.get(req_id, 0) + 1
+        self._write_n[req_id] = n
+        return n
 
     def _tables(self, key: str) -> tuple[torch.Tensor, torch.Tensor]:
         state = self._key_state.get(key)
@@ -594,7 +594,7 @@ class OmniTensorCacheManager:
         reserved by save_outputs)."""
         for req_id, seg in segs:
             task = self._deferred_tasks.get(req_id)
-            if task is not None and not self._controller.append_segment(task, seg, reserved=True):
+            if task is not None and not self._controller.append_segment(task, seg):
                 # Entry closed under us (cap flush / escalation): start a new one.
                 task = None
             if task is not None and freeze_event is not None:
@@ -606,14 +606,14 @@ class OmniTensorCacheManager:
                 task = WriteTask(
                     tid=self._alloc_tid(),
                     req_id=req_id,
-                    seq=self._next_seq(req_id),
+                    write_n=self._next_write_n(req_id),
                     schedule=WriteSchedule.JOIN_ON_FINISH,
                     segments=[seg],
                     freeze_event=freeze_event,
                 )
                 self._deferred_tasks[req_id] = task
                 self._req_tasks.setdefault(req_id, set()).add(task.tid)
-                self._controller.submit(task, queued=False, reserved=True)
+                self._controller.submit(task, queued=False)
             # Block reuse across deferred tenants (preemption path) is
             # handled inside _map_slots: the old tenant's rows are skipped.
             self._map_slots(seg.slots_cpu, task.tid, seg.tensors.keys())
@@ -750,7 +750,7 @@ class OmniTensorCacheManager:
             except KeyError:
                 raise OmniTensorCacheUnmatchError(
                     f"(slot, {src.key}) rows of req {src.req_id} are staged in entry "
-                    f"{task.tid} (req {task.req_id}, seq {task.seq}) but the task cannot serve them"
+                    f"{task.tid} (req {task.req_id}, write_n {task.write_n}) but the task cannot serve them"
                 ) from None
             if out is None:
                 out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)

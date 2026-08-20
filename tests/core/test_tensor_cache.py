@@ -524,8 +524,9 @@ def test_materialize_unknown_step_id_fails_fast():
 
 
 def test_fetch_host_fast_path_matches_general_path():
-    """The single-segment fast path must return exactly what the general
-    regroup path does, including for shuffled and partial slot sets."""
+    """Single-segment fetch matches the general path for this-step identity,
+    a shorter prefix hit, and a gapped subsequence (some slots already
+    in the mirror). Hit/save order is increasing; no shuffle."""
     from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
     from vllm_omni.core.tensor_cache.controller import (
         OmniTensorCacheController,
@@ -539,23 +540,24 @@ def test_fetch_host_fast_path_matches_general_path():
     pool.ensure_key(HIDDEN_KEY, DTYPE, HIDDEN)
     ctrl = OmniTensorCacheController(pool, cfg, eager=True)
 
-    slots = torch.tensor([12, 4, 7, 20, 1], dtype=torch.int64)
+    # In-order rows well inside the pool (NUM_BLOCKS * BLOCK_SIZE = 64).
+    slots = torch.tensor([40, 41, 42, 43, 44], dtype=torch.int64)
     rows = torch.arange(slots.numel() * HIDDEN, dtype=DTYPE).reshape(slots.numel(), HIDDEN)
     task = WriteTask(
         tid=1,
         req_id="r",
-        seq=1,
+        write_n=1,
         schedule=WriteSchedule.JOIN_NEXT_STEP,
         segments=[_Segment(slots_cpu=slots, tensors={HIDDEN_KEY: rows})],
     )
+    ctrl.reserve(rows.numel() * rows.element_size())
     ctrl.submit(task)
 
-    for want in (slots, slots[[3, 0, 4]], slots[[2]]):
+    for want in (slots, slots[:3], slots[[0, 1, 3, 4]]):
         fast = ctrl.fetch_host(task, want, HIDDEN_KEY)
         s2r = task.slot_to_row()
-        general = ctrl._rows_from(task, [s2r[int(s)] for s in want.tolist()], HIDDEN_KEY, host=True)
+        general = ctrl._rows_from(task, [s2r[int(s)] for s in want.tolist()], HIDDEN_KEY)
         assert torch.equal(fast, general), (want, fast, general)
-        # And it is the actual data for those slots.
         expect = torch.stack([rows[(slots == s).nonzero()[0, 0]] for s in want.tolist()])
         assert torch.equal(fast, expect)
 
@@ -645,7 +647,7 @@ def test_failed_write_fails_fast_at_next_facade_entry():
     task = WriteTask(
         tid=999,
         req_id="x",
-        seq=1,
+        write_n=1,
         schedule=WriteSchedule.JOIN_NEXT_STEP,
         segments=[_Segment(slots_cpu=torch.tensor([0]), tensors={})],
     )

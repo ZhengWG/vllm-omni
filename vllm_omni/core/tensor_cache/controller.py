@@ -1,20 +1,16 @@
-"""OmniTensorCacheController: Task execution Controller.
+"""Runs WriteTasks: GPU-stage, host copy, scatter into the CPU block pool.
 
-Two-stage pipeline per:
+The manager owns request/slot identity and when to submit. This class
+owns the queues, the staging-byte cap, and the single committer that
+writes the pool.
 
-1. A copy queue (D2H issuance — class
-priority, chunked join-on-finish trickle, cap accounting) and a scatter stage
-(runs tasks whose copy finished). The committer thread is the mirror's
-single writer; slot-reuse needs no ordering edges — a reassigned
-(slot, key) is pushed into the old task's skip set, so old and new
-mirror writes are disjoint by construction.
-
-2. Eager mode (no background thread) serves CPU-only tests and non-CUDA
-platforms: submit() completes the whole pipeline synchronously.
+Async: hi/lo copy queues, then scatter.
+Eager: submit() does both inline (CPU tests / no CUDA).
 """
 
 import logging
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -37,30 +33,69 @@ class _Segment:
 
 @dataclass
 class WriteTask:
-    """One write: a set of (slot, key) rows for one request.
+    """One write of (slot, key) rows for a single request.
 
-    `tid` is the compact handle stored in the manager's state tables; the
-    logical identity is (req_id, key, seq), recoverable via the metadata
-    here for every key the task carries.
+    Identity: `tid` is the handle in the manager's (slot, key) tables.
+    `req_id` + `write_n` mark whose write this is and the nth time that
+    request opened a write. One task may carry several keys.
+
+    Pipeline (one direction, no rollback)::
+
+        queued / GPU-staged
+            -> copy claimed (`d2h_claimed`)
+            -> `host_ready`  (host published; GPU refs may drop)
+            -> scatter
+            -> `done`        (in the CPU mirror; `failed` instead on error)
+
+    `JOIN_NEXT_STEP` starts on the hi copy queue and is joined at the
+    next save (`host_ready` only). `JOIN_ON_FINISH` stays on the lo
+    queue, or unqueued (deferred `submit(queued=False)`), until finish
+    or cap pressure `escalate`s it onto hi — once. Cap flush takes the
+    unfinished task with the oldest `enqueued_time`.
+
+    Concurrent readers/writers:
+    - Copy: `publish_host` and the committer race `d2h_claimed`;
+      only the winner publishes `seg.host`.
+    - Remount: a later task taking the same (slot, key) pushes those
+      rows into `skip`; the old scatter omits them so the two writes
+      stay disjoint (no join edge).
+    - Append: `append_segment` loses if copy already claimed or `done`
+      — caller opens a fresh task rather than mutating a closed one.
+    - `lock` covers `skip` / `d2h_claimed` / segment append only.
+      `host_ready` and `done` are their own events.
     """
 
     tid: int
     req_id: str
-    seq: int
+    write_n: int  # 1-based: nth write opened by this request
     schedule: WriteSchedule
     segments: list[_Segment]
+    # Compute-stream D2D freeze completion. Copy/read streams must wait
+    # this before touching `segments[].tensors`, or they can read the
+    # next CUDA-graph static-buffer overwrite.
     freeze_event: object | None = None  # torch.cuda.Event
-    nbytes: int = 0
+    nbytes: int = 0  # GPU-staging cap accounting only; not a correctness signal
+    # Promoted from the lazy queue onto the hi queue (finish / cap). Once.
     escalated: bool = False
+    # Single publisher for the host copy: publish_host and the
+    # committer D2H race this; only the winner may write `seg.host`.
     d2h_claimed: bool = False
+    # Committer could not land the write; manager fail-fasts on next entry.
     failed: bool = False
     # (slot, key) pairs reassigned to a newer task: the scatter skips them,
     # making old and new mirror writes disjoint (no ordering edges needed).
     skip: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Host copy published; GPU refs may drop; join_copied can return.
     host_ready: threading.Event = field(default_factory=threading.Event)
+    # Scatter into the CPU mirror has finished (strictly after host_ready).
     done: threading.Event = field(default_factory=threading.Event)
+    # Guards skip / d2h_claimed / segment append. Not host_ready or done.
     lock: threading.Lock = field(default_factory=threading.Lock)
-    _slot_to_row: dict[int, tuple[int, int]] | None = None  # slot -> (seg, row)
+    # time.monotonic() at submit; cap flush picks the smallest of these.
+    enqueued_time: float = field(default_factory=time.monotonic)
+    # slot -> (which segment, row in that segment's tensor). Built on demand
+    # for multi-segment tasks; scatter uses slot, the tensor uses row.
+    _slot_to_row: dict[int, tuple[int, int]] | None = None
 
     def num_rows(self) -> int:
         return sum(int(s.slots_cpu.numel()) for s in self.segments)
@@ -112,16 +147,15 @@ class OmniTensorCacheController:
 
     # ------------------------------------------------------------------ submit
 
-    def submit(self, task: WriteTask, queued: bool = True, reserved: bool = False) -> None:
+    def submit(self, task: WriteTask, queued: bool = True) -> None:
         """Register a task. queued=False (deferred tasks) stays GPU-staged
         until escalated or cap-flushed.
 
-        reserved=True: the caller already ran reserve() for these bytes (so
-        the blocking cap flush stays outside the manager's state lock).
+        Caller must reserve() the task bytes first (cap flush can block;
+        the manager does that outside the state lock).
         """
         task.nbytes = sum(t.numel() * t.element_size() for s in task.segments for t in s.tensors.values())
-        if not reserved:
-            self._reserve_bytes(task.nbytes)
+        task.enqueued_time = time.monotonic()
         with self._lock:
             self._tasks[task.tid] = task
         if self._eager:
@@ -133,27 +167,18 @@ class OmniTensorCacheController:
                 (self._queue_hi if task.schedule is WriteSchedule.JOIN_NEXT_STEP else self._queue_lo).append(task.tid)
                 self._wake.notify_all()
 
-    def append_segment(self, task: WriteTask, seg: _Segment, reserved: bool = False) -> bool:
+    def append_segment(self, task: WriteTask, seg: _Segment) -> bool:
         """Grow a deferred (JOIN_ON_FINISH) task with one step's rows.
 
         Returns False when the task already started copying (cap flush or a
         finish/conflict escalation got there first); the caller then opens a
-        fresh task instead of mutating a closed one.
-
-        reserved=True: bytes were reserved by the caller; on False they stay
-        reserved and carry over to the fresh task submitted with
-        reserved=True.
+        fresh task instead of mutating a closed one. Bytes for this segment
+        must already be reserve()'d; on False they stay reserved for the
+        replacement submit.
         """
         nbytes = sum(t.numel() * t.element_size() for t in seg.tensors.values())
-        if not reserved:
-            # Exclude this task from the cap flush: flushing the very task
-            # we are appending to would close it under us.
-            self._reserve_bytes(nbytes, exclude={task.tid})
         with task.lock:
             if task.d2h_claimed or task.done.is_set():
-                if not reserved:
-                    with self._lock:
-                        self._staged_bytes = max(0, self._staged_bytes - nbytes)
                 return False
             task.segments.append(seg)
             task._slot_to_row = None
@@ -173,9 +198,10 @@ class OmniTensorCacheController:
             with self._lock:
                 pending = [tid for tid, t in self._tasks.items() if not t.done.is_set() and tid not in exclude]
                 if self._staged_bytes + nbytes <= self._config.gpu_staging_bytes or not pending:
+                    # Under budget or no pending tasks; admit reservation.
                     self._staged_bytes += nbytes
                     return
-                oldest = min(pending)
+                oldest = min(pending, key=lambda tid: self._tasks[tid].enqueued_time)
             logger.warning("omni prefix cache: staging cap hit, force-flushing task %d", oldest)
             self.escalate([oldest])
             self.join([oldest])
@@ -206,22 +232,21 @@ class OmniTensorCacheController:
             self._wake.notify_all()
 
     def join(self, tids: list[int]) -> None:
+        """Block until each task has finished scatter (or failed)."""
         for tid in tids:
             task = self._tasks.get(tid)
             if task is not None:
                 task.done.wait()
 
     def join_host_ready(self, tids: list[int]) -> None:
-        """Bounded-depth wait: waits only for in-flight GPU staging
-        to complete, i.e., for host buffer to be ready. Waiting for
-        the scatter phase as in join() is unnecessary for correctness."""
+        """Block until each task's host copy is published."""
         for tid in tids:
             task = self._tasks.get(tid)
             if task is not None:
                 task.host_ready.wait()
 
     def drain_completed(self) -> list[int]:
-        """Manager-side fixed-point drain; returns scattered task ids."""
+        """Pop scattered tasks from `_completed` and drop them from `_tasks`."""
         out: list[int] = []
         with self._lock:
             while self._completed:
@@ -231,7 +256,7 @@ class OmniTensorCacheController:
         return out
 
     def drain_failed(self) -> list[int]:
-        """Task ids whose write failed; the manager fail-fasts on these."""
+        """Pop failed task ids from `_failed`. Does not drop `_tasks`."""
         out: list[int] = []
         with self._lock:
             while self._failed:
@@ -252,39 +277,17 @@ class OmniTensorCacheController:
 
     @torch.inference_mode()
     def fetch_host(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
-        """Rows for `slots` of one in-flight task, resolved shortest-path.
+        """Rows for `slots` of one in-flight task.
 
-        pre-staged -> host buffer rows; otherwise slice sync D2H on the read
-        stream. A full-coverage read that wins the claim feeds its result
-        back as the pre-staged host copy (skips the background D2H).
+        Host copy if published; otherwise slice sync D2H on the read stream.
         """
         if len(task.segments) == 1:
-            # Fast path: one segment (every main task) needs no regroup or
-            # reorder — resolve rows with a single tensor op.
-            rows = self._rows_single_segment(task, slots, key)
-            seg = task.segments[0]
-            if (
-                not task.host_ready.is_set()
-                and slots.numel() == seg.slots_cpu.numel()
-                and bool(torch.equal(slots, seg.slots_cpu))
-            ):
-                # Full in-order read: publish it as the pre-staged host copy
-                # so the background committer skips its own D2H (PCIe once).
-                self._try_feed_back(task, key, rows, [])
-            return rows
-
+            return self._rows_single_segment(task, slots, key)
         s2r = task.slot_to_row()
         idx = [s2r[int(s)] for s in slots.tolist()]
-        if task.host_ready.is_set():
-            return self._rows_from(task, idx, key, host=True)
+        return self._rows_from(task, idx, key)
 
-        full_cover = len(idx) == task.num_rows()
-        rows = self._rows_from(task, idx, key, host=False)  # sync D2H inside
-        if full_cover:
-            self._try_feed_back(task, key, rows, idx)
-        return rows
-
-    def _rows_from(self, task: WriteTask, idx: list[tuple[int, int]], key: str, host: bool) -> torch.Tensor:
+    def _rows_from(self, task: WriteTask, idx: list[tuple[int, int]], key: str) -> torch.Tensor:
         # Group by segment, preserve caller order via position bookkeeping.
         parts: list[torch.Tensor] = []
         order: list[int] = []
@@ -295,15 +298,15 @@ class OmniTensorCacheController:
             pos += 1
         for si, items in seg_groups.items():
             seg = task.segments[si]
-            src = seg.host.get(key) if host else seg.tensors.get(key)
-            if src is None and not host:
-                # Copy thread may have published host bufs and dropped the
-                # GPU refs between our host_ready check and here.
-                src = seg.host.get(key)
+            # host[k] is published only after D2H; else the freeze. (`or`
+            # would bool() a Tensor and raise.)
+            src = seg.host.get(key)
+            if src is None:
+                src = seg.tensors.get(key)
             if src is None:
                 continue
             rows_idx = torch.tensor([ri for _, ri in items], dtype=torch.long)
-            picked = self._slice_rows(task, src, rows_idx, host)
+            picked = self._slice_rows(task, src, rows_idx, host=(src.device.type == "cpu"))
             parts.append(picked)
             order.extend(p for p, _ in items)
         if not parts:
@@ -314,33 +317,27 @@ class OmniTensorCacheController:
         return out
 
     def _rows_single_segment(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
-        """Row lookup for a single-segment task, without per-token Python.
-
-        Row index = position of each slot inside the task's slot list. The
-        task's slots are the step's slot mapping, so a searchsorted over its
-        sorted order maps requested slots to rows in one vectorized step.
-        """
+        """Map `slots` to rows in this task's one packed segment."""
         seg = task.segments[0]
-        host_ready = task.host_ready.is_set()
-        src = seg.host.get(key) if host_ready else seg.tensors.get(key)
+        # host[k] is published only after D2H; else the freeze. (`or`
+        # would bool() a Tensor and raise.)
+        src = seg.host.get(key)
         if src is None:
-            src = seg.host.get(key)
+            src = seg.tensors.get(key)
         if src is None:
             raise KeyError(f"key {key} not present in task {task.tid}")
 
-        entry_slots = seg.slots_cpu
-        # Reading the whole entry in order is the common case (this step's own
-        # rows): the row indices are just 0..n-1, so skip the lookup entirely.
-        if slots.numel() == entry_slots.numel() and bool(torch.equal(slots, entry_slots)):
-            return self._slice_rows(
-                task, src, torch.arange(entry_slots.numel(), dtype=torch.int64), host=(src.device.type == "cpu")
-            )
-
-        order = torch.argsort(entry_slots)
-        pos = torch.searchsorted(entry_slots[order], slots).clamp(max=entry_slots.numel() - 1)
-        rows_idx = order[pos]
-        if not bool(torch.equal(entry_slots[rows_idx], slots)):
-            raise KeyError(f"slots not covered by task {task.tid}")
+        seg_slots = seg.slots_cpu
+        n = int(slots.numel())
+        # Same token order: this-step rows or a prefix hit → 0..n-1.
+        if n <= seg_slots.numel() and bool(torch.equal(slots, seg_slots[:n])):
+            rows_idx = torch.arange(n, dtype=torch.int64)
+        else:
+            loc = {int(s): i for i, s in enumerate(seg_slots.tolist())}
+            try:
+                rows_idx = torch.tensor([loc[int(s)] for s in slots.tolist()], dtype=torch.int64)
+            except KeyError:
+                raise KeyError(f"slots not covered by task {task.tid}") from None
         return self._slice_rows(task, src, rows_idx, host=(src.device.type == "cpu"))
 
     def _slice_rows(self, task: WriteTask, src: torch.Tensor, rows_idx: torch.Tensor, host: bool) -> torch.Tensor:
@@ -413,33 +410,6 @@ class OmniTensorCacheController:
             self._scatter(task)
         return True
 
-    def _try_feed_back(self, task: WriteTask, key: str, rows_cpu: torch.Tensor, idx: list[tuple[int, int]]) -> None:
-        # Feed back only for single-segment entries with all keys covered by
-        # separate fetches is over-engineering; claim per-entry, attach the
-        # fetched key, and D2H the remaining keys inline (rare, same window).
-        with task.lock:
-            if task.d2h_claimed or len(task.segments) != 1:
-                return
-            task.d2h_claimed = True
-        seg = task.segments[0]
-        seg.host[key] = rows_cpu
-        for k, src in seg.tensors.items():
-            if k not in seg.host:
-                seg.host[k] = self._slice_rows(task, src, torch.arange(src.shape[0]), host=False)
-        task.host_ready.set()
-        released = sum(t.numel() * t.element_size() for t in seg.tensors.values())
-        seg.tensors = {}
-        with self._wake:
-            self._staged_bytes -= released
-            # Move out of the copy queues; scatter stage picks it up.
-            for q in (self._queue_hi, self._queue_lo):
-                try:
-                    q.remove(task.tid)
-                except ValueError:
-                    pass
-            self._blocked.append(task.tid)
-            self._wake.notify_all()
-
     # ------------------------------------------------------------ eager mode
 
     @torch.inference_mode()
@@ -472,7 +442,7 @@ class OmniTensorCacheController:
                     while not self._shutdown and not self._queue_hi and not self._queue_lo:
                         if self._blocked:
                             break
-                        # submit / escalate / feed-back / shutdown all notify.
+                        # submit / escalate / publish_host / shutdown all notify.
                         self._wake.wait()
                     if self._shutdown and not self._queue_hi and not self._queue_lo and not self._blocked:
                         return
@@ -503,6 +473,7 @@ class OmniTensorCacheController:
             task.d2h_claimed = True
         assert self._copy_stream is not None
         chunk_bytes = self._config.copy_chunk_bytes
+        pending_host: list[tuple[_Segment, str, torch.Tensor]] = []
         pending_cats: list[tuple[_Segment, str, list[torch.Tensor]]] = []
         with torch.cuda.stream(self._copy_stream):
             if task.freeze_event is not None:
@@ -517,13 +488,15 @@ class OmniTensorCacheController:
                         ]
                         pending_cats.append((seg, k, parts))
                     else:
-                        seg.host[k] = src.to("cpu", non_blocking=True)
+                        pending_host.append((seg, k, src.to("cpu", non_blocking=True)))
             ev = torch.cuda.Event()
             ev.record()
         ev.synchronize()
+        # Publish host only after D2H; readers treat host[k] as complete.
         for seg, k, parts in pending_cats:
             seg.host[k] = torch.cat(parts, dim=0)
-        # host bufs complete -> host_ready -> drop GPU refs. Do not reorder.
+        for seg, k, cpu in pending_host:
+            seg.host[k] = cpu
         task.host_ready.set()
         with self._wake:
             self._staged_bytes -= task.nbytes
@@ -579,6 +552,7 @@ class OmniTensorCacheController:
     @torch.inference_mode()
     def _scatter(self, task: WriteTask) -> None:
         with task.lock:
+            # Slots a later task took over (block reuse); do not write those.
             skip = {k: s.clone() for k, s in task.skip.items()}
         for seg in task.segments:
             for k, host in seg.host.items():
