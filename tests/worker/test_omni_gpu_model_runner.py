@@ -695,7 +695,7 @@ def test_full_payload_output_accumulation_hook_matrix():
 def _make_request_end_payload_runner(*, enabled=True, tensor_cache=None):
     runner = object.__new__(GPUARModelRunner)
     runner.model = SimpleNamespace(omni_payload_at_request_end=enabled)
-    runner.omni_tensor_cache = tensor_cache
+    runner.omni_prefix_cache = tensor_cache
     runner.model_config = SimpleNamespace(
         model_arch="IndexTTS25TalkerForConditionalGeneration",
         model_stage="indextts2_5_talker",

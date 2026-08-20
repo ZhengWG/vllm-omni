@@ -86,10 +86,17 @@ class OmniGPUModelRunner(GPUModelRunner):
         self.model_intermediate_buffer: dict[str, dict[str, Any]] = {}
         self._omni_num_scheduled_tokens_np: np.ndarray | None = None
         self._omni_last_model_output: object | None = None
-        self.omni_tensor_cache = None
-        self._omni_tensor_cache_cfg = None
+        # Omni prefix cache (hidden / per-token mm tensors reused on prefix
+        # hits). Built once, on the first real step after load_model: the
+        # config is staged at kv-cache init and cleared after construction.
+        self.omni_prefix_cache = None
+        self._omni_prefix_cache_cfg = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
+        # Model constants snapshotted once in load_model; the hot path must
+        # not re-probe model attributes every step.
+        self._needs_full_prefix_hidden_states_flag = True
+        self._pooler_payload_include_hidden_flag = True
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
         override_fn = self._sampled_token_ids_cpu_override
@@ -174,32 +181,41 @@ class OmniGPUModelRunner(GPUModelRunner):
         # the first step so input_batch is guaranteed to exist. Non-CUDA
         # platforms run the Controller in eager mode (auto-selected).
         if self.cache_config.enable_prefix_caching:
-            self._omni_tensor_cache_cfg = TensorCacheConfig(
+            self._omni_prefix_cache_cfg = TensorCacheConfig(
                 num_blocks=kv_cache_config.num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),
                 hs_dtype=self.dtype,
+                kv_cache_groups=getattr(kv_cache_config, "kv_cache_groups", None),
             )
 
-    def _ensure_omni_tensor_cache(self) -> None:
-        if getattr(self, "omni_tensor_cache", None) is not None:
-            return
-        cfg = getattr(self, "_omni_tensor_cache_cfg", None)
-        if cfg is None:
-            return
-        view = get_tensor_cache_group_view(self.input_batch, cfg.block_size, cfg.num_blocks)
+    def _snapshot_prefix_cache_model_flags(self, model) -> None:
+        """Freeze the model's prefix-cache-relevant constants (set in the
+        model's __init__) so per-step code reads plain attributes."""
+        self._needs_full_prefix_hidden_states_flag = bool(
+            getattr(model, "requires_full_prefix_cached_hidden_states", True)
+        )
+        self._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
+
+    def _ensure_omni_prefix_cache(self) -> None:
+        """One-shot construction (caller gates on the staged config)."""
+        cfg = self._omni_prefix_cache_cfg
+        self._omni_prefix_cache_cfg = None
+        view = get_tensor_cache_group_view(
+            self.input_batch, cfg.block_size, cfg.num_blocks, kv_cache_groups=cfg.kv_cache_groups
+        )
         if view is None:
-            # No usable full-attention group (hybrid/multi-group models, G5 is
-            # P2). Serving prefix hits without the omni cache would hand
+            # No usable full-attention group (hybrid/multi-group model).
+            # Serving prefix hits without the omni cache would hand
             # downstream stages truncated conditioning, so refuse loudly
             # instead of degrading.
             raise OmniTensorCacheUnmatchError(
-                "omni tensor caching requires a single full-attention kv-cache group; "
-                "disable enable_prefix_caching for this model or wait for multi-group support (G5)"
+                "omni prefix caching requires a single full-attention kv-cache group; "
+                "disable enable_prefix_caching for this model"
             )
         manager = OmniTensorCacheManager(cfg, view)
         manager.register_policy(ModelCachePolicy.from_model(getattr(self, "model", None)))
-        self.omni_tensor_cache = manager
+        self.omni_prefix_cache = manager
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
@@ -211,6 +227,7 @@ class OmniGPUModelRunner(GPUModelRunner):
             if callable(candidate):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
+        self._snapshot_prefix_cache_model_flags(model)
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()

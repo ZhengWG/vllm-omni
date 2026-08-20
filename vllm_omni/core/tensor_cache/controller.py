@@ -3,7 +3,7 @@
 Two-stage pipeline per:
 
 1. A copy queue (D2H issuance — class
-priority, chunked Class A trickle, cap accounting) and a scatter stage
+priority, chunked join-on-finish trickle, cap accounting) and a scatter stage
 (runs tasks whose copy finished). The committer thread is the mirror's
 single writer; slot-reuse needs no ordering edges — a reassigned
 (slot, key) is pushed into the old task's skip set, so old and new
@@ -21,12 +21,9 @@ from dataclasses import dataclass, field
 import torch
 
 from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
-from vllm_omni.core.tensor_cache.interface import TensorCacheConfig
+from vllm_omni.core.tensor_cache.interface import TensorCacheConfig, WriteSchedule
 
 logger = logging.getLogger(__name__)
-
-CLASS_A = "A"
-CLASS_B = "B"
 
 
 @dataclass
@@ -43,14 +40,14 @@ class WriteTask:
     """One write: a set of (slot, key) rows for one request.
 
     `tid` is the compact handle stored in the manager's state tables; the
-    RFC's logical id is (req_id, key, seq) — recoverable via the metadata
+    logical identity is (req_id, key, seq), recoverable via the metadata
     here for every key the task carries.
     """
 
     tid: int
     req_id: str
     seq: int
-    klass: str
+    schedule: WriteSchedule
     segments: list[_Segment]
     freeze_event: object | None = None  # torch.cuda.Event
     nbytes: int = 0
@@ -100,8 +97,8 @@ class OmniTensorCacheController:
         self._staged_bytes = 0
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
-        self._queue_hi: deque[int] = deque()  # Class B + escalated
-        self._queue_lo: deque[int] = deque()  # Class A trickle
+        self._queue_hi: deque[int] = deque()  # join-next-step + escalated
+        self._queue_lo: deque[int] = deque()  # join-on-finish trickle
         self._blocked: list[int] = []  # copy done, awaiting scatter
         self._shutdown = False
         self._copy_stream: torch.cuda.Stream | None = None
@@ -116,7 +113,7 @@ class OmniTensorCacheController:
     # ------------------------------------------------------------------ submit
 
     def submit(self, task: WriteTask, queued: bool = True, reserved: bool = False) -> None:
-        """Register a task. queued=False (deferred entries) stays GPU-staged
+        """Register a task. queued=False (deferred tasks) stays GPU-staged
         until escalated or cap-flushed.
 
         reserved=True: the caller already ran reserve() for these bytes (so
@@ -133,23 +130,23 @@ class OmniTensorCacheController:
             return
         if queued:
             with self._wake:
-                (self._queue_hi if task.klass == CLASS_B else self._queue_lo).append(task.tid)
+                (self._queue_hi if task.schedule is WriteSchedule.JOIN_NEXT_STEP else self._queue_lo).append(task.tid)
                 self._wake.notify_all()
 
     def append_segment(self, task: WriteTask, seg: _Segment, reserved: bool = False) -> bool:
-        """Grow a deferred (Class A) entry with one step's rows.
+        """Grow a deferred (JOIN_ON_FINISH) task with one step's rows.
 
-        Returns False when the entry already started copying (cap flush or a
+        Returns False when the task already started copying (cap flush or a
         finish/conflict escalation got there first); the caller then opens a
-        fresh entry instead of mutating a closed one.
+        fresh task instead of mutating a closed one.
 
         reserved=True: bytes were reserved by the caller; on False they stay
-        reserved and carry over to the fresh entry submitted with
+        reserved and carry over to the fresh task submitted with
         reserved=True.
         """
         nbytes = sum(t.numel() * t.element_size() for t in seg.tensors.values())
         if not reserved:
-            # Exclude this task from the cap flush: flushing the very entry
+            # Exclude this task from the cap flush: flushing the very task
             # we are appending to would close it under us.
             self._reserve_bytes(nbytes, exclude={task.tid})
         with task.lock:
@@ -169,48 +166,48 @@ class OmniTensorCacheController:
         self._reserve_bytes(nbytes, exclude=exclude)
 
     def _reserve_bytes(self, nbytes: int, exclude: set[int] | None = None) -> None:
-        # Cap backpressure: force-flush oldest pending entries until under
+        # Cap backpressure: force-flush oldest pending tasks until under
         # budget. Bounded block: their D2H has usually long completed.
         exclude = exclude or set()
         while True:
             with self._lock:
-                pending = [eid for eid, t in self._tasks.items() if not t.done.is_set() and eid not in exclude]
+                pending = [tid for tid, t in self._tasks.items() if not t.done.is_set() and tid not in exclude]
                 if self._staged_bytes + nbytes <= self._config.gpu_staging_bytes or not pending:
                     self._staged_bytes += nbytes
                     return
                 oldest = min(pending)
-            logger.warning("tensor_cache: staging cap hit, force-flushing entry %d", oldest)
+            logger.warning("omni prefix cache: staging cap hit, force-flushing task %d", oldest)
             self.escalate([oldest])
             self.join([oldest])
 
     # ------------------------------------------------------------- lifecycle
 
-    def escalate(self, entry_ids: list[int]) -> None:
+    def escalate(self, tids: list[int]) -> None:
         if self._eager:
-            for eid in entry_ids:
-                task = self._tasks.get(eid)
+            for tid in tids:
+                task = self._tasks.get(tid)
                 if task is not None and not task.done.is_set():
                     self._run_eager(task)
             return
         with self._wake:
-            for eid in entry_ids:
-                task = self._tasks.get(eid)
+            for tid in tids:
+                task = self._tasks.get(tid)
                 if task is None or task.escalated or task.done.is_set():
                     continue
                 task.escalated = True
                 try:
-                    self._queue_lo.remove(eid)
-                    self._queue_hi.appendleft(eid)
+                    self._queue_lo.remove(tid)
+                    self._queue_hi.appendleft(tid)
                 except ValueError:
                     # Not in the lazy queue: either an unqueued deferred
-                    # entry (queue it now) or already claimed/queued-hi.
-                    if eid not in self._queue_hi and eid not in self._blocked and not task.d2h_claimed:
-                        self._queue_hi.appendleft(eid)
+                    # task (queue it now) or already claimed/queued-hi.
+                    if tid not in self._queue_hi and tid not in self._blocked and not task.d2h_claimed:
+                        self._queue_hi.appendleft(tid)
             self._wake.notify_all()
 
-    def join(self, entry_ids: list[int]) -> None:
-        for eid in entry_ids:
-            task = self._tasks.get(eid)
+    def join(self, tids: list[int]) -> None:
+        for tid in tids:
+            task = self._tasks.get(tid)
             if task is not None:
                 task.done.wait()
 
@@ -224,17 +221,17 @@ class OmniTensorCacheController:
                 task.host_ready.wait()
 
     def drain_completed(self) -> list[int]:
-        """Manager-side fixed-point drain; returns scattered entry ids."""
+        """Manager-side fixed-point drain; returns scattered task ids."""
         out: list[int] = []
         with self._lock:
             while self._completed:
                 out.append(self._completed.popleft())
-            for eid in out:
-                self._tasks.pop(eid, None)
+            for tid in out:
+                self._tasks.pop(tid, None)
         return out
 
     def drain_failed(self) -> list[int]:
-        """Entry ids whose write failed; the manager fail-fasts on these."""
+        """Task ids whose write failed; the manager fail-fasts on these."""
         out: list[int] = []
         with self._lock:
             while self._failed:
@@ -255,14 +252,14 @@ class OmniTensorCacheController:
 
     @torch.inference_mode()
     def fetch_host(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
-        """Rows for `slots` of one in-flight entry, resolved shortest-path.
+        """Rows for `slots` of one in-flight task, resolved shortest-path.
 
         pre-staged -> host buffer rows; otherwise slice sync D2H on the read
         stream. A full-coverage read that wins the claim feeds its result
         back as the pre-staged host copy (skips the background D2H).
         """
         if len(task.segments) == 1:
-            # Fast path: one segment (every main entry) needs no regroup or
+            # Fast path: one segment (every main task) needs no regroup or
             # reorder — resolve rows with a single tensor op.
             rows = self._rows_single_segment(task, slots, key)
             seg = task.segments[0]
@@ -310,17 +307,17 @@ class OmniTensorCacheController:
             parts.append(picked)
             order.extend(p for p, _ in items)
         if not parts:
-            raise KeyError(f"key {key} not present in entry {task.tid}")
+            raise KeyError(f"key {key} not present in task {task.tid}")
         cat = torch.cat(parts, dim=0)
         out = torch.empty_like(cat)
         out[torch.tensor(order, dtype=torch.long)] = cat
         return out
 
     def _rows_single_segment(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
-        """Row lookup for a single-segment entry, without per-token Python.
+        """Row lookup for a single-segment task, without per-token Python.
 
-        Row index = position of each slot inside the entry's slot list. The
-        entry's slots are the step's slot mapping, so a searchsorted over its
+        Row index = position of each slot inside the task's slot list. The
+        task's slots are the step's slot mapping, so a searchsorted over its
         sorted order maps requested slots to rows in one vectorized step.
         """
         seg = task.segments[0]
@@ -329,7 +326,7 @@ class OmniTensorCacheController:
         if src is None:
             src = seg.host.get(key)
         if src is None:
-            raise KeyError(f"key {key} not present in entry {task.tid}")
+            raise KeyError(f"key {key} not present in task {task.tid}")
 
         entry_slots = seg.slots_cpu
         # Reading the whole entry in order is the common case (this step's own
@@ -343,7 +340,7 @@ class OmniTensorCacheController:
         pos = torch.searchsorted(entry_slots[order], slots).clamp(max=entry_slots.numel() - 1)
         rows_idx = order[pos]
         if not bool(torch.equal(entry_slots[rows_idx], slots)):
-            raise KeyError(f"slots not covered by entry {task.tid}")
+            raise KeyError(f"slots not covered by task {task.tid}")
         return self._slice_rows(task, src, rows_idx, host=(src.device.type == "cpu"))
 
     def _slice_rows(self, task: WriteTask, src: torch.Tensor, rows_idx: torch.Tensor, host: bool) -> torch.Tensor:
@@ -469,7 +466,7 @@ class OmniTensorCacheController:
         # A dying committer would strand every join() forever, so the loop
         # never propagates: it fails the offending task and keeps serving.
         while True:
-            eid = None
+            tid = None
             try:
                 with self._wake:
                     while not self._shutdown and not self._queue_hi and not self._queue_lo:
@@ -480,20 +477,20 @@ class OmniTensorCacheController:
                     if self._shutdown and not self._queue_hi and not self._queue_lo and not self._blocked:
                         return
                     if self._queue_hi:
-                        eid = self._queue_hi.popleft()
+                        tid = self._queue_hi.popleft()
                     elif self._queue_lo:
-                        eid = self._queue_lo.popleft()
-                if eid is not None:
-                    task = self._tasks.get(eid)
+                        tid = self._queue_lo.popleft()
+                if tid is not None:
+                    task = self._tasks.get(tid)
                     if task is not None:
                         self._copy_task(task)
                         with self._wake:
-                            if eid not in self._blocked:
-                                self._blocked.append(eid)
+                            if tid not in self._blocked:
+                                self._blocked.append(tid)
                 self._scatter_ready()
             except BaseException:
-                logger.exception("tensor_cache committer failed on entry %s; releasing waiters", eid)
-                self._fail_task(eid)
+                logger.exception("omni prefix cache committer failed on task %s; releasing waiters", tid)
+                self._fail_task(tid)
 
     @torch.inference_mode()
     def _copy_task(self, task: WriteTask) -> None:
@@ -512,7 +509,7 @@ class OmniTensorCacheController:
                 self._copy_stream.wait_event(task.freeze_event)
             for seg in task.segments:
                 for k, src in seg.tensors.items():
-                    if task.klass == CLASS_A and src.numel() * src.element_size() > chunk_bytes:
+                    if task.schedule is WriteSchedule.JOIN_ON_FINISH and src.numel() * src.element_size() > chunk_bytes:
                         rows_per_chunk = max(1, chunk_bytes // max(1, src.shape[-1] * src.element_size()))
                         parts = [
                             src[start : start + rows_per_chunk].to("cpu", non_blocking=True)
@@ -533,22 +530,22 @@ class OmniTensorCacheController:
         for seg in task.segments:
             seg.tensors = {}
 
-    def _fail_task(self, entry_id: int | None) -> None:
+    def _fail_task(self, tid: int | None) -> None:
         """Release waiters for a task the committer could not complete.
 
         Idempotent, and only releases bytes the copy stage has not already
         released: a raise AFTER a successful _copy_task (host_ready set)
         must not subtract this task's bytes a second time.
         """
-        task = self._tasks.get(entry_id) if entry_id is not None else None
+        task = self._tasks.get(tid) if tid is not None else None
         if task is None or task.done.is_set():
             return
         task.failed = True
         with self._wake:
             if not task.host_ready.is_set():
                 self._staged_bytes = max(0, self._staged_bytes - task.nbytes)
-            if entry_id in self._blocked:
-                self._blocked.remove(entry_id)
+            if tid in self._blocked:
+                self._blocked.remove(tid)
         for seg in task.segments:
             seg.tensors = {}
         task.host_ready.set()
@@ -562,11 +559,11 @@ class OmniTensorCacheController:
     @torch.inference_mode()
     def _scatter_ready(self) -> None:
         with self._wake:
-            ready = [eid for eid in self._blocked if (t := self._tasks.get(eid)) and t.host_ready.is_set()]
-            for eid in ready:
-                self._blocked.remove(eid)
-        for eid in ready:
-            task = self._tasks.get(eid)
+            ready = [tid for tid in self._blocked if (t := self._tasks.get(tid)) and t.host_ready.is_set()]
+            for tid in ready:
+                self._blocked.remove(tid)
+        for tid in ready:
+            task = self._tasks.get(tid)
             if task is None:
                 continue
             try:
@@ -576,8 +573,8 @@ class OmniTensorCacheController:
                 # would fail whichever entry the worker loop happened to be
                 # copying, double-release its bytes, and strand this one's
                 # join() forever.
-                logger.exception("tensor_cache scatter failed on entry %s; releasing waiters", eid)
-                self._fail_task(eid)
+                logger.exception("omni prefix cache scatter failed on task %s; releasing waiters", tid)
+                self._fail_task(tid)
 
     @torch.inference_mode()
     def _scatter(self, task: WriteTask) -> None:

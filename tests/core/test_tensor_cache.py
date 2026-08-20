@@ -301,11 +301,11 @@ def test_group_view_slot_math():
     assert view.slots_for("r1", 3, 3).numel() == 0
 
 
-def test_class_b_join_previous_step():
+def test_join_next_step_previous_save():
     mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0], 0, 2)})
-    assert len(mgr._prev_class_b) == 1
-    task_id = mgr._prev_class_b[0]
+    assert len(mgr._join_next_step_tids) == 1
+    task_id = mgr._join_next_step_tids[0]
     mgr.materialize(s1, ["a"])
     s2 = run_step(mgr, view, {"a": ([0], 2, 1)})
     # Previous B entry joined & drained at the save above.
@@ -528,12 +528,11 @@ def test_fetch_host_fast_path_matches_general_path():
     regroup path does, including for shuffled and partial slot sets."""
     from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
     from vllm_omni.core.tensor_cache.controller import (
-        CLASS_B,
         OmniTensorCacheController,
         WriteTask,
         _Segment,
     )
-    from vllm_omni.core.tensor_cache.interface import HIDDEN_KEY
+    from vllm_omni.core.tensor_cache.interface import HIDDEN_KEY, WriteSchedule
 
     cfg = TensorCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, hidden_size=HIDDEN, hs_dtype=DTYPE)
     pool = TensorBlockPool(cfg)
@@ -543,7 +542,11 @@ def test_fetch_host_fast_path_matches_general_path():
     slots = torch.tensor([12, 4, 7, 20, 1], dtype=torch.int64)
     rows = torch.arange(slots.numel() * HIDDEN, dtype=DTYPE).reshape(slots.numel(), HIDDEN)
     task = WriteTask(
-        tid=1, req_id="r", seq=1, klass=CLASS_B, segments=[_Segment(slots_cpu=slots, tensors={HIDDEN_KEY: rows})]
+        tid=1,
+        req_id="r",
+        seq=1,
+        schedule=WriteSchedule.JOIN_NEXT_STEP,
+        segments=[_Segment(slots_cpu=slots, tensors={HIDDEN_KEY: rows})],
     )
     ctrl.submit(task)
 
@@ -619,7 +622,8 @@ def test_lock_never_covers_fetch_or_join():
 
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
     mgr.materialize(s1, ["a"])
-    # Hit forces a staged fetch; the follow-up save forces a Class B join.
+    # Hit forces a staged fetch; the follow-up save forces a join of the
+    # previous step's JOIN_NEXT_STEP tasks.
     s2 = run_step(mgr, view, {"b": ([0, 1], 4, 2)}, new_hits={"b": 4}, mm={"k": torch.full((2, 2), 9.0)})
     mgr.materialize(s2, ["b"])
     assert any(kind == "fetch" for kind, _ in calls)
@@ -635,10 +639,15 @@ def test_failed_write_fails_fast_at_next_facade_entry():
     sid = run_step(mgr, view, {"a": ([0], 0, 4)})
     mgr.materialize(sid, ["a"])
     # Simulate a committer failure on a still-registered entry.
-    from vllm_omni.core.tensor_cache.controller import CLASS_B, WriteTask, _Segment
+    from vllm_omni.core.tensor_cache.controller import WriteTask, _Segment
+    from vllm_omni.core.tensor_cache.interface import WriteSchedule
 
     task = WriteTask(
-        tid=999, req_id="x", seq=1, klass=CLASS_B, segments=[_Segment(slots_cpu=torch.tensor([0]), tensors={})]
+        tid=999,
+        req_id="x",
+        seq=1,
+        schedule=WriteSchedule.JOIN_NEXT_STEP,
+        segments=[_Segment(slots_cpu=torch.tensor([0]), tensors={})],
     )
     mgr._controller._tasks[999] = task
     mgr._controller._fail_task(999)
@@ -646,19 +655,22 @@ def test_failed_write_fails_fast_at_next_facade_entry():
         run_step(mgr, view, {"a": ([0, 1], 4, 1)})
 
 
-def test_per_request_task_class_split():
-    """One save produces one WriteTask per request; class is per-request
-    (prefill rows -> Class A lazy, decode rows -> Class B per-step)."""
-    mgr, view = make_manager(class_a_min_tokens=4)
+def test_per_request_task_schedule_split():
+    """One save produces one WriteTask per request; the schedule is
+    per-request (prefill rows -> JOIN_ON_FINISH lazy trickle, decode rows ->
+    JOIN_NEXT_STEP)."""
+    mgr, view = make_manager(join_on_finish_min_tokens=4)
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})
     ctx = mgr._step_ctxs[sid]
     tp = mgr._controller.get_task(ctx.task_ids["p"])
     td = mgr._controller.get_task(ctx.task_ids["d"])
     assert tp is not None and td is not None
-    assert (tp.klass, td.klass) == ("A", "B")
+    from vllm_omni.core.tensor_cache.interface import WriteSchedule
+
+    assert (tp.schedule, td.schedule) == (WriteSchedule.JOIN_ON_FINISH, WriteSchedule.JOIN_NEXT_STEP)
     assert (tp.req_id, td.req_id) == ("p", "d")
-    # Only the Class B task is joined at the next save.
-    assert mgr._prev_class_b == [td.tid]
+    # Only the JOIN_NEXT_STEP task is joined at the next save.
+    assert mgr._join_next_step_tids == [td.tid]
     outs = mgr.materialize(sid, ["p", "d"])
     assert torch.equal(outs.hidden_states["p"], expected_rows(view.slots_for("p", 0, 8)))
     assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))

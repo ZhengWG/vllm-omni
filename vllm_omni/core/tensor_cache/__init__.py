@@ -14,9 +14,9 @@ from vllm_omni.core.tensor_cache.interface import (
     HIDDEN_KEY,
     ModelCachePolicy,
     OmniTensorCacheUnmatchError,
-    Placement,
     StageCacheOutputs,
     TensorCacheConfig,
+    WriteSchedule,
 )
 from vllm_omni.core.tensor_cache.manager import OmniTensorCacheManager
 
@@ -28,7 +28,7 @@ __all__ = [
     "OmniTensorCacheController",
     "OmniTensorCacheManager",
     "OmniTensorCacheUnmatchError",
-    "Placement",
+    "WriteSchedule",
     "StageCacheOutputs",
     "TensorBlockPool",
     "TensorCacheConfig",

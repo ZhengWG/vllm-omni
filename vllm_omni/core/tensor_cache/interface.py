@@ -4,7 +4,7 @@ Naming aligns with vLLM's v1/core KV-cache design; see
 rfc-omni-tensor-cache-refactor.md for the full contract.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, NamedTuple
 
@@ -14,10 +14,14 @@ import torch
 HIDDEN_KEY = "__hidden_states__"
 
 
-class Placement(Enum):
-    CPU = "cpu"
-    # Reserved for GPU-resident assembly; not implemented.
-    GPU = "gpu"
+class WriteSchedule(Enum):
+    """Write scheduling policy for one WriteTask."""
+
+    # Copied every step; completion joined at the NEXT step's save.
+    JOIN_NEXT_STEP = "join_next_step"
+    # Background trickle; escalated & joined when the request finishes
+    # (cap pressure may spill it earlier).
+    JOIN_ON_FINISH = "join_on_finish"
 
 
 @dataclass(frozen=True)
@@ -30,12 +34,15 @@ class TensorCacheConfig:
     hs_dtype: torch.dtype
     # GPU staging byte budget; exceeding it force-flushes oldest entries.
     gpu_staging_bytes: int = 512 * 1024 * 1024
-    # Entries covering more than this many tokens are Class A (bulk one-shot,
-    # lazy background trickle); smaller ones are Class B (per-step, joined
-    # one step later).
-    class_a_min_tokens: int = 256
-    # D2H chunk size for the Class A trickle.
+    # Tasks covering more than this many tokens use JOIN_ON_FINISH;
+    # smaller ones use JOIN_NEXT_STEP.
+    join_on_finish_min_tokens: int = 256
+    # D2H chunk size for the JOIN_ON_FINISH trickle.
     copy_chunk_bytes: int = 16 * 1024 * 1024
+    # vLLM kv-cache groups (KVCacheGroupSpec list); the group-view factory
+    # selects by spec type. Excluded from equality (config identity is the
+    # sizing knobs).
+    kv_cache_groups: Any = field(default=None, compare=False)
 
 
 class StageCacheOutputs(NamedTuple):
@@ -61,7 +68,6 @@ class ModelCachePolicy:
     merge_consumed_by_postprocess: bool = False
     deferred_keys: frozenset[str] = frozenset()
     skip_keys: frozenset[str] = frozenset()
-    default_placement: Placement = Placement.CPU
 
     @classmethod
     def from_model(cls, model: Any) -> "ModelCachePolicy":

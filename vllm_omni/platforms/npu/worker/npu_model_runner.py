@@ -35,27 +35,27 @@ else:
 
 class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config) -> None:
-        """Stage the omni tensor cache config (hidden states of prefix tokens)."""
+        """Stage the omni prefix-cache config (hidden / mm tensors reused on hits)."""
         NPUModelRunner.initialize_kv_cache(self, kv_cache_config)
-        if getattr(self, "_omni_tensor_cache_cfg", None) is None and self.cache_config.enable_prefix_caching:
+        if getattr(self, "_omni_prefix_cache_cfg", None) is None and self.cache_config.enable_prefix_caching:
             # Read num_blocks back off self.kv_cache_config: vllm-ascend
             # deepcopies the config it was handed, so the value it stored is the
             # authoritative one, not our caller's argument.
             num_blocks = self.kv_cache_config.num_blocks
             from vllm_omni.core.tensor_cache.interface import TensorCacheConfig
 
-            # v2 tensor cache in Controller eager mode (no CUDA streams:
-            # submit() completes the copy+scatter synchronously). Manager is
-            # built lazily on the first step via the inherited
-            # _ensure_omni_tensor_cache, once input_batch exists.
-            self._omni_tensor_cache_cfg = TensorCacheConfig(
+            # Controller runs in eager mode on NPU (no CUDA streams:
+            # submit() completes the copy+scatter synchronously). Built once
+            # on the first step via the inherited _ensure_omni_prefix_cache.
+            self._omni_prefix_cache_cfg = TensorCacheConfig(
                 num_blocks=num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),
                 hs_dtype=self.dtype,
+                kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
             )
             logger.info(
-                "Initialized omni tensor cache on NPU (eager mode, num_blocks=%d, block_size=%d).",
+                "Initialized omni prefix cache on NPU (eager mode, num_blocks=%d, block_size=%d).",
                 num_blocks,
                 self.cache_config.block_size,
             )
@@ -78,6 +78,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             if callable(candidate):
                 override_fn = candidate
         self._sampled_token_ids_cpu_override = override_fn
+        self._snapshot_prefix_cache_model_flags(model)
         self._omni_query_start_loc_model_kwarg = bool(getattr(model, "supports_omni_query_start_loc", False))
         self._maybe_enable_output_token_ids_for_model_sampler()
         self._init_talker_mtp()

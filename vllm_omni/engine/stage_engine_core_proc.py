@@ -14,14 +14,6 @@ from typing import Any
 
 import vllm.v1.engine.core as _vllm_engine_core_module
 from vllm.logger import init_logger
-
-# Force the omni patches even when the package resolved as a namespace
-# package: a stray extensionless vllm_omni/ dir on sys.path (e.g. the wheel
-# data dir in dist-packages) makes PathFinder skip our __init__ entirely,
-# and the missing RequestStatus enum extensions then crash the engine on
-# the first chunk/full-payload request. vllm is importable here, so this
-# import is safe and idempotent.
-import vllm_omni.patch  # noqa: F401  isort: skip
 from vllm.transformers_utils.config import (
     maybe_register_config_serialize_by_value,
 )

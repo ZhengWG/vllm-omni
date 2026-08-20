@@ -1,18 +1,15 @@
-"""OmniTensorCacheManager: facade over the omni tensor cache.
+"""Omni prefix cache, manager side.
 
-Owns the block/slot semantic domain: (slot, key) state authority, hit/span
-registry, merge math, and the scheduler_output lifecycle stream. Data
-movement is delegated to OmniTensorCacheController.
+Owns the (slot, key) state tables, per-step snapshots, hit/span registry,
+and the merge math. Data movement belongs to OmniTensorCacheController;
+its completion events are drained here at fixed points. One non-reentrant
+lock guards the state tables only — it never covers a join, a cap flush,
+or a D2H.
 
-Threading (invariant 6): one non-reentrant state lock serializes the facade
-entry points, covering only state-table reads/writes — never a blocking
-wait. save_outputs joins/reserves unlocked; materialize plans under the
-lock and fetches/merges outside it.
-
-Runner contract (invariant 7): new_step_starts() before _update_states
-removes finished requests; every real scheduler_output exactly once, in
-order (warmup/dummy runs must not be fed); every step context returned by
-save_outputs is consumed exactly once via materialize or discard_step.
+Runner contract, per real scheduler_output and in order:
+new_step_starts (before _update_states removes finished requests) ->
+forward -> save_outputs -> materialize OR discard_step (the returned
+step id is consumed exactly once). Warmup/dummy runs are never fed.
 """
 
 from __future__ import annotations
@@ -27,8 +24,6 @@ import torch
 
 from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
 from vllm_omni.core.tensor_cache.controller import (
-    CLASS_A,
-    CLASS_B,
     OmniTensorCacheController,
     WriteTask,
     _Segment,
@@ -40,6 +35,7 @@ from vllm_omni.core.tensor_cache.interface import (
     OmniTensorCacheUnmatchError,
     StageCacheOutputs,
     TensorCacheConfig,
+    WriteSchedule,
 )
 
 if TYPE_CHECKING:
@@ -135,7 +131,7 @@ class OmniTensorCacheManager:
         self._req_tasks: dict[str, set[int]] = {}
         self._deferred_tasks: dict[str, WriteTask] = {}  # req_id -> task
         self._next_tid = 1
-        self._prev_class_b: list[int] = []
+        self._join_next_step_tids: list[int] = []
         self._seq: dict[str, int] = {}  # req_id -> physical-task counter
         self._finished_join: set[int] = set()
         self._pending_hits: dict[str, int] = {}
@@ -154,7 +150,14 @@ class OmniTensorCacheManager:
     @_locked
     @torch.inference_mode()
     def new_step_starts(self, scheduler_output: SchedulerOutput) -> None:
-        """Consume the lifecycle stream. Must run before _update_states."""
+        """Consume one scheduler_output (lifecycle stream).
+
+        Engine thread only; before _update_states removes finished
+        requests; exactly once per real step. Registers new-request prefix
+        hits (snapshotting their block tables) and escalates the writes of
+        finished/aborted requests — a block hash that entered the batch
+        must land in the cache, abort included.
+        """
         self._apply_completions()
 
         finished = getattr(scheduler_output, "finished_req_ids", None) or ()
@@ -190,8 +193,8 @@ class OmniTensorCacheManager:
                     blocks = blocks[0]
                 if not blocks:
                     # Fail at the cause: a hit we cannot snapshot now would
-                    # crash at materialize time with less context (invariant 6
-                    # forbids falling back to the live batch there).
+                    # crash at materialize time with less context (materialize is
+                    # forbidden from reading the live batch).
                     raise OmniTensorCacheUnmatchError(
                         f"prefix hit for req {req_id} ({num_computed} tokens) carries no block_ids"
                     )
@@ -209,20 +212,29 @@ class OmniTensorCacheManager:
         num_tokens_unpadded: int,
         num_tokens_padded: int,
     ) -> int:
-        """Lock discipline (invariant 6): the state lock never covers a
-        blocking wait. Join, D2D clone building, and the cap reservation
-        (which may flush) all run unlocked; only the state-table writes and
-        task registration take the lock."""
+        """Write this step's outputs into the cache; returns the step id.
+
+        Engine thread only, after the forward and before materialize.
+        Freezes the step's rows (one D2D clone), submits one WriteTask per
+        request, and snapshots everything materialize needs. The returned
+        step id MUST be consumed exactly once — by materialize() or
+        discard_step(); leaking contexts fails fast at a later save.
+
+        The state lock never covers a blocking wait: the previous step's
+        JOIN_NEXT_STEP join, the clone build, and the cap reservation (which may
+        flush) all run unlocked.
+        """
         with self._state_lock:
-            # Step-boundary join (consume-then-schedule): previous Class B
-            # task plus tasks escalated for requests finished this step.
+            # Step-boundary join (consume-then-schedule): the previous
+            # step's JOIN_NEXT_STEP tasks plus tasks escalated for requests
+            # finished this step.
             join_ids = list(self._finished_join)
-            join_ids.extend(self._prev_class_b)
+            join_ids.extend(self._join_next_step_tids)
             self._finished_join.clear()
-            self._prev_class_b = []
+            self._join_next_step_tids = []
         if join_ids:
-            # Copy-completion wait only (RFC D1): scatter completion is the
-            # committer's business, not the engine step's.
+            # Copy-completion wait only: the join bounds in-flight GPU staging;
+            # scatter completion is the committer's business.
             self._controller.join_host_ready(join_ids)
 
         n = num_tokens_unpadded
@@ -299,7 +311,9 @@ class OmniTensorCacheManager:
                         tid=tid,
                         req_id=r,
                         seq=self._next_seq(r),
-                        klass=CLASS_A if (e - s) > self._config.class_a_min_tokens else CLASS_B,
+                        schedule=WriteSchedule.JOIN_ON_FINISH
+                        if (e - s) > self._config.join_on_finish_min_tokens
+                        else WriteSchedule.JOIN_NEXT_STEP,
                         segments=[_Segment(slots_cpu=slots_cpu[s:e], tensors=r_tensors)],
                         freeze_event=freeze_event,
                     )
@@ -307,8 +321,8 @@ class OmniTensorCacheManager:
                     self._controller.submit(task, reserved=True)
                     self._req_tasks.setdefault(r, set()).add(tid)
                     task_ids[r] = tid
-                    if task.klass == CLASS_B:
-                        self._prev_class_b.append(tid)
+                    if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
+                        self._join_next_step_tids.append(tid)
 
             self._stage_deferred(deferred_segs, freeze_event)
 
@@ -350,15 +364,21 @@ class OmniTensorCacheManager:
 
     @torch.inference_mode()
     def materialize(self, step_id: int, req_ids: list[str]) -> StageCacheOutputs:
-        """Merged outputs for the step saved as `step_id`.
+        """Per-request merged outputs for the step saved as `step_id`.
 
-        Two phases (invariant 6): under the lock, drain completions and
-        resolve every row source into a plan — pinned task refs plus slot
-        masks, with the absent checks done here; the storage tier is NOT
-        baked in. Unlocked, fetch and merge: fetch_host re-resolves the tier
-        at call time, and a pinned task stays readable after commit (host
-        buffers are never dropped), so the engine thread is never blocked
-        behind this thread's PCIe.
+        Any thread. `req_ids` must be (a subset of) the save-time snapshot;
+        an outside id means the caller is reading the live batch (debug
+        assert). A request without a hit is a plain miss and gets exactly
+        this step's rows — normal path, nothing logged. A hit span that
+        resolves to absent rows raises OmniTensorCacheUnmatchError: fatal
+        by contract, never a degrade.
+
+        Two phases: under the lock, drain completions and pin every row
+        source (task refs + masks, absent checks included) — the storage
+        tier is NOT baked in. Unlocked, fetch and merge: fetch_host
+        re-resolves the tier at call time and pinned tasks stay readable
+        after commit, so the engine thread never waits on this thread's
+        PCIe.
         """
         with self._state_lock:
             ctx = self._take_step_ctx(step_id)
@@ -366,8 +386,8 @@ class OmniTensorCacheManager:
 
             # The builder must pass (a subset of) the req list captured at
             # save time — an id outside the snapshot means it is reading the
-            # live batch, which the contract forbids (G2: debug assert, not
-            # a degrade path).
+            # live batch, which the contract forbids (debug assert, not a
+            # degrade path).
             assert set(req_ids) <= set(ctx.query_start), (
                 f"materialize(step {step_id}) got req ids outside the save snapshot: "
                 f"{sorted(set(req_ids) - set(ctx.query_start))[:8]}"
@@ -448,10 +468,11 @@ class OmniTensorCacheManager:
 
     @_locked
     def discard_step(self, step_id: int) -> None:
-        """Drop the read-side snapshot for `step_id` when no consumer will
-        materialize it (e.g. no pooler payload). The cache write still
-        proceeds; must target the id — dropping "the oldest" would discard
-        step N while its async builder is still pending and N+1 returns early.
+        """Consume the step context when nothing will materialize it.
+
+        Any thread; same exactly-once contract as materialize (unknown or
+        duplicate id fails fast). Only the read-side snapshot is dropped —
+        the cache write proceeds unchanged.
         """
         self._take_step_ctx(step_id)
 
@@ -483,7 +504,7 @@ class OmniTensorCacheManager:
         A (slot, key) still in-transit under another task means block reuse
         (the old request was preempted/aborted): push those rows into the old
         task's skip set — its mirror write skips them, ours lands, so the
-        writes are disjoint and need no ordering edge (invariant 2).
+        writes are disjoint and need no ordering edge.
         """
         keys = tuple(keys)
         for key in keys:
@@ -510,23 +531,23 @@ class OmniTensorCacheManager:
         failed = self._controller.drain_failed()
         if failed:
             # A failed write leaves rows absent behind hashes vLLM already
-            # published — unservable and unrecoverable (G2 fatal). Raise here,
+            # published — unservable and unrecoverable, so fatal. Raise here,
             # once, at the earliest facade entry instead of poisoning every
             # future hit that touches these slots.
             raise OmniTensorCacheUnmatchError(
                 f"tensor cache write failed for task(s) {failed}; cached rows lost behind published hashes"
             )
         drained = self._controller.drain_completed()
-        for eid in drained:
-            slots = self._task_slots.pop(eid, None)
-            keys = self._task_keys.pop(eid, ())
+        for tid in drained:
+            slots = self._task_slots.pop(tid, None)
+            keys = self._task_keys.pop(tid, ())
             if slots is None:
                 continue
             for key in keys:
                 state, owner = self._tables(key)
                 # Only publish slots we still own: a later entry may have
                 # taken them over (block reuse), and its write must win.
-                still_owned = owner[slots] == eid
+                still_owned = owner[slots] == tid
                 idx = slots[still_owned]
                 state[idx] = _COMMITTED
                 owner[idx] = 0
@@ -586,7 +607,7 @@ class OmniTensorCacheManager:
                     tid=self._alloc_tid(),
                     req_id=req_id,
                     seq=self._next_seq(req_id),
-                    klass=CLASS_A,
+                    schedule=WriteSchedule.JOIN_ON_FINISH,
                     segments=[seg],
                     freeze_event=freeze_event,
                 )
@@ -643,7 +664,7 @@ class OmniTensorCacheManager:
         )
         if hit_blocks is None:
             # The hit block table is snapshotted in new_step_starts precisely
-            # so materialize never reads the live batch (invariant 6); a
+            # so materialize never reads the live batch; a
             # missing snapshot is a registration bug, not a fallback case.
             raise OmniTensorCacheUnmatchError(
                 f"no hit-block snapshot for req {req_id} (hit_upto={hit_upto}); hit registered without block_ids"

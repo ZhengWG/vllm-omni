@@ -105,9 +105,9 @@ class ExecuteModelState(NamedTuple):
     cudagraph_stats: CUDAGraphStat | None
     batch_desc: BatchDescriptor
     multimodal_outputs: Any # Omni-Specific
-    # Omni: v2 tensor-cache step id; its context must be consumed exactly
+    # Omni: prefix-cache step id; its context must be consumed exactly
     # once (materialize or discard_step) in sample_tokens.
-    tensor_cache_step_id: int | None = None
+    prefix_cache_step_id: int | None = None
 
 class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
     """Autoregressive NPU model runner that returns hidden states per request."""
@@ -219,8 +219,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _model_needs_full_prefix_hidden_states(self) -> bool:
         """See gpu_ar_model_runner._model_needs_full_prefix_hidden_states."""
-        model = getattr(self, "model", None)
-        return bool(getattr(model, "requires_full_prefix_cached_hidden_states", True))
+        return self._needs_full_prefix_hidden_states_flag
 
     def _maybe_update_prefix_cache(
         self,
@@ -231,12 +230,12 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
     ) -> int | None:
         """Write this step's outputs into the omni cache.
 
-        v2 path returns the step id whose context must be consumed exactly
-        once (materialize or discard_step) in sample_tokens; legacy returns
-        None.
+        Returns the step id whose context must be consumed exactly once
+        (materialize or discard_step) in sample_tokens; None when this rank
+        does not write the cache.
         """
-        if getattr(self, "omni_tensor_cache", None) is not None and get_pp_group().is_last_rank:
-            return self.omni_tensor_cache.save_outputs(
+        if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
+            return self.omni_prefix_cache.save_outputs(
                 hidden_states,
                 flatten_payload(multimodal_outputs) if multimodal_outputs else {},
                 num_tokens_unpadded=num_tokens_unpadded,
@@ -254,13 +253,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
         req_ids: list[str] | None = None,
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
         combined_hidden_states, combined_multimodal_outputs = None, None
-        if getattr(self, "omni_tensor_cache", None) is not None:
+        if self.omni_prefix_cache is not None:
             if step_id is None:
                 return None, None
             # The manager decides read-vs-nothing by policy/hits; the return
             # is already assembled per request. req_ids must be (a subset of)
             # the save-time snapshot (debug-asserted inside).
-            outs = self.omni_tensor_cache.materialize(step_id, list(req_ids or ()))
+            outs = self.omni_prefix_cache.materialize(step_id, list(req_ids or ()))
             return outs.hidden_states, (outs.mm_outputs or None)
         return combined_hidden_states, combined_multimodal_outputs
 
@@ -420,12 +419,13 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
 
-        # v2 tensor cache lifecycle: must run before _update_states removes
-        # finished requests (invariant 7). Finished/abort escalation inside
-        # new_step_starts replaces the legacy commit_deferred_mm_outputs.
-        self._ensure_omni_tensor_cache()
-        if getattr(self, "omni_tensor_cache", None) is not None:
-            self.omni_tensor_cache.new_step_starts(scheduler_output)
+        # Prefix-cache lifecycle: must run before _update_states removes
+        # finished requests (finished/abort escalation happens inside
+        # new_step_starts).
+        if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
+            self._ensure_omni_prefix_cache()
+        if self.omni_prefix_cache is not None:
+            self.omni_prefix_cache.new_step_starts(scheduler_output)
         # self._draft_token_ids is None when `input_fits_in_drafter=False`
         # and there is no draft tokens scheduled. so it need to update the
         # spec_decoding info in scheduler_output with async_scheduling.
@@ -752,7 +752,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                 hidden_states, aux_hidden_states = hidden_states
 
             #  -------------------------------------- Omni-new -------------------------------------------------
-            tensor_cache_step_id = self._maybe_update_prefix_cache(
+            prefix_cache_step_id = self._maybe_update_prefix_cache(
                 hidden_states=hidden_states,
                 multimodal_outputs=multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
@@ -834,7 +834,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                 cudagraph_stats,
                 batch_desc,
                 multimodal_outputs, # Omni-specific
-                tensor_cache_step_id,
+                prefix_cache_step_id,
             )
             self.kv_connector_output = kv_connector_output
 
@@ -927,7 +927,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
             cudagraph_stats,
             batch_desc,
             multimodal_outputs, # Omni-Specific
-            tensor_cache_step_id,
+            prefix_cache_step_id,
         ) = self.execute_model_state
         # Clear ephemeral state.
         self.execute_model_state = None
@@ -1076,15 +1076,15 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         audio_sparse_output = engine_output_type == "audio" and sparse_mm_req_ids is not None
-        _omni_cache_on = getattr(self, "omni_tensor_cache", None) is not None
+        _omni_cache_on = self.omni_prefix_cache is not None
         needs_scheduled_hidden_payload = needs_pooler_payload and (
             not _omni_cache_on or not self._model_needs_full_prefix_hidden_states()
         )
-        if not needs_pooler_payload and tensor_cache_step_id is not None:
+        if not needs_pooler_payload and prefix_cache_step_id is not None:
             # No consumer for this step's merge: consume the step context by
             # id (exactly-once contract). The cache write still lands.
-            self.omni_tensor_cache.discard_step(tensor_cache_step_id)
-            tensor_cache_step_id = None
+            self.omni_prefix_cache.discard_step(prefix_cache_step_id)
+            prefix_cache_step_id = None
         if needs_scheduled_hidden_payload:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
@@ -1126,7 +1126,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states,
                     multimodal_outputs,
                     scheduler_output.num_scheduled_tokens,
-                    step_id=tensor_cache_step_id,
+                    step_id=prefix_cache_step_id,
                     req_ids=list(req_ids_output_copy),
                 )
             if not _omni_cache_on or combined_multimodal_outputs is None:

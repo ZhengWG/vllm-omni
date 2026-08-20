@@ -123,18 +123,27 @@ def get_tensor_cache_group_view(
     input_batch: InputBatch,
     block_size: int,
     num_blocks: int,
+    kv_cache_groups: object = None,
 ) -> KVCacheGroupView | None:
     """Build the group view for a runner's input batch; None means no
     usable group (the caller fails fast rather than serving hits without
-    cached tensors)."""
+    cached tensors).
+
+    Selection is by kv-cache group SPEC, not by counting block tables: a
+    hybrid model's group 0 is not necessarily full attention, and a
+    narrower per-group table would make step_slots_cpu silently clamp.
+    """
     block_tables = getattr(input_batch.block_table, "block_tables", None)
     if not block_tables:
         return None
-    if len(block_tables) > 1:
-        # Hybrid models: group 0 may not be full-attention, and a narrower
-        # per-group block table would make step_slots_cpu silently clamp —
-        # surfacing later as a misleading save-time unmatch. Refuse until
-        # multi-group support lands (G5, P2).
-        logger.warning("Omni tensor caching does not support multiple kv-cache groups yet (G5).")
+    groups = list(kv_cache_groups or ())
+    if len(groups) != 1:
+        logger.warning("Omni prefix caching needs exactly one kv-cache group, found %d.", len(groups))
+        return None
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    spec = getattr(groups[0], "kv_cache_spec", None)
+    if not isinstance(spec, FullAttentionSpec):
+        logger.warning("Omni prefix caching needs a full-attention group 0, found %s.", type(spec).__name__)
         return None
     return FullAttentionGroupView(input_batch, block_size, num_blocks)
