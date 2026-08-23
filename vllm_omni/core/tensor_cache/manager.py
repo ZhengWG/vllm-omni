@@ -71,9 +71,8 @@ class _RowSource:
     slots: torch.Tensor
     key: str
     req_id: str
-    baseline_mirror: bool
-    staged: list[tuple[WriteTask, torch.Tensor]]  # (task, mask over slots)
-    staged_any: torch.Tensor | None = None  # union of staged masks (validation)
+    already_staged: bool  # this key is already in the CPU pool
+    staged_list: list[tuple[WriteTask, torch.Tensor]]  # (task, mask over slots)
 
 
 @dataclass
@@ -119,6 +118,7 @@ class OmniTensorCacheManager:
         # on purpose: facade entry points never call each other, and the lock
         # must never cover a blocking wait (join / cap flush / D2H).
         self._state_lock = threading.Lock()
+        # TODO：need to pre-allocate buffer for the slot mapping
         self._num_slots = config.num_blocks * config.block_size
         # (slot, key) state: per-key tables, lazily created. hidden may be
         # committed while a deferred key on the same slot is still in-transit;
@@ -729,22 +729,26 @@ class OmniTensorCacheManager:
                 )
             staged.append((task, staged_mask & (owners == owner)))
 
-        baseline = self._pool.has_key(key)
-        if not baseline and not staged:
+        already_staged = self._pool.has_key(key)
+        if not already_staged and not staged:
             if strict:
                 raise OmniTensorCacheUnmatchError(f"no data source for hit span of req {req_id}, key {key}")
             raise KeyError(f"key {key} has no cache mirror")
         return _RowSource(
-            slots=slots, key=key, req_id=req_id, baseline_mirror=baseline, staged=staged, staged_any=staged_mask
+            slots=slots,
+            key=key,
+            req_id=req_id,
+            already_staged=already_staged,
+            staged_list=staged,
         )
 
     def _fetch_source(self, src: _RowSource) -> torch.Tensor:
         """Fetch a planned row source (execute phase, no lock)."""
         n = int(src.slots.numel())
         out: torch.Tensor | None = None
-        if src.baseline_mirror:
+        if src.already_staged:
             out = self._pool.rows(src.key, src.slots)
-        for task, mask in src.staged:
+        for task, mask in src.staged_list:
             try:
                 rows = self._controller.fetch_host(task, src.slots[mask], src.key)
             except KeyError:
@@ -756,7 +760,10 @@ class OmniTensorCacheManager:
                 out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
             out[mask] = rows
         assert out is not None  # _plan_rows guarantees a source
-        self._ensure_not_reassigned(src.slots, src.key, planned_staged=src.staged_any, req_id=src.req_id)
+        in_transit = None
+        for _, mask in src.staged_list:
+            in_transit = mask if in_transit is None else in_transit | mask
+        self._ensure_not_reassigned(src.slots, src.key, in_transit_mask=in_transit, req_id=src.req_id)
         return out
 
     def _ensure_not_reassigned(
@@ -764,21 +771,21 @@ class OmniTensorCacheManager:
         slots: torch.Tensor,
         key: str,
         *,
-        planned_staged: torch.Tensor | None = None,
+        in_transit_mask: torch.Tensor | None = None,
         allow_tid: int | None = None,
         req_id: str = "?",
     ) -> None:
-        """Post-fetch validation: baseline (mirror) rows read without a lock
-        may have been re-registered by a new tenant mid-read (block reuse
-        after abort/preemption of the hit request) — the scatter races the
-        mirror read, so a torn read must fail loudly, never ship."""
+        """Post-fetch validation: pool rows read without a lock may have
+        been remounted mid-read (block reuse). A torn pool read must
+        fail-fast. Slots already in-transit at plan time are excluded.
+        """
         with self._state_lock:
             state = self._key_state.get(key)
             if state is None:
                 return
             violated = state[slots] == _IN_TRANSIT
-            if planned_staged is not None:
-                violated &= ~planned_staged
+            if in_transit_mask is not None:
+                violated &= ~in_transit_mask
             if allow_tid is not None and bool(violated.any()):
                 violated &= self._key_owner[key][slots] != allow_tid
             if bool(violated.any()):
