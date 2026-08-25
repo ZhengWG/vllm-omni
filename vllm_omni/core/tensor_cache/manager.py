@@ -14,9 +14,11 @@ step id is consumed exactly once). Warmup/dummy runs are never fed.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import threading
 from collections.abc import Iterable
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
@@ -73,6 +75,10 @@ class _RowSource:
     req_id: str
     already_staged: bool  # this key is already in the CPU pool
     staged_list: list[tuple[WriteTask, torch.Tensor]]  # (task, mask over slots)
+    # Reader pins on ring slots backing staged tasks: bound at plan (locked),
+    # released by the fetch. Without them a drain could free the slot for
+    # reclaim while the unlocked fetch is still reading its views.
+    ring_pins: list[tuple[int, object]] = field(default_factory=list)
 
 
 @dataclass
@@ -84,12 +90,20 @@ class _StepContext:
     req_order: list[str]
     query_start: dict[str, int]
     frozen_mm_keys: set[str]
+    # req_id -> key -> prefetched merged buffer ([hit + this step] rows,
+    # prefix filled during the forward); materialize only writes the tail.
+    hit_prefetch: dict[str, dict[str, Future]] = field(default_factory=dict)
     mm_flat_refs: dict[str, Any] = field(default_factory=dict)
     num_tokens_unpadded: int = 0
     # Cached-key classification frozen at save time: recomputing it at
     # materialize would race a later save's ensure_key and reclassify a
     # passthrough key into an (all-absent) cached one mid-flight.
     cached_keys: set[str] = field(default_factory=set)
+    # Step host ring: pre-launched whole-step D2H (host views + its event).
+    # None when the step bypassed the ring (too large / no rows).
+    ring_slot: int | None = None
+    host_views: dict[str, torch.Tensor] | None = None
+    host_event: Any = None
     # Whole-step frozen clones (the per-request tasks hold views of these).
     # materialize reads them with ONE D2H per key and feeds the host copy
     # back into the per-request tasks — without this, a cc8 decode step pays
@@ -135,6 +149,12 @@ class OmniTensorCacheManager:
         self._write_n: dict[str, int] = {}  # req_id -> last write_n issued
         self._finished_join: set[int] = set()
         self._pending_hits: dict[str, int] = {}
+        self._pending_hit_prefetch: dict[str, dict[str, Future]] = {}
+        # Hit spans are known before the forward; one worker gathers them
+        # from the mirror while the GPU runs (large CPU ops release the GIL).
+        self._prefetch_pool = ThreadPoolExecutor(1, thread_name_prefix="omni-prefix-cache-prefetch")
+        self._prefetch_jobs: list[tuple[Future, _RowSource]] = []
+        self._pin_seq = itertools.count(1)  # reader-pin tokens, never reused
         self._live_reqs: set[str] = set()
         # step_id -> context; each entry is consumed exactly once, by
         # materialize or discard_step (unknown/duplicate id = fail-fast).
@@ -176,6 +196,7 @@ class OmniTensorCacheManager:
                 self._finished_join.update(pending)
 
         self._pending_hits.clear()
+        self._pending_hit_prefetch.clear()
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = new_req.req_id
             if req_id in self._live_reqs:
@@ -201,7 +222,48 @@ class OmniTensorCacheManager:
                 hit_blocks = list(blocks[: num_computed // self._config.block_size])
                 self._pending_hits[req_id] = (num_computed, hit_blocks)
 
+        self._prefetch_jobs = [(f, s) for f, s in self._prefetch_jobs if not f.done()]
         self._cur_num_scheduled = dict(scheduler_output.num_scheduled_tokens)
+        if self._pending_hits:
+            self._prefetch_pending_hits()
+
+    def _prefetch_pending_hits(self) -> None:
+        """Plan each pending hit span now (we hold the state lock) and gather
+        it on the prefetch thread, overlapping the forward. A span that fails
+        to plan — same-step hits resolve rows this step's save has not
+        registered yet — is left to materialize, which owns the fail-fast.
+        """
+        keys = sorted(self._pool.keys() - {HIDDEN_KEY})
+        if self._policy.needs_full_hidden_states:
+            keys = [HIDDEN_KEY, *keys]
+        for req_id, (hit_upto, hit_blocks) in self._pending_hits.items():
+            n_new = int(self._cur_num_scheduled.get(req_id, 0))
+            futs: dict[str, Future] = {}
+            for key in keys:
+                try:
+                    src = self._plan_hit_rows(req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY))
+                except Exception:
+                    continue
+                try:
+                    fut = self._prefetch_pool.submit(self._prefetch_hit, src, n_new)
+                except Exception:
+                    self._release_ring_pins(src.ring_pins)
+                    raise
+                self._prefetch_jobs.append((fut, src))
+                futs[key] = fut
+            if futs:
+                self._pending_hit_prefetch[req_id] = futs
+
+    @torch.inference_mode()
+    def _prefetch_hit(self, src: _RowSource, n_new: int) -> torch.Tensor:
+        """Prefetch thread: gather the hit span and pre-build the merged
+        buffer with the prefix filled. materialize writes only this step's
+        rows at the tail — the gather AND the prefix copy both happen while
+        the forward runs, and the cat leaves the critical path."""
+        rows = self._fetch_source(src)
+        out = torch.empty((rows.shape[0] + n_new, rows.shape[-1]), dtype=rows.dtype)
+        out[: rows.shape[0]] = rows
+        return out
 
     @torch.inference_mode()
     def save_outputs(
@@ -292,66 +354,106 @@ class OmniTensorCacheManager:
                 exclude = {self._deferred_tasks[r].tid for r, _ in deferred_segs if r in self._deferred_tasks}
                 self._controller.reserve(sum(t.numel() * t.element_size() for t in staged), exclude=exclude)
 
-        with self._state_lock:
-            self._apply_completions()
-            task_ids: dict[str, int] = {}
+        # Launch the whole-step D2H NOW (copy stream, ordered after the
+        # freeze): by consumption time it is usually complete, and per-task
+        # copies plus their fetch/cat/publish machinery all disappear.
+        ring_slot: int | None = None
+        host_views: dict[str, torch.Tensor] | None = None
+        host_event = None
+        step_token = ("s", self._next_step_id)
+        transferred = False
+        bound_tids: list[int] = []
+        try:
             if tensors:
-                # One WriteTask per request (tid handle; req_id + write_n):
-                # per-req views of the shared frozen clone, so the D2D freeze
-                # stays a single kernel while finish/abort escalation, skip
-                # masks, and completion validation are all req-scoped.
-                for r in req_order:
-                    s = query_start[r]
-                    e = s + num_sched[r]
-                    if e == s:
-                        continue
-                    r_tensors = {k: v[s:e] for k, v in tensors.items()}
-                    tid = self._alloc_tid()
-                    task = WriteTask(
-                        tid=tid,
-                        req_id=r,
-                        write_n=self._next_write_n(r),
-                        schedule=WriteSchedule.JOIN_ON_FINISH
-                        if (e - s) > self._config.join_on_finish_min_tokens
-                        else WriteSchedule.JOIN_NEXT_STEP,
-                        segments=[_Segment(slots_cpu=slots_cpu[s:e], tensors=r_tensors)],
-                        freeze_event=freeze_event,
-                    )
-                    self._map_slots(slots_cpu[s:e], tid, r_tensors.keys())
-                    self._controller.submit(task)
-                    self._req_tasks.setdefault(r, set()).add(tid)
-                    task_ids[r] = tid
-                    if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
-                        self._join_next_step_tids.append(tid)
+                ring = self._controller.stage_step_host(tensors, n, freeze_event, step_token)
+                if ring is not None:
+                    ring_slot, host_views, host_event = ring
 
-            self._stage_deferred(deferred_segs, freeze_event)
+            with self._state_lock:
+                self._apply_completions()
+                task_ids: dict[str, int] = {}
+                if tensors:
+                    # One WriteTask per request (tid handle; req_id + write_n):
+                    # per-req views of the shared frozen clone, so the D2D freeze
+                    # stays a single kernel while finish/abort escalation, skip
+                    # masks, and completion validation are all req-scoped.
+                    for r in req_order:
+                        s = query_start[r]
+                        e = s + num_sched[r]
+                        if e == s:
+                            continue
+                        r_tensors = {k: v[s:e] for k, v in tensors.items()}
+                        tid = self._alloc_tid()
+                        seg = _Segment(slots_cpu=slots_cpu[s:e], tensors=r_tensors)
+                        if host_views is not None:
+                            # Ring step: host rows are views into the slot; the
+                            # committer only waits the shared step event.
+                            seg.host = {k: v[s:e] for k, v in host_views.items()}
+                        task = WriteTask(
+                            tid=tid,
+                            req_id=r,
+                            write_n=self._next_write_n(r),
+                            # Ring tasks never defer: their D2H is already in
+                            # flight, so JOIN_ON_FINISH would only pin the slot.
+                            schedule=WriteSchedule.JOIN_ON_FINISH
+                            if (ring_slot is None and (e - s) > self._config.join_on_finish_min_tokens)
+                            else WriteSchedule.JOIN_NEXT_STEP,
+                            segments=[seg],
+                            freeze_event=freeze_event,
+                            ring_slot=ring_slot,
+                            host_event=host_event,
+                        )
+                        self._map_slots(slots_cpu[s:e], tid, r_tensors.keys())
+                        if ring_slot is not None:
+                            # Bind before submit: the slot must never be token-free
+                            # while the task is live (freed at completion drain).
+                            self._controller.ring_bind(ring_slot, ("t", tid))
+                            bound_tids.append(tid)
+                        self._controller.submit(task)
+                        self._req_tasks.setdefault(r, set()).add(tid)
+                        task_ids[r] = tid
+                        if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
+                            self._join_next_step_tids.append(tid)
 
-            step_id = self._next_step_id
-            self._next_step_id += 1
-            self._step_ctxs[step_id] = _StepContext(
-                task_ids=task_ids,
-                slots_cpu=slots_cpu,
-                hits=dict(self._pending_hits),
-                num_scheduled=num_sched,
-                req_order=req_order,
-                query_start=query_start,
-                frozen_mm_keys=frozen_mm_keys,
-                mm_flat_refs=dict(mm_flat),
-                num_tokens_unpadded=n,
-                cached_keys=(self._pool.keys() - {HIDDEN_KEY}) & set(mm_flat.keys()),
-                step_tensors=dict(tensors),
-                freeze_event=freeze_event,
-            )
-            self._pending_hits.clear()
-            if len(self._step_ctxs) > 4:
-                # The async builder runs at most one step behind; more
-                # unconsumed contexts means the runner is leaking them (a
-                # consume path skipping both materialize and discard_step).
-                raise OmniTensorCacheUnmatchError(
-                    f"{len(self._step_ctxs)} unconsumed step contexts (ids={sorted(self._step_ctxs)}); "
-                    "runner violated the consume-exactly-once contract"
+                self._stage_deferred(deferred_segs, freeze_event)
+
+                step_id = self._next_step_id
+                self._next_step_id += 1
+                self._step_ctxs[step_id] = _StepContext(
+                    task_ids=task_ids,
+                    slots_cpu=slots_cpu,
+                    hits=dict(self._pending_hits),
+                    hit_prefetch=dict(self._pending_hit_prefetch),
+                    num_scheduled=num_sched,
+                    req_order=req_order,
+                    query_start=query_start,
+                    frozen_mm_keys=frozen_mm_keys,
+                    mm_flat_refs=dict(mm_flat),
+                    num_tokens_unpadded=n,
+                    cached_keys=(self._pool.keys() - {HIDDEN_KEY}) & set(mm_flat.keys()),
+                    step_tensors=dict(tensors),
+                    freeze_event=freeze_event,
+                    ring_slot=ring_slot,
+                    host_views=host_views,
+                    host_event=host_event,
                 )
-            return step_id
+                self._pending_hits.clear()
+                self._pending_hit_prefetch.clear()
+                transferred = True
+                if len(self._step_ctxs) > self._config.ring_depth:
+                    # The async builder runs at most one step behind; more
+                    # unconsumed contexts means the runner is leaking them (a
+                    # consume path skipping both materialize and discard_step).
+                    raise OmniTensorCacheUnmatchError(
+                        f"{len(self._step_ctxs)} unconsumed step contexts (ids={sorted(self._step_ctxs)}); "
+                        "runner violated the consume-exactly-once contract"
+                    )
+                return step_id
+        finally:
+            if not transferred and ring_slot is not None:
+                self._controller.ring_release(ring_slot, step_token)
+                for tid in bound_tids:
+                    self._controller.ring_release(ring_slot, ("t", tid))
 
     def _take_step_ctx(self, step_id: int) -> _StepContext:
         """Pop the context for this step id (consume-exactly-once)."""
@@ -380,91 +482,120 @@ class OmniTensorCacheManager:
         after commit, so the engine thread never waits on this thread's
         PCIe.
         """
-        with self._state_lock:
-            ctx = self._take_step_ctx(step_id)
-            self._apply_completions()
+        ctx = None
+        step_released = False
+        try:
+            with self._state_lock:
+                ctx = self._take_step_ctx(step_id)
+                self._apply_completions()
 
-            # The builder must pass (a subset of) the req list captured at
-            # save time — an id outside the snapshot means it is reading the
-            # live batch, which the contract forbids (debug assert, not a
-            # degrade path).
-            assert set(req_ids) <= set(ctx.query_start), (
-                f"materialize(step {step_id}) got req ids outside the save snapshot: "
-                f"{sorted(set(req_ids) - set(ctx.query_start))[:8]}"
-            )
+                # The builder must pass (a subset of) the req list captured at
+                # save time — an id outside the snapshot means it is reading the
+                # live batch, which the contract forbids (debug assert, not a
+                # degrade path).
+                assert set(req_ids) <= set(ctx.query_start), (
+                    f"materialize(step {step_id}) got req ids outside the save snapshot: "
+                    f"{sorted(set(req_ids) - set(ctx.query_start))[:8]}"
+                )
 
-            if not self._policy.needs_full_hidden_states and not ctx.hits:
-                return StageCacheOutputs(hidden_states=None, mm_outputs={})
+                if not self._policy.needs_full_hidden_states and not ctx.hits:
+                    # Nothing will read the views; drop the step token here
+                    # or the slot leaks (consume-exactly-once ends with us).
+                    self._release_step_ring(ctx, step_id)
+                    step_released = True
+                    return StageCacheOutputs(hidden_states=None, mm_outputs={})
 
-            served = list(req_ids)
-            own_tasks = {r: self._controller.get_task(t) for r, t in ctx.task_ids.items()}
-            want_hidden = self._policy.needs_full_hidden_states
-            cached_keys = ctx.cached_keys
+                served = list(req_ids)
+                own_tasks = {r: self._controller.get_task(t) for r, t in ctx.task_ids.items()}
+                want_hidden = self._policy.needs_full_hidden_states
+                cached_keys = ctx.cached_keys
 
-            hit_sources: dict[tuple[str, str], _RowSource] = {}
-            for req_id in served:
-                hit = ctx.hits.get(req_id)
-                if not hit:
-                    continue
-                hit_upto, hit_blocks = hit
-                keys = ([HIDDEN_KEY] if want_hidden else []) + sorted(cached_keys)
-                for key in keys:
-                    hit_sources[(req_id, key)] = self._plan_hit_rows(
-                        req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY)
-                    )
-
-        # ---- unlocked: data movement + merge ----
-        current: dict[str, torch.Tensor] = {}
-        if ctx.slots_cpu is not None and ctx.task_ids:
-            # Tier order matters: when the async builder runs a step late the
-            # committer has already copied every task (host bufs) — reading
-            # them is sync-free. snapshot_host is the SAME-STEP fallback
-            # (eager consumers) and must wait for this step's forward on the
-            # GPU, so preferring it on the builder would re-serialize the
-            # async pipeline (measured: +3.4ms/step, itl p90 24ms vs 15ms).
-            # Drained (None) means committed: the mirror read is sync-free too.
-            all_ready = all((t := own_tasks.get(r)) is None or t.host_ready.is_set() for r in ctx.task_ids)
-            for key in [HIDDEN_KEY, *ctx.frozen_mm_keys]:
-                src = ctx.step_tensors.get(key)
-                if src is not None and not all_ready:
-                    # One D2H for the whole step (the per-req tasks hold
-                    # views of this same frozen clone).
-                    current[key] = self._controller.snapshot_host(src, ctx.freeze_event)
-                else:
-                    rows = self._step_rows(ctx, own_tasks, key)
-                    if rows is not None:
-                        current[key] = rows
-            if ctx.step_tensors and not all_ready:
-                # D6 feed-back, per-request form: hand each task its host
-                # rows so the committer skips its own D2H (PCIe once).
-                hosts = {k: current[k] for k in ctx.step_tensors if k in current}
-                if hosts:
-                    for r, _tid in ctx.task_ids.items():
-                        task = own_tasks.get(r)
-                        if task is None or task.host_ready.is_set():
+                hit_sources: dict[tuple[str, str], _RowSource | Future] = {}
+                for req_id in served:
+                    hit = ctx.hits.get(req_id)
+                    if not hit:
+                        continue
+                    hit_upto, hit_blocks = hit
+                    prefetched = ctx.hit_prefetch.get(req_id, {})
+                    keys = ([HIDDEN_KEY] if want_hidden else []) + sorted(cached_keys)
+                    for key in keys:
+                        fut = prefetched.get(key)
+                        if fut is not None:
+                            hit_sources[(req_id, key)] = fut
                             continue
-                        s = ctx.query_start[r]
-                        e = s + ctx.num_scheduled.get(r, 0)
-                        self._controller.publish_host(task, {k: v[s:e] for k, v in hosts.items()})
+                        hit_sources[(req_id, key)] = self._plan_hit_rows(
+                            req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY)
+                        )
 
-        hidden_out: dict[str, torch.Tensor] | None = None
-        if want_hidden and HIDDEN_KEY in current:
-            hidden_out = {}
-            for req_id in served:
-                hidden_out[req_id] = self._merged_for_req(ctx, req_id, HIDDEN_KEY, current[HIDDEN_KEY], hit_sources)
+            # ---- unlocked: data movement + merge ----
+            current: dict[str, torch.Tensor] = {}
+            if ctx.host_views is not None:
+                # Step host ring: the whole-step D2H was launched at save. One
+                # event wait (usually already complete), then a single
+                # contiguous copy-out per key — the copy detaches consumers
+                # from the reusable ring slot and replaces the old per-request
+                # fetch + cat machinery outright.
+                if ctx.host_event is not None:
+                    ctx.host_event.synchronize()
+                for key in [HIDDEN_KEY, *ctx.frozen_mm_keys]:
+                    v = ctx.host_views.get(key)
+                    if v is not None:
+                        current[key] = v.clone()
+                self._release_step_ring(ctx, step_id)
+                step_released = True
+            elif ctx.slots_cpu is not None and ctx.task_ids:
+                # Tier order matters: when the async builder runs a step late the
+                # committer has already copied every task (host bufs) — reading
+                # them is sync-free. snapshot_host is the SAME-STEP fallback
+                # (eager consumers) and must wait for this step's forward on the
+                # GPU, so preferring it on the builder would re-serialize the
+                # async pipeline (measured: +3.4ms/step, itl p90 24ms vs 15ms).
+                # Drained (None) means committed: the mirror read is sync-free too.
+                all_ready = all((t := own_tasks.get(r)) is None or t.host_ready.is_set() for r in ctx.task_ids)
+                for key in [HIDDEN_KEY, *ctx.frozen_mm_keys]:
+                    src = ctx.step_tensors.get(key)
+                    if src is not None and not all_ready:
+                        # One D2H for the whole step (the per-req tasks hold
+                        # views of this same frozen clone).
+                        current[key] = self._controller.snapshot_host(src, ctx.freeze_event)
+                    else:
+                        rows = self._step_rows(ctx, own_tasks, key)
+                        if rows is not None:
+                            current[key] = rows
+                if ctx.step_tensors and not all_ready:
+                    # D6 feed-back, per-request form: hand each task its host
+                    # rows so the committer skips its own D2H (PCIe once).
+                    hosts = {k: current[k] for k in ctx.step_tensors if k in current}
+                    if hosts:
+                        for r, _tid in ctx.task_ids.items():
+                            task = own_tasks.get(r)
+                            if task is None or task.host_ready.is_set():
+                                continue
+                            s = ctx.query_start[r]
+                            e = s + ctx.num_scheduled.get(r, 0)
+                            self._controller.publish_host(task, {k: v[s:e] for k, v in hosts.items()})
 
-        mm_out: dict[str, dict[str, Any]] = {}
-        for key in cached_keys:
-            cur = current.get(key)
-            if cur is None:
-                val = ctx.mm_flat_refs.get(key)
-                if not isinstance(val, torch.Tensor):
-                    continue
-                cur = val[: ctx.num_tokens_unpadded].detach().cpu()
-            mm_out[key] = {req_id: self._merged_for_req(ctx, req_id, key, cur, hit_sources) for req_id in served}
+            hidden_out: dict[str, torch.Tensor] | None = None
+            if want_hidden and HIDDEN_KEY in current:
+                hidden_out = {}
+                for req_id in served:
+                    hidden_out[req_id] = self._merged_for_req(ctx, req_id, HIDDEN_KEY, current[HIDDEN_KEY], hit_sources)
 
-        self._merge_passthrough(ctx, served, cached_keys, mm_out)
-        return StageCacheOutputs(hidden_states=hidden_out, mm_outputs=mm_out)
+            mm_out: dict[str, dict[str, Any]] = {}
+            for key in cached_keys:
+                cur = current.get(key)
+                if cur is None:
+                    val = ctx.mm_flat_refs.get(key)
+                    if not isinstance(val, torch.Tensor):
+                        continue
+                    cur = val[: ctx.num_tokens_unpadded].detach().cpu()
+                mm_out[key] = {req_id: self._merged_for_req(ctx, req_id, key, cur, hit_sources) for req_id in served}
+
+            self._merge_passthrough(ctx, served, cached_keys, mm_out)
+            return StageCacheOutputs(hidden_states=hidden_out, mm_outputs=mm_out)
+        finally:
+            if ctx is not None and not step_released:
+                self._release_step_ring(ctx, step_id)
 
     @_locked
     def discard_step(self, step_id: int) -> None:
@@ -474,10 +605,24 @@ class OmniTensorCacheManager:
         duplicate id fails fast). Only the read-side snapshot is dropped —
         the cache write proceeds unchanged.
         """
-        self._take_step_ctx(step_id)
+        ctx = self._take_step_ctx(step_id)
+        self._release_step_ring(ctx, step_id)
 
     def shutdown(self) -> None:
+        self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
+        for fut, src in self._prefetch_jobs:
+            if fut.cancelled():
+                self._release_ring_pins(src.ring_pins)
+        self._prefetch_jobs.clear()
         self._controller.shutdown()
+
+    def _release_step_ring(self, ctx: _StepContext, step_id: int) -> None:
+        if ctx.ring_slot is not None:
+            self._controller.ring_release(ctx.ring_slot, ("s", step_id))
+
+    def _release_ring_pins(self, pins: list[tuple[int, object]]) -> None:
+        for slot, token in pins:
+            self._controller.ring_release(slot, token)
 
     # ------------------------------------------------------------ internals
 
@@ -718,6 +863,7 @@ class OmniTensorCacheManager:
         staged_mask = states == _IN_TRANSIT
 
         staged: list[tuple[WriteTask, torch.Tensor]] = []
+        ring_slots: list[int] = []
         for owner in {int(o) for o in owners[staged_mask].tolist()}:
             task = self._controller.get_task(owner) if owner != 0 else None
             if task is None:
@@ -728,22 +874,39 @@ class OmniTensorCacheManager:
                     f"(slot, {key}) rows of req {req_id} are in-transit but entry {owner} cannot serve them"
                 )
             staged.append((task, staged_mask & (owners == owner)))
+            if task.ring_slot is not None:
+                ring_slots.append(task.ring_slot)
 
         already_staged = self._pool.has_key(key)
         if not already_staged and not staged:
             if strict:
                 raise OmniTensorCacheUnmatchError(f"no data source for hit span of req {req_id}, key {key}")
             raise KeyError(f"key {key} has no cache mirror")
+        # Bind only after the plan is valid: a raise above must not leak pins.
+        ring_pins: list[tuple[int, object]] = []
+        for slot in ring_slots:
+            pin = (slot, ("r", next(self._pin_seq)))
+            self._controller.ring_bind(*pin)
+            ring_pins.append(pin)
         return _RowSource(
             slots=slots,
             key=key,
             req_id=req_id,
             already_staged=already_staged,
             staged_list=staged,
+            ring_pins=ring_pins,
         )
 
     def _fetch_source(self, src: _RowSource) -> torch.Tensor:
-        """Fetch a planned row source (execute phase, no lock)."""
+        """Fetch a planned row source (execute phase, no lock). Releases the
+        plan's reader pins on the way out, success or raise."""
+        try:
+            return self._fetch_source_pinned(src)
+        finally:
+            for slot, token in src.ring_pins:
+                self._controller.ring_release(slot, token)
+
+    def _fetch_source_pinned(self, src: _RowSource) -> torch.Tensor:
         n = int(src.slots.numel())
         out: torch.Tensor | None = None
         if src.already_staged:
@@ -827,6 +990,13 @@ class OmniTensorCacheManager:
         src = hit_sources.get((req_id, key))
         if src is None:
             return new_rows
+        if isinstance(src, Future):
+            # Prefetched during the forward, prefix already in place; only
+            # this step's rows land here. result() re-raises fetch/validation
+            # errors — the fail-fast contract survives the thread hop.
+            merged = src.result()
+            merged[merged.shape[0] - new_rows.shape[0] :] = new_rows
+            return merged
         cached = self._fetch_source(src)
         return torch.cat([cached, new_rows], dim=0)
 

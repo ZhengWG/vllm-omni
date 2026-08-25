@@ -26,6 +26,7 @@ except ModuleNotFoundError:
 
 from vllm_omni.core.tensor_cache.group_view import FullAttentionGroupView
 from vllm_omni.core.tensor_cache.interface import (
+    DEFAULT_RING_DEPTH,
     HIDDEN_KEY,
     ModelCachePolicy,
     OmniTensorCacheUnmatchError,
@@ -184,8 +185,12 @@ def test_absent_hit_fails_fast():
     mgr, view = make_manager()
     view.req_blocks["c"] = [5, 6]
     sid = run_step(mgr, view, {"c": ([5, 6, 7], 8, 4)}, new_hits={"c": 8})
+    slot = mgr._step_ctxs[sid].ring_slot
     with pytest.raises(OmniTensorCacheUnmatchError):
         mgr.materialize(sid, ["c"])
+    # Fail-fast after take_ctx must still drop the step token.
+    if slot is not None:
+        assert not mgr._controller._ring._busy[slot]
 
 
 def test_hit_not_block_aligned_asserts():
@@ -612,15 +617,22 @@ def test_lock_never_covers_fetch_or_join():
         deferred_keys=frozenset({"k"}),
         skip_keys=frozenset({"k"}),
     )
+    import threading
+
     mgr, view = make_manager(policy=policy)
     calls = []
+
+    def probe(kind):
+        # locked() sees ANY holder; the prefetch worker fetches by design
+        # while the engine thread holds the lock in new_step_starts, so only
+        # facade-thread calls prove a violation.
+        on_facade = not threading.current_thread().name.startswith("omni-prefix-cache-prefetch")
+        calls.append((kind, on_facade and mgr._state_lock.locked()))
+
     real_fetch = mgr._controller.fetch_host
     real_join = mgr._controller.join_host_ready
-    mgr._controller.fetch_host = lambda *a, **kw: (
-        calls.append(("fetch", mgr._state_lock.locked())),
-        real_fetch(*a, **kw),
-    )[1]
-    mgr._controller.join_host_ready = lambda ids: (calls.append(("join", mgr._state_lock.locked())), real_join(ids))[1]
+    mgr._controller.fetch_host = lambda *a, **kw: (probe("fetch"), real_fetch(*a, **kw))[1]
+    mgr._controller.join_host_ready = lambda ids: (probe("join"), real_join(ids))[1]
 
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
     mgr.materialize(s1, ["a"])
@@ -660,8 +672,9 @@ def test_failed_write_fails_fast_at_next_facade_entry():
 def test_per_request_task_schedule_split():
     """One save produces one WriteTask per request; the schedule is
     per-request (prefill rows -> JOIN_ON_FINISH lazy trickle, decode rows ->
-    JOIN_NEXT_STEP)."""
-    mgr, view = make_manager(join_on_finish_min_tokens=4)
+    JOIN_NEXT_STEP). Size split applies to ring-bypassed steps (capacity 4
+    forces the bypass here); ring tasks always JOIN_NEXT_STEP."""
+    mgr, view = make_manager(join_on_finish_min_tokens=4, ring_capacity_tokens=4)
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})
     ctx = mgr._step_ctxs[sid]
     tp = mgr._controller.get_task(ctx.task_ids["p"])
@@ -676,3 +689,130 @@ def test_per_request_task_schedule_split():
     outs = mgr.materialize(sid, ["p", "d"])
     assert torch.equal(outs.hidden_states["p"], expected_rows(view.slots_for("p", 0, 8)))
     assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))
+
+
+def test_ring_step_prefills_task_host_and_recycles():
+    """Ring steps pre-fill per-task host views at save (no per-task copy),
+    and slots recycle safely across > depth steps without cross-step
+    corruption (outputs are copied out of the reusable slot)."""
+    mgr, view = make_manager()
+    for i in range(6):  # > ring_depth(4): forces slot reuse
+        sid = run_step(mgr, view, {"a": ([i % 8, (i % 8) + 8], i, 1)})
+        ctx = mgr._step_ctxs[sid]
+        assert ctx.host_views is not None and ctx.ring_slot is not None
+        expect = expected_rows(view.slots_for("a", i, i + 1))  # capture per step
+        outs = mgr.materialize(sid, ["a"])
+        assert torch.equal(outs.hidden_states["a"], expect), i
+
+
+def test_ring_bypass_for_oversized_step():
+    """Steps larger than ring capacity fall back to the per-task copy path."""
+    mgr, view = make_manager(ring_capacity_tokens=4)
+    sid = run_step(mgr, view, {"a": ([0, 1], 0, 8)})  # 8 > 4
+    ctx = mgr._step_ctxs[sid]
+    assert ctx.host_views is None and ctx.ring_slot is None
+    outs = mgr.materialize(sid, ["a"])
+    assert torch.equal(outs.hidden_states["a"], expected_rows(view.slots_for("a", 0, 8)))
+
+
+def test_ring_task_never_defers_and_slot_held_until_drain():
+    """A ring task's D2H is already in flight -> always JOIN_NEXT_STEP, and
+    its slot token survives the (eager, inline) scatter until the manager
+    drains the completion — the window hit readers pin on."""
+    from vllm_omni.core.tensor_cache.interface import WriteSchedule
+
+    mgr, view = make_manager(join_on_finish_min_tokens=4)
+    sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
+    ctx = mgr._step_ctxs[sid]
+    tid = ctx.task_ids["p"]
+    assert mgr._controller.get_task(tid).schedule is WriteSchedule.JOIN_NEXT_STEP
+    busy = mgr._controller._ring._busy[ctx.ring_slot]
+    assert ("t", tid) in busy and ("s", sid) in busy
+    mgr.materialize(sid, ["p"])  # drain releases ("t", tid); consume releases ("s", sid)
+    assert not busy
+
+
+def test_hit_prefetch_prebuilds_merged_buffer():
+    """A registered hit over committed rows is gathered by the prefetch
+    thread before the forward finishes; materialize only fills the tail."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"])
+    ctx = mgr._step_ctxs[s2]
+    fut = ctx.hit_prefetch["b"][HIDDEN_KEY]
+    buf = fut.result()
+    assert buf.shape == (12, HIDDEN)
+    assert torch.equal(buf[:8], expected_rows(view.slots_for("b", 0, 8)))
+    merged = mgr.materialize(s2, ["b"]).hidden_states["b"]
+    assert merged.data_ptr() == buf.data_ptr()  # the prefetched buffer IS the output
+    assert torch.equal(merged[8:], expected_rows(view.slots_for("b", 8, 12)))
+
+
+def test_same_step_hit_skips_prefetch():
+    """Rows this step's save has not registered yet cannot be planned at
+    new_step_starts; the hit falls back to materialize's plan+fetch."""
+    mgr, view = make_manager()
+    view.req_blocks["a"] = [0, 1]
+    sid = run_step(mgr, view, {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8})
+    ctx = mgr._step_ctxs[sid]
+    assert HIDDEN_KEY not in ctx.hit_prefetch.get("b", {})
+    outs = mgr.materialize(sid, ["a", "b"])
+    assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
+
+
+def test_ring_slot_released_on_no_consumer_early_return():
+    """materialize's nothing-to-serve early return must still drop the step
+    token, or the ring leaks a slot per step and exhausts."""
+    policy = ModelCachePolicy(needs_full_hidden_states=False)
+    mgr, view = make_manager(policy=policy)
+    for i in range(6):  # > ring_depth(4): leak would exhaust and bypass
+        sid = run_step(mgr, view, {"a": ([i % 8, (i % 8) + 8], i, 1)}, mm={"k": torch.full((1, 2), float(i))})
+        ctx = mgr._step_ctxs[sid]
+        assert ctx.ring_slot is not None, i
+        mgr.materialize(sid, ["a"])
+        assert not mgr._controller._ring._busy[ctx.ring_slot], i
+
+
+def test_save_releases_ring_if_apply_completions_fails():
+    """Claim happens outside the lock; a later fail-fast must drop ("s", ...)."""
+    mgr, view = make_manager(ring_depth=2)
+    calls = {"n": 0}
+    real = mgr._apply_completions
+
+    def wrapped():
+        calls["n"] += 1
+        if calls["n"] == 2:
+            raise OmniTensorCacheUnmatchError("injected fail")
+        return real()
+
+    mgr._apply_completions = wrapped
+    with pytest.raises(OmniTensorCacheUnmatchError, match="injected fail"):
+        run_step(mgr, view, {"a": ([0], 0, 4)})
+    assert all(not busy for busy in mgr._controller._ring._busy)
+    mgr._apply_completions = real
+    sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+    assert mgr._step_ctxs[sid].ring_slot is not None
+    mgr.materialize(sid, ["a"])
+
+
+def test_from_vllm_config_uses_batched_tokens():
+    from types import SimpleNamespace
+
+    cfg = TensorCacheConfig.from_vllm_config(
+        num_blocks=NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        hidden_size=HIDDEN,
+        hs_dtype=DTYPE,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=8192, max_model_len=32768, max_num_seqs=64),
+    )
+    assert cfg.ring_capacity_tokens == 8192
+    assert cfg.ring_depth == DEFAULT_RING_DEPTH
+    cfg_fallback = TensorCacheConfig.from_vllm_config(
+        num_blocks=NUM_BLOCKS,
+        block_size=BLOCK_SIZE,
+        hidden_size=HIDDEN,
+        hs_dtype=DTYPE,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=None, max_model_len=4096),
+    )
+    assert cfg_fallback.ring_capacity_tokens == 4096

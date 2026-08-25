@@ -37,12 +37,55 @@ class TensorCacheConfig:
     # Tasks covering more than this many tokens use JOIN_ON_FINISH;
     # smaller ones use JOIN_NEXT_STEP.
     join_on_finish_min_tokens: int = 256
+    # Step host ring: Temporarily buffers D2H (device-to-host) data for the entire step phase.
+    # Each slot holds data for one step (not per request).
+    # It is recommended to use from_vllm_config to automatically set ring_capacity_tokens
+    # to match max_num_batched_tokens.
+    ring_depth: int = 4
+    ring_capacity_tokens: int = 1024
     # D2H chunk size for the JOIN_ON_FINISH trickle.
     copy_chunk_bytes: int = 16 * 1024 * 1024
     # vLLM kv-cache groups (KVCacheGroupSpec list); the group-view factory
     # selects by spec type. Excluded from equality (config identity is the
     # sizing knobs).
     kv_cache_groups: Any = field(default=None, compare=False)
+
+    @classmethod
+    def from_vllm_config(
+        cls,
+        *,
+        num_blocks: int,
+        block_size: int,
+        hidden_size: int,
+        hs_dtype: torch.dtype,
+        scheduler_config: Any = None,
+        model_config: Any = None,
+        kv_cache_groups: Any = None,
+    ) -> "TensorCacheConfig":
+        """Size the step-host ring from the running scheduler.
+
+        A slot holds one *step* (the whole batch), not one request:
+        ``ring_capacity_tokens`` is ``max_num_batched_tokens`` (falls back
+        to ``max_model_len``); ``ring_depth`` is the in-flight step bound,
+        not ``max_num_seqs``.
+        """
+        batched = getattr(scheduler_config, "max_num_batched_tokens", None)
+        model_len = getattr(scheduler_config, "max_model_len", None)
+        if not model_len and model_config is not None:
+            model_len = getattr(model_config, "max_model_len", None)
+        try:
+            capacity = int(batched or model_len or 1024)
+        except (TypeError, ValueError):
+            capacity = 1024
+        return cls(
+            num_blocks=num_blocks,
+            block_size=block_size,
+            hidden_size=hidden_size,
+            hs_dtype=hs_dtype,
+            ring_depth=4,
+            ring_capacity_tokens=max(1, capacity),
+            kv_cache_groups=kv_cache_groups,
+        )
 
 
 class StageCacheOutputs(NamedTuple):

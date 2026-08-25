@@ -93,6 +93,9 @@ class WriteTask:
     lock: threading.Lock = field(default_factory=threading.Lock)
     # time.monotonic() at submit; cap flush picks the smallest of these.
     enqueued_time: float = field(default_factory=time.monotonic)
+    # uses ring views and a shared D2H (host_event) instead of per-task copies.
+    ring_slot: int | None = None
+    host_event: object | None = None  # torch.cuda.Event of the step D2H
     # slot -> (which segment, row in that segment's tensor). Built on demand
     # for multi-segment tasks; scatter uses slot, the tensor uses row.
     _slot_to_row: dict[int, tuple[int, int]] | None = None
@@ -121,6 +124,55 @@ class WriteTask:
         return self._slot_to_row
 
 
+class _StepHostRing:
+    """Pinned host staging for whole-step rows, written by ONE async D2H per
+    step at save time (launched early, on the copy stream). Per-task host
+    buffers become row-range views into a slot, so the committer skips its
+    per-task D2H and every later fetch is sync-free.
+
+    A slot is busy while any token holds it: one per WriteTask (freed when
+    the manager drains its completion), one for the step context (freed when
+    materialize/discard consumes it), plus transient reader pins for hit
+    fetches that run unlocked. No free slot means the step falls back to
+    per-task copies.
+    """
+
+    def __init__(self, depth: int, capacity: int):
+        self.depth = depth
+        self.capacity = capacity  # rows per slot; larger steps bypass the ring
+        self._bufs: dict[str, torch.Tensor] = {}  # key -> [depth*capacity, width]
+        self._busy: list[set[object]] = [set() for _ in range(depth)]
+        self._lock = threading.Lock()
+
+    def _buf(self, key: str, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
+        buf = self._bufs.get(key)
+        if buf is None or buf.shape[-1] != width or buf.dtype != dtype:
+            buf = torch.empty((self.depth * self.capacity, width), dtype=dtype, pin_memory=pin)
+            self._bufs[key] = buf
+        return buf
+
+    def try_claim(self, token: object) -> int | None:
+        """Grab a free slot for `token` (the step token); None if all busy."""
+        with self._lock:
+            for slot in range(self.depth):
+                if not self._busy[slot]:
+                    self._busy[slot].add(token)
+                    return slot
+        return None
+
+    def bind(self, slot: int, token: object) -> None:
+        with self._lock:
+            self._busy[slot].add(token)
+
+    def release(self, slot: int, token: object) -> None:
+        with self._lock:
+            self._busy[slot].discard(token)
+
+    def views(self, slot: int, key: str, n: int, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
+        base = slot * self.capacity
+        return self._buf(key, width, dtype, pin)[base : base + n]
+
+
 class OmniTensorCacheController:
     def __init__(self, pool: TensorBlockPool, config: TensorCacheConfig, eager: bool | None = None):
         self._pool = pool
@@ -139,11 +191,63 @@ class OmniTensorCacheController:
         self._copy_stream: torch.cuda.Stream | None = None
         self._read_stream: torch.cuda.Stream | None = None
         self._worker: threading.Thread | None = None
+        self._ring = _StepHostRing(config.ring_depth, config.ring_capacity_tokens)
         if not self._eager:
             self._copy_stream = torch.cuda.Stream()
             self._read_stream = torch.cuda.Stream()
             self._worker = threading.Thread(target=self._worker_loop, name="omni-tensor-cache-committer", daemon=True)
             self._worker.start()
+
+    # --------------------------------------------------------- step host ring
+
+    def stage_step_host(
+        self, tensors: dict[str, torch.Tensor], n: int, freeze_event: object | None, step_token: object
+    ) -> tuple[int, dict[str, torch.Tensor], object | None] | None:
+        """Launch ONE whole-step D2H into a ring slot, ahead of consumption.
+
+        Returns (slot, key -> host view of rows [0:n), d2h event) or None
+        when the step bypasses the ring (too large, or no rows). The caller
+        binds task tokens after submit; `step_token` is released by
+        materialize/discard via ring_release.
+        """
+        if not tensors or n <= 0 or n > self._ring.capacity:
+            return None
+        slot = self._ring.try_claim(step_token)
+        if slot is None:
+            # All slots busy: consume-exactly-once bounds this to pathological
+            # lag; fall back to the per-task copy path rather than blocking.
+            logger.warning("omni prefix cache: step host ring exhausted; falling back to per-task copies")
+            return None
+        try:
+            pin = not self._eager
+            views: dict[str, torch.Tensor] = {}
+            event: object | None = None
+            if self._eager or all(t.device.type == "cpu" for t in tensors.values()):
+                for key, src in tensors.items():
+                    v = self._ring.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
+                    v.copy_(src)
+                    views[key] = v
+            else:
+                assert self._copy_stream is not None
+                with torch.cuda.stream(self._copy_stream):
+                    if freeze_event is not None:
+                        self._copy_stream.wait_event(freeze_event)
+                    for key, src in tensors.items():
+                        v = self._ring.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
+                        v.copy_(src, non_blocking=True)
+                        views[key] = v
+                    event = torch.cuda.Event()
+                    event.record()
+            return slot, views, event
+        except Exception:
+            self._ring.release(slot, step_token)
+            raise
+
+    def ring_bind(self, slot: int, token: object) -> None:
+        self._ring.bind(slot, token)
+
+    def ring_release(self, slot: int, token: object) -> None:
+        self._ring.release(slot, token)
 
     # ------------------------------------------------------------------ submit
 
@@ -246,13 +350,20 @@ class OmniTensorCacheController:
                 task.host_ready.wait()
 
     def drain_completed(self) -> list[int]:
-        """Pop scattered tasks from `_completed` and drop them from `_tasks`."""
+        """Pop scattered tasks from `_completed` and drop them from `_tasks`.
+
+        Ring task tokens release HERE — the same locked drain that flips
+        state to committed — not at scatter: a hit plan that still sees rows
+        in-transit must be able to pin the slot before it is reclaimable.
+        """
         out: list[int] = []
         with self._lock:
             while self._completed:
                 out.append(self._completed.popleft())
-            for tid in out:
-                self._tasks.pop(tid, None)
+            tasks = [self._tasks.pop(tid, None) for tid in out]
+        for task in tasks:
+            if task is not None and task.ring_slot is not None:
+                self._ring.release(task.ring_slot, ("t", task.tid))
         return out
 
     def drain_failed(self) -> list[int]:
@@ -420,9 +531,10 @@ class OmniTensorCacheController:
                     self._scatter(task)
                 return
             task.d2h_claimed = True
-        for seg in task.segments:
-            for k, t in seg.tensors.items():
-                seg.host[k] = t.detach().cpu() if t.device.type != "cpu" else t.clone()
+        if task.ring_slot is None:
+            for seg in task.segments:
+                for k, t in seg.tensors.items():
+                    seg.host[k] = t.detach().cpu() if t.device.type != "cpu" else t.clone()
         task.host_ready.set()
         with self._lock:
             self._staged_bytes -= task.nbytes
@@ -471,6 +583,18 @@ class OmniTensorCacheController:
             if task.d2h_claimed:
                 return
             task.d2h_claimed = True
+        if task.host_event is not None:
+            # Step host ring: seg.host was pre-filled with ring views and the
+            # whole step's D2H was launched at save. Wait that one event
+            # (shared across the step's tasks; idempotent), release the GPU
+            # refs, done.
+            task.host_event.synchronize()
+            task.host_ready.set()
+            with self._wake:
+                self._staged_bytes -= task.nbytes
+            for seg in task.segments:
+                seg.tensors = {}
+            return
         assert self._copy_stream is not None
         chunk_bytes = self._config.copy_chunk_bytes
         pending_host: list[tuple[_Segment, str, torch.Tensor]] = []
@@ -523,6 +647,8 @@ class OmniTensorCacheController:
             seg.tensors = {}
         task.host_ready.set()
         task.done.set()
+        if task.ring_slot is not None:
+            self._ring.release(task.ring_slot, ("t", task.tid))
         with self._lock:
             # Publish the failure: rows behind already-published block hashes
             # never landed, which the manager must turn into a fail-fast (a

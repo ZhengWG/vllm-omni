@@ -1661,13 +1661,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
     def _should_use_async_omni_output(self) -> bool:
         if not self.use_async_scheduling:
             return False
-        if self.omni_prefix_cache is not None:
-            # Performance, not correctness: materialize consumes only the
-            # step snapshot, so the async builder is safe — but offloading
-            # the merge there measured slower end to end (GIL contention,
-            # cc8: eager 354.0 tok/s / itl p90 17.7 vs builder 326.9 / 24.3),
-            # so cache-enabled runs always consume on the main thread.
-            return False
         if self.speculative_config is not None:
             return False
 

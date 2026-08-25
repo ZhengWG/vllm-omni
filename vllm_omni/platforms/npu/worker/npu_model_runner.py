@@ -47,11 +47,13 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             # Controller runs in eager mode on NPU (no CUDA streams:
             # submit() completes the copy+scatter synchronously). Built once
             # on the first step via the inherited _ensure_omni_prefix_cache.
-            self._omni_prefix_cache_cfg = TensorCacheConfig(
+            self._omni_prefix_cache_cfg = TensorCacheConfig.from_vllm_config(
                 num_blocks=num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),
                 hs_dtype=self.dtype,
+                scheduler_config=self.scheduler_config,
+                model_config=self.model_config,
                 kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
             )
             logger.info(

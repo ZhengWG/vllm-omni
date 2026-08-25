@@ -181,11 +181,13 @@ class OmniGPUModelRunner(GPUModelRunner):
         # the first step so input_batch is guaranteed to exist. Non-CUDA
         # platforms run the Controller in eager mode (auto-selected).
         if self.cache_config.enable_prefix_caching:
-            self._omni_prefix_cache_cfg = TensorCacheConfig(
+            self._omni_prefix_cache_cfg = TensorCacheConfig.from_vllm_config(
                 num_blocks=kv_cache_config.num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),
                 hs_dtype=self.dtype,
+                scheduler_config=self.scheduler_config,
+                model_config=self.model_config,
                 kv_cache_groups=getattr(kv_cache_config, "kv_cache_groups", None),
             )
 
