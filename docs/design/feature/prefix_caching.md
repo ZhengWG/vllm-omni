@@ -167,71 +167,33 @@ Finally, we look up the output hidden states/multimodal tensors corresponding to
 
 ### Implementation
 
-The block/slot model above is `vllm_omni/core/prefix_cache/`.
+The block/slot model is `vllm_omni/core/prefix_cache/`.
 `OmniPrefixCacheManager` owns `(slot, key)` occupancy, hit spans, and merge.
-`OmniPrefixCacheController` owns the staging pool, copy queues, and scatter
-into `PrefixBlockPool`. The state lock covers those tables only — never a
-join, a cap flush, or a copy.
+`OmniPrefixCacheController` moves data: a reusable `StagingBufferPool` for
+this step's D2H, and scatter into the durable `PrefixBlockPool`. The state
+lock covers those tables only.
 
-Miss is not an error: a request in this step's snapshot with no hit span gets
-this step's forward slice only. A hit span that resolves to absent slots is
-fatal (`OmniPrefixCacheUnmatchError`). Abort still writes: once a hash entered
+Miss is not an error (this step's forward slice only). A hit span that
+resolves to absent slots is fatal. Abort still writes: once a hash entered
 this step's batch it must land in the cache.
 
-![Class relationships](../figures/omni_prefix_cache_class.svg)
-
-Two host stores, not two caches:
-
-- **`StagingBufferPool`**: reusable step-sized pages. `save_outputs` launches
-  one whole-step D2H here for immediately-cached keys. Per-req `seg.host` is a
-  view into that page.
-- **`PrefixBlockPool`**: durable `(kv_slot, key)` prefix cache. The committer
-  only scatters into it.
-
-`KVCacheGroupView` is the only path into the vLLM block table, and only from
-`new_step_starts` / `save_outputs`. `materialize` uses the save-time snapshot
-and never reads the live `input_batch`.
-
-Schedule is a key split, not a token-count split:
-
-| Schedule | Keys | D2H | Join |
-|---|---|---|---|
-| `JOIN_NEXT_STEP` | hidden + non-deferred mm | launched at save into staging; committer waits `host_event` then H2H-scatters | next `save_outputs` (`host_ready` only) |
-| `JOIN_ON_FINISH` | `deferred_keys` | committer copies the GPU freeze | finish/abort escalate, then the next save; cap may flush earlier |
-
-Staging-page holders (`for_step` / `for_task` / `for_reader`) share one slot.
-The page is free only when none remain. `host_event` is record-once,
-wait-many: `materialize`, the committer, and `fetch_host` all wait it before
-touching a staging view.
-
-A hit span is grouped by the save-time `tid` of each `(slot, key)`:
-committed rows come from `PrefixBlockPool`; in-transit `JOIN_NEXT_STEP` waits
-`host_event` and slices the staging view; in-transit `JOIN_ON_FINISH` uses the
-GPU freeze. Prefetch during `new_step_starts` overlaps the forward;
-`materialize` clones this step's staging views and writes only the tail.
-
-![Per-step sequence](../figures/omni_prefix_cache_step.svg)
+Schedule is a key split: hidden and non-deferred mm use `JOIN_NEXT_STEP`
+(D2H at save, join at the next save); `deferred_keys` use `JOIN_ON_FINISH`
+(committer copies the GPU freeze on finish/abort, or earlier under cap
+pressure).
 
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
-
 cache.new_step_starts(scheduler_output)   # before _update_states
-# ...forward...
-sid = cache.save_outputs(hidden, mm_flat,
-                         num_tokens_unpadded=n, num_tokens_padded=n_pad)
+sid = cache.save_outputs(hidden, mm_flat, num_tokens_unpadded=n,
+                         num_tokens_padded=n_pad)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
 
-`save_outputs` must not hold the state lock across join, D2H, or cap flush.
-Each `sid` is consumed exactly once (`materialize` XOR `discard_step`).
-`req_ids` must be a subset of the save snapshot. Warmup/dummy steps are never
-fed.
-
-Prefix cache and [async Omni output materialization](omni_async_output_materialization.md)
-can run together: the output builder later calls `materialize(sid, req_ids)`
-with the save-time request list, possibly after the engine has entered the
-next step. `_should_use_async_omni_output()` does not disable itself when the
-cache is present.
+Each `sid` is consumed exactly once. `req_ids` must be a subset of the save
+snapshot. `materialize` may run on the async output builder after the engine
+has entered the next step; see
+[Async Omni Output Materialization](omni_async_output_materialization.md).
 
 ### Related Files
 
