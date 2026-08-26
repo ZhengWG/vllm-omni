@@ -9,6 +9,7 @@
 - [High-Level Approach](#high-level-approach)
 - [Example](#example)
 - [What About Multimodal Inputs?](#what-about-multimodal-inputs)
+- [Implementation](#implementation)
 
 ---
 
@@ -162,3 +163,10 @@ Because we have multimodal data in a scheduled span that isn't fully precomputed
 When we pass our multimodal tensors to the language model component in the same stage, we'll then expect the same outputs, because the prefix caching behaviors in vLLM-Omni / vLLM match, so the LLM will use vLLM's KV cache manager's prefix caching to correctly handle the attention information for `Block 1` while calculating the outputs for `Block 2`, giving us the correct results for processing `Block 2` with the context of `Block 1`.
 
 Finally, we look up the output hidden states/multimodal tensors corresponding to the prefix cache hit `Block 1` and concatenate it with the forward pass result to get the final result, which is expected to be identical to the full hidden states when prefix caching is disabled.
+
+### Implementation
+
+The block/slot model above is implemented by `vllm_omni/core/prefix_cache/`.
+Manager/controller split, staging vs durable pool, write schedules, and the
+runner contract (`new_step_starts` / `save_outputs` / `materialize`) are in
+[Omni Prefix Cache Runtime](omni_prefix_cache.md).
