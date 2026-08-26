@@ -1,4 +1,4 @@
-"""Unit tests for vllm_omni/core/tensor_cache (manager + controller + pool).
+"""Unit tests for vllm_omni/core/prefix_cache (manager + controller + pool).
 
 CPU-only: the controller runs in eager mode. Uses a fake group view, so no
 vLLM runtime is required (runnable without a vllm install via
@@ -16,7 +16,7 @@ try:  # pragma: no cover - shim only matters on vllm-less dev machines
     import vllm  # noqa: F401
 except ModuleNotFoundError:
     # Bypass vllm_omni/__init__ (which imports vllm): register namespace
-    # parents so the pure-torch tensor_cache subpackage imports directly.
+    # parents so the pure-torch prefix_cache subpackage imports directly.
     _root = Path(__file__).resolve().parents[2]
     for _pkg in ("vllm_omni", "vllm_omni.core"):
         if _pkg not in sys.modules:
@@ -24,15 +24,15 @@ except ModuleNotFoundError:
             _m.__path__ = [str(_root / _pkg.replace(".", "/"))]
             sys.modules[_pkg] = _m
 
-from vllm_omni.core.tensor_cache.group_view import FullAttentionGroupView
-from vllm_omni.core.tensor_cache.interface import (
-    DEFAULT_RING_DEPTH,
+from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
+from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
+from vllm_omni.core.prefix_cache.interface import (
     HIDDEN_KEY,
     ModelCachePolicy,
-    OmniTensorCacheUnmatchError,
-    TensorCacheConfig,
+    OmniPrefixCacheUnmatchError,
+    PrefixCacheConfig,
 )
-from vllm_omni.core.tensor_cache.manager import OmniTensorCacheManager
+from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -97,12 +97,12 @@ class FakeSchedOut:
         self.num_scheduled_tokens = dict(num_scheduled or {})
 
 
-def make_manager(view=None, policy=None, **cfg_kwargs) -> tuple[OmniTensorCacheManager, FakeView]:
+def make_manager(view=None, policy=None, **cfg_kwargs) -> tuple[OmniPrefixCacheManager, FakeView]:
     view = view or FakeView()
-    config = TensorCacheConfig(
+    config = PrefixCacheConfig(
         num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, hidden_size=HIDDEN, hs_dtype=DTYPE, **cfg_kwargs
     )
-    mgr = OmniTensorCacheManager(config, view, eager=True)
+    mgr = OmniPrefixCacheManager(config, view, eager=True)
     if policy is not None:
         mgr.register_policy(policy)
     return mgr, view
@@ -185,12 +185,12 @@ def test_absent_hit_fails_fast():
     mgr, view = make_manager()
     view.req_blocks["c"] = [5, 6]
     sid = run_step(mgr, view, {"c": ([5, 6, 7], 8, 4)}, new_hits={"c": 8})
-    slot = mgr._step_ctxs[sid].ring_slot
-    with pytest.raises(OmniTensorCacheUnmatchError):
+    d2h = mgr._step_ctxs[sid].d2h
+    with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.materialize(sid, ["c"])
-    # Fail-fast after take_ctx must still drop the step token.
-    if slot is not None:
-        assert not mgr._controller._ring._busy[slot]
+    # Fail-fast after take_ctx must still drop the step holder.
+    if d2h is not None:
+        assert not mgr._controller._staging_pool._busy[d2h.slot]
 
 
 def test_hit_not_block_aligned_asserts():
@@ -478,17 +478,18 @@ def test_step_context_exactly_once():
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"a": ([0], 0, 4)})
     mgr.materialize(sid, ["a"])
-    with pytest.raises(OmniTensorCacheUnmatchError):
+    with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.materialize(sid, ["a"])
-    with pytest.raises(OmniTensorCacheUnmatchError):
+    with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.discard_step(sid)
 
 
 def test_unconsumed_contexts_overflow_fails_fast():
     """A runner that leaks step contexts (never materialize/discard) must be
-    caught at save time, not silently dropped."""
+    caught at save time, not silently dropped. Row-bearing steps fill the
+    staging pool first (same error type)."""
     mgr, view = make_manager()
-    with pytest.raises(OmniTensorCacheUnmatchError):
+    with pytest.raises(OmniPrefixCacheUnmatchError):
         for pos in range(8):
             run_step(mgr, view, {"a": ([0, 1, 2, 3], pos, 1)})
 
@@ -502,7 +503,7 @@ def test_save_slot_mismatch_fails_fast():
     view.computed["a"] = 0
     mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": 2}))
     hidden = torch.zeros(4, HIDDEN, dtype=DTYPE)
-    with pytest.raises(OmniTensorCacheUnmatchError):
+    with pytest.raises(OmniPrefixCacheUnmatchError):
         # num_scheduled says 2 tokens but we claim 4 were produced.
         mgr.save_outputs(hidden, {}, num_tokens_unpadded=4, num_tokens_padded=4)
 
@@ -523,7 +524,7 @@ def test_materialize_unknown_step_id_fails_fast():
     a sid), never a degrade path."""
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"a": ([0], 0, 4)})
-    with pytest.raises(OmniTensorCacheUnmatchError):
+    with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.materialize(sid + 999, ["ghost"])
     mgr.discard_step(sid)
 
@@ -532,18 +533,18 @@ def test_fetch_host_fast_path_matches_general_path():
     """Single-segment fetch matches the general path for this-step identity,
     a shorter prefix hit, and a gapped subsequence (some slots already
     in the mirror). Hit/save order is increasing; no shuffle."""
-    from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
-    from vllm_omni.core.tensor_cache.controller import (
-        OmniTensorCacheController,
+    from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
+    from vllm_omni.core.prefix_cache.controller import (
+        OmniPrefixCacheController,
         WriteTask,
         _Segment,
     )
-    from vllm_omni.core.tensor_cache.interface import HIDDEN_KEY, WriteSchedule
+    from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, WriteSchedule
 
-    cfg = TensorCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, hidden_size=HIDDEN, hs_dtype=DTYPE)
-    pool = TensorBlockPool(cfg)
+    cfg = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, hidden_size=HIDDEN, hs_dtype=DTYPE)
+    pool = PrefixBlockPool(cfg)
     pool.ensure_key(HIDDEN_KEY, DTYPE, HIDDEN)
-    ctrl = OmniTensorCacheController(pool, cfg, eager=True)
+    ctrl = OmniPrefixCacheController(pool, cfg, eager=True)
 
     # In-order rows well inside the pool (NUM_BLOCKS * BLOCK_SIZE = 64).
     slots = torch.tensor([40, 41, 42, 43, 44], dtype=torch.int64)
@@ -565,6 +566,49 @@ def test_fetch_host_fast_path_matches_general_path():
         assert torch.equal(fast, general), (want, fast, general)
         expect = torch.stack([rows[(slots == s).nonzero()[0, 0]] for s in want.tolist()])
         assert torch.equal(fast, expect)
+
+
+def test_fetch_host_waits_staging_host_event():
+    """JOIN_NEXT_STEP hangs seg.host as a staging view at save; D2H may
+    still be in flight. fetch_host must wait host_event before slicing."""
+    from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
+    from vllm_omni.core.prefix_cache.controller import (
+        OmniPrefixCacheController,
+        WriteTask,
+        _Segment,
+    )
+    from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, WriteSchedule
+
+    cfg = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, hidden_size=HIDDEN, hs_dtype=DTYPE)
+    pool = PrefixBlockPool(cfg)
+    ctrl = OmniPrefixCacheController(pool, cfg, eager=True)
+
+    slots = torch.tensor([0, 1, 2], dtype=torch.int64)
+    src = torch.arange(3 * HIDDEN, dtype=DTYPE).reshape(3, HIDDEN)
+    landing = torch.zeros_like(src)
+
+    class _HostEvent:
+        n = 0
+
+        def synchronize(self):
+            self.n += 1
+            landing.copy_(src)
+
+    event = _HostEvent()
+    seg = _Segment(slots_cpu=slots, tensors={HIDDEN_KEY: src})
+    seg.host = {HIDDEN_KEY: landing}
+    task = WriteTask(
+        tid=1,
+        req_id="r",
+        write_n=1,
+        schedule=WriteSchedule.JOIN_NEXT_STEP,
+        segments=[seg],
+        staging_slot=0,
+        host_event=event,
+    )
+    rows = ctrl.fetch_host(task, slots, HIDDEN_KEY)
+    assert event.n == 1
+    assert torch.equal(rows, src)
 
 
 def test_mm_hit_span_never_registered_serves_mirror_baseline():
@@ -605,7 +649,7 @@ def test_mm_in_transit_unresolvable_fails_fast():
     tid = mgr._deferred_tasks["a"].tid
     mgr._controller._tasks.pop(tid)
     s2 = run_step(mgr, view, {"b": ([0, 1], 4, 2)}, new_hits={"b": 4}, mm={"k": torch.full((2, 2), 9.0)})
-    with pytest.raises(OmniTensorCacheUnmatchError):
+    with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.materialize(s2, ["b"])
 
 
@@ -653,8 +697,8 @@ def test_failed_write_fails_fast_at_next_facade_entry():
     sid = run_step(mgr, view, {"a": ([0], 0, 4)})
     mgr.materialize(sid, ["a"])
     # Simulate a committer failure on a still-registered entry.
-    from vllm_omni.core.tensor_cache.controller import WriteTask, _Segment
-    from vllm_omni.core.tensor_cache.interface import WriteSchedule
+    from vllm_omni.core.prefix_cache.controller import WriteTask, _Segment
+    from vllm_omni.core.prefix_cache.interface import WriteSchedule
 
     task = WriteTask(
         tid=999,
@@ -665,27 +709,24 @@ def test_failed_write_fails_fast_at_next_facade_entry():
     )
     mgr._controller._tasks[999] = task
     mgr._controller._fail_task(999)
-    with pytest.raises(OmniTensorCacheUnmatchError, match="write failed"):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
         run_step(mgr, view, {"a": ([0, 1], 4, 1)})
 
 
-def test_per_request_task_schedule_split():
-    """One save produces one WriteTask per request; the schedule is
-    per-request (prefill rows -> JOIN_ON_FINISH lazy trickle, decode rows ->
-    JOIN_NEXT_STEP). Size split applies to ring-bypassed steps (capacity 4
-    forces the bypass here); ring tasks always JOIN_NEXT_STEP."""
-    mgr, view = make_manager(join_on_finish_min_tokens=4, ring_capacity_tokens=4)
+def test_per_request_staging_writes_join_next_step():
+    """One save produces one WriteTask per request; staging D2H is already
+    in flight, so every queued write is JOIN_NEXT_STEP."""
+    mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})
-    ctx = mgr._step_ctxs[sid]
-    tp = mgr._controller.get_task(ctx.task_ids["p"])
-    td = mgr._controller.get_task(ctx.task_ids["d"])
+    tp = mgr._controller.get_task(next(iter(mgr._req_tasks["p"])))
+    td = mgr._controller.get_task(next(iter(mgr._req_tasks["d"])))
     assert tp is not None and td is not None
-    from vllm_omni.core.tensor_cache.interface import WriteSchedule
+    from vllm_omni.core.prefix_cache.interface import WriteSchedule
 
-    assert (tp.schedule, td.schedule) == (WriteSchedule.JOIN_ON_FINISH, WriteSchedule.JOIN_NEXT_STEP)
+    assert tp.schedule is WriteSchedule.JOIN_NEXT_STEP
+    assert td.schedule is WriteSchedule.JOIN_NEXT_STEP
     assert (tp.req_id, td.req_id) == ("p", "d")
-    # Only the JOIN_NEXT_STEP task is joined at the next save.
-    assert mgr._join_next_step_tids == [td.tid]
+    assert mgr._join_next_step_tids == [tp.tid, td.tid]
     outs = mgr.materialize(sid, ["p", "d"])
     assert torch.equal(outs.hidden_states["p"], expected_rows(view.slots_for("p", 0, 8)))
     assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))
@@ -696,39 +737,37 @@ def test_ring_step_prefills_task_host_and_recycles():
     and slots recycle safely across > depth steps without cross-step
     corruption (outputs are copied out of the reusable slot)."""
     mgr, view = make_manager()
-    for i in range(6):  # > ring_depth(4): forces slot reuse
+    for i in range(6):  # > staging_depth(4): forces slot reuse
         sid = run_step(mgr, view, {"a": ([i % 8, (i % 8) + 8], i, 1)})
         ctx = mgr._step_ctxs[sid]
-        assert ctx.host_views is not None and ctx.ring_slot is not None
+        assert ctx.d2h is not None
         expect = expected_rows(view.slots_for("a", i, i + 1))  # capture per step
         outs = mgr.materialize(sid, ["a"])
         assert torch.equal(outs.hidden_states["a"], expect), i
 
 
-def test_ring_bypass_for_oversized_step():
-    """Steps larger than ring capacity fall back to the per-task copy path."""
-    mgr, view = make_manager(ring_capacity_tokens=4)
-    sid = run_step(mgr, view, {"a": ([0, 1], 0, 8)})  # 8 > 4
-    ctx = mgr._step_ctxs[sid]
-    assert ctx.host_views is None and ctx.ring_slot is None
-    outs = mgr.materialize(sid, ["a"])
-    assert torch.equal(outs.hidden_states["a"], expected_rows(view.slots_for("a", 0, 8)))
+def test_oversized_step_fails_fast():
+    """A step larger than staging capacity is a config/contract error."""
+    mgr, view = make_manager(staging_capacity_tokens=4)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="staging capacity is 4"):
+        run_step(mgr, view, {"a": ([0, 1], 0, 8)})  # 8 > 4
 
 
 def test_ring_task_never_defers_and_slot_held_until_drain():
     """A ring task's D2H is already in flight -> always JOIN_NEXT_STEP, and
     its slot token survives the (eager, inline) scatter until the manager
     drains the completion — the window hit readers pin on."""
-    from vllm_omni.core.tensor_cache.interface import WriteSchedule
+    from vllm_omni.core.prefix_cache.interface import WriteSchedule
 
     mgr, view = make_manager(join_on_finish_min_tokens=4)
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
     ctx = mgr._step_ctxs[sid]
-    tid = ctx.task_ids["p"]
+    tid = next(iter(mgr._req_tasks["p"]))
+    assert ctx.d2h is not None
     assert mgr._controller.get_task(tid).schedule is WriteSchedule.JOIN_NEXT_STEP
-    busy = mgr._controller._ring._busy[ctx.ring_slot]
-    assert ("t", tid) in busy and ("s", sid) in busy
-    mgr.materialize(sid, ["p"])  # drain releases ("t", tid); consume releases ("s", sid)
+    busy = mgr._controller._staging_pool._busy[ctx.d2h.slot]
+    assert StagingBufferHolder.for_task(tid) in busy and StagingBufferHolder.for_step(sid) in busy
+    mgr.materialize(sid, ["p"])  # drain releases the task holder; consume releases the step holder
     assert not busy
 
 
@@ -766,53 +805,53 @@ def test_ring_slot_released_on_no_consumer_early_return():
     token, or the ring leaks a slot per step and exhausts."""
     policy = ModelCachePolicy(needs_full_hidden_states=False)
     mgr, view = make_manager(policy=policy)
-    for i in range(6):  # > ring_depth(4): leak would exhaust and bypass
+    for i in range(6):  # > staging_depth(4): leak would exhaust and fail-fast
         sid = run_step(mgr, view, {"a": ([i % 8, (i % 8) + 8], i, 1)}, mm={"k": torch.full((1, 2), float(i))})
         ctx = mgr._step_ctxs[sid]
-        assert ctx.ring_slot is not None, i
+        assert ctx.d2h is not None, i
         mgr.materialize(sid, ["a"])
-        assert not mgr._controller._ring._busy[ctx.ring_slot], i
+        assert not mgr._controller._staging_pool._busy[ctx.d2h.slot], i
 
 
-def test_save_releases_ring_if_apply_completions_fails():
-    """Claim happens outside the lock; a later fail-fast must drop ("s", ...)."""
-    mgr, view = make_manager(ring_depth=2)
+def test_save_releases_ring_if_commit_drained_writes_fails():
+    """Claim happens outside the lock; a later fail-fast must drop the step holder."""
+    mgr, view = make_manager(staging_depth=2)
     calls = {"n": 0}
-    real = mgr._apply_completions
+    real = mgr._commit_drained_writes
 
     def wrapped():
         calls["n"] += 1
         if calls["n"] == 2:
-            raise OmniTensorCacheUnmatchError("injected fail")
+            raise OmniPrefixCacheUnmatchError("injected fail")
         return real()
 
-    mgr._apply_completions = wrapped
-    with pytest.raises(OmniTensorCacheUnmatchError, match="injected fail"):
+    mgr._commit_drained_writes = wrapped
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="injected fail"):
         run_step(mgr, view, {"a": ([0], 0, 4)})
-    assert all(not busy for busy in mgr._controller._ring._busy)
-    mgr._apply_completions = real
+    assert all(not busy for busy in mgr._controller._staging_pool._busy)
+    mgr._commit_drained_writes = real
     sid = run_step(mgr, view, {"a": ([0], 0, 4)})
-    assert mgr._step_ctxs[sid].ring_slot is not None
+    assert mgr._step_ctxs[sid].d2h is not None
     mgr.materialize(sid, ["a"])
 
 
 def test_from_vllm_config_uses_batched_tokens():
     from types import SimpleNamespace
 
-    cfg = TensorCacheConfig.from_vllm_config(
+    cfg = PrefixCacheConfig.from_vllm_config(
         num_blocks=NUM_BLOCKS,
         block_size=BLOCK_SIZE,
         hidden_size=HIDDEN,
         hs_dtype=DTYPE,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=8192, max_model_len=32768, max_num_seqs=64),
     )
-    assert cfg.ring_capacity_tokens == 8192
-    assert cfg.ring_depth == DEFAULT_RING_DEPTH
-    cfg_fallback = TensorCacheConfig.from_vllm_config(
+    assert cfg.staging_capacity_tokens == 8192
+    assert cfg.staging_depth == 4
+    cfg_fallback = PrefixCacheConfig.from_vllm_config(
         num_blocks=NUM_BLOCKS,
         block_size=BLOCK_SIZE,
         hidden_size=HIDDEN,
         hs_dtype=DTYPE,
         scheduler_config=SimpleNamespace(max_num_batched_tokens=None, max_model_len=4096),
     )
-    assert cfg_fallback.ring_capacity_tokens == 4096
+    assert cfg_fallback.staging_capacity_tokens == 4096

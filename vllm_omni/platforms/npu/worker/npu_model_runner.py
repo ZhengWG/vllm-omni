@@ -42,12 +42,12 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             # deepcopies the config it was handed, so the value it stored is the
             # authoritative one, not our caller's argument.
             num_blocks = self.kv_cache_config.num_blocks
-            from vllm_omni.core.tensor_cache.interface import TensorCacheConfig
+            from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 
             # Controller runs in eager mode on NPU (no CUDA streams:
             # submit() completes the copy+scatter synchronously). Built once
             # on the first step via the inherited _ensure_omni_prefix_cache.
-            self._omni_prefix_cache_cfg = TensorCacheConfig.from_vllm_config(
+            self._omni_prefix_cache_cfg = PrefixCacheConfig.from_vllm_config(
                 num_blocks=num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),

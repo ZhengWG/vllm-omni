@@ -1,4 +1,4 @@
-"""TensorBlockPool: pinned CPU block mirror (mirrors vLLM BlockPool).
+"""PrefixBlockPool: pinned CPU block mirror (mirrors vLLM BlockPool).
 
 Storage is (num_blocks, block_size, feat) per key, viewed flat as
 (num_slots, feat) so vLLM slot ids index rows directly. Write access is
@@ -9,13 +9,13 @@ import logging
 
 import torch
 
-from vllm_omni.core.tensor_cache.interface import TensorCacheConfig
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 
 logger = logging.getLogger(__name__)
 
 
-class TensorBlockPool:
-    def __init__(self, config: TensorCacheConfig):
+class PrefixBlockPool:
+    def __init__(self, config: PrefixCacheConfig):
         self._config = config
         self.num_slots = config.num_blocks * config.block_size
         self._caches: dict[str, torch.Tensor] = {}
@@ -34,7 +34,7 @@ class TensorBlockPool:
         if key in self._caches:
             return
         self._caches[key] = self._alloc(dtype, feat)
-        logger.info("tensor_cache: initialized mirror %s for key %s", list(self._caches[key].shape), key)
+        logger.info("prefix_cache: initialized mirror %s for key %s", list(self._caches[key].shape), key)
 
     def has_key(self, key: str) -> bool:
         return key in self._caches

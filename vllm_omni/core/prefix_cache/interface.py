@@ -1,7 +1,6 @@
-"""Interface types for the omni tensor cache.
+"""Interface types for the omni prefix cache.
 
-Naming aligns with vLLM's v1/core KV-cache design; see
-rfc-omni-tensor-cache-refactor.md for the full contract.
+Naming aligns with vLLM's v1/core KV-cache design.
 """
 
 from dataclasses import dataclass, field
@@ -17,15 +16,16 @@ HIDDEN_KEY = "__hidden_states__"
 class WriteSchedule(Enum):
     """Write scheduling policy for one WriteTask."""
 
-    # Copied every step; completion joined at the NEXT step's save.
+    # Immediately-cached keys: D2H launched at save into the staging
+    # pool; committer waits that event and scatters. Joined at the next save.
     JOIN_NEXT_STEP = "join_next_step"
-    # Background trickle; escalated & joined when the request finishes
+    # Deferred mm: committer D2H + scatter. Escalated on finish/abort
     # (cap pressure may spill it earlier).
     JOIN_ON_FINISH = "join_on_finish"
 
 
 @dataclass(frozen=True)
-class TensorCacheConfig:
+class PrefixCacheConfig:
     """Sizing and flow-control knobs (mirrors KVCacheConfig)."""
 
     num_blocks: int
@@ -37,12 +37,10 @@ class TensorCacheConfig:
     # Tasks covering more than this many tokens use JOIN_ON_FINISH;
     # smaller ones use JOIN_NEXT_STEP.
     join_on_finish_min_tokens: int = 256
-    # Step host ring: Temporarily buffers D2H (device-to-host) data for the entire step phase.
-    # Each slot holds data for one step (not per request).
-    # It is recommended to use from_vllm_config to automatically set ring_capacity_tokens
-    # to match max_num_batched_tokens.
-    ring_depth: int = 4
-    ring_capacity_tokens: int = 1024
+    # D2H staging: circular slots, one whole step each (not per request).
+    # Prefer from_vllm_config so staging_capacity_tokens tracks max_num_batched_tokens.
+    staging_depth: int = 4
+    staging_capacity_tokens: int = 1024
     # D2H chunk size for the JOIN_ON_FINISH trickle.
     copy_chunk_bytes: int = 16 * 1024 * 1024
     # vLLM kv-cache groups (KVCacheGroupSpec list); the group-view factory
@@ -61,12 +59,12 @@ class TensorCacheConfig:
         scheduler_config: Any = None,
         model_config: Any = None,
         kv_cache_groups: Any = None,
-    ) -> "TensorCacheConfig":
-        """Size the step-host ring from the running scheduler.
+    ) -> "PrefixCacheConfig":
+        """Size D2H staging from the running scheduler.
 
         A slot holds one *step* (the whole batch), not one request:
-        ``ring_capacity_tokens`` is ``max_num_batched_tokens`` (falls back
-        to ``max_model_len``); ``ring_depth`` is the in-flight step bound,
+        ``staging_capacity_tokens`` is ``max_num_batched_tokens`` (falls back
+        to ``max_model_len``); ``staging_depth`` is the in-flight step bound,
         not ``max_num_seqs``.
         """
         batched = getattr(scheduler_config, "max_num_batched_tokens", None)
@@ -82,8 +80,8 @@ class TensorCacheConfig:
             block_size=block_size,
             hidden_size=hidden_size,
             hs_dtype=hs_dtype,
-            ring_depth=4,
-            ring_capacity_tokens=max(1, capacity),
+            staging_depth=4,
+            staging_capacity_tokens=max(1, capacity),
             kv_cache_groups=kv_cache_groups,
         )
 
@@ -97,7 +95,7 @@ class StageCacheOutputs(NamedTuple):
     mm_outputs: dict[str, dict[str, Any]]
 
 
-class OmniTensorCacheUnmatchError(RuntimeError):
+class OmniPrefixCacheUnmatchError(RuntimeError):
     """A hit span resolved to absent slots: omni cache diverged from vLLM KV
     state. Fail-fast — this must never fire in a correct system."""
 

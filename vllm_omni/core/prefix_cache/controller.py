@@ -1,25 +1,65 @@
-"""Runs WriteTasks: GPU-stage, host copy, scatter into the CPU block pool.
+"""Runs WriteTasks and the step D2H staging pool.
 
 The manager owns request/slot identity and when to submit. This class
-owns the queues, the staging-byte cap, and the single committer that
-writes the pool.
+owns the staging pool, the GPU-byte cap, the copy queues, and the
+single committer that scatters into the CPU block pool.
 
-Async: hi/lo copy queues, then scatter.
-Eager: submit() does both inline (CPU tests / no CUDA).
+Two D2H paths — there is no per-task `publish_host` on the step path:
+
+    JOIN_NEXT_STEP   save already launched a whole-step D2H into a
+                     staging slot and hung `seg.host` as views.
+                     Committer waits that `host_event`, then scatters.
+    JOIN_ON_FINISH   committer copies GPU freeze → owned host tensors,
+                     then scatters.
+
+Async: hi/lo queues, then scatter.
+Eager: submit() does wait+scatter inline (CPU tests / no CUDA).
 """
+
+from __future__ import annotations
 
 import logging
 import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
+from typing import Literal, NamedTuple
 
 import torch
 
-from vllm_omni.core.tensor_cache.block_pool import TensorBlockPool
-from vllm_omni.core.tensor_cache.interface import TensorCacheConfig, WriteSchedule
+from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
+from vllm_omni.core.prefix_cache.interface import (
+    OmniPrefixCacheUnmatchError,
+    PrefixCacheConfig,
+    WriteSchedule,
+)
 
 logger = logging.getLogger(__name__)
+
+
+class StagingBufferHolder(NamedTuple):
+    """One holder of a D2H staging-buffer slot. The slot is free when none remain.
+
+    Not a buffer state — concurrent owners share the same slot:
+    - step: claimed at save, released when materialize/discard consumes the ctx
+    - task: bound before WriteTask submit, released when that tid drains
+    - reader: hit prefetch/plan, released after the unlocked copy-out
+    """
+
+    kind: Literal["step", "task", "reader"]
+    owner_id: int
+
+    @classmethod
+    def for_step(cls, step_id: int) -> StagingBufferHolder:
+        return cls("step", step_id)
+
+    @classmethod
+    def for_task(cls, tid: int) -> StagingBufferHolder:
+        return cls("task", tid)
+
+    @classmethod
+    def for_reader(cls, seq: int) -> StagingBufferHolder:
+        return cls("reader", seq)
 
 
 @dataclass
@@ -28,6 +68,9 @@ class _Segment:
 
     slots_cpu: torch.Tensor  # int64 flat row ids, in token order
     tensors: dict[str, torch.Tensor]  # frozen (GPU) or eager CPU tensors
+    # JOIN_NEXT_STEP: view into the staging page, hung at save (D2H may
+    # still be in flight; wait `host_event`). JOIN_ON_FINISH: owned CPU
+    # tensor written by the committer after its D2H.
     host: dict[str, torch.Tensor] = field(default_factory=dict)
 
 
@@ -43,9 +86,15 @@ class WriteTask:
 
         queued / GPU-staged
             -> copy claimed (`d2h_claimed`)
-            -> `host_ready`  (host published; GPU refs may drop)
+            -> `host_ready`  (D2H complete; GPU freeze refs may drop)
             -> scatter
             -> `done`        (in the CPU mirror; `failed` instead on error)
+
+    How `host_ready` is reached:
+    - JOIN_NEXT_STEP: `seg.host` is a staging view hung at save.
+      `_copy_task` only waits `host_event` (does not write host).
+    - JOIN_ON_FINISH: committer D2H writes owned tensors into
+      `seg.host`, then sets `host_ready`.
 
     `JOIN_NEXT_STEP` starts on the hi copy queue and is joined at the
     next save (`host_ready` only). `JOIN_ON_FINISH` stays on the lo
@@ -54,8 +103,10 @@ class WriteTask:
     unfinished task with the oldest `enqueued_time`.
 
     Concurrent readers/writers:
-    - Copy: `publish_host` and the committer race `d2h_claimed`;
-      only the winner publishes `seg.host`.
+    - Staging readers (materialize clone, fetch_host, committer scatter)
+      all wait the same `host_event` before touching the view.
+      `d2h_claimed` is the single-claimer so only one `_copy_task`
+      runs; it does not publish host on this path.
     - Remount: a later task taking the same (slot, key) pushes those
       rows into `skip`; the old scatter omits them so the two writes
       stay disjoint (no join edge).
@@ -77,15 +128,17 @@ class WriteTask:
     nbytes: int = 0  # GPU-staging cap accounting only; not a correctness signal
     # Promoted from the lazy queue onto the hi queue (finish / cap). Once.
     escalated: bool = False
-    # Single publisher for the host copy: publish_host and the
-    # committer D2H race this; only the winner may write `seg.host`.
+    # Single claimer for the copy stage. Staging: wait `host_event`.
+    # Deferred: committer writes `seg.host`. Not a host publisher on
+    # the staging path.
     d2h_claimed: bool = False
     # Committer could not land the write; manager fail-fasts on next entry.
     failed: bool = False
     # (slot, key) pairs reassigned to a newer task: the scatter skips them,
     # making old and new mirror writes disjoint (no ordering edges needed).
     skip: dict[str, torch.Tensor] = field(default_factory=dict)
-    # Host copy published; GPU refs may drop; join_copied can return.
+    # D2H complete (staging event done, or deferred host tensors written).
+    # GPU freeze refs may drop; join_host_ready can return.
     host_ready: threading.Event = field(default_factory=threading.Event)
     # Scatter into the CPU mirror has finished (strictly after host_ready).
     done: threading.Event = field(default_factory=threading.Event)
@@ -93,8 +146,8 @@ class WriteTask:
     lock: threading.Lock = field(default_factory=threading.Lock)
     # time.monotonic() at submit; cap flush picks the smallest of these.
     enqueued_time: float = field(default_factory=time.monotonic)
-    # uses ring views and a shared D2H (host_event) instead of per-task copies.
-    ring_slot: int | None = None
+    # uses staging views and a shared D2H (host_event) instead of per-task copies.
+    staging_slot: int | None = None
     host_event: object | None = None  # torch.cuda.Event of the step D2H
     # slot -> (which segment, row in that segment's tensor). Built on demand
     # for multi-segment tasks; scatter uses slot, the tensor uses row.
@@ -124,24 +177,26 @@ class WriteTask:
         return self._slot_to_row
 
 
-class _StepHostRing:
-    """Pinned host staging for whole-step rows, written by ONE async D2H per
-    step at save time (launched early, on the copy stream). Per-task host
-    buffers become row-range views into a slot, so the committer skips its
-    per-task D2H and every later fetch is sync-free.
+class StagingBufferPool:
+    """Reusable pinned landing zone for ONE whole-step D2H at save.
 
-    A slot is busy while any token holds it: one per WriteTask (freed when
-    the manager drains its completion), one for the step context (freed when
-    materialize/discard consumes it), plus transient reader pins for hit
-    fetches that run unlocked. No free slot means the step falls back to
-    per-task copies.
+    Per-task `seg.host` is a row-range view into a slot, so the committer
+    skips per-task D2H. Readers (materialize, committer, fetch_host) all
+    wait the same `host_event` before touching the view. Slots recycle;
+    this is not the CPU block pool.
+
+    A slot is busy while any StagingBufferHolder is in `_busy`: one per
+    WriteTask (freed when the manager drains its completion), one for the
+    step context (freed when materialize/discard consumes it), plus
+    transient reader holders for hit fetches that run unlocked. No free
+    slot is a contract break (fail-fast), not a second D2H path.
     """
 
     def __init__(self, depth: int, capacity: int):
         self.depth = depth
-        self.capacity = capacity  # rows per slot; larger steps bypass the ring
+        self.capacity = capacity  # rows per slot; a larger step fails fast
         self._bufs: dict[str, torch.Tensor] = {}  # key -> [depth*capacity, width]
-        self._busy: list[set[object]] = [set() for _ in range(depth)]
+        self._busy: list[set[StagingBufferHolder]] = [set() for _ in range(depth)]
         self._lock = threading.Lock()
 
     def _buf(self, key: str, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
@@ -151,30 +206,35 @@ class _StepHostRing:
             self._bufs[key] = buf
         return buf
 
-    def try_claim(self, token: object) -> int | None:
-        """Grab a free slot for `token` (the step token); None if all busy."""
+    def try_claim(self, holder: StagingBufferHolder) -> int | None:
+        """Grab a free slot for `holder` (the step holder); None if all busy."""
         with self._lock:
             for slot in range(self.depth):
                 if not self._busy[slot]:
-                    self._busy[slot].add(token)
+                    self._busy[slot].add(holder)
                     return slot
         return None
 
-    def bind(self, slot: int, token: object) -> None:
+    def bind(self, slot: int, holder: StagingBufferHolder) -> None:
         with self._lock:
-            self._busy[slot].add(token)
+            self._busy[slot].add(holder)
 
-    def release(self, slot: int, token: object) -> None:
+    def release(self, slot: int, holder: StagingBufferHolder) -> None:
         with self._lock:
-            self._busy[slot].discard(token)
+            self._busy[slot].discard(holder)
 
     def views(self, slot: int, key: str, n: int, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
         base = slot * self.capacity
         return self._buf(key, width, dtype, pin)[base : base + n]
 
 
-class OmniTensorCacheController:
-    def __init__(self, pool: TensorBlockPool, config: TensorCacheConfig, eager: bool | None = None):
+class OmniPrefixCacheController:
+    """Staging pool + committer. Step D2H is launched at save; this
+    thread waits that event (JOIN_NEXT_STEP) or copies deferred rows
+    (JOIN_ON_FINISH), then scatters into the CPU pool.
+    """
+
+    def __init__(self, pool: PrefixBlockPool, config: PrefixCacheConfig, eager: bool | None = None):
         self._pool = pool
         self._config = config
         self._eager = (not torch.cuda.is_available()) if eager is None else eager
@@ -191,40 +251,43 @@ class OmniTensorCacheController:
         self._copy_stream: torch.cuda.Stream | None = None
         self._read_stream: torch.cuda.Stream | None = None
         self._worker: threading.Thread | None = None
-        self._ring = _StepHostRing(config.ring_depth, config.ring_capacity_tokens)
+        self._staging_pool = StagingBufferPool(config.staging_depth, config.staging_capacity_tokens)
         if not self._eager:
             self._copy_stream = torch.cuda.Stream()
             self._read_stream = torch.cuda.Stream()
             self._worker = threading.Thread(target=self._worker_loop, name="omni-tensor-cache-committer", daemon=True)
             self._worker.start()
 
-    # --------------------------------------------------------- step host ring
+    # --------------------------------------------------------- step D2H staging
 
     def stage_step_host(
-        self, tensors: dict[str, torch.Tensor], n: int, freeze_event: object | None, step_token: object
+        self, tensors: dict[str, torch.Tensor], n: int, freeze_event: object | None, step_holder: StagingBufferHolder
     ) -> tuple[int, dict[str, torch.Tensor], object | None] | None:
-        """Launch ONE whole-step D2H into a ring slot, ahead of consumption.
+        """Launch ONE whole-step D2H into a staging slot, ahead of consumption.
 
         Returns (slot, key -> host view of rows [0:n), d2h event) or None
-        when the step bypasses the ring (too large, or no rows). The caller
-        binds task tokens after submit; `step_token` is released by
-        materialize/discard via ring_release.
+        when there are no rows. Too large a step, or no free slot, is a
+        contract break — not a second D2H path. The caller binds task
+        holders after submit; `step_holder` is released by
+        materialize/discard via staging_release.
         """
-        if not tensors or n <= 0 or n > self._ring.capacity:
+        if not tensors or n <= 0:
             return None
-        slot = self._ring.try_claim(step_token)
+        if n > self._staging_pool.capacity:
+            raise OmniPrefixCacheUnmatchError(
+                f"step has {n} tokens; staging capacity is {self._staging_pool.capacity} "
+                "(size staging_capacity_tokens to max_num_batched_tokens)"
+            )
+        slot = self._staging_pool.try_claim(step_holder)
         if slot is None:
-            # All slots busy: consume-exactly-once bounds this to pathological
-            # lag; fall back to the per-task copy path rather than blocking.
-            logger.warning("omni prefix cache: step host ring exhausted; falling back to per-task copies")
-            return None
+            raise OmniPrefixCacheUnmatchError("D2H staging pool exhausted; unconsumed steps or leaked holders")
         try:
             pin = not self._eager
             views: dict[str, torch.Tensor] = {}
             event: object | None = None
             if self._eager or all(t.device.type == "cpu" for t in tensors.values()):
                 for key, src in tensors.items():
-                    v = self._ring.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
+                    v = self._staging_pool.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
                     v.copy_(src)
                     views[key] = v
             else:
@@ -233,21 +296,21 @@ class OmniTensorCacheController:
                     if freeze_event is not None:
                         self._copy_stream.wait_event(freeze_event)
                     for key, src in tensors.items():
-                        v = self._ring.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
+                        v = self._staging_pool.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
                         v.copy_(src, non_blocking=True)
                         views[key] = v
                     event = torch.cuda.Event()
                     event.record()
             return slot, views, event
         except Exception:
-            self._ring.release(slot, step_token)
+            self._staging_pool.release(slot, step_holder)
             raise
 
-    def ring_bind(self, slot: int, token: object) -> None:
-        self._ring.bind(slot, token)
+    def staging_bind(self, slot: int, holder: StagingBufferHolder) -> None:
+        self._staging_pool.bind(slot, holder)
 
-    def ring_release(self, slot: int, token: object) -> None:
-        self._ring.release(slot, token)
+    def staging_release(self, slot: int, holder: StagingBufferHolder) -> None:
+        self._staging_pool.release(slot, holder)
 
     # ------------------------------------------------------------------ submit
 
@@ -343,7 +406,11 @@ class OmniTensorCacheController:
                 task.done.wait()
 
     def join_host_ready(self, tids: list[int]) -> None:
-        """Block until each task's host copy is published."""
+        """Block until each task's D2H is complete (`host_ready`).
+
+        Staging: committer has waited `host_event`. Deferred: committer
+        has written `seg.host`. Does not wait scatter.
+        """
         for tid in tids:
             task = self._tasks.get(tid)
             if task is not None:
@@ -352,9 +419,9 @@ class OmniTensorCacheController:
     def drain_completed(self) -> list[int]:
         """Pop scattered tasks from `_completed` and drop them from `_tasks`.
 
-        Ring task tokens release HERE — the same locked drain that flips
+        WriteTask holders release HERE — the same locked drain that flips
         state to committed — not at scatter: a hit plan that still sees rows
-        in-transit must be able to pin the slot before it is reclaimable.
+        in-transit must be able to hold the slot before it is reclaimable.
         """
         out: list[int] = []
         with self._lock:
@@ -362,8 +429,8 @@ class OmniTensorCacheController:
                 out.append(self._completed.popleft())
             tasks = [self._tasks.pop(tid, None) for tid in out]
         for task in tasks:
-            if task is not None and task.ring_slot is not None:
-                self._ring.release(task.ring_slot, ("t", task.tid))
+            if task is not None and task.staging_slot is not None:
+                self._staging_pool.release(task.staging_slot, StagingBufferHolder.for_task(task.tid))
         return out
 
     def drain_failed(self) -> list[int]:
@@ -390,8 +457,15 @@ class OmniTensorCacheController:
     def fetch_host(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
         """Rows for `slots` of one in-flight task.
 
-        Host copy if published; otherwise slice sync D2H on the read stream.
+        JOIN_NEXT_STEP hangs `seg.host` as a staging view at save, before
+        D2H finishes. Wait that step's `host_event` (same event materialize
+        and the committer wait; record-once, wait-many) so a prefetch
+        cannot slice a half-written page. No `host_event` means either
+        eager (copy already done) or deferred (empty host falls through
+        to a sync D2H from the GPU freeze).
         """
+        if task.host_event is not None:
+            task.host_event.synchronize()
         if len(task.segments) == 1:
             return self._rows_single_segment(task, slots, key)
         s2r = task.slot_to_row()
@@ -409,8 +483,9 @@ class OmniTensorCacheController:
             pos += 1
         for si, items in seg_groups.items():
             seg = task.segments[si]
-            # host[k] is published only after D2H; else the freeze. (`or`
-            # would bool() a Tensor and raise.)
+            # Staging: host[k] is a view hung at save (waited above).
+            # Deferred: host[k] is set only after the committer D2H; else
+            # the GPU freeze. (`or` would bool() a Tensor and raise.)
             src = seg.host.get(key)
             if src is None:
                 src = seg.tensors.get(key)
@@ -430,8 +505,9 @@ class OmniTensorCacheController:
     def _rows_single_segment(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
         """Map `slots` to rows in this task's one packed segment."""
         seg = task.segments[0]
-        # host[k] is published only after D2H; else the freeze. (`or`
-        # would bool() a Tensor and raise.)
+        # Staging: host[k] is a view hung at save (waited above).
+        # Deferred: host[k] is set only after the committer D2H; else
+        # the GPU freeze. (`or` would bool() a Tensor and raise.)
         src = seg.host.get(key)
         if src is None:
             src = seg.tensors.get(key)
@@ -473,54 +549,6 @@ class OmniTensorCacheController:
         ev.synchronize()
         return cpu
 
-    @torch.inference_mode()
-    def snapshot_host(self, src: torch.Tensor, freeze_event: object | None) -> torch.Tensor:
-        """One whole-tensor D2H of a frozen step clone (read stream, single
-        sync). CPU tensors pass through."""
-        if src.device.type == "cpu":
-            return src
-        if self._read_stream is None:
-            return src.detach().cpu()
-        with torch.cuda.stream(self._read_stream):
-            if freeze_event is not None:
-                self._read_stream.wait_event(freeze_event)
-            cpu = src.to("cpu", non_blocking=True)
-            ev = torch.cuda.Event()
-            ev.record()
-        ev.synchronize()
-        return cpu
-
-    def publish_host(self, task: WriteTask, host: dict[str, torch.Tensor]) -> bool:
-        """Attach a ready host copy to a single-segment task:
-        the background committer skips its own D2H and just scatters.
-        Loses the claim race -> False, caller's copy is
-        discarded (single-publisher rule)."""
-        with task.lock:
-            if task.d2h_claimed or task.done.is_set() or len(task.segments) != 1:
-                return False
-            task.d2h_claimed = True
-        seg = task.segments[0]
-        missing = [k for k in seg.tensors if k not in host]
-        for k, rows in host.items():
-            seg.host[k] = rows
-        for k in missing:
-            seg.host[k] = self._slice_rows(task, seg.tensors[k], torch.arange(seg.tensors[k].shape[0]), host=False)
-        task.host_ready.set()
-        released = sum(t.numel() * t.element_size() for t in seg.tensors.values())
-        seg.tensors = {}
-        with self._wake:
-            self._staged_bytes -= released
-            for q in (self._queue_hi, self._queue_lo):
-                try:
-                    q.remove(task.tid)
-                except ValueError:
-                    pass
-            self._blocked.append(task.tid)
-            self._wake.notify_all()
-        if self._eager:
-            self._scatter(task)
-        return True
-
     # ------------------------------------------------------------ eager mode
 
     @torch.inference_mode()
@@ -531,7 +559,7 @@ class OmniTensorCacheController:
                     self._scatter(task)
                 return
             task.d2h_claimed = True
-        if task.ring_slot is None:
+        if task.staging_slot is None:
             for seg in task.segments:
                 for k, t in seg.tensors.items():
                     seg.host[k] = t.detach().cpu() if t.device.type != "cpu" else t.clone()
@@ -554,7 +582,7 @@ class OmniTensorCacheController:
                     while not self._shutdown and not self._queue_hi and not self._queue_lo:
                         if self._blocked:
                             break
-                        # submit / escalate / publish_host / shutdown all notify.
+                        # submit / escalate / shutdown all notify.
                         self._wake.wait()
                     if self._shutdown and not self._queue_hi and not self._queue_lo and not self._blocked:
                         return
@@ -576,15 +604,15 @@ class OmniTensorCacheController:
 
     @torch.inference_mode()
     def _copy_task(self, task: WriteTask) -> None:
-        """
-        Asynchronously copy tensor data for a WriteTask from device (GPU) to host (CPU).
+        """Reach `host_ready`. Staging: wait the save-time D2H event.
+        Deferred: this is the D2H into owned `seg.host` tensors.
         """
         with task.lock:
             if task.d2h_claimed:
                 return
             task.d2h_claimed = True
         if task.host_event is not None:
-            # Step host ring: seg.host was pre-filled with ring views and the
+            # Staging: seg.host was pre-filled with slot views and the
             # whole step's D2H was launched at save. Wait that one event
             # (shared across the step's tasks; idempotent), release the GPU
             # refs, done.
@@ -647,8 +675,8 @@ class OmniTensorCacheController:
             seg.tensors = {}
         task.host_ready.set()
         task.done.set()
-        if task.ring_slot is not None:
-            self._ring.release(task.ring_slot, ("t", task.tid))
+        if task.staging_slot is not None:
+            self._staging_pool.release(task.staging_slot, StagingBufferHolder.for_task(task.tid))
         with self._lock:
             # Publish the failure: rows behind already-published block hashes
             # never landed, which the manager must turn into a fail-fast (a

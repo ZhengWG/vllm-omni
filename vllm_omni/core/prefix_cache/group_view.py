@@ -1,6 +1,6 @@
-"""KV-cache group access seam for the omni tensor cache.
+"""KV-cache group access seam for the omni prefix cache.
 
-The sole path through which the tensor cache touches vLLM scheduler
+The sole path through which the prefix cache touches vLLM scheduler
 internals (block tables, slot mappings). Hybrid-attention models plug in
 by providing another view implementation; no usable group => the factory
 returns None and the feature self-disables.
@@ -119,7 +119,7 @@ class FullAttentionGroupView:
         return self._block_table_cpu()[req_idx, :num_cached_blocks]
 
 
-def get_tensor_cache_group_view(
+def get_prefix_cache_group_view(
     input_batch: InputBatch,
     block_size: int,
     num_blocks: int,

@@ -30,12 +30,12 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
-from vllm_omni.core.tensor_cache import (
+from vllm_omni.core.prefix_cache import (
     ModelCachePolicy,
-    OmniTensorCacheManager,
-    OmniTensorCacheUnmatchError,
-    TensorCacheConfig,
-    get_tensor_cache_group_view,
+    OmniPrefixCacheManager,
+    OmniPrefixCacheUnmatchError,
+    PrefixCacheConfig,
+    get_prefix_cache_group_view,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
@@ -181,7 +181,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         # the first step so input_batch is guaranteed to exist. Non-CUDA
         # platforms run the Controller in eager mode (auto-selected).
         if self.cache_config.enable_prefix_caching:
-            self._omni_prefix_cache_cfg = TensorCacheConfig.from_vllm_config(
+            self._omni_prefix_cache_cfg = PrefixCacheConfig.from_vllm_config(
                 num_blocks=kv_cache_config.num_blocks,
                 block_size=self.cache_config.block_size,
                 hidden_size=self.model_config.get_hidden_size(),
@@ -203,7 +203,7 @@ class OmniGPUModelRunner(GPUModelRunner):
         """One-shot construction (caller gates on the staged config)."""
         cfg = self._omni_prefix_cache_cfg
         self._omni_prefix_cache_cfg = None
-        view = get_tensor_cache_group_view(
+        view = get_prefix_cache_group_view(
             self.input_batch, cfg.block_size, cfg.num_blocks, kv_cache_groups=cfg.kv_cache_groups
         )
         if view is None:
@@ -211,11 +211,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             # Serving prefix hits without the omni cache would hand
             # downstream stages truncated conditioning, so refuse loudly
             # instead of degrading.
-            raise OmniTensorCacheUnmatchError(
+            raise OmniPrefixCacheUnmatchError(
                 "omni prefix caching requires a single full-attention kv-cache group; "
                 "disable enable_prefix_caching for this model"
             )
-        manager = OmniTensorCacheManager(cfg, view)
+        manager = OmniPrefixCacheManager(cfg, view)
         manager.register_policy(ModelCachePolicy.from_model(getattr(self, "model", None)))
         self.omni_prefix_cache = manager
 
