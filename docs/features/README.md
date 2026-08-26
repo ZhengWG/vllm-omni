@@ -31,10 +31,9 @@ features yet:
   [Async Omni Output Materialization](../design/feature/omni_async_output_materialization.md)
   are model- and pipeline-dependent. Use the selected model's deploy
   configuration and recipe for the supported settings.
-- [Automatic Prefix Caching](../design/feature/prefix_caching.md) describes
-  the block/slot model. [Omni Prefix Cache Runtime](../design/feature/omni_prefix_cache.md)
-  is the implementation contract. Both remain design-level until the
-  user-facing configuration surface is consolidated.
+- [Automatic Prefix Caching](../design/feature/prefix_caching.md) remains a
+  design-level contract until its user-facing configuration and compatibility
+  surface is consolidated.
 
 ## Quantization
 

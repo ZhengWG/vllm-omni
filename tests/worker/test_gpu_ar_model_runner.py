@@ -914,7 +914,7 @@ def test_sample_tokens_tail_only_prefix_cache_uses_staged_cpu_hidden_states(monk
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_payload_sources",
+        "_prepare_prefix_cache_pooler_payload_sources",
         lambda self, **kwargs: (kwargs["staged_hidden_states_cpu"], None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
@@ -950,7 +950,7 @@ def test_build_omni_output_falls_back_to_mm_cpu_without_prefix_merge(monkeypatch
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_payload_sources",
+        "_prepare_prefix_cache_pooler_payload_sources",
         lambda *args, **kwargs: (None, None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
@@ -1097,7 +1097,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_payload_sources",
+        "_prepare_prefix_cache_pooler_payload_sources",
         lambda *args, **kwargs: (None, None, None),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)
@@ -1137,7 +1137,7 @@ def test_build_omni_output_filters_multimodal_by_partial_downstream_batch(monkey
 
 def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_downstream_batch(monkeypatch):
     """When the prefix-cache merge path is engaged (i.e.
-    _prepare_prefix_cache_payload_sources returns a non-None
+    _prepare_prefix_cache_pooler_payload_sources returns a non-None
     combined_multimodal_outputs), _build_omni_mm_payload must take the
     _build_combined_prefix_cache_mm_payload branch -- keyed by req_id,
     not by row/slice -- rather than falling back to build_mm_cpu, and
@@ -1172,7 +1172,7 @@ def test_build_omni_output_uses_combined_prefix_cache_mm_payload_for_partial_dow
     monkeypatch.setattr(GPUARModelRunner, "_model_needs_full_prefix_hidden_states", lambda self: False)
     monkeypatch.setattr(
         GPUARModelRunner,
-        "_prepare_prefix_cache_payload_sources",
+        "_prepare_prefix_cache_pooler_payload_sources",
         lambda *args, **kwargs: (None, None, combined_mm),
     )
     monkeypatch.setattr(GPUARModelRunner, "_process_additional_information_updates", lambda *args, **kwargs: None)

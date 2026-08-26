@@ -380,8 +380,7 @@ the source for configuration, compatibility, and implementation details.
   CPU-side payload construction off the AR decode critical path.
 * **Automatic prefix caching:** [Automatic Prefix Caching in Omni Models](feature/prefix_caching.md)
   reuses KV-cache-aligned stage outputs and multimodal tensors for requests
-  with common prefixes. The runtime contract is
-  [Omni Prefix Cache Runtime](feature/omni_prefix_cache.md).
+  with common prefixes.
 
 ### Communication
 

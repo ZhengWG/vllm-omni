@@ -329,7 +329,7 @@ because they use the same Talker implementation.
     the save-time request list, which may be a step late relative to the live
     `input_batch`. `_should_use_async_omni_output()` does not disable itself
     when the cache is present. See
-    [Omni Prefix Cache Runtime](omni_prefix_cache.md).
+    [Automatic Prefix Caching](prefix_caching.md#implementation).
 
 ## Compatibility and Fallbacks
 
@@ -379,8 +379,8 @@ so Omni payload materialization remains synchronous.
 - `tests/worker/test_gpu_ar_model_runner.py`: Snapshot, guard, connector
   ordering, and background error-propagation tests.
 - [Async Chunk](async_chunk.md): Inter-stage chunking and scheduling design.
-- [Omni Prefix Cache Runtime](omni_prefix_cache.md): Prefix-cache `step_id` /
-  `materialize` contract used by the deferred output builder.
+- [Automatic Prefix Caching](prefix_caching.md#implementation): Prefix-cache
+  `step_id` / `materialize` contract used by the deferred output builder.
 - [Qwen3-Omni optimization blog](https://vllm.ai/blog/2026-07-01-qwen3-omni-optimization):
   Optimization context and controlled performance results.
 - [PR #4476](https://github.com/vllm-project/vllm-omni/pull/4476): Feature

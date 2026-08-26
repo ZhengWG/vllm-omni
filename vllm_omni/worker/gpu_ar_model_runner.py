@@ -757,7 +757,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         )
         return True
 
-    def _prepare_prefix_cache_payload_sources(
+    def _prepare_prefix_cache_pooler_payload_sources(
         self,
         *,
         staged_hidden_states_cpu: torch.Tensor | None,
@@ -1867,7 +1867,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     hidden_states_cpu,
                     combined_hidden_states,
                     combined_multimodal_outputs,
-                ) = self._prepare_prefix_cache_payload_sources(
+                ) = self._prepare_prefix_cache_pooler_payload_sources(
                     staged_hidden_states_cpu=staged_hidden_states_cpu,
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                     step_id=prefix_cache_step_id,

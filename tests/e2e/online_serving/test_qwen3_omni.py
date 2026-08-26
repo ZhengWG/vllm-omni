@@ -178,7 +178,7 @@ def test_thinker_prefix_caching_text_output(omni_server, openai_client) -> None:
     NOTE: Checking the output of prefix caching directly can be a bit unstable
     due to slight numerical differences as a result of running different scheduled
     sequence lengths. As such, for E2E tests on prefix cache, we only check the cached
-    token count and not the output, since the omni prefix cache has solid unit tests,
+    token count and not the output, since the omni tensor cache has solid unit tests,
     and the core prefix cache algorithm is largely tested by upstream vLLM.
     """
     img_res = generate_synthetic_image(224, 224)
