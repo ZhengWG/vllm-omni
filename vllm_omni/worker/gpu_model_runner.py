@@ -177,7 +177,7 @@ class OmniGPUModelRunner(GPUModelRunner):
                                 device=sm.device,
                             )
 
-        # Stage the omni tensor cache config; the manager is built lazily on
+        # Stage the omni prefix cache config; the manager is built lazily on
         # the first step so input_batch is guaranteed to exist. Non-CUDA
         # platforms run the Controller in eager mode (auto-selected).
         if self.cache_config.enable_prefix_caching:

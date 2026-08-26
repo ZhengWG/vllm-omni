@@ -255,24 +255,26 @@ class OmniPrefixCacheController:
         if not self._eager:
             self._copy_stream = torch.cuda.Stream()
             self._read_stream = torch.cuda.Stream()
-            self._worker = threading.Thread(target=self._worker_loop, name="omni-tensor-cache-committer", daemon=True)
+            self._worker = threading.Thread(target=self._worker_loop, name="omni-prefix-cache-committer", daemon=True)
             self._worker.start()
 
     # --------------------------------------------------------- step D2H staging
 
     def stage_step_host(
         self, tensors: dict[str, torch.Tensor], n: int, freeze_event: object | None, step_holder: StagingBufferHolder
-    ) -> tuple[int, dict[str, torch.Tensor], object | None] | None:
+    ) -> tuple[int, dict[str, torch.Tensor], object | None]:
         """Launch ONE whole-step D2H into a staging slot, ahead of consumption.
 
-        Returns (slot, key -> host view of rows [0:n), d2h event) or None
-        when there are no rows. Too large a step, or no free slot, is a
-        contract break — not a second D2H path. The caller binds task
-        holders after submit; `step_holder` is released by
-        materialize/discard via staging_release.
+        Returns (slot, key -> host view of rows [0:n), d2h event). The
+        caller only invokes this for a non-empty packed step. Too large a
+        step, or no free slot, is a contract break — not a second D2H
+        path. The caller binds task holders after submit; `step_holder`
+        is released by materialize/discard via staging_release.
         """
         if not tensors or n <= 0:
-            return None
+            raise OmniPrefixCacheUnmatchError(
+                f"stage_step_host called with n={n} keys={list(tensors)}; only a non-empty packed step may launch D2H"
+            )
         if n > self._staging_pool.capacity:
             raise OmniPrefixCacheUnmatchError(
                 f"step has {n} tokens; staging capacity is {self._staging_pool.capacity} "

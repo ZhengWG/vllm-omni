@@ -53,10 +53,6 @@ class FakeView:
         self.computed: dict[str, int] = {}
         self.step_slot_mapping: torch.Tensor | None = None
 
-    def slot_mapping_gpu(self, num_tokens: int) -> torch.Tensor:
-        assert self.step_slot_mapping is not None
-        return self.step_slot_mapping[:num_tokens]
-
     def slots_for(self, req_id, token_start, token_end):
         blocks = self.req_blocks[req_id]
         slots = []
@@ -486,10 +482,10 @@ def test_step_context_exactly_once():
 
 def test_unconsumed_contexts_overflow_fails_fast():
     """A runner that leaks step contexts (never materialize/discard) must be
-    caught at save time, not silently dropped. Row-bearing steps fill the
-    staging pool first (same error type)."""
+    caught at save time with the leaked ids, before staging-pool exhaustion
+    can hide them."""
     mgr, view = make_manager()
-    with pytest.raises(OmniPrefixCacheUnmatchError):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="unconsumed step contexts"):
         for pos in range(8):
             run_step(mgr, view, {"a": ([0, 1, 2, 3], pos, 1)})
 
@@ -732,8 +728,8 @@ def test_per_request_staging_writes_join_next_step():
     assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))
 
 
-def test_ring_step_prefills_task_host_and_recycles():
-    """Ring steps pre-fill per-task host views at save (no per-task copy),
+def test_staging_step_prefills_task_host_and_recycles():
+    """Staging steps pre-fill per-task host views at save (no per-task copy),
     and slots recycle safely across > depth steps without cross-step
     corruption (outputs are copied out of the reusable slot)."""
     mgr, view = make_manager()
@@ -753,13 +749,13 @@ def test_oversized_step_fails_fast():
         run_step(mgr, view, {"a": ([0, 1], 0, 8)})  # 8 > 4
 
 
-def test_ring_task_never_defers_and_slot_held_until_drain():
-    """A ring task's D2H is already in flight -> always JOIN_NEXT_STEP, and
-    its slot token survives the (eager, inline) scatter until the manager
+def test_staging_task_never_defers_and_slot_held_until_drain():
+    """A staging task's D2H is already in flight -> always JOIN_NEXT_STEP, and
+    its slot holder survives the (eager, inline) scatter until the manager
     drains the completion — the window hit readers pin on."""
     from vllm_omni.core.prefix_cache.interface import WriteSchedule
 
-    mgr, view = make_manager(join_on_finish_min_tokens=4)
+    mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
     ctx = mgr._step_ctxs[sid]
     tid = next(iter(mgr._req_tasks["p"]))
@@ -800,9 +796,9 @@ def test_same_step_hit_skips_prefetch():
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
 
 
-def test_ring_slot_released_on_no_consumer_early_return():
+def test_staging_slot_released_on_no_consumer_early_return():
     """materialize's nothing-to-serve early return must still drop the step
-    token, or the ring leaks a slot per step and exhausts."""
+    holder, or the staging pool leaks a slot per step and exhausts."""
     policy = ModelCachePolicy(needs_full_hidden_states=False)
     mgr, view = make_manager(policy=policy)
     for i in range(6):  # > staging_depth(4): leak would exhaust and fail-fast
@@ -813,7 +809,7 @@ def test_ring_slot_released_on_no_consumer_early_return():
         assert not mgr._controller._staging_pool._busy[ctx.d2h.slot], i
 
 
-def test_save_releases_ring_if_commit_drained_writes_fails():
+def test_save_releases_staging_if_commit_drained_writes_fails():
     """Claim happens outside the lock; a later fail-fast must drop the step holder."""
     mgr, view = make_manager(staging_depth=2)
     calls = {"n": 0}

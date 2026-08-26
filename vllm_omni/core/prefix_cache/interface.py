@@ -34,10 +34,8 @@ class PrefixCacheConfig:
     hs_dtype: torch.dtype
     # GPU staging byte budget; exceeding it force-flushes oldest entries.
     gpu_staging_bytes: int = 512 * 1024 * 1024
-    # Tasks covering more than this many tokens use JOIN_ON_FINISH;
-    # smaller ones use JOIN_NEXT_STEP.
-    join_on_finish_min_tokens: int = 256
     # D2H staging: circular slots, one whole step each (not per request).
+    # Host memory per key ≈ staging_depth * staging_capacity_tokens * width * dtype.
     # Prefer from_vllm_config so staging_capacity_tokens tracks max_num_batched_tokens.
     staging_depth: int = 4
     staging_capacity_tokens: int = 1024
@@ -66,6 +64,12 @@ class PrefixCacheConfig:
         ``staging_capacity_tokens`` is ``max_num_batched_tokens`` (falls back
         to ``max_model_len``); ``staging_depth`` is the in-flight step bound,
         not ``max_num_seqs``.
+
+        Pinned staging is allocated lazily per key at
+        ``depth * capacity_tokens * width * dtype``. There is no clamp: a
+        step larger than capacity fail-fasts. A 16k-token thinking batch at
+        hidden=2048 bf16 is ~256 MiB for hidden alone; each mm key adds
+        another slab.
         """
         batched = getattr(scheduler_config, "max_num_batched_tokens", None)
         model_len = getattr(scheduler_config, "max_model_len", None)
@@ -96,8 +100,12 @@ class StageCacheOutputs(NamedTuple):
 
 
 class OmniPrefixCacheUnmatchError(RuntimeError):
-    """A hit span resolved to absent slots: omni cache diverged from vLLM KV
-    state. Fail-fast — this must never fire in a correct system."""
+    """Fail-fast contract, config, or KV-occupancy error.
+
+    Includes hit spans that resolve to absent slots (omni cache diverged
+    from vLLM KV), consume-exactly-once violations, staging capacity /
+    pool exhaustion, and poisoned saves. Never a degrade path.
+    """
 
 
 @dataclass(frozen=True)

@@ -592,7 +592,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         CUDAGraphWrapper.clear_all_graphs()
         BreakableCUDAGraphWrapper.clear_all_graphs()
 
-        # 6. Stop the tensor-cache committer before the CUDA context and the
+        # 6. Stop the prefix-cache committer before the CUDA context and the
         # tensors it copies from are torn down.
         cache = self.omni_prefix_cache
         if cache is not None:
@@ -663,7 +663,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         """Opt-out hook for models whose postprocess only consumes the tail.
 
         When False, we skip both the per-step hidden-state write into the
-        omni tensor cache and the merged-tensor reconstruction on hits;
+        omni prefix cache and the merged-tensor reconstruction on hits;
         postprocess receives the normal scheduled-token slice instead. Models
         that need the full cached_prefix + new_tail span (default) are not
         affected.
@@ -773,7 +773,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         async omni output this runs a step late, when the live batch has moved on.
         """
         if not get_pp_group().is_last_rank:
-            raise RuntimeError("Omni tensor-cache merge is only valid on the last pipeline parallel rank.")
+            raise RuntimeError("Omni prefix-cache merge is only valid on the last pipeline parallel rank.")
         hidden_states_cpu = None
         if needs_scheduled_hidden_payload:
             if staged_hidden_states_cpu is None:

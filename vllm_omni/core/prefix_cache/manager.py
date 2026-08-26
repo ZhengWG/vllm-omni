@@ -337,8 +337,11 @@ class OmniPrefixCacheManager:
                 exclude = {self._deferred_tasks[r].tid for r, _ in deferred_segs if r in self._deferred_tasks}
                 self._controller.reserve(sum(t.numel() * t.element_size() for t in staged), exclude=exclude)
 
-        # 4. Optional D2H into the staging pool (unlocked), then submit
-        #    per-req writes and snapshot the consume-once ctx (locked).
+        # 4. Fail-fast if the runner leaked prior step contexts *before*
+        #    claiming a staging slot — otherwise a full pool raises a
+        #    holder-exhaustion error and hides the consume-once ids.
+        #    Then optional D2H (unlocked), then submit + hang ctx (locked).
+        self._raise_if_unconsumed_ctxs_at_capacity()
         staging_slot: int | None = None
         host_views: dict[str, torch.Tensor] | None = None
         host_event = None
@@ -347,14 +350,15 @@ class OmniPrefixCacheManager:
         bound_tids: list[int] = []
         try:
             if frozen_rows:
-                claim = self._controller.stage_step_host(frozen_rows, num_tokens_unpadded, freeze_event, step_holder)
-                assert claim is not None
-                staging_slot, host_views, host_event = claim
+                staging_slot, host_views, host_event = self._controller.stage_step_host(
+                    frozen_rows, num_tokens_unpadded, freeze_event, step_holder
+                )
 
             with self._state_lock:
                 self._commit_drained_writes()
+                d2h = None
                 if frozen_rows:
-                    assert slots_cpu is not None
+                    assert slots_cpu is not None and host_views is not None and staging_slot is not None
                     self._submit_step_writes(
                         req_order,
                         query_start,
@@ -367,6 +371,7 @@ class OmniPrefixCacheManager:
                         host_event,
                         bound_tids,
                     )
+                    d2h = _StepD2HClaim(slot=staging_slot, views=host_views, event=host_event)
 
                 self._stage_deferred(deferred_segs, freeze_event)
 
@@ -379,21 +384,11 @@ class OmniPrefixCacheManager:
                     hit_prefetch=dict(self._hit_prefetch),
                     cached_keys=(self._pool.keys() - {HIDDEN_KEY}) & set(mm_flat.keys()),
                     mm_flat_refs=dict(mm_flat),
-                    d2h=_StepD2HClaim(slot=staging_slot, views=host_views, event=host_event)
-                    if staging_slot is not None and host_views is not None
-                    else None,
+                    d2h=d2h,
                 )
                 self._hit_spans.clear()
                 self._hit_prefetch.clear()
                 transferred = True
-                if len(self._step_ctxs) > self._config.staging_depth:
-                    # The async builder runs at most one step behind; more
-                    # unconsumed contexts means the runner is leaking them (a
-                    # consume path skipping both materialize and discard_step).
-                    raise OmniPrefixCacheUnmatchError(
-                        f"{len(self._step_ctxs)} unconsumed step contexts (ids={sorted(self._step_ctxs)}); "
-                        "runner violated the consume-exactly-once contract"
-                    )
                 return step_id
         finally:
             # Slot claim is outside the lock; a later raise must drop holders.
@@ -448,21 +443,25 @@ class OmniPrefixCacheManager:
                 cached_keys = ctx.cached_keys
 
                 hit_sources: dict[tuple[str, str], _RowSource | Future] = {}
-                for req_id in req_ids:
-                    hit = ctx.hits.get(req_id)
-                    if not hit:
-                        continue
-                    hit_upto, hit_blocks = hit
-                    prefetched = ctx.hit_prefetch.get(req_id, {})
-                    keys = ([HIDDEN_KEY] if want_hidden else []) + sorted(cached_keys)
-                    for key in keys:
-                        fut = prefetched.get(key)
-                        if fut is not None:
-                            hit_sources[(req_id, key)] = fut
+                try:
+                    for req_id in req_ids:
+                        hit = ctx.hits.get(req_id)
+                        if not hit:
                             continue
-                        hit_sources[(req_id, key)] = self._plan_hit_rows(
-                            req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY)
-                        )
+                        hit_upto, hit_blocks = hit
+                        prefetched = ctx.hit_prefetch.get(req_id, {})
+                        keys = ([HIDDEN_KEY] if want_hidden else []) + sorted(cached_keys)
+                        for key in keys:
+                            fut = prefetched.get(key)
+                            if fut is not None:
+                                hit_sources[(req_id, key)] = fut
+                                continue
+                            hit_sources[(req_id, key)] = self._plan_hit_rows(
+                                req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY)
+                            )
+                except Exception:
+                    self._release_planned_hit_holders(hit_sources)
+                    raise
 
             # ---- unlocked: data movement + merge ----
             current: dict[str, torch.Tensor] = {}
@@ -636,9 +635,9 @@ class OmniPrefixCacheManager:
         num_sched: dict[str, int],
         frozen_rows: dict[str, torch.Tensor],
         slots_cpu: torch.Tensor,
-        host_views: dict[str, torch.Tensor] | None,
+        host_views: dict[str, torch.Tensor],
         freeze_event,
-        staging_slot: int | None,
+        staging_slot: int,
         host_event,
         bound_tids: list[int],
     ) -> None:
@@ -656,7 +655,6 @@ class OmniPrefixCacheManager:
             req_rows = {k: v[start:end] for k, v in frozen_rows.items()}
             tid = self._alloc_task_id()
             seg = _Segment(slots_cpu=slots_cpu[start:end], tensors=req_rows)
-            assert host_views is not None and staging_slot is not None
             # Host rows are views into the slot; the committer only waits
             # the shared step event. D2H is already in flight.
             seg.host = {k: v[start:end] for k, v in host_views.items()}
@@ -803,6 +801,19 @@ class OmniPrefixCacheManager:
             )
         return ctx
 
+    def _raise_if_unconsumed_ctxs_at_capacity(self) -> None:
+        """The async builder runs at most one step behind; `staging_depth`
+        unconsumed contexts means the runner skipped both materialize and
+        discard_step. Checked before claiming a staging slot so a full
+        pool does not hide the leaked ids.
+        """
+        with self._state_lock:
+            if len(self._step_ctxs) >= self._config.staging_depth:
+                raise OmniPrefixCacheUnmatchError(
+                    f"{len(self._step_ctxs)} unconsumed step contexts (ids={sorted(self._step_ctxs)}); "
+                    "runner violated the consume-exactly-once contract"
+                )
+
     def _release_step_staging_buffer(self, ctx: _StepContext, step_id: int) -> None:
         """Drop this step's holder on the staging-pool slot (no-op if no rows)."""
         if ctx.d2h is not None:
@@ -811,6 +822,11 @@ class OmniPrefixCacheManager:
     def _release_staging_holders(self, holders: list[tuple[int, StagingBufferHolder]]) -> None:
         for slot, holder in holders:
             self._controller.staging_release(slot, holder)
+
+    def _release_planned_hit_holders(self, hit_sources: dict[tuple[str, str], _RowSource | Future]) -> None:
+        for src in hit_sources.values():
+            if isinstance(src, _RowSource):
+                self._release_staging_holders(src.staging_holders)
 
     # -------------------------------------------------- plan / fetch
 
@@ -939,8 +955,7 @@ class OmniPrefixCacheManager:
             self._ensure_not_reassigned(src.slots, src.key, in_transit_mask=in_transit, req_id=src.req_id)
             return out
         finally:
-            for slot, holder in src.staging_holders:
-                self._controller.staging_release(slot, holder)
+            self._release_staging_holders(src.staging_holders)
 
     def _ensure_not_reassigned(
         self,

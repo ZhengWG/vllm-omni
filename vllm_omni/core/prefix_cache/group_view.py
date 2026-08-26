@@ -24,7 +24,7 @@ class KVCacheGroupView(Protocol):
     block_size: int
     num_blocks: int
 
-    def slot_mapping_gpu(self, num_tokens: int) -> torch.Tensor: ...
+    def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor: ...
 
     def slots_for(self, req_id: str, token_start: int, token_end: int) -> torch.Tensor: ...
 
@@ -38,7 +38,8 @@ class FullAttentionGroupView:
 
     Behavior-preserving port of the block-table math previously inlined in
     the legacy prefix cache (_get_slot_ids_for_token_range /
-    _get_cached_block_ids) plus the runner-side slot_mapping access.
+    _get_cached_block_ids). Step slots come from the CPU block table
+    (`step_slots_cpu`), not the device slot_mapping.
     """
 
     def __init__(self, input_batch: InputBatch, block_size: int, num_blocks: int):
@@ -48,9 +49,6 @@ class FullAttentionGroupView:
 
     def _block_table_cpu(self) -> torch.Tensor:
         return self._input_batch.block_table[0].block_table.cpu
-
-    def slot_mapping_gpu(self, num_tokens: int) -> torch.Tensor:
-        return self._input_batch.block_table[0].slot_mapping.gpu[:num_tokens]
 
     def batch_req_ids(self) -> list[str]:
         return list(self._input_batch.req_ids)

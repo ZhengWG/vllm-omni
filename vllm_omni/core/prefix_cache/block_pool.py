@@ -50,15 +50,6 @@ class PrefixBlockPool:
         """Gather rows for non-contiguous slots (returns a copy)."""
         return self._flat(key).index_select(0, slots)
 
-    def rows_view(self, key: str, slots: torch.Tensor) -> torch.Tensor:
-        """Zero-copy view when slots are a contiguous ascending range."""
-        flat = self._flat(key)
-        start = int(slots[0])
-        n = int(slots.numel())
-        if n > 1 and (int(slots[-1]) - start + 1) == n:
-            return flat[start : start + n]
-        return flat.index_select(0, slots)
-
     def write(self, key: str, slots: torch.Tensor, src_cpu: torch.Tensor) -> None:
         """Row scatter; caller (committer thread) is the single writer."""
         if slots.dtype != torch.int64:
