@@ -65,7 +65,7 @@ WebSocket /v1/video/chat/stream
 | ------- | ------ | --------- | ------------- |
 | `model` | string or null | null | Optional model name. Usually omitted because the server hosts one model. |
 | `modalities` | list[string] | `["text", "audio"]` | Output modalities. Use `["text"]`, `["audio"]`, or both. |
-| `num_frames` | integer, 1-128 | `4` | Number of buffered frames sampled for each query. |
+| `num_frames` | integer, 1-128 | `4` | Number of buffered frames sampled for each query. Legacy path only: with eager prefill active, every buffered frame is submitted and frame density is the client's responsibility (clients push discrete frames at their own rate). |
 | `max_frames` | integer, 1-256 | `50` | Maximum retained frame buffer size. Oldest frames are evicted first. |
 | `system_prompt` | string or null | null | Optional custom system prompt. |
 | `use_audio_in_video` | bool | `true` | Include streamed audio chunks in multimodal video understanding when audio is present. |

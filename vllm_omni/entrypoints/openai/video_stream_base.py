@@ -108,14 +108,18 @@ class VideoStreamPipelineHooks(Protocol):
         """Update session state after a successful turn."""
         ...
 
-    def build_warmup_messages(
+    def build_engine_prompt_prefix(
         self,
         config: "StreamingVideoSessionConfig",
         frame_buffer: list[str],
         message_history: list[dict[str, Any]],
         prewarmed_frames: dict[str, tuple[Any, str]],
     ) -> list[dict[str, Any]] | None:
-        """Messages for an eager-prefill warmup request (None disables it)."""
+        """Prefix of the next :meth:`build_engine_prompt` through the last vision token.
+
+        History plus arriving video frames, without query text or input audio.
+        Return None when there are no usable frames (or to disable eager prefill).
+        """
         ...
 
 
@@ -202,15 +206,87 @@ class OmniStreamingVideoHandler:
     ) -> None:
         raise NotImplementedError
 
-    def build_warmup_messages(
+    @staticmethod
+    def _build_frame_image_parts(
+        frames: list[str],
+        prewarmed_frames: dict[str, tuple[Any, str]] | None,
+    ) -> list[dict[str, Any]]:
+        """Frame parts with arrival-time uuids so the prefix prompt and query
+        prompt hash every frame identically (a hash mismatch would void the
+        warmed prefix from that frame onward)."""
+        prewarmed = prewarmed_frames or {}
+        parts: list[dict[str, Any]] = []
+        for frame_b64 in frames:
+            cached = prewarmed.get(frame_b64)
+            if cached is _BAD_FRAME:
+                continue
+            if cached is not None:
+                pil, mm_uuid = cached
+                if pil is not None:
+                    parts.append(
+                        {
+                            "type": "image_pil",
+                            "image_pil": pil,
+                            "uuid": mm_uuid,
+                        }
+                    )
+                    continue
+                # PIL prewarm not finished: same uuid over the base64 payload.
+                parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+                        "uuid": mm_uuid,
+                    }
+                )
+                continue
+            parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+                }
+            )
+        return parts
+
+    def _history_prefix_messages(
+        self,
+        config: StreamingVideoSessionConfig,
+        message_history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Shared prompt prefix (system + compressed text-only history).
+
+        :meth:`build_engine_prompt_prefix` and :meth:`build_engine_prompt`
+        MUST build this identically: any divergence before the frame parts
+        voids the warmed KV from that token onward.
+        """
+        messages: list[dict[str, Any]] = []
+        if config.system_prompt:
+            messages.append({"role": "system", "content": config.system_prompt})
+        recent_history = message_history[-2:] if len(message_history) > 2 else message_history
+        for hist_msg in recent_history:
+            messages.append(self._text_only_message(hist_msg))
+        return messages
+
+    def build_engine_prompt_prefix(
         self,
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
         message_history: list[dict[str, Any]],
         prewarmed_frames: dict[str, tuple[Any, str]],
     ) -> list[dict[str, Any]] | None:
-        """Messages for an eager-prefill warmup request (default: disabled)."""
-        return None
+        """Prefix of the next :meth:`build_engine_prompt` through the last vision token.
+
+        History plus arriving video frames, without query text or input audio.
+        A mismatch voids the warmed KV from the first diverging token.
+        Return None when there are no usable frames (or override to disable).
+        """
+        frame_parts = self._build_frame_image_parts(frame_buffer, prewarmed_frames)
+        if not frame_parts:
+            return None
+
+        messages = self._history_prefix_messages(config, message_history)
+        messages.append({"role": "user", "content": frame_parts})
+        return messages
 
     def create_message_history(self, config: StreamingVideoSessionConfig) -> Any:
         """Per-session conversation state (default: empty OpenAI-style list)."""
@@ -267,8 +343,8 @@ class OmniStreamingVideoHandler:
             frame_metadata: list[dict[str, Any]] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
             frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
-            # b64 -> md5, fixed at arrival: warmup and query must hash a frame
-            # identically even when its PIL prewarm hasn't finished yet.
+            # b64 -> md5, fixed at arrival: prefix prompt and query must hash a
+            # frame identically even when its PIL prewarm hasn't finished yet.
             frame_uuids: dict[str, str] = {}
             frame_filter = (
                 FrameSimilarityFilter(threshold=config.frame_filter_threshold) if config.enable_frame_filter else None
@@ -368,7 +444,7 @@ class OmniStreamingVideoHandler:
                 if not frame_buffer or _context_signature() == warmed_signature:
                     return
                 prewarmed = _augment_with_uuids(dict(frame_pil_cache), frame_buffer)
-                messages = self.build_warmup_messages(config, list(frame_buffer), message_history, prewarmed)
+                messages = self.build_engine_prompt_prefix(config, list(frame_buffer), message_history, prewarmed)
                 if not messages:
                     return
                 signature = _context_signature()
