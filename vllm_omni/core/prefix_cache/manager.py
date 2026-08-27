@@ -41,7 +41,7 @@ from __future__ import annotations
 import itertools
 import logging
 import threading
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -71,6 +71,37 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _ABSENT, _IN_TRANSIT, _COMMITTED = 0, 1, 2
+
+
+def _snapshot_leftover_mm_cpu(
+    mm_flat: dict[str, Any],
+    frozen_keys: set[str],
+    num_tokens_unpadded: int,
+) -> dict[str, Any]:
+    """Copy leftover mm onto CPU. ``num_tokens_unpadded`` slices token-major tensors.
+
+    Keys already in ``frozen_keys`` go through staging D2H. Everything else
+    (deferred tails, uncached passthrough) must be copied here: materialize
+    may run after the next forward has overwritten CUDA-graph static buffers.
+    """
+
+    def _copy(val: Any) -> Any:
+        if isinstance(val, torch.Tensor):
+            n = num_tokens_unpadded
+            t = val[:n] if val.ndim >= 1 and n > 0 and val.shape[0] >= n else val
+            copied = t.detach()
+            # .cpu() copies device tensors; CPU/pinned views still share storage.
+            copied = copied.cpu() if copied.device.type != "cpu" else copied.clone()
+            return copied.contiguous()
+        if isinstance(val, Mapping):
+            return {k: _copy(v) for k, v in val.items()}
+        if isinstance(val, list):
+            return [_copy(v) for v in val]
+        if isinstance(val, tuple):
+            return tuple(_copy(v) for v in val)
+        return val
+
+    return {key: _copy(val) for key, val in mm_flat.items() if key not in frozen_keys and key != HIDDEN_KEY}
 
 
 def _locked(fn):
@@ -136,7 +167,10 @@ class _StepContext:
 
     # Key split frozen at save: recompute at materialize races ensure_key.
     cached_keys: set[str] = field(default_factory=set)
-    mm_flat_refs: dict[str, Any] = field(default_factory=dict)
+    # Leftover mm copied to CPU at save (deferred tails + uncached
+    # passthrough). Never live graph-buffer refs: materialize may run
+    # after the next forward has overwritten those buffers.
+    mm_cpu_snapshot: dict[str, Any] = field(default_factory=dict)
 
     # Staging claim if this step had rows.
     d2h: _StepD2HClaim | None = None
@@ -278,6 +312,8 @@ class OmniPrefixCacheManager:
         the staging pool, then one JOIN_NEXT_STEP WriteTask per request
         whose `seg.host` is a view of that page. Deferred rows stay on
         the GPU freeze (JOIN_ON_FINISH); the committer copies them later.
+        Leftover mm (deferred tails, uncached passthrough) is copied to
+        CPU here so materialize never reads live graph buffers.
         Snapshots everything materialize needs. The returned step id MUST
         be consumed exactly once — by materialize() or discard_step();
         leaking contexts fails fast at a later save.
@@ -337,10 +373,16 @@ class OmniPrefixCacheManager:
                 exclude = {self._deferred_tasks[r].tid for r, _ in deferred_segs if r in self._deferred_tasks}
                 self._controller.reserve(sum(t.numel() * t.element_size() for t in staged), exclude=exclude)
 
-        # 4. Fail-fast if the runner leaked prior step contexts *before*
+        # 4. Leftover mm D2H (unlocked). Keys already in frozen_rows go
+        #    through staging; deferred tails and uncached passthrough must
+        #    be on CPU before the next forward can overwrite graph buffers.
+        leftover_mm = _snapshot_leftover_mm_cpu(mm_flat, set(frozen_rows), num_tokens_unpadded)
+
+        # 5. Fail-fast if the runner leaked prior step contexts *before*
         #    claiming a staging slot — otherwise a full pool raises a
         #    holder-exhaustion error and hides the consume-once ids.
         #    Then optional D2H (unlocked), then submit + hang ctx (locked).
+
         self._raise_if_unconsumed_ctxs_at_capacity()
         staging_slot: int | None = None
         host_views: dict[str, torch.Tensor] | None = None
@@ -383,7 +425,7 @@ class OmniPrefixCacheManager:
                     hits=dict(self._hit_spans),
                     hit_prefetch=dict(self._hit_prefetch),
                     cached_keys=(self._pool.keys() - {HIDDEN_KEY}) & set(mm_flat.keys()),
-                    mm_flat_refs=dict(mm_flat),
+                    mm_cpu_snapshot=leftover_mm,
                     d2h=d2h,
                 )
                 self._hit_spans.clear()
@@ -461,6 +503,7 @@ class OmniPrefixCacheManager:
                             )
                 except Exception:
                     self._release_planned_hit_holders(hit_sources)
+                    logger.critical("omni prefix cache unmatch during materialize", exc_info=True)
                     raise
 
             # ---- unlocked: data movement + merge ----
@@ -487,10 +530,10 @@ class OmniPrefixCacheManager:
             for key in cached_keys:
                 cur = current.get(key)
                 if cur is None:
-                    val = ctx.mm_flat_refs.get(key)
+                    val = ctx.mm_cpu_snapshot.get(key)
                     if not isinstance(val, torch.Tensor):
                         continue
-                    cur = val[: ctx.num_tokens_unpadded].detach().cpu()
+                    cur = val[: ctx.num_tokens_unpadded] if val.shape[0] >= ctx.num_tokens_unpadded else val
                 mm_out[key] = {
                     req_id: self._merge_cached_for_req(ctx, req_id, key, cur, hit_sources) for req_id in req_ids
                 }
@@ -852,17 +895,13 @@ class OmniPrefixCacheManager:
         state = self._key_state.get(key)
         states = state[slots] if state is not None else torch.zeros(int(slots.numel()), dtype=torch.int8)
         if strict and bool((states == _ABSENT).any()):
+            # Same-step prefetch hits this before save registers the rows;
+            # prefetch swallows it. materialize owns the fail-fast log.
             absent = slots[states == _ABSENT]
-            logger.critical(
-                "omni prefix cache unmatch: req=%s key=%s hit_upto=%d absent_slots=%s states=%s",
-                req_id,
-                key,
-                hit_upto,
-                absent[:32].tolist(),
-                states[:64].tolist(),
-            )
             raise OmniPrefixCacheUnmatchError(
-                f"hit span for req {req_id} resolved to {int((states == _ABSENT).sum())} absent slots"
+                f"hit span for req {req_id} key={key} hit_upto={hit_upto} "
+                f"resolved to {int((states == _ABSENT).sum())} absent slots "
+                f"(absent={absent[:32].tolist()}, states={states[:64].tolist()})"
             )
 
         return self._plan_rows(slots, key, strict, req_id, states)
@@ -1038,22 +1077,22 @@ class OmniPrefixCacheManager:
     ) -> None:
         """Write mm keys that are not in the prefix cache into mm_out.
 
-        No hit concat: one CPU copy of the leftover mm_flat, then per-req
-        slices by ctx.spans. cached_keys already went through _merge_cached_for_req.
+        No hit concat: leftover mm was already copied to CPU at save
+        (``ctx.mm_cpu_snapshot``). cached_keys already went through
+        _merge_cached_for_req. ``req_ids`` is a subset of ``ctx.spans``.
         """
-        uncached = {k: v for k, v in ctx.mm_flat_refs.items() if k not in cached_keys and k != HIDDEN_KEY}
+        uncached = {k: v for k, v in ctx.mm_cpu_snapshot.items() if k not in cached_keys and k != HIDDEN_KEY}
         if not uncached:
             return
-        from vllm_omni.utils.mm_outputs import build_mm_cpu, to_payload_element
+        from vllm_omni.utils.mm_outputs import to_payload_element
 
-        mm_cpu = build_mm_cpu(multimodal_outputs=uncached)
         order = list(ctx.spans)
         total = sum(e - s for s, e in ctx.spans.values())
-        for key, val in mm_cpu.items():
+        for key, val in uncached.items():
             per_req: dict[str, Any] = {}
             for req_id in req_ids:
-                idx = order.index(req_id) if req_id in ctx.spans else 0
-                start, end = ctx.spans.get(req_id, (0, 0))
+                idx = order.index(req_id)
+                start, end = ctx.spans[req_id]
                 per_req[req_id] = to_payload_element(
                     val,
                     idx,

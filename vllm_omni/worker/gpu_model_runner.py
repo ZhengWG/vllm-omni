@@ -200,9 +200,16 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
 
     def _ensure_omni_prefix_cache(self) -> None:
-        """One-shot construction (caller gates on the staged config)."""
+        """One-shot construction (caller gates on the staged config).
+
+        Only the last PP rank writes and materializes the cache. Other ranks
+        would register hits they can never serve (save_outputs is last-rank
+        only), so skip construction there.
+        """
         cfg = self._omni_prefix_cache_cfg
         self._omni_prefix_cache_cfg = None
+        if not get_pp_group().is_last_rank:
+            return
         view = get_prefix_cache_group_view(
             self.input_batch, cfg.block_size, cfg.num_blocks, kv_cache_groups=cfg.kv_cache_groups
         )

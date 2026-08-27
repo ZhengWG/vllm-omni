@@ -343,7 +343,7 @@ runtime conditions hold:
 | The model stage opts in with `use_async_omni_output` | Models must declare that their output lifecycle is safe to defer |
 | Speculative decoding is disabled | Speculative output state is not included in this deferred path |
 | Routed-expert output is disabled | Routed-expert extraction currently requires the synchronous path |
-| Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns |
+| Postprocess is absent or explicitly runs eagerly | State needed by the next decode step must be updated before the runner returns. Eager postprocess sees the scheduled slice (`None, None` combined tensors), not the prefix-cache-merged full prompt; it must only consume the tail |
 
 These checks are evaluated per stage on runners based on `GPUARModelRunner`.
 An unsupported combination does not prevent serving; it only falls back to

@@ -192,8 +192,14 @@ outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 
 Each `sid` is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. `materialize` may run on the async output builder after the engine
-has entered the next step; see
+has entered the next step; leftover mm (deferred tails and uncached
+passthrough) is copied to CPU at `save_outputs` so the builder never reads
+live CUDA-graph buffers. See
 [Async Omni Output Materialization](omni_async_output_materialization.md).
+
+The cache is constructed only on the last pipeline-parallel rank
+(`_ensure_omni_prefix_cache`). Other ranks skip it: they never call
+`save_outputs`, so a hit table there would resolve to absent slots.
 
 ### Related Files
 

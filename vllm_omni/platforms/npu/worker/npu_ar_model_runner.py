@@ -245,23 +245,17 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
 
     def _maybe_get_combined_prefix_cache_tensors(
         self,
-        hidden_states: torch.Tensor,
-        multimodal_outputs: dict,
-        num_scheduled_tokens: dict[str, int],
         *,
         step_id: int | None = None,
         req_ids: list[str] | None = None,
     ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
-        combined_hidden_states, combined_multimodal_outputs = None, None
-        if self.omni_prefix_cache is not None:
-            if step_id is None:
-                return None, None
-            # The manager decides read-vs-nothing by policy/hits; the return
-            # is already assembled per request. req_ids must be (a subset of)
-            # the save-time snapshot (debug-asserted inside).
-            outs = self.omni_prefix_cache.materialize(step_id, list(req_ids or ()))
-            return outs.hidden_states, (outs.mm_outputs or None)
-        return combined_hidden_states, combined_multimodal_outputs
+        if self.omni_prefix_cache is None or step_id is None:
+            return None, None
+        # The manager decides read-vs-nothing by policy/hits; the return
+        # is already assembled per request. req_ids must be (a subset of)
+        # the save-time snapshot (debug-asserted inside).
+        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids or ()))
+        return outs.hidden_states, (outs.mm_outputs or None)
 
     @staticmethod
     def _resolve_req_hidden_states(
@@ -1107,12 +1101,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
         if callable(query_start_loc_cpu):
             query_start_loc_cpu = query_start_loc_cpu()
 
-        self._stage_deferred_prefix_cache_mm_outputs(
-            scheduler_output=scheduler_output,
-            multimodal_outputs=multimodal_outputs,
-            query_start_loc_cpu=query_start_loc_cpu,
-        )
-
         pooler_output: list[dict[str, object]] | None = None
         if needs_pooler_payload:
             combined_hidden_states = None
@@ -1123,9 +1111,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin):
                     combined_hidden_states,
                     combined_multimodal_outputs,
                 ) = self._maybe_get_combined_prefix_cache_tensors(
-                    hidden_states,
-                    multimodal_outputs,
-                    scheduler_output.num_scheduled_tokens,
                     step_id=prefix_cache_step_id,
                     req_ids=list(req_ids_output_copy),
                 )

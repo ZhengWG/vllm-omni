@@ -635,13 +635,11 @@ def test_async_omni_output_guard_requires_safe_conditions():
 
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
-    # Cache-enabled runs always consume on the main thread (eager
-    # materialize): offloading the merge to the builder thread measured
-    # slower end to end (GIL contention).
+    # Prefix cache no longer forces the sync output path; leftover mm is
+    # snapshotted at save so the builder can materialize a step late.
     runner.omni_prefix_cache = object()
-    assert not GPUARModelRunner._should_use_async_omni_output(runner)
+    assert GPUARModelRunner._should_use_async_omni_output(runner)
 
-    runner.omni_prefix_cache = None
     runner.model.has_postprocess = True
     assert not GPUARModelRunner._should_use_async_omni_output(runner)
 

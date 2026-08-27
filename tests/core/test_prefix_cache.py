@@ -5,6 +5,7 @@ vLLM runtime is required (runnable without a vllm install via
 ``pytest --confcutdir=tests/core``).
 """
 
+import logging
 import sys
 import types
 from pathlib import Path
@@ -784,16 +785,36 @@ def test_hit_prefetch_prebuilds_merged_buffer():
     assert torch.equal(merged[8:], expected_rows(view.slots_for("b", 8, 12)))
 
 
-def test_same_step_hit_skips_prefetch():
+def test_same_step_hit_skips_prefetch(caplog):
     """Rows this step's save has not registered yet cannot be planned at
-    new_step_starts; the hit falls back to materialize's plan+fetch."""
+    new_step_starts; the hit falls back to materialize's plan+fetch.
+    Prefetch must not log CRITICAL for that expected miss."""
     mgr, view = make_manager()
     view.req_blocks["a"] = [0, 1]
-    sid = run_step(mgr, view, {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8})
+    with caplog.at_level(logging.CRITICAL, logger="vllm_omni.core.prefix_cache.manager"):
+        sid = run_step(mgr, view, {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8})
+    assert not any("omni prefix cache unmatch" in r.message for r in caplog.records)
     ctx = mgr._step_ctxs[sid]
     assert HIDDEN_KEY not in ctx.hit_prefetch.get("b", {})
     outs = mgr.materialize(sid, ["a", "b"])
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
+
+
+def test_leftover_mm_snapshot_survives_live_overwrite():
+    """Deferred / uncached mm is copied at save; mutating the live buffer
+    afterwards must not change materialize (async builder vs next step)."""
+    policy = ModelCachePolicy(
+        needs_full_hidden_states=True,
+        deferred_keys=frozenset({"codes.audio"}),
+        skip_keys=frozenset({"codes.audio"}),
+    )
+    mgr, view = make_manager(policy=policy)
+    live = torch.full((2, 2), 1.0)
+    sid = run_step(mgr, view, {"a": ([0], 0, 2)}, mm={"codes.audio": live})
+    assert "codes.audio" in mgr._step_ctxs[sid].mm_cpu_snapshot
+    live.fill_(99.0)
+    outs = mgr.materialize(sid, ["a"])
+    assert torch.equal(outs.mm_outputs["codes.audio"]["a"], torch.full((2, 2), 1.0))
 
 
 def test_staging_slot_released_on_no_consumer_early_return():

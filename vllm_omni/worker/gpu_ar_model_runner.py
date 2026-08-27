@@ -763,8 +763,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
         staged_hidden_states_cpu: torch.Tensor | None,
         needs_scheduled_hidden_payload: bool,
         req_ids: list[str],
-        scheduler_output: SchedulerOutput,
-        hidden_states: torch.Tensor,
         step_id: int | None,
     ) -> tuple[torch.Tensor | None, dict[str, torch.Tensor] | None, dict | None]:
         """Prefix-cache payload sources for the pooler payload build.
@@ -1872,8 +1870,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin):
                     needs_scheduled_hidden_payload=needs_scheduled_hidden_payload,
                     step_id=prefix_cache_step_id,
                     req_ids=req_ids_output_copy,
-                    scheduler_output=scheduler_output,
-                    hidden_states=hidden_states,
                 )
             if combined_multimodal_outputs is None:
                 flat_mm = flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs

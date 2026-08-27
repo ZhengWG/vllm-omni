@@ -113,8 +113,6 @@ class ModelCachePolicy:
     """Replaces getattr probing on models for cache behavior decisions."""
 
     needs_full_hidden_states: bool = True
-    # Forces eager materialize on the main thread.
-    merge_consumed_by_postprocess: bool = False
     deferred_keys: frozenset[str] = frozenset()
     skip_keys: frozenset[str] = frozenset()
 
