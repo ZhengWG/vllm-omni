@@ -91,45 +91,22 @@ EVS compares downsampled frames and drops near-duplicate frames before they ente
 
 ## Eager Prefill (Incremental Prefill)
 
-When stage-0 (thinker) prefix caching is enabled, text-only sessions prefill arriving
-frames into the KV cache before the query is submitted. This is a **server-side
-capability**, derived once at startup from the deploy config — there is no
-`session.config` flag for it. It activates when both hold:
+Server-side only (stage-0 `enable_prefix_caching: true` and `modalities: ["text"]`).
+There is no `session.config` flag. Audio-output sessions stay on the legacy path.
 
-- stage 0 has `enable_prefix_caching: true`, and
-- the session is text-only (`modalities: ["text"]`).
-
-Audio-output sessions (any `modalities` that include `"audio"`) always use the legacy path.
-
-When active:
-
-1. **Eager warmup on `video.frame`** — after each accepted frame (when no query is
-   running), the server submits a short `max_tokens=1` warmup whose prompt is
-   `system? + recent text-only history + user(frames only)`. That runs vision encode +
-   prefill into the engine prefix cache as frames arrive, so a later query only pays for
-   its text suffix. At most one warmup is in flight; it is cancelled when a query starts
-   (already computed cache blocks are kept).
-2. **`video.query`** — submits every buffered frame in arrival order as the new user turn
-   (`frames + optional input audio + query text`). The query prompt is a strict extension
-   of the warmup prompt through the last vision token, so it reuses the warmed KV. Frame
-   selection happens at **arrival time only** (EVS filter + `max_frames`); query-time
-   `num_frames` subsampling is a legacy-path-only knob, because a sampled subset is not a
-   prefix of the warmed sequence.
-3. **Turn boundaries** — history stays compressed exactly like the legacy path (at most
-   the last two messages, text only). A committed turn therefore changes the prompt
-   prefix, and the next warmup re-prefills the buffered frames against it — off the
-   query's critical path, so TTFT stays protected. The prompt is bounded by
-   `max_frames` + the two-message history window.
+Input is unchanged: `video.frame` and `audio.chunk` are separate buffers. Warmup
+prefills `history + frames` as they arrive (`max_tokens=1`). `video.query` is the
+same prompt plus optional input audio and the question text, so the warmed vision
+KV is reused and the query pays for the audio/text suffix. All buffered frames are
+submitted in arrival order (`num_frames` subsample is legacy-only). After a turn,
+history compresses to the last two text messages and the next warmup follows the
+new prefix.
 
 ### Legacy path (eager prefill inactive)
 
-Used when stage-0 prefix caching is off, or `modalities` includes `"audio"`:
-
-- Frames are re-sampled from the buffer up to `num_frames` each query.
-- No eager warmup requests.
-
-Both paths keep frames in the buffer across queries (bounded by `max_frames`) and compress
-history to the last two messages, text only.
+Stage-0 prefix caching is off, or `modalities` includes `"audio"`: no warmup,
+frames are re-sampled up to `num_frames` each query. Both paths keep the frame
+buffer across queries (`max_frames`) and compress history the same way.
 
 ## Known Limitations
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Base WebSocket handler for streaming video input understanding.
 
 Shared session loop, frame/audio buffering, EVS pre-filter, prewarm,
@@ -274,18 +274,7 @@ class OmniStreamingVideoHandler:
         return []
 
     def _incremental_prefill_active(self, config: StreamingVideoSessionConfig) -> bool:
-        """Whether this session eagerly prefills arriving frames so the
-        query's prompt prefix is already in the prefix cache.
-
-        Frames are sampled at arrival time only (EVS filter + max_frames);
-        query-time num_frames subsampling is disabled because a subset is
-        not a prefix of the warmed sequence.
-
-        Enabled server-side when stage-0 prefix caching is on; forced off
-        for audio-output sessions because the talker needs thinker hidden
-        states covering the whole prompt, so those turns must fully
-        re-prefill.
-        """
+        """Eager frame prefill: stage-0 prefix cache on, text-only output."""
         return self._incremental_prefill_supported and "audio" not in config.modalities
 
     def on_frame_buffered(
@@ -807,12 +796,8 @@ class OmniStreamingVideoHandler:
             ChatCompletionRequest,
         )
 
-        engine_client = self._engine_client
-        if engine_client is None:
-            await self._send_error(websocket, "Streaming video requires an engine client")
-            return
-
         reuse_active = self._incremental_prefill_active(config)
+        assert self._engine_client is not None
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -831,10 +816,9 @@ class OmniStreamingVideoHandler:
             "continue_final_message": False,
             "add_special_tokens": False,
         }
-        # With eager prefill the kwargs must match the warmup request: they
-        # fold into the multimodal item hashes, and flipping them would
-        # invalidate the warmed prefix of every buffered frame.
-        if config.use_audio_in_video and (len(audio_buffer) > 0 or reuse_active):
+        # reuse: same kwargs as warmup so frame mm hashes stay a prefix.
+        # legacy: only when this query actually has input audio.
+        if config.use_audio_in_video and (reuse_active or len(audio_buffer) > 0):
             request_kwargs["mm_processor_kwargs"] = {
                 "use_audio_in_video": True,
             }
@@ -853,8 +837,6 @@ class OmniStreamingVideoHandler:
             await self._send_error(websocket, f"Preprocess failed: {e}")
             return
         decoded_ready_ts_ms = _time.monotonic() * 1000
-        # Eager prefill submits every buffered frame in arrival order (the
-        # warmed sequence); only the legacy path samples at query time.
         if reuse_active:
             selected_metadata = list(frame_metadata or [])
         else:
@@ -883,7 +865,7 @@ class OmniStreamingVideoHandler:
         audio_tail_tensors: list[Any] = []
 
         try:
-            result_gen = engine_client.generate(
+            result_gen = self._engine_client.generate(
                 prompt=engine_prompt,
                 request_id=request_id,
                 output_modalities=config.modalities,
@@ -1224,12 +1206,7 @@ class OmniStreamingVideoHandler:
         messages: list[dict[str, Any]],
         request_id: str,
     ) -> None:
-        """Prefill the given messages into the engine's prefix cache.
-
-        A max_tokens=1 request whose prompt shares every frame token with the
-        upcoming query prompt: vision encode + prefill happen at frame-arrival
-        time, so the query only pays for its own text suffix.
-        """
+        """max_tokens=1 generate so arriving frames land in the prefix cache."""
         from vllm import SamplingParams
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
@@ -1248,7 +1225,6 @@ class OmniStreamingVideoHandler:
             "continue_final_message": False,
             "add_special_tokens": False,
         }
-        # Must match the query-time kwargs: they fold into the mm hashes.
         if config.use_audio_in_video:
             request_kwargs["mm_processor_kwargs"] = {"use_audio_in_video": True}
 
