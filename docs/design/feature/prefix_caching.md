@@ -182,6 +182,13 @@ Schedule is a key split: hidden and non-deferred mm use `JOIN_NEXT_STEP`
 (committer copies the GPU freeze on finish/abort, or earlier under cap
 pressure).
 
+Hit reads follow the same split. A `JOIN_NEXT_STEP` in-transit span waits
+the owner's `done` (scatter, not just D2H), drains so occupancy flips to
+committed, then reads the pool. A `JOIN_ON_FINISH` in-transit span still
+uses `fetch_host` on the GPU freeze so a concurrent same-prefix hit does
+not force the whole deferred payload to disk. Staging-slot reader holders
+are gone: once scattered, pool rows persist across slot reuse.
+
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
 cache.new_step_starts(scheduler_output)   # before _update_states

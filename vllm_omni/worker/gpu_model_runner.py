@@ -188,7 +188,6 @@ class OmniGPUModelRunner(GPUModelRunner):
                 hs_dtype=self.dtype,
                 scheduler_config=self.scheduler_config,
                 model_config=self.model_config,
-                kv_cache_groups=getattr(kv_cache_config, "kv_cache_groups", None),
             )
 
     def _snapshot_prefix_cache_model_flags(self, model) -> None:
@@ -211,7 +210,10 @@ class OmniGPUModelRunner(GPUModelRunner):
         if not get_pp_group().is_last_rank:
             return
         view = get_prefix_cache_group_view(
-            self.input_batch, cfg.block_size, cfg.num_blocks, kv_cache_groups=cfg.kv_cache_groups
+            self.input_batch,
+            cfg.block_size,
+            cfg.num_blocks,
+            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
         )
         if view is None:
             # No usable full-attention group (hybrid/multi-group model).

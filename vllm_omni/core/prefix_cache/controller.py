@@ -43,10 +43,9 @@ class StagingBufferHolder(NamedTuple):
     Not a buffer state — concurrent owners share the same slot:
     - step: claimed at save, released when materialize/discard consumes the ctx
     - task: bound before WriteTask submit, released when that tid drains
-    - reader: hit prefetch/plan, released after the unlocked copy-out
     """
 
-    kind: Literal["step", "task", "reader"]
+    kind: Literal["step", "task"]
     owner_id: int
 
     @classmethod
@@ -56,10 +55,6 @@ class StagingBufferHolder(NamedTuple):
     @classmethod
     def for_task(cls, tid: int) -> StagingBufferHolder:
         return cls("task", tid)
-
-    @classmethod
-    def for_reader(cls, seq: int) -> StagingBufferHolder:
-        return cls("reader", seq)
 
 
 @dataclass
@@ -186,10 +181,11 @@ class StagingBufferPool:
     this is not the CPU block pool.
 
     A slot is busy while any StagingBufferHolder is in `_busy`: one per
-    WriteTask (freed when the manager drains its completion), one for the
-    step context (freed when materialize/discard consumes it), plus
-    transient reader holders for hit fetches that run unlocked. No free
-    slot is a contract break (fail-fast), not a second D2H path.
+    WriteTask (freed when the manager drains its completion) and one for
+    the step context (freed when materialize/discard consumes it). Hit
+    reads of JOIN_NEXT_STEP rows join scatter and then read the pool, so
+    they do not pin this slot. No free slot is a contract break
+    (fail-fast), not a second D2H path.
     """
 
     def __init__(self, depth: int, capacity: int):

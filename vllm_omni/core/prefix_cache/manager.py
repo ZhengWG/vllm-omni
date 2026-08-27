@@ -38,7 +38,6 @@ already in the next step. Warmup/dummy runs are never fed.
 
 from __future__ import annotations
 
-import itertools
 import logging
 import threading
 from collections.abc import Iterable, Mapping
@@ -121,20 +120,23 @@ def _locked(fn):
 class _RowSource:
     """Row sources resolved under the state lock, fetched outside it.
 
-    Holds pinned task references, never a storage tier: a task may commit
-    between plan and fetch. fetch_host re-resolves at call time — staging
-    views wait `host_event`; deferred host is the committer's own copy;
-    pool rows are already scattered. Reader holders keep a staging slot
-    alive across that unlocked fetch.
+    Schedule split, not a single read tier:
+    - JOIN_NEXT_STEP in-transit: ``join_tids``. Fetch waits ``done``,
+      drains, then reads the pool. Staging views are never sliced.
+    - JOIN_ON_FINISH in-transit: ``staged_list`` task refs. Fetch uses
+      ``fetch_host`` (GPU freeze / committer host).
+    - Already scattered: ``already_staged`` → pool.
+
+    A JOIN_NEXT_STEP task may disappear between plan and join (another
+    facade already drained it); ``join`` no-ops and the pool rows persist.
     """
 
     slots: torch.Tensor
     key: str
     req_id: str
     already_staged: bool  # this key is already in the CPU pool
-    staged_list: list[tuple[WriteTask, torch.Tensor]]  # (task, mask over slots)
-    # Staging-buffer holders for an unlocked fetch; released when the copy-out finishes.
-    staging_holders: list[tuple[int, StagingBufferHolder]] = field(default_factory=list)
+    staged_list: list[tuple[WriteTask, torch.Tensor]]  # JOIN_ON_FINISH only
+    join_tids: list[int] = field(default_factory=list)  # JOIN_NEXT_STEP in-transit
 
 
 @dataclass
@@ -219,7 +221,6 @@ class OmniPrefixCacheManager:
         # Prefix gather during forward (CPU work releases the GIL).
         self._prefetch_pool = ThreadPoolExecutor(1, thread_name_prefix="omni-prefix-cache-prefetch")
         self._prefetch_jobs: list[tuple[Future, _RowSource]] = []
-        self._holder_seq = itertools.count(1)  # StagingBufferHolder.for_reader ids, never reused
 
         # Consume-exactly-once snapshots (materialize XOR discard_step).
         self._next_step_id = 1
@@ -502,7 +503,6 @@ class OmniPrefixCacheManager:
                                 req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY)
                             )
                 except Exception:
-                    self._release_planned_hit_holders(hit_sources)
                     logger.critical("omni prefix cache unmatch during materialize", exc_info=True)
                     raise
 
@@ -557,9 +557,6 @@ class OmniPrefixCacheManager:
 
     def shutdown(self) -> None:
         self._prefetch_pool.shutdown(wait=False, cancel_futures=True)
-        for fut, src in self._prefetch_jobs:
-            if fut.cancelled():
-                self._release_staging_holders(src.staging_holders)
         self._prefetch_jobs.clear()
         self._controller.shutdown()
 
@@ -582,11 +579,7 @@ class OmniPrefixCacheManager:
                     src = self._plan_hit_rows(req_id, hit_upto, hit_blocks, key, strict=(key == HIDDEN_KEY))
                 except Exception:
                     continue
-                try:
-                    fut = self._prefetch_pool.submit(self._prefetch_hit, src, n_new)
-                except Exception:
-                    self._release_staging_holders(src.staging_holders)
-                    raise
+                fut = self._prefetch_pool.submit(self._prefetch_hit, src, n_new)
                 self._prefetch_jobs.append((fut, src))
                 futs[key] = fut
             if futs:
@@ -629,7 +622,7 @@ class OmniPrefixCacheManager:
             self._pool.ensure_key(HIDDEN_KEY, hidden_states.dtype, int(hidden_states.shape[-1]))
             out[HIDDEN_KEY] = hidden_states[:n].clone()
 
-        reserved = self._policy.skip_keys | self._policy.deferred_keys | {HIDDEN_KEY}
+        reserved = self._policy.deferred_keys | {HIDDEN_KEY}
         for key, val in mm_flat.items():
             if key in reserved or not isinstance(val, torch.Tensor) or val.ndim < 2:
                 continue
@@ -797,6 +790,7 @@ class OmniPrefixCacheManager:
             self._task_slots[tid] = torch.cat([prev, slots])
             self._task_keys[tid] = tuple(dict.fromkeys(self._task_keys[tid] + keys))
 
+    @torch.inference_mode()
     def _commit_drained_writes(self) -> None:
         """Fold controller drain into the (slot, key) tables.
 
@@ -862,15 +856,6 @@ class OmniPrefixCacheManager:
         if ctx.d2h is not None:
             self._controller.staging_release(ctx.d2h.slot, StagingBufferHolder.for_step(step_id))
 
-    def _release_staging_holders(self, holders: list[tuple[int, StagingBufferHolder]]) -> None:
-        for slot, holder in holders:
-            self._controller.staging_release(slot, holder)
-
-    def _release_planned_hit_holders(self, hit_sources: dict[tuple[str, str], _RowSource | Future]) -> None:
-        for src in hit_sources.values():
-            if isinstance(src, _RowSource):
-                self._release_staging_holders(src.staging_holders)
-
     # -------------------------------------------------- plan / fetch
 
     def _plan_hit_rows(
@@ -922,8 +907,9 @@ class OmniPrefixCacheManager:
         the mirror baseline (legitimate for sparse/deferred keys — the strict
         caller has already rejected absent); rows registered in-transit whose
         entry cannot serve them are a bookkeeping error, never silent zeros.
-        The plan holds task references, not storage tiers: fetch_host
-        re-resolves the tier when the fetch actually runs.
+
+        JOIN_NEXT_STEP owners are recorded as tids (join-then-pool at
+        fetch). JOIN_ON_FINISH owners stay as task refs for fetch_host.
         """
         n = int(slots.numel())
         if states is None:
@@ -934,7 +920,7 @@ class OmniPrefixCacheManager:
         staged_mask = states == _IN_TRANSIT
 
         staged: list[tuple[WriteTask, torch.Tensor]] = []
-        staging_slots: list[int] = []
+        join_tids: list[int] = []
         for owner in {int(o) for o in owners[staged_mask].tolist()}:
             task = self._controller.get_task(owner) if owner != 0 else None
             if task is None:
@@ -944,57 +930,58 @@ class OmniPrefixCacheManager:
                 raise OmniPrefixCacheUnmatchError(
                     f"(slot, {key}) rows of req {req_id} are in-transit but entry {owner} cannot serve them"
                 )
-            staged.append((task, staged_mask & (owners == owner)))
-            if task.staging_slot is not None:
-                staging_slots.append(task.staging_slot)
+            if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
+                join_tids.append(task.tid)
+            else:
+                staged.append((task, staged_mask & (owners == owner)))
 
         already_staged = self._pool.has_key(key)
-        if not already_staged and not staged:
+        if not already_staged and not staged and not join_tids:
             if strict:
                 raise OmniPrefixCacheUnmatchError(f"no data source for hit span of req {req_id}, key {key}")
             raise KeyError(f"key {key} has no cache mirror")
-        # Bind only after the plan is valid: a raise above must not leak holders.
-        staging_holders: list[tuple[int, StagingBufferHolder]] = []
-        for slot in staging_slots:
-            holder = StagingBufferHolder.for_reader(next(self._holder_seq))
-            self._controller.staging_bind(slot, holder)
-            staging_holders.append((slot, holder))
         return _RowSource(
             slots=slots,
             key=key,
             req_id=req_id,
             already_staged=already_staged,
             staged_list=staged,
-            staging_holders=staging_holders,
+            join_tids=join_tids,
         )
 
     def _fetch_source(self, src: _RowSource) -> torch.Tensor:
-        """Fetch a planned row source (execute phase, no lock). Releases the
-        plan's reader holders on the way out, success or raise."""
-        try:
-            n = int(src.slots.numel())
-            out: torch.Tensor | None = None
-            if src.already_staged:
+        """Fetch a planned row source (execute phase, no lock).
+
+        JOIN_NEXT_STEP: wait ``done`` (not host_ready — pool is still zero
+        after D2H), drain so manager tables flip to COMMITTED, then read
+        the pool. JOIN_ON_FINISH: fetch_host on the GPU freeze.
+        """
+        if src.join_tids:
+            self._controller.join(src.join_tids)
+            with self._state_lock:
+                self._commit_drained_writes()
+        n = int(src.slots.numel())
+        out: torch.Tensor | None = None
+        if src.already_staged or src.join_tids:
+            if self._pool.has_key(src.key):
                 out = self._pool.rows(src.key, src.slots)
-            for task, mask in src.staged_list:
-                try:
-                    rows = self._controller.fetch_host(task, src.slots[mask], src.key)
-                except KeyError:
-                    raise OmniPrefixCacheUnmatchError(
-                        f"(slot, {src.key}) rows of req {src.req_id} are staged in entry "
-                        f"{task.tid} (req {task.req_id}, write_n {task.write_n}) but the task cannot serve them"
-                    ) from None
-                if out is None:
-                    out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
-                out[mask] = rows
-            assert out is not None  # _plan_rows guarantees a source
-            in_transit = None
-            for _, mask in src.staged_list:
-                in_transit = mask if in_transit is None else in_transit | mask
-            self._ensure_not_reassigned(src.slots, src.key, in_transit_mask=in_transit, req_id=src.req_id)
-            return out
-        finally:
-            self._release_staging_holders(src.staging_holders)
+        for task, mask in src.staged_list:
+            try:
+                rows = self._controller.fetch_host(task, src.slots[mask], src.key)
+            except KeyError:
+                raise OmniPrefixCacheUnmatchError(
+                    f"(slot, {src.key}) rows of req {src.req_id} are staged in entry "
+                    f"{task.tid} (req {task.req_id}, write_n {task.write_n}) but the task cannot serve them"
+                ) from None
+            if out is None:
+                out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
+            out[mask] = rows
+        assert out is not None  # _plan_rows guarantees a source
+        in_transit = None
+        for _, mask in src.staged_list:
+            in_transit = mask if in_transit is None else in_transit | mask
+        self._ensure_not_reassigned(src.slots, src.key, in_transit_mask=in_transit, req_id=src.req_id)
+        return out
 
     def _ensure_not_reassigned(
         self,
@@ -1006,7 +993,8 @@ class OmniPrefixCacheManager:
     ) -> None:
         """Post-fetch validation: pool rows read without a lock may have
         been remounted mid-read (block reuse). A torn pool read must
-        fail-fast. Slots already in-transit at plan time are excluded.
+        fail-fast. JOIN_ON_FINISH slots already in-transit at plan time
+        are excluded; JOIN_NEXT_STEP slots must be COMMITTED after drain.
         """
         with self._state_lock:
             state = self._key_state.get(key)
@@ -1020,19 +1008,6 @@ class OmniPrefixCacheManager:
                     f"(slot, {key}) rows of req {req_id} were reassigned to a new entry during "
                     f"materialize ({int(violated.sum())} slots; block reuse mid-read)"
                 )
-
-    def _resolve_rows(
-        self,
-        slots: torch.Tensor,
-        key: str,
-        strict: bool,
-        req_id: str,
-        states: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Plan + fetch in one call (tests / debugging)."""
-        with self._state_lock:
-            src = self._plan_rows(slots, key, strict, req_id, states)
-        return self._fetch_source(src)
 
     # ---------------------------------------------------------- merge
 

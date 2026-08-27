@@ -3,7 +3,7 @@
 Naming aligns with vLLM's v1/core KV-cache design.
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, NamedTuple
 
@@ -41,10 +41,6 @@ class PrefixCacheConfig:
     staging_capacity_tokens: int = 1024
     # D2H chunk size for the JOIN_ON_FINISH trickle.
     copy_chunk_bytes: int = 16 * 1024 * 1024
-    # vLLM kv-cache groups (KVCacheGroupSpec list); the group-view factory
-    # selects by spec type. Excluded from equality (config identity is the
-    # sizing knobs).
-    kv_cache_groups: Any = field(default=None, compare=False)
 
     @classmethod
     def from_vllm_config(
@@ -56,7 +52,6 @@ class PrefixCacheConfig:
         hs_dtype: torch.dtype,
         scheduler_config: Any = None,
         model_config: Any = None,
-        kv_cache_groups: Any = None,
     ) -> "PrefixCacheConfig":
         """Size D2H staging from the running scheduler.
 
@@ -86,7 +81,6 @@ class PrefixCacheConfig:
             hs_dtype=hs_dtype,
             staging_depth=4,
             staging_capacity_tokens=max(1, capacity),
-            kv_cache_groups=kv_cache_groups,
         )
 
 
@@ -113,19 +107,15 @@ class ModelCachePolicy:
     """Replaces getattr probing on models for cache behavior decisions."""
 
     needs_full_hidden_states: bool = True
+    # Token-major mm that stays on the GPU freeze until finish/abort
+    # (JOIN_ON_FINISH). Also skipped by the immediate freeze/D2H path.
     deferred_keys: frozenset[str] = frozenset()
-    skip_keys: frozenset[str] = frozenset()
 
     @classmethod
     def from_model(cls, model: Any) -> "ModelCachePolicy":
-        """Shim over legacy per-model attributes (deprecation window).
-
-        Legacy runners pass the deferred keys as the write-path skip keys,
-        so both policy fields map from the same attribute.
-        """
+        """Shim over legacy per-model attributes (deprecation window)."""
         deferred = frozenset(getattr(model, "deferred_prefix_cache_mm_keys", ()) or ())
         return cls(
             needs_full_hidden_states=bool(getattr(model, "requires_full_prefix_cached_hidden_states", True)),
             deferred_keys=deferred,
-            skip_keys=deferred,
         )

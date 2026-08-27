@@ -26,20 +26,14 @@ class KVCacheGroupView(Protocol):
 
     def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor: ...
 
-    def slots_for(self, req_id: str, token_start: int, token_end: int) -> torch.Tensor: ...
-
-    def cached_block_ids(self, req_id: str) -> torch.Tensor: ...
-
     def batch_req_ids(self) -> list[str]: ...
 
 
 class FullAttentionGroupView:
     """View over the first (full-attention) KV-cache group.
 
-    Behavior-preserving port of the block-table math previously inlined in
-    the legacy prefix cache (_get_slot_ids_for_token_range /
-    _get_cached_block_ids). Step slots come from the CPU block table
-    (`step_slots_cpu`), not the device slot_mapping.
+    Step slots come from the CPU block table (`step_slots_cpu`), not the
+    device slot_mapping.
     """
 
     def __init__(self, input_batch: InputBatch, block_size: int, num_blocks: int):
@@ -80,41 +74,6 @@ class FullAttentionGroupView:
                     continue
             parts.append(block_table[req_idx, offs].to(torch.long) * bs + (pos % bs))
         return torch.cat(parts) if parts else torch.empty((0,), dtype=torch.long)
-
-    def slots_for(self, req_id: str, token_start: int, token_end: int) -> torch.Tensor:
-        """Flat cache-row indices for a logical token range of a request.
-
-        Positions past the request's block table are dropped (legacy
-        clamping behavior for over-long deferred chunks).
-        """
-        if token_end <= token_start:
-            return torch.empty((0,), dtype=torch.long)
-
-        req_idx = self._input_batch.req_id_to_index[req_id]
-        block_table = self._block_table_cpu()
-        token_positions = torch.arange(token_start, token_end, dtype=torch.long)
-        block_offsets = token_positions // self.block_size
-        max_blocks = int(block_table.shape[1])
-        valid = block_offsets < max_blocks
-        if not bool(valid.all()):
-            token_positions = token_positions[valid]
-            block_offsets = block_offsets[valid]
-        if token_positions.numel() == 0:
-            return torch.empty((0,), dtype=torch.long)
-
-        block_ids = block_table[req_idx, block_offsets].to(torch.long)
-        return block_ids * self.block_size + (token_positions % self.block_size)
-
-    def cached_block_ids(self, req_id: str) -> torch.Tensor:
-        """Block ids covering a request's prefix-cache hit.
-
-        Relies on vLLM guaranteeing block-aligned num_computed_tokens for
-        prefix hits (full-hit rolls back a whole block).
-        """
-        req_idx = self._input_batch.req_id_to_index[req_id]
-        num_computed = self._input_batch.num_computed_tokens_cpu[req_idx]
-        num_cached_blocks = num_computed // self.block_size
-        return self._block_table_cpu()[req_idx, :num_cached_blocks]
 
 
 def get_prefix_cache_group_view(

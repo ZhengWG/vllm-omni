@@ -61,9 +61,6 @@ class FakeView:
             slots.append(blocks[pos // BLOCK_SIZE] * BLOCK_SIZE + pos % BLOCK_SIZE)
         return torch.tensor(slots, dtype=torch.long)
 
-    def cached_block_ids(self, req_id) -> torch.Tensor:
-        return torch.tensor(self.req_blocks[req_id], dtype=torch.long)
-
     def batch_req_ids(self) -> list[str]:
         return list(self.order)
 
@@ -137,6 +134,14 @@ def expected_rows(slots: torch.Tensor) -> torch.Tensor:
     return slots.to(DTYPE).unsqueeze(1).expand(slots.numel(), HIDDEN)
 
 
+def plan_fetch(mgr, slots, key, *, strict, req_id):
+    """Test stand-in for the deleted _resolve_rows helper."""
+    with mgr._state_lock:
+        src = mgr._plan_rows(slots, key, strict, req_id)
+    with torch.inference_mode():
+        return mgr._fetch_source(src)
+
+
 def test_no_hit_passthrough():
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
@@ -156,6 +161,46 @@ def test_hit_merge_from_mirror():
     assert merged.shape == (12, HIDDEN)
     assert torch.equal(merged[:8], expected_rows(view.slots_for("b", 0, 8)))
     assert torch.equal(merged[8:], expected_rows(view.slots_for("b", 8, 12)))
+
+
+def test_join_next_step_hit_waits_done_then_reads_pool():
+    """CPU stand-in for the non-eager A path: submit registers but does not
+    scatter. A same-step hit must join(done), drain, then read the pool —
+    not staging views. join is what unblocks scatter in this fixture."""
+    mgr, view = make_manager()
+    held: list = []
+    real_run = mgr._controller._run_eager
+    real_join = mgr._controller.join
+
+    def hold_submit(task, queued=True):
+        task.nbytes = sum(t.numel() * t.element_size() for s in task.segments for t in s.tensors.values())
+        mgr._controller._tasks[task.tid] = task
+        if queued:
+            held.append(task)
+
+    def join_then_scatter(tids):
+        for task in list(held):
+            if task.tid in tids and not task.done.is_set():
+                real_run(task)
+                held.remove(task)
+        real_join(tids)
+
+    mgr._controller.submit = hold_submit
+    mgr._controller.join = join_then_scatter
+
+    view.req_blocks["a"] = [0, 1]
+    sid = run_step(
+        mgr,
+        view,
+        {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)},
+        new_hits={"b": 8},
+    )
+    outs = mgr.materialize(sid, ["a", "b"])
+    assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
+    # After materialize's join+drain the producer task is gone and the
+    # pool holds the rows (join-then-pool, not a live staging view).
+    slots = view.slots_for("a", 0, 8)
+    assert torch.equal(mgr._pool.rows(HIDDEN_KEY, slots), expected_rows(slots))
 
 
 def test_same_step_hit_reads_in_transit():
@@ -215,9 +260,7 @@ def test_mm_cached_key_merge():
 
 
 def test_deferred_key_accumulates_and_flushes_on_finish():
-    policy = ModelCachePolicy(
-        needs_full_hidden_states=False, deferred_keys=frozenset({"codes.audio"}), skip_keys=frozenset({"codes.audio"})
-    )
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"codes.audio"}))
     mgr, view = make_manager(policy=policy)
     feat = 2
     # Two decode steps of one token each, then finish -> flush.
@@ -231,7 +274,7 @@ def test_deferred_key_accumulates_and_flushes_on_finish():
         mgr.materialize(sid, ["a"])
     # In-transit read before finish: deferred rows come from staged chunks.
     slots = view.slots_for("a", 0, 2)
-    rows = mgr._resolve_rows(slots, "codes.audio", strict=False, req_id="a")
+    rows = plan_fetch(mgr, slots, "codes.audio", strict=False, req_id="a")
     assert torch.equal(rows[:, 0], torch.tensor([1.0, 2.0]))
     # Finish (abort semantics identical): entry escalates and commits.
     sid = run_step(mgr, view, {"z": ([9], 0, 1)}, finished=["a"])
@@ -241,9 +284,7 @@ def test_deferred_key_accumulates_and_flushes_on_finish():
 
 
 def test_cap_forces_flush_of_deferred():
-    policy = ModelCachePolicy(
-        needs_full_hidden_states=False, deferred_keys=frozenset({"k"}), skip_keys=frozenset({"k"})
-    )
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
     # float32 feat=4 row = 16 bytes; 48 forces a flush by step 4.
     mgr, view = make_manager(policy=policy, gpu_staging_bytes=48)
     for pos in range(4):
@@ -262,12 +303,28 @@ def test_policy_from_model_shim():
     p = ModelCachePolicy.from_model(M())
     assert p.needs_full_hidden_states is False
     assert p.deferred_keys == frozenset({"codes.audio"})
-    assert p.skip_keys == frozenset({"codes.audio"})
     d = ModelCachePolicy.from_model(object())
     assert d.needs_full_hidden_states is True and not d.deferred_keys
 
 
-def test_group_view_slot_math():
+def _table_slots(table, req_idx, token_start, token_end, block_size=BLOCK_SIZE):
+    """Inline of the deleted FullAttentionGroupView.slots_for math."""
+    if token_end <= token_start:
+        return torch.empty((0,), dtype=torch.long)
+    token_positions = torch.arange(token_start, token_end, dtype=torch.long)
+    block_offsets = token_positions // block_size
+    max_blocks = int(table.shape[1])
+    valid = block_offsets < max_blocks
+    if not bool(valid.all()):
+        token_positions = token_positions[valid]
+        block_offsets = block_offsets[valid]
+    if token_positions.numel() == 0:
+        return torch.empty((0,), dtype=torch.long)
+    block_ids = table[req_idx, block_offsets].to(torch.long)
+    return block_ids * block_size + (token_positions % block_size)
+
+
+def test_group_view_step_slots_cpu():
     class TensorWrap:
         def __init__(self, t):
             self.cpu = t
@@ -294,13 +351,11 @@ def test_group_view_slot_math():
 
     table = torch.tensor([[2, 5, 7], [1, 0, 0]])
     view = FullAttentionGroupView(IB(table), block_size=BLOCK_SIZE, num_blocks=NUM_BLOCKS)
-    slots = view.slots_for("r1", 2, 6)
-    assert slots.tolist() == [2 * 4 + 2, 2 * 4 + 3, 5 * 4 + 0, 5 * 4 + 1]
-    # Positions past the block table are clamped (legacy parity).
-    slots = view.slots_for("r1", 10, 14)
-    assert slots.tolist() == [7 * 4 + 2, 7 * 4 + 3]
-    assert view.cached_block_ids("r1").tolist() == [2, 5]
-    assert view.slots_for("r1", 3, 3).numel() == 0
+    # r1 computed=8 → tokens 8,9 land on block 7.
+    assert view.step_slots_cpu(["r1"], {"r1": 2}).tolist() == [7 * 4 + 0, 7 * 4 + 1]
+    # Past the last block is clamped (legacy parity).
+    assert view.step_slots_cpu(["r1"], {"r1": 8}).tolist() == [7 * 4 + i for i in range(4)]
+    assert view.step_slots_cpu(["r1"], {"r1": 0}).numel() == 0
 
 
 def test_join_next_step_previous_save():
@@ -334,9 +389,7 @@ def test_deferred_tenant_succession_no_stale_wins():
     # Preemption-style reuse on the deferred path: a's staged rows (val 1)
     # still pending when b stages the same slots (val 2). Whatever the
     # finish order, the mirror's final value must be b's.
-    policy = ModelCachePolicy(
-        needs_full_hidden_states=False, deferred_keys=frozenset({"k"}), skip_keys=frozenset({"k"})
-    )
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
     s1 = run_step(mgr, view, {"a": ([2], 0, 2)}, mm={"k": torch.full((2, 2), 1.0)})
     mgr.materialize(s1, ["a"])
@@ -357,9 +410,7 @@ def test_slot_reuse_pushes_skip_to_old_task():
     """Reassignment = task swap: the old tenant's write skips the reassigned
     (slot, key) rows instead of ordering behind a dependency edge."""
     mgr, view = make_manager()
-    policy = ModelCachePolicy(
-        needs_full_hidden_states=False, deferred_keys=frozenset({"k"}), skip_keys=frozenset({"k"})
-    )
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
     mgr.register_policy(policy)
     # Deferred task holds slots of block 2 in-transit for key "k".
     s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.ones(1, 2)})
@@ -382,7 +433,6 @@ def test_deferred_key_hit_reads_staged_rows_not_mirror():
     policy = ModelCachePolicy(
         needs_full_hidden_states=True,
         deferred_keys=frozenset({"k"}),
-        skip_keys=frozenset({"k"}),
     )
     mgr, view = make_manager(policy=policy)
     # a stages 4 deferred rows and stays live (entry never flushed).
@@ -400,7 +450,6 @@ def test_append_to_closed_deferred_entry_opens_new_one():
     policy = ModelCachePolicy(
         needs_full_hidden_states=False,
         deferred_keys=frozenset({"k"}),
-        skip_keys=frozenset({"k"}),
     )
     mgr, view = make_manager(policy=policy)
     s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 1.0)})
@@ -412,7 +461,7 @@ def test_append_to_closed_deferred_entry_opens_new_one():
     mgr.materialize(s2, ["a"])
     assert mgr._deferred_tasks["a"].tid != first.tid
     slots = view.slots_for("a", 0, 2)
-    rows = mgr._resolve_rows(slots, "k", strict=False, req_id="a")
+    rows = plan_fetch(mgr, slots, "k", strict=False, req_id="a")
     assert torch.equal(rows[:, 0], torch.tensor([1.0, 2.0]))
 
 
@@ -447,10 +496,10 @@ def test_step_slots_cpu_matches_block_table_math():
     view = FullAttentionGroupView(IB(table, [4, 0]), block_size=BLOCK_SIZE, num_blocks=NUM_BLOCKS)
     num_sched = {"r1": 3, "r2": 5}
     got = view.step_slots_cpu(["r1", "r2"], num_sched)
-    want = torch.cat([view.slots_for("r1", 4, 7), view.slots_for("r2", 0, 5)])
+    want = torch.cat([_table_slots(table, 0, 4, 7), _table_slots(table, 1, 0, 5)])
     assert torch.equal(got, want), (got, want)
     # A request scheduled for 0 tokens contributes nothing.
-    assert torch.equal(view.step_slots_cpu(["r1", "r2"], {"r1": 3, "r2": 0}), view.slots_for("r1", 4, 7))
+    assert torch.equal(view.step_slots_cpu(["r1", "r2"], {"r1": 3, "r2": 0}), _table_slots(table, 0, 4, 7))
 
 
 def test_step_context_consumed_by_id_not_order():
@@ -615,7 +664,6 @@ def test_mm_hit_span_never_registered_serves_mirror_baseline():
     policy = ModelCachePolicy(
         needs_full_hidden_states=True,
         deferred_keys=frozenset({"k"}),
-        skip_keys=frozenset({"k"}),
     )
     mgr, view = make_manager(policy=policy)
     # a stages k on block 0 only; c prefills block 1 with no mm at all.
@@ -637,7 +685,6 @@ def test_mm_in_transit_unresolvable_fails_fast():
     policy = ModelCachePolicy(
         needs_full_hidden_states=True,
         deferred_keys=frozenset({"k"}),
-        skip_keys=frozenset({"k"}),
     )
     mgr, view = make_manager(policy=policy)
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
@@ -656,7 +703,6 @@ def test_lock_never_covers_fetch_or_join():
     policy = ModelCachePolicy(
         needs_full_hidden_states=True,
         deferred_keys=frozenset({"k"}),
-        skip_keys=frozenset({"k"}),
     )
     import threading
 
@@ -753,7 +799,7 @@ def test_oversized_step_fails_fast():
 def test_staging_task_never_defers_and_slot_held_until_drain():
     """A staging task's D2H is already in flight -> always JOIN_NEXT_STEP, and
     its slot holder survives the (eager, inline) scatter until the manager
-    drains the completion — the window hit readers pin on."""
+    drains the completion (hit reads join-then-pool and do not pin the slot)."""
     from vllm_omni.core.prefix_cache.interface import WriteSchedule
 
     mgr, view = make_manager()
@@ -800,13 +846,37 @@ def test_same_step_hit_skips_prefetch(caplog):
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
 
 
+def test_join_next_step_hit_survives_task_already_drained():
+    """Plan vs join: another facade drained the task; join no-ops and the
+    pool rows persist."""
+    mgr, view = make_manager()
+
+    def register_only(task, queued=True):
+        task.nbytes = sum(t.numel() * t.element_size() for s in task.segments for t in s.tensors.values())
+        with mgr._controller._lock:
+            mgr._controller._tasks[task.tid] = task
+
+    mgr._controller.submit = register_only
+    view.req_blocks["a"] = [0, 1]
+    sid = run_step(mgr, view, {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8})
+    with mgr._state_lock:
+        src = mgr._plan_hit_rows("b", 8, [0, 1], HIDDEN_KEY, strict=True)
+    for tid in src.join_tids:
+        mgr._controller._run_eager(mgr._controller.get_task(tid))
+    with torch.inference_mode():
+        with mgr._state_lock:
+            mgr._commit_drained_writes()
+        assert mgr._controller.get_task(src.join_tids[0]) is None
+        assert torch.equal(mgr._fetch_source(src), expected_rows(view.slots_for("b", 0, 8)))
+    mgr.materialize(sid, ["a", "b"])
+
+
 def test_leftover_mm_snapshot_survives_live_overwrite():
     """Deferred / uncached mm is copied at save; mutating the live buffer
     afterwards must not change materialize (async builder vs next step)."""
     policy = ModelCachePolicy(
         needs_full_hidden_states=True,
         deferred_keys=frozenset({"codes.audio"}),
-        skip_keys=frozenset({"codes.audio"}),
     )
     mgr, view = make_manager(policy=policy)
     live = torch.full((2, 2), 1.0)

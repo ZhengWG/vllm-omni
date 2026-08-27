@@ -54,7 +54,6 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 hs_dtype=self.dtype,
                 scheduler_config=self.scheduler_config,
                 model_config=self.model_config,
-                kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
             )
             logger.info(
                 "Initialized omni prefix cache on NPU (eager mode, num_blocks=%d, block_size=%d).",
