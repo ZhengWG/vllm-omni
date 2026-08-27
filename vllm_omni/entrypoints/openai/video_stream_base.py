@@ -415,6 +415,7 @@ class OmniStreamingVideoHandler:
 
                 async def _run_warmup() -> None:
                     nonlocal warmup_request_id, warmed_signature
+                    cancelled = False
                     try:
                         await _await_frame_prewarms()
                         messages = self.build_engine_prompt_prefix(
@@ -426,6 +427,7 @@ class OmniStreamingVideoHandler:
                         await self._prefill_context(config, messages, request_id)
                         warmed_signature = signature
                     except asyncio.CancelledError:
+                        cancelled = True
                         raise
                     except Exception:
                         # Mark attempted so a persistently failing state does
@@ -435,7 +437,12 @@ class OmniStreamingVideoHandler:
                     finally:
                         if warmup_request_id == request_id:
                             warmup_request_id = None
-                        asyncio.get_running_loop().call_soon(_maybe_start_warmup)
+                        # Skip on cancel: query already owns the session and will
+                        # call_soon after it finishes. Restarting here can spawn a
+                        # second warmup with the same frames before active_request_id
+                        # is set.
+                        if not cancelled:
+                            asyncio.get_running_loop().call_soon(_maybe_start_warmup)
 
                 warmup_task = asyncio.create_task(_run_warmup())
 
@@ -458,13 +465,20 @@ class OmniStreamingVideoHandler:
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
 
                 await _cancel_active_query()
+
+                if not frame_buffer:
+                    await _cancel_warmup()
+                    await self._send_error(websocket, "No frames buffered")
+                    return
+
+                # Claim the session before cancelling warmup so a leftover
+                # call_soon from a just-finished warmup hits the 405 gate.
+                request_id = f"video-{uuid.uuid4().hex[:12]}"
+                active_request_id = request_id
+                interrupt_event.clear()
                 # Free prefill capacity for the query; completed warmup blocks
                 # stay in the prefix cache and are reused by it.
                 await _cancel_warmup()
-
-                if not frame_buffer:
-                    await self._send_error(websocket, "No frames buffered")
-                    return
 
                 if prev_was_interrupted and prev_request_id and self._engine_client:
                     try:
@@ -473,10 +487,6 @@ class OmniStreamingVideoHandler:
                         pass
                     await asyncio.sleep(0.1)
                 prev_was_interrupted = False
-
-                request_id = f"video-{uuid.uuid4().hex[:12]}"
-                active_request_id = request_id
-                interrupt_event.clear()
                 query_frames = list(frame_buffer)
                 query_frame_metadata = list(frame_metadata)
                 query_audio_buffer = bytearray(audio_buffer)
@@ -796,8 +806,12 @@ class OmniStreamingVideoHandler:
             ChatCompletionRequest,
         )
 
+        engine_client = self._engine_client
+        if engine_client is None:
+            await self._send_error(websocket, "Streaming video requires an engine client")
+            return
+
         reuse_active = self._incremental_prefill_active(config)
-        assert self._engine_client is not None
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -865,7 +879,7 @@ class OmniStreamingVideoHandler:
         audio_tail_tensors: list[Any] = []
 
         try:
-            result_gen = self._engine_client.generate(
+            result_gen = engine_client.generate(
                 prompt=engine_prompt,
                 request_id=request_id,
                 output_modalities=config.modalities,
