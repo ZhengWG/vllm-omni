@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Qwen-Omni streaming video WebSocket handler.
 
 Accepts video frames incrementally via WebSocket, buffers them, and
@@ -104,9 +104,9 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         prewarmed_frames: dict[str, tuple[Any, str]],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if self._incremental_prefill_active(config):
-            # Every retained frame joins the context in arrival order — the
-            # same sequence the warmup prefilled, so the prefix cache covers
-            # it. Query-time subsampling would break that correspondence.
+            # Frames are sampled at arrival time only (EVS + max_frames), so
+            # the buffer already is the warmed sequence. Query-time
+            # subsampling would pick a subset, which is not a prefix.
             frames = list(frame_buffer)
         else:
             n_buf = len(frame_buffer)
@@ -136,24 +136,28 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
 
         user_message: dict[str, Any] = {"role": "user", "content": user_content}
 
-        messages: list[dict[str, Any]] = []
-        if config.system_prompt:
-            messages.append({"role": "system", "content": config.system_prompt})
-
-        if self._incremental_prefill_active(config):
-            # Append-only multimodal history: committed turns are replayed
-            # verbatim (same PIL objects / uuids), so the rendered prompt is a
-            # strict extension of the previous turn and the engine's prefix
-            # cache reuses their KV instead of re-encoding every frame.
-            messages.extend(message_history)
-        else:
-            recent_history = message_history[-2:] if len(message_history) > 2 else message_history
-            for hist_msg in recent_history:
-                messages.append(self._text_only_message(hist_msg))
-
+        messages = self._history_prefix_messages(config, message_history)
         messages.append(user_message)
 
         return messages, user_message
+
+    def _history_prefix_messages(
+        self,
+        config: StreamingVideoSessionConfig,
+        message_history: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Shared prompt prefix (system + compressed text-only history).
+
+        Warmup and query MUST build this identically: any divergence before
+        the frame parts voids the warmed KV from that token onward.
+        """
+        messages: list[dict[str, Any]] = []
+        if config.system_prompt:
+            messages.append({"role": "system", "content": config.system_prompt})
+        recent_history = message_history[-2:] if len(message_history) > 2 else message_history
+        for hist_msg in recent_history:
+            messages.append(self._text_only_message(hist_msg))
+        return messages
 
     def on_turn_complete(
         self,
@@ -171,16 +175,13 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         message_history: list[dict[str, Any]],
         prewarmed_frames: dict[str, tuple[Any, str]],
     ) -> list[dict[str, Any]] | None:
-        """History + a frames-only user turn: a strict prefix (up to the last
-        vision token) of the prompt the next query will submit."""
+        """History prefix + a frames-only user turn: a strict prefix (up to
+        the last vision token) of the prompt the next query will submit."""
         frame_parts = self._build_frame_image_parts(frame_buffer, prewarmed_frames)
         if not frame_parts:
             return None
 
-        messages: list[dict[str, Any]] = []
-        if config.system_prompt:
-            messages.append({"role": "system", "content": config.system_prompt})
-        messages.extend(message_history)
+        messages = self._history_prefix_messages(config, message_history)
         messages.append({"role": "user", "content": frame_parts})
         return messages
 

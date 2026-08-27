@@ -16,8 +16,8 @@ vllm serve Qwen/Qwen3-Omni-30B-A3B-Instruct \
     --trust-remote-code
 ```
 
-To enable [session context reuse / eager prefill](#session-context-reuse-and-eager-prefill),
-set `enable_prefix_caching: true` on stage 0 (the thinker) in the deploy config. Otherwise
+To enable [eager prefill](#eager-prefill-incremental-prefill), set
+`enable_prefix_caching: true` on stage 0 (the thinker) in the deploy config. Otherwise
 the server falls back to rebuilding the prompt per query.
 
 ### Run the Example Client
@@ -45,7 +45,7 @@ WebSocket /v1/video/chat/stream
 ### Protocol
 
 | Direction | Type | Required fields | Description |
-|-----------|------|-----------------|-------------|
+| ----------- | ------ | ----------------- | ------------- |
 | Client -> Server | `session.config` | none | First message. Configures output modalities, frame sampling, EVS, and prompts. |
 | Client -> Server | `video.frame` | `data` | Base64 JPEG/PNG frame. |
 | Client -> Server | `audio.chunk` | `data` | Base64 PCM16 16 kHz mono audio bytes. |
@@ -62,7 +62,7 @@ WebSocket /v1/video/chat/stream
 ### `session.config` Fields
 
 | Field | Type | Default | Description |
-|-------|------|---------|-------------|
+| ------- | ------ | --------- | ------------- |
 | `model` | string or null | null | Optional model name. Usually omitted because the server hosts one model. |
 | `modalities` | list[string] | `["text", "audio"]` | Output modalities. Use `["text"]`, `["audio"]`, or both. |
 | `num_frames` | integer, 1-128 | `4` | Number of buffered frames sampled for each query. |
@@ -78,7 +78,7 @@ WebSocket /v1/video/chat/stream
 The server accepts these legacy field names and rewrites them before validation. New clients should send the canonical names above.
 
 | Legacy field | Canonical field |
-|--------------|-----------------|
+| -------------- | ----------------- |
 | `num_sample_frames` | `num_frames` |
 | `evs_enabled` | `enable_frame_filter` |
 | `evs_threshold` | `frame_filter_threshold` |
@@ -86,7 +86,7 @@ The server accepts these legacy field names and rewrites them before validation.
 ### Environment Variables
 
 | Variable | Values | Default | Description |
-|----------|--------|---------|-------------|
+| ---------- | -------- | --------- | ------------- |
 | `VLLM_VIDEO_ASYNC_CHUNK` | `on`, `off` | `on` | Wire-level streaming switch. `off` buffers server-side deltas and emits coalesced outputs at the end of a query. |
 | `VLLM_VIDEO_AUDIO_DELTA_MODE` | `fast`, `slow` | `fast` | Audio delta extraction strategy. `fast` emits only newly produced chunks; `slow` recomputes from accumulated audio and exists for A/B verification. |
 
@@ -94,12 +94,12 @@ The server accepts these legacy field names and rewrites them before validation.
 
 EVS compares downsampled frames and drops near-duplicate frames before they enter the session frame buffer. `frame_filter_threshold` controls retention: higher values are more permissive and keep more frames; lower values are more aggressive and drop more similar frames.
 
-## Session Context Reuse and Eager Prefill
+## Eager Prefill (Incremental Prefill)
 
-When stage-0 (thinker) prefix caching is enabled, text-only sessions do not rebuild the
-prompt from scratch on every query. This is a **server-side capability**, derived once at
-startup from the deploy config — there is no `session.config` flag for it. It activates
-when both hold:
+When stage-0 (thinker) prefix caching is enabled, text-only sessions prefill arriving
+frames into the KV cache before the query is submitted. This is a **server-side
+capability**, derived once at startup from the deploy config — there is no
+`session.config` flag for it. It activates when both hold:
 
 - stage 0 has `enable_prefix_caching: true`, and
 - the session is text-only (`modalities: ["text"]`).
@@ -110,40 +110,40 @@ When active:
 
 1. **Eager warmup on `video.frame`** — after each accepted frame (when no query is
    running), the server submits a short `max_tokens=1` warmup whose prompt is
-   `system? + committed history + user(frames only)`. That runs vision encode + prefill
-   into the engine prefix cache as frames arrive, so a later query only pays for its text
-   suffix. At most one warmup is in flight; it is cancelled when a query starts (already
-   computed cache blocks are kept).
-2. **`video.query`** — consumes the current frame buffer into a new user turn
-   (`frames + optional input audio + query text`) and generates. The query prompt is a
-   strict extension of the warmup prompt through the last vision token, so it reuses the
-   warmed KV. In reuse mode every buffered frame is consumed in arrival order (`num_frames`
-   subsampling is a legacy-path-only knob).
-3. **Multi-turn history** — successful turns append full multimodal user/assistant
-   messages, replayed verbatim (same image objects / content hashes) so prior turns stay
-   prefix-cacheable.
-4. **Failure / interrupt** — the turn is not committed; its frames and audio are restored
-   to the buffers. If the restored buffer exceeds `max_frames`, frames are thinned
-   uniformly rather than dropping only the oldest prefix.
+   `system? + recent text-only history + user(frames only)`. That runs vision encode +
+   prefill into the engine prefix cache as frames arrive, so a later query only pays for
+   its text suffix. At most one warmup is in flight; it is cancelled when a query starts
+   (already computed cache blocks are kept).
+2. **`video.query`** — submits every buffered frame in arrival order as the new user turn
+   (`frames + optional input audio + query text`). The query prompt is a strict extension
+   of the warmup prompt through the last vision token, so it reuses the warmed KV. Frame
+   selection happens at **arrival time only** (EVS filter + `max_frames`); query-time
+   `num_frames` subsampling is a legacy-path-only knob, because a sampled subset is not a
+   prefix of the warmed sequence.
+3. **Turn boundaries** — history stays compressed exactly like the legacy path (at most
+   the last two messages, text only). A committed turn therefore changes the prompt
+   prefix, and the next warmup re-prefills the buffered frames against it — off the
+   query's critical path, so TTFT stays protected. The prompt is bounded by
+   `max_frames` + the two-message history window.
 
-### Legacy path (reuse inactive)
+### Legacy path (eager prefill inactive)
 
 Used when stage-0 prefix caching is off, or `modalities` includes `"audio"`:
 
-- Frames stay in the buffer and are re-sampled up to `num_frames` each query.
-- Prompt history is at most the last two messages, stripped to text only.
+- Frames are re-sampled from the buffer up to `num_frames` each query.
 - No eager warmup requests.
+
+Both paths keep frames in the buffer across queries (bounded by `max_frames`) and compress
+history to the last two messages, text only.
 
 ## Known Limitations
 
-- Session KV reuse / eager prefill applies only to text-only sessions with stage-0 prefix
-  caching enabled; audio-output sessions rebuild the prompt each query.
+- Eager prefill applies only to text-only sessions with stage-0 prefix caching enabled;
+  audio-output sessions rebuild the prompt each query.
 - Isolating audio-output requests from an enabled stage-0 prefix cache (so a cache hit
   cannot stall the talker, which needs thinker hidden states for the whole prompt) is
   tracked separately. Until then, do not enable stage-0 prefix caching on an instance that
   also serves audio-output requests.
-- The committed session context grows without bound; very long sessions eventually exceed
-  the model context window. Reconnect to start a fresh session.
 - Back-to-back short replies can still expose an engine-layer scheduler race. The PR notes an observed workaround of at least 200 ms idle between turns when clients repeatedly see idle timeouts.
 - If the audio buffer exceeds the server limit, the server emits `Audio buffer overflow` and clears the currently buffered audio for the session.
 - The API is intended for Qwen3-Omni streaming video understanding; other models may not support the same multimodal processor arguments.
