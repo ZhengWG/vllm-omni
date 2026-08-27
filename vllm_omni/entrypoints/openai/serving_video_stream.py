@@ -32,6 +32,7 @@ from vllm_omni.entrypoints.openai.video_stream_base import (
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
     StreamingVideoSessionConfig,
+    VideoStreamTurnTrigger,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
     OmniStreamingVideoHandler as OmniStreamingVideoHandlerBase,
@@ -46,6 +47,9 @@ __all__ = [
 
 class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
     """Qwen-Omni pipeline: manual ``video.query`` trigger and image_pil prompts."""
+
+    def should_trigger_turn(self, trigger: VideoStreamTurnTrigger) -> bool:
+        return False
 
     def build_engine_prompt(
         self,

@@ -24,15 +24,10 @@ the server falls back to rebuilding the prompt per query.
 
 ```bash
 python examples/online_serving/qwen3_omni/streaming_video_client.py \
-    --host localhost --port 8000 \
+    --url ws://localhost:8000/v1/video/chat/stream \
     --video /path/to/video.mp4 \
-    --query "Describe what is happening in the video." \
-    --turns 2
+    --query "Describe what is happening in the video."
 ```
-
-`--turns > 1` splits the frames across several queries so eager prefill / KV reuse can be
-observed: each turn prints `first_text` and `total` timing, and later turns should show a
-lower `first_text` when stage-0 prefix caching is on.
 
 ## API Reference
 

@@ -747,16 +747,14 @@ def test_build_messages_keeps_recent_history_text_only():
 
 def test_build_frame_image_parts_requires_decoded_pil():
     ready = _b64(_make_jpeg(1, 1, 1))
-    pending = _b64(_make_jpeg(2, 2, 2))
     bad = _b64(_make_jpeg(3, 3, 3))
     missing = _b64(_make_jpeg(4, 4, 4))
     pil = Image.new("RGB", (8, 8), (1, 1, 1))
 
     parts = OmniStreamingVideoHandler._build_frame_image_parts(
-        [ready, pending, bad, missing],
+        [ready, bad, missing],
         {
             ready: (pil, "ready-uuid"),
-            pending: (None, "pending-uuid"),
             bad: _BAD_FRAME,
         },
     )
