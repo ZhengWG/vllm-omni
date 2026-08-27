@@ -324,6 +324,24 @@ class OmniStreamingVideoHandler:
             interrupt_event = asyncio.Event()
             prewarm_tasks: set[asyncio.Task[Any]] = set()
             query_task: asyncio.Task[Any] | None = None
+            # In-flight warmup/query snapshots keep their PIL entries if FIFO
+            # evicts the live buffer while they await prewarm.
+            pinned_frame_refs: dict[str, int] = {}
+
+            def _pin_frames(frames: list[str]) -> None:
+                for frame_b64 in frames:
+                    pinned_frame_refs[frame_b64] = pinned_frame_refs.get(frame_b64, 0) + 1
+
+            def _unpin_frames(frames: list[str]) -> None:
+                for frame_b64 in frames:
+                    remaining = pinned_frame_refs.get(frame_b64, 0) - 1
+                    if remaining <= 0:
+                        pinned_frame_refs.pop(frame_b64, None)
+                    else:
+                        pinned_frame_refs[frame_b64] = remaining
+
+            def _snapshot_prewarmed(frames: list[str]) -> dict[str, Any]:
+                return {frame_b64: frame_pil_cache[frame_b64] for frame_b64 in frames if frame_b64 in frame_pil_cache}
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -412,6 +430,7 @@ class OmniStreamingVideoHandler:
                 frames = list(frame_buffer)
                 request_id = f"video-warmup-{uuid.uuid4().hex[:12]}"
                 warmup_request_id = request_id
+                _pin_frames(frames)
 
                 async def _run_warmup() -> None:
                     nonlocal warmup_request_id, warmed_signature
@@ -419,7 +438,7 @@ class OmniStreamingVideoHandler:
                     try:
                         await _await_frame_prewarms()
                         messages = self.build_engine_prompt_prefix(
-                            config, frames, message_history, dict(frame_pil_cache)
+                            config, frames, message_history, _snapshot_prewarmed(frames)
                         )
                         if not messages:
                             warmed_signature = signature
@@ -435,6 +454,7 @@ class OmniStreamingVideoHandler:
                         warmed_signature = signature
                         logger.debug("Context warmup failed for %s", request_id, exc_info=True)
                     finally:
+                        _unpin_frames(frames)
                         if warmup_request_id == request_id:
                             warmup_request_id = None
                         # Skip on cancel: query already owns the session and will
@@ -491,12 +511,13 @@ class OmniStreamingVideoHandler:
                 query_frame_metadata = list(frame_metadata)
                 query_audio_buffer = bytearray(audio_buffer)
                 audio_buffer.clear()
+                _pin_frames(query_frames)
 
                 async def _run_query() -> None:
                     nonlocal active_request_id, prev_request_id
                     try:
                         await _await_frame_prewarms()
-                        query_prewarmed_frames = dict(frame_pil_cache)
+                        query_prewarmed_frames = _snapshot_prewarmed(query_frames)
                         process_kwargs: dict[str, Any] = {}
                         if any(metadata.get("frame_id") for metadata in query_frame_metadata):
                             process_kwargs["frame_metadata"] = query_frame_metadata
@@ -513,6 +534,7 @@ class OmniStreamingVideoHandler:
                             **process_kwargs,
                         )
                     finally:
+                        _unpin_frames(query_frames)
                         if active_request_id == request_id:
                             prev_request_id = request_id
                             active_request_id = None
@@ -580,7 +602,8 @@ class OmniStreamingVideoHandler:
                             dropped = frame_buffer.pop(0)
                             dropped_metadata = frame_metadata.pop(0)
                             dropped_frame_id = dropped_metadata.get("frame_id")
-                            frame_pil_cache.pop(dropped, None)
+                            if dropped not in pinned_frame_refs:
+                                frame_pil_cache.pop(dropped, None)
                         frame_buffer.append(frame_data)
                         frame_metadata.append(
                             {
