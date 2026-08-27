@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Base WebSocket handler for streaming video input understanding.
 
 Shared session loop, frame/audio buffering, EVS pre-filter, prewarm,
@@ -94,7 +94,7 @@ class VideoStreamPipelineHooks(Protocol):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         """Build OpenAI-style messages and the current user message."""
         ...
@@ -113,7 +113,7 @@ class VideoStreamPipelineHooks(Protocol):
         config: "StreamingVideoSessionConfig",
         frame_buffer: list[str],
         message_history: list[dict[str, Any]],
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
     ) -> list[dict[str, Any]] | None:
         """Prefix of the next :meth:`build_engine_prompt` through the last vision token.
 
@@ -194,7 +194,7 @@ class OmniStreamingVideoHandler:
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         raise NotImplementedError
 
@@ -209,41 +209,24 @@ class OmniStreamingVideoHandler:
     @staticmethod
     def _build_frame_image_parts(
         frames: list[str],
-        prewarmed_frames: dict[str, tuple[Any, str]] | None,
+        prewarmed_frames: dict[str, Any] | None,
     ) -> list[dict[str, Any]]:
-        """Frame parts with arrival-time uuids so the prefix prompt and query
-        prompt hash every frame identically (a hash mismatch would void the
-        warmed prefix from that frame onward)."""
+        """Decoded frame parts. Prefix and query both wait for PIL prewarm so
+        every frame is ``image_pil`` plus the arrival-time uuid."""
         prewarmed = prewarmed_frames or {}
         parts: list[dict[str, Any]] = []
         for frame_b64 in frames:
             cached = prewarmed.get(frame_b64)
-            if cached is _BAD_FRAME:
+            if cached is _BAD_FRAME or cached is None:
                 continue
-            if cached is not None:
-                pil, mm_uuid = cached
-                if pil is not None:
-                    parts.append(
-                        {
-                            "type": "image_pil",
-                            "image_pil": pil,
-                            "uuid": mm_uuid,
-                        }
-                    )
-                    continue
-                # PIL prewarm not finished: same uuid over the base64 payload.
-                parts.append(
-                    {
-                        "type": "image_url",
-                        "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
-                        "uuid": mm_uuid,
-                    }
-                )
+            pil, mm_uuid = cached
+            if pil is None:
                 continue
             parts.append(
                 {
-                    "type": "image_url",
-                    "image_url": {"url": f"data:image/jpeg;base64,{frame_b64}"},
+                    "type": "image_pil",
+                    "image_pil": pil,
+                    "uuid": mm_uuid,
                 }
             )
         return parts
@@ -272,7 +255,7 @@ class OmniStreamingVideoHandler:
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
         message_history: list[dict[str, Any]],
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
     ) -> list[dict[str, Any]] | None:
         """Prefix of the next :meth:`build_engine_prompt` through the last vision token.
 
@@ -341,10 +324,9 @@ class OmniStreamingVideoHandler:
 
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
             frame_metadata: list[dict[str, Any]] = []
-            # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
+            # Per-frame PIL cache + uuid for mm_hash reuse.
             frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
-            # b64 -> md5, fixed at arrival: prefix prompt and query must hash a
-            # frame identically even when its PIL prewarm hasn't finished yet.
+            # b64 -> md5, assigned at arrival and stored with the decoded PIL.
             frame_uuids: dict[str, str] = {}
             frame_filter = (
                 FrameSimilarityFilter(threshold=config.frame_filter_threshold) if config.enable_frame_filter else None
@@ -355,7 +337,7 @@ class OmniStreamingVideoHandler:
             prev_request_id: str | None = None  # abort target iff prev was interrupted
             prev_was_interrupted: bool = False
             interrupt_event = asyncio.Event()
-            prewarm_tasks: set[asyncio.Task[Any]] = set()
+            prewarm_tasks: dict[str, asyncio.Task[Any]] = {}
             query_task: asyncio.Task[Any] | None = None
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
@@ -427,11 +409,17 @@ class OmniStreamingVideoHandler:
                 history_len = len(message_history) if isinstance(message_history, list) else None
                 return (history_len, len(frame_buffer), frame_buffer[-1] if frame_buffer else None)
 
-            def _augment_with_uuids(prewarmed: dict[str, Any], frames: list[str]) -> dict[str, Any]:
-                for frame_b64 in frames:
-                    if frame_b64 not in prewarmed and frame_b64 in frame_uuids:
-                        prewarmed[frame_b64] = (None, frame_uuids[frame_b64])
-                return prewarmed
+            async def _await_frame_prewarms(frames: list[str]) -> None:
+                tasks = [prewarm_tasks[frame] for frame in dict.fromkeys(frames) if frame in prewarm_tasks]
+                if tasks:
+                    await asyncio.gather(*tasks, return_exceptions=True)
+
+            def _drop_frame_state(frame_b64: str) -> None:
+                frame_pil_cache.pop(frame_b64, None)
+                frame_uuids.pop(frame_b64, None)
+                task = prewarm_tasks.pop(frame_b64, None)
+                if task is not None and not task.done():
+                    task.cancel()
 
             def _maybe_start_warmup() -> None:
                 nonlocal warmup_task, warmup_request_id
@@ -443,17 +431,21 @@ class OmniStreamingVideoHandler:
                     return
                 if not frame_buffer or _context_signature() == warmed_signature:
                     return
-                prewarmed = _augment_with_uuids(dict(frame_pil_cache), frame_buffer)
-                messages = self.build_engine_prompt_prefix(config, list(frame_buffer), message_history, prewarmed)
-                if not messages:
-                    return
                 signature = _context_signature()
+                frames = list(frame_buffer)
                 request_id = f"video-warmup-{uuid.uuid4().hex[:12]}"
                 warmup_request_id = request_id
 
                 async def _run_warmup() -> None:
                     nonlocal warmup_request_id, warmed_signature
                     try:
+                        await _await_frame_prewarms(frames)
+                        messages = self.build_engine_prompt_prefix(
+                            config, frames, message_history, dict(frame_pil_cache)
+                        )
+                        if not messages:
+                            warmed_signature = signature
+                            return
                         await self._prefill_context(config, messages, request_id)
                         warmed_signature = signature
                     except asyncio.CancelledError:
@@ -505,18 +497,23 @@ class OmniStreamingVideoHandler:
                     await asyncio.sleep(0.1)
                 prev_was_interrupted = False
 
-                request_id = f"video-{uuid.uuid4().hex[:12]}"
-                active_request_id = request_id
-                interrupt_event.clear()
                 query_frames = list(frame_buffer)
                 query_frame_metadata = list(frame_metadata)
                 query_audio_buffer = bytearray(audio_buffer)
                 audio_buffer.clear()
-                query_prewarmed_frames = _augment_with_uuids(dict(frame_pil_cache), query_frames)
+
+                request_id = f"video-{uuid.uuid4().hex[:12]}"
+                active_request_id = request_id
+                interrupt_event.clear()
 
                 async def _run_query() -> None:
                     nonlocal active_request_id, prev_request_id
                     try:
+                        await _await_frame_prewarms(query_frames)
+                        query_prewarmed_frames = dict(frame_pil_cache)
+                        if not self._build_frame_image_parts(query_frames, query_prewarmed_frames):
+                            await self._send_error(websocket, "No frames buffered")
+                            return
                         process_kwargs: dict[str, Any] = {}
                         if any(metadata.get("frame_id") for metadata in query_frame_metadata):
                             process_kwargs["frame_metadata"] = query_frame_metadata
@@ -563,11 +560,10 @@ class OmniStreamingVideoHandler:
                             ]
                             frame_buffer[:] = [frame_buffer[index] for index in retained_indices]
                             frame_metadata[:] = [frame_metadata[index] for index in retained_indices]
-                        if frame_pil_cache.get(frame_data) is _BAD_FRAME:
-                            frame_pil_cache.pop(frame_data, None)
-                        if removed:
-                            frame_uuids.pop(frame_data, None)
+                            _drop_frame_state(frame_data)
                             await self._send_error(websocket, "Frame decode failed")
+                        elif frame_pil_cache.get(frame_data) is _BAD_FRAME:
+                            _drop_frame_state(frame_data)
 
                     elif msg_type == "video.frame":
                         frame_data = msg.get("data", "")
@@ -601,8 +597,7 @@ class OmniStreamingVideoHandler:
                             dropped = frame_buffer.pop(0)
                             dropped_metadata = frame_metadata.pop(0)
                             dropped_frame_id = dropped_metadata.get("frame_id")
-                            frame_pil_cache.pop(dropped, None)
-                            frame_uuids.pop(dropped, None)
+                            _drop_frame_state(dropped)
                         frame_buffer.append(frame_data)
                         if frame_data not in frame_uuids:
                             frame_uuids[frame_data] = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
@@ -624,8 +619,8 @@ class OmniStreamingVideoHandler:
                             buffered_frames=len(frame_buffer),
                             dropped_frame_id=dropped_frame_id,
                         )
-                        # Prewarm: decode PIL off the event loop so query-time chat_template
-                        # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
+                        # Decode PIL off the event loop. Warmup and query wait
+                        # for this so they always submit image_pil + arrival uuid.
                         if frame_data not in frame_pil_cache:
                             mm_uuid = frame_uuids[frame_data]
 
@@ -644,8 +639,13 @@ class OmniStreamingVideoHandler:
                                         )
 
                             task = asyncio.create_task(_prewarm(frame_data, raw_bytes, mm_uuid))
-                            prewarm_tasks.add(task)
-                            task.add_done_callback(prewarm_tasks.discard)
+                            prewarm_tasks[frame_data] = task
+
+                            def _clear_prewarm(done: asyncio.Task[Any], key: str = frame_data) -> None:
+                                if prewarm_tasks.get(key) is done:
+                                    prewarm_tasks.pop(key, None)
+
+                            task.add_done_callback(_clear_prewarm)
 
                         is_generating = active_request_id is not None or (
                             query_task is not None and not query_task.done()
@@ -714,10 +714,11 @@ class OmniStreamingVideoHandler:
                     await reader_task
                 except (asyncio.CancelledError, Exception):
                     pass
-                for t in list(prewarm_tasks):
+                pending_prewarms = list(prewarm_tasks.values())
+                for t in pending_prewarms:
                     t.cancel()
-                if prewarm_tasks:
-                    await asyncio.gather(*prewarm_tasks, return_exceptions=True)
+                if pending_prewarms:
+                    await asyncio.gather(*pending_prewarms, return_exceptions=True)
                 await _cancel_warmup()
                 if query_task is not None and not query_task.done():
                     await _cancel_active_query(abort_now=True)
@@ -783,7 +784,7 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
@@ -822,7 +823,7 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""

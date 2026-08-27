@@ -9,6 +9,7 @@ import base64
 import io
 import json
 import threading
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,7 +20,10 @@ from vllm_omni.entrypoints.openai.serving_video_stream import (
     QwenOmniStreamingVideoHandler,
     StreamingVideoSessionConfig,
 )
-from vllm_omni.entrypoints.openai.video_stream_base import OmniStreamingVideoHandler
+from vllm_omni.entrypoints.openai.video_stream_base import (
+    _BAD_FRAME,
+    OmniStreamingVideoHandler,
+)
 from vllm_omni.outputs import OmniRequestOutput
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -37,30 +41,12 @@ def _b64(data: bytes) -> str:
 
 
 def _text_result(text: str) -> OmniRequestOutput:
-    class Output:
-        pass
-
-    class RequestOutput:
-        pass
-
-    output = Output()
-    output.text = text
-    request_output = RequestOutput()
-    request_output.outputs = [output]
+    request_output = SimpleNamespace(outputs=[SimpleNamespace(text=text)])
     return OmniRequestOutput.from_stage_output(request_output, final_output_type="text")
 
 
 def _audio_result(audio_data: Any) -> OmniRequestOutput:
-    class Output:
-        pass
-
-    class RequestOutput:
-        pass
-
-    output = Output()
-    output.multimodal_output = {"audio": audio_data}
-    request_output = RequestOutput()
-    request_output.outputs = [output]
+    request_output = SimpleNamespace(outputs=[SimpleNamespace(multimodal_output={"audio": audio_data})])
     return OmniRequestOutput.from_stage_output(request_output, final_output_type="audio")
 
 
@@ -549,7 +535,7 @@ async def test_video_done_waits_for_in_flight_query():
 
 
 @pytest.mark.asyncio
-async def test_frame_prewarm_does_not_block_following_query(monkeypatch):
+async def test_query_waits_for_frame_prewarm(monkeypatch):
     decode_started = threading.Event()
     release_decode = threading.Event()
     query_started = asyncio.Event()
@@ -580,9 +566,11 @@ async def test_frame_prewarm_does_not_block_following_query(monkeypatch):
     assert decode_started.is_set()
 
     ws.put({"type": "video.query", "text": "describe"})
-    await asyncio.wait_for(query_started.wait(), timeout=2.0)
+    await asyncio.sleep(0.05)
+    assert not query_started.is_set()
 
     release_decode.set()
+    await asyncio.wait_for(query_started.wait(), timeout=2.0)
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
     assert "session.done" in ws.sent_types()
@@ -755,3 +743,22 @@ def test_build_messages_keeps_recent_history_text_only():
     assert messages[1] == {"role": "assistant", "content": "recent answer"}
     assert messages[2] == user_message
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
+
+
+def test_build_frame_image_parts_requires_decoded_pil():
+    ready = _b64(_make_jpeg(1, 1, 1))
+    pending = _b64(_make_jpeg(2, 2, 2))
+    bad = _b64(_make_jpeg(3, 3, 3))
+    missing = _b64(_make_jpeg(4, 4, 4))
+    pil = Image.new("RGB", (8, 8), (1, 1, 1))
+
+    parts = OmniStreamingVideoHandler._build_frame_image_parts(
+        [ready, pending, bad, missing],
+        {
+            ready: (pil, "ready-uuid"),
+            pending: (None, "pending-uuid"),
+            bad: _BAD_FRAME,
+        },
+    )
+
+    assert parts == [{"type": "image_pil", "image_pil": pil, "uuid": "ready-uuid"}]

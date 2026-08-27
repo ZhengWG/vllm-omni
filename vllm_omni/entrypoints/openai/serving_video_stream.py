@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Qwen-Omni streaming video WebSocket handler.
 
 Accepts video frames incrementally via WebSocket, buffers them, and
@@ -54,7 +54,7 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, tuple[Any, str]],
+        prewarmed_frames: dict[str, Any],
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         if self._incremental_prefill_active(config):
             # Frames are sampled at arrival time only (EVS + max_frames), so
