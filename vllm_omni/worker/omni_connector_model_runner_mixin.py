@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified data-plane communication mixin for Model Runners.
 
 All connector.put()/get() calls are consolidated here. Background I/O
@@ -26,7 +26,6 @@ from vllm.logger import init_logger
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.distributed.omni_connectors.factory import OmniConnectorFactory
 from vllm_omni.distributed.omni_connectors.utils.config import (
-    ConnectorSpec,
     get_stage_connector_role,
 )
 from vllm_omni.outputs import OmniConnectorOutput
@@ -288,6 +287,12 @@ class OmniConnectorModelRunnerMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
+        conn = getattr(self, "_omni_connector", None)
+        if conn is not None and getattr(conn, "request_scoped_cleanup", False):
+            try:
+                conn.cleanup(req_id)
+            except Exception:
+                logger.debug("connector cleanup failed for %s", req_id, exc_info=True)
         # Force-flush any pending full-payload accumulator entry before
         # cleanup proceeds.  Without this, finished requests with no
         # downstream consumer (e.g. text-only on multi-modal arch) leave
@@ -2112,33 +2117,17 @@ class OmniConnectorModelRunnerMixin:
 
     @staticmethod
     def _create_connector(model_config: Any) -> OmniConnectorBase | None:
-        """Create a connector from model_config, or None if unconfigured."""
+        """Create a connector from model_config, or None if unconfigured.
+
+        Dual ``{"input","output"}`` configs resolve to one routed connector
+        via the factory single entry point.
+        """
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
             return None
-
-        if not isinstance(connector_config, dict):
-            connector_config = {
-                "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", None),
-            }
-
-        name = connector_config.get("name")
-        if not isinstance(name, str) or not name.strip():
-            raise RuntimeError("Invalid stage connector config: missing connector name")
-        name = name.strip()
-
-        extra = connector_config.get("extra")
-        if extra is None:
-            extra = {}
-        elif not isinstance(extra, dict):
-            raise RuntimeError(f"Invalid extra config for connector {name}: expected dict, got {type(extra).__name__}")
-
-        spec = ConnectorSpec(name=name, extra=extra)
-        try:
-            return OmniConnectorFactory.create_connector(spec)
-        except Exception as exc:
-            raise RuntimeError(f"Failed to create connector {name}") from exc
+        # Factory errors are already descriptive (invalid name/extra, unknown
+        # connector); let them propagate unwrapped.
+        return OmniConnectorFactory.create_stage_connector(connector_config)
 
     @staticmethod
     def _load_custom_func(model_config: Any) -> tuple[str | None, Any | None]:

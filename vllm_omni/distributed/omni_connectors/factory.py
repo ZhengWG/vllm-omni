@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from collections.abc import Callable
@@ -53,6 +53,54 @@ class OmniConnectorFactory:
     def list_registered_connectors(cls) -> list[str]:
         """List all registered connector names."""
         return list(cls._registry.keys())
+
+    @classmethod
+    def create_stage_connector(cls, stage_connector_config: Any) -> OmniConnectorBase | None:
+        """Create a stage-level connector.
+
+        Supports all historical ``stage_connector_config`` formats:
+
+          - ``None``                              -> no connector
+          - object with ``.name`` / ``.extra``    -> single connector
+          - ``{"name": ..., "extra": ...}``       -> single connector (shared
+            by the stage's input and output edges)
+          - ``{"input": {...}, "output": {...}}`` -> ``EdgeRoutedConnector``
+            with per-direction backends (either side optional)
+        """
+        config = stage_connector_config
+        if config is None:
+            return None
+        if not isinstance(config, dict):
+            config = {
+                "name": getattr(config, "name", None),
+                "extra": getattr(config, "extra", None),
+            }
+
+        def _make(spec_dict: dict[str, Any]) -> OmniConnectorBase:
+            name = spec_dict.get("name") or "SharedMemoryConnector"
+            if not isinstance(name, str) or not name.strip():
+                raise RuntimeError("Invalid stage connector config: missing connector name")
+            extra = spec_dict.get("extra") or {}
+            if not isinstance(extra, dict):
+                raise RuntimeError(f"Invalid extra config for connector {name}: expected dict")
+            return cls.create_connector(ConnectorSpec(name=name.strip(), extra=dict(extra)))
+
+        if "input" in config or "output" in config:
+            backends: dict[str, OmniConnectorBase | None] = {}
+            for direction in ("input", "output"):
+                spec = config.get(direction)
+                if spec is not None and not isinstance(spec, dict):
+                    raise RuntimeError(
+                        f"Invalid {direction!r} connector spec: expected dict, got {type(spec).__name__}"
+                    )
+                backends[direction] = _make(spec) if spec else None
+            from .connectors.edge_routed_connector import EdgeRoutedConnector
+
+            connector = EdgeRoutedConnector(backends["input"], backends["output"])
+            logger.info(f"Created stage connector: {connector!r}")
+            return connector
+
+        return _make(config)
 
 
 # Register built-in connectors with lazy imports
@@ -114,6 +162,12 @@ def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
     return MooncakeTransferEngineConnector(config)
 
 
+def _create_torch_ipc_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    from .connectors.torch_ipc_connector import TorchIpcConnector
+
+    return TorchIpcConnector(config)
+
+
 def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
         from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
@@ -129,6 +183,7 @@ def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnec
 OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
 OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
+OmniConnectorFactory.register_connector("TorchIpcConnector", _create_torch_ipc_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
 OmniConnectorFactory.register_connector("YuanrongTransferEngineConnector", _create_yuanrong_transfer_engine_connector)
 OmniConnectorFactory.register_connector("MoriTransferEngineConnector", _create_mori_transfer_engine_connector)

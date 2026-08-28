@@ -17,7 +17,7 @@ from vllm_omni.data_entry_keys import MetaStruct, OmniPayloadStruct, unflatten_p
 
 from ..adapter import construct_next_stage_streaming_input_prompt
 from ..factory import OmniConnectorFactory
-from ..utils.config import ConnectorSpec, stage_receives_chunks
+from ..utils.config import stage_receives_chunks
 from ..utils.logging import get_connector_logger
 from .base import OmniTransferAdapterBase
 
@@ -160,20 +160,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
     @classmethod
     def create_connector(cls, model_config: Any):
+        """Build the stage's connector via the factory single entry point.
+
+        Direction routing (dual ``{"input": ..., "output": ...}`` configs) is
+        a connector implementation detail — the factory returns an
+        ``EdgeRoutedConnector`` for that shape.  An unconfigured stage keeps
+        the legacy default of a SharedMemoryConnector.
+        """
         connector_config = getattr(model_config, "stage_connector_config", None)
         if connector_config is None:
-            connector_config = {}
-        elif not isinstance(connector_config, dict):
-            connector_config = {
-                "name": getattr(connector_config, "name", None),
-                "extra": getattr(connector_config, "extra", {}),
-            }
-
-        connector_specs = ConnectorSpec(
-            name=connector_config.get("name", "SharedMemoryConnector"),
-            extra=connector_config.get("extra", {}),
-        )
-        return OmniConnectorFactory.create_connector(connector_specs)
+            connector_config = {"name": "SharedMemoryConnector", "extra": {}}
+        return OmniConnectorFactory.create_stage_connector(connector_config)
 
     def load_async(self, request: Request):
         """Register a request for asynchronous chunk retrieval.
@@ -518,6 +515,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._discard_from_chunk_deque(self.waiting_for_chunk_waiting_requests, request_id)
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
+
+        # request_scoped_cleanup is opt-in: only connectors holding
+        # per-request receive-side resources (e.g. pending IPC views)
+        # participate.
+        try:
+            if self.connector is not None and getattr(self.connector, "request_scoped_cleanup", False):
+                self.connector.cleanup(request_id)
+        except Exception:
+            logger.warning("connector cleanup failed for %s", request_id, exc_info=True)
 
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)

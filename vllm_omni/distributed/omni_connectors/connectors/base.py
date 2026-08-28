@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from abc import ABC, abstractmethod
 from typing import Any
@@ -16,6 +16,22 @@ class OmniConnectorBase(ABC):
     # without going through OmniSerializer.  Connectors that copy raw
     # payloads directly (e.g. RDMA) should override this to True.
     supports_raw_data: bool = False
+
+    # Whether the connector can move CUDA tensors between same-host stages
+    # without a host bounce (device-to-device data plane).  Payload builders
+    # consult this capability, together with ``gpu_tensor_keys``, through
+    # ``connectors.gpu_placement`` to decide which tensors stay on GPU for
+    # the send edge.
+    supports_gpu_tensor: bool = False
+
+    # Stable per-edge set of payload key roots (or full dotted keys) that
+    # stay on GPU for the send edge.  ``None`` disables GPU placement.
+    gpu_tensor_keys: frozenset[str] | None = None
+
+    # Connectors holding per-request receive-side resources opt in so the
+    # transfer adapter / worker mixin call ``cleanup(request_id)`` when a
+    # request finishes.
+    request_scoped_cleanup: bool = False
 
     @abstractmethod
     def put(self, from_stage: str, to_stage: str, put_key: str, data: Any) -> tuple[bool, int, dict[str, Any] | None]:

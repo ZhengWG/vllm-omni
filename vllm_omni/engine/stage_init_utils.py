@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 Stage initialization helpers for vLLM-Omni multi-stage runtime.
 
@@ -1440,24 +1443,18 @@ def get_stage_connector_spec(
     stage_id: int,
     async_chunk: bool,
 ) -> dict[str, Any]:
-    """Return the first connector spec for a stage data-plane edge."""
+    """Resolve the stage worker's connector spec from its configured edges.
+
+    Returns the dual ``{"input": spec, "output": spec}`` shape (either side
+    optional; the lowest-numbered edge wins per direction), or ``{}`` when the
+    stage has no configured edge.  Edge resolution itself is connector-owned
+    (``resolve_stage_connector_spec``); normalisation into a
+    ``stage_connector_config`` happens in ``build_stage_connector_config``.
+    """
     from vllm_omni.distributed.omni_connectors import get_stage_connector_config
+    from vllm_omni.distributed.omni_connectors.utils.initialization import resolve_stage_connector_spec
 
-    stage_connectors_cfg = get_stage_connector_config(omni_transfer_config, stage_id)
-    for cfg in stage_connectors_cfg.values():
-        return dict(cfg.get("spec", {}))
-
-    # A producer does not consume connector data itself. Keep its connector
-    # for both async-chunk and terminal full-payload sends, but mark it
-    # sender-only so the scheduler does not park orchestrator-provided inputs
-    # waiting for an upstream payload.
-    target_stage = str(stage_id)
-    for (from_stage, _to_stage), spec in getattr(omni_transfer_config, "connectors", {}).items():
-        if from_stage == target_stage:
-            extra = dict(spec.extra or {})
-            extra.setdefault("role", "sender")
-            return {"name": spec.name, "extra": extra}
-    return {}
+    return resolve_stage_connector_spec(get_stage_connector_config(omni_transfer_config, stage_id))
 
 
 def build_diffusion_config(
