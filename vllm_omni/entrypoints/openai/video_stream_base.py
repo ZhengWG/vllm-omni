@@ -158,7 +158,10 @@ class StreamingVideoSessionConfig(BaseModel):
     )
     use_audio_in_video: bool = Field(
         default=True,
-        description="Interleave audio chunks with video frames when audio input is present.",
+        description=(
+            "Legacy path only: pass mm_processor_kwargs.use_audio_in_video "
+            "when this query has input audio. Ignored under eager prefill."
+        ),
     )
     sampling_params_list: list[dict[str, Any]] | None = Field(
         default=None,
@@ -324,9 +327,18 @@ class OmniStreamingVideoHandler:
             interrupt_event = asyncio.Event()
             prewarm_tasks: set[asyncio.Task[Any]] = set()
             query_task: asyncio.Task[Any] | None = None
+            session_alive = True
+            # Session-owned decode readiness. Warmup/query wait on these
+            # Events, not on the prewarm tasks, so cancelling an engine
+            # request cannot cascade into JPEG decode.
+            frame_ready: dict[str, asyncio.Event] = {}
             # In-flight warmup/query snapshots keep their PIL entries if FIFO
-            # evicts the live buffer while they await prewarm.
+            # evicts the live buffer while they await readiness.
             pinned_frame_refs: dict[str, int] = {}
+
+            def _drop_frame_cache(frame_b64: str) -> None:
+                frame_pil_cache.pop(frame_b64, None)
+                frame_ready.pop(frame_b64, None)
 
             def _pin_frames(frames: list[str]) -> None:
                 for frame_b64 in frames:
@@ -337,11 +349,31 @@ class OmniStreamingVideoHandler:
                     remaining = pinned_frame_refs.get(frame_b64, 0) - 1
                     if remaining <= 0:
                         pinned_frame_refs.pop(frame_b64, None)
+                        # Settle the eviction this pin deferred: the frame left
+                        # the buffer, so its cache entry is orphaned.
+                        if frame_b64 not in frame_buffer:
+                            _drop_frame_cache(frame_b64)
                     else:
                         pinned_frame_refs[frame_b64] = remaining
 
             def _snapshot_prewarmed(frames: list[str]) -> dict[str, Any]:
                 return {frame_b64: frame_pil_cache[frame_b64] for frame_b64 in frames if frame_b64 in frame_pil_cache}
+
+            def _frames_ready(frames: list[str]) -> bool:
+                for frame_b64 in frames:
+                    event = frame_ready.get(frame_b64)
+                    if event is None or not event.is_set():
+                        return False
+                return True
+
+            async def _await_frames_ready(frames: list[str]) -> None:
+                waits: list[Any] = []
+                for frame_b64 in dict.fromkeys(frames):
+                    event = frame_ready.get(frame_b64)
+                    if event is not None and not event.is_set():
+                        waits.append(event.wait())
+                if waits:
+                    await asyncio.gather(*waits)
 
             msg_queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue(maxsize=_MAX_MSG_QUEUE)
 
@@ -412,12 +444,10 @@ class OmniStreamingVideoHandler:
                 history_len = len(message_history) if isinstance(message_history, list) else None
                 return (history_len, len(frame_buffer), frame_buffer[-1] if frame_buffer else None)
 
-            async def _await_frame_prewarms() -> None:
-                if prewarm_tasks:
-                    await asyncio.gather(*prewarm_tasks, return_exceptions=True)
-
             def _maybe_start_warmup() -> None:
                 nonlocal warmup_task, warmup_request_id
+                if not session_alive:
+                    return
                 if self._engine_client is None or not self._incremental_prefill_active(config):
                     return
                 if active_request_id is not None:
@@ -426,8 +456,12 @@ class OmniStreamingVideoHandler:
                     return
                 if not frame_buffer or _context_signature() == warmed_signature:
                     return
-                signature = _context_signature()
                 frames = list(frame_buffer)
+                # Decode is session-owned: do not start prefill until PIL is
+                # already in cache, so this task is only engine work.
+                if not _frames_ready(frames):
+                    return
+                signature = _context_signature()
                 request_id = f"video-warmup-{uuid.uuid4().hex[:12]}"
                 warmup_request_id = request_id
                 _pin_frames(frames)
@@ -436,7 +470,6 @@ class OmniStreamingVideoHandler:
                     nonlocal warmup_request_id, warmed_signature
                     cancelled = False
                     try:
-                        await _await_frame_prewarms()
                         messages = self.build_engine_prompt_prefix(
                             config, frames, message_history, _snapshot_prewarmed(frames)
                         )
@@ -516,7 +549,7 @@ class OmniStreamingVideoHandler:
                 async def _run_query() -> None:
                     nonlocal active_request_id, prev_request_id
                     try:
-                        await _await_frame_prewarms()
+                        await _await_frames_ready(query_frames)
                         query_prewarmed_frames = _snapshot_prewarmed(query_frames)
                         process_kwargs: dict[str, Any] = {}
                         if any(metadata.get("frame_id") for metadata in query_frame_metadata):
@@ -547,10 +580,12 @@ class OmniStreamingVideoHandler:
             async def _processor() -> None:
                 """Process enqueued messages."""
                 nonlocal active_request_id, prev_request_id, prev_was_interrupted, query_task
+                nonlocal session_alive
 
                 while True:
                     msg = await msg_queue.get()
                     if msg is None:
+                        session_alive = False
                         await _cancel_active_query(abort_now=True)
                         return
 
@@ -566,7 +601,7 @@ class OmniStreamingVideoHandler:
                             frame_buffer[:] = [frame_buffer[index] for index in retained_indices]
                             frame_metadata[:] = [frame_metadata[index] for index in retained_indices]
                         if frame_pil_cache.get(frame_data) is _BAD_FRAME:
-                            frame_pil_cache.pop(frame_data, None)
+                            _drop_frame_cache(frame_data)
                         if removed:
                             await self._send_error(websocket, "Frame decode failed")
 
@@ -603,7 +638,7 @@ class OmniStreamingVideoHandler:
                             dropped_metadata = frame_metadata.pop(0)
                             dropped_frame_id = dropped_metadata.get("frame_id")
                             if dropped not in pinned_frame_refs:
-                                frame_pil_cache.pop(dropped, None)
+                                _drop_frame_cache(dropped)
                         frame_buffer.append(frame_data)
                         frame_metadata.append(
                             {
@@ -625,14 +660,22 @@ class OmniStreamingVideoHandler:
                         )
                         # Prewarm: decode PIL off the event loop so query-time chat_template
                         # can skip base64+Image.open. uuid=md5 lets mm_cache dedupe identical frames.
-                        if frame_data not in frame_pil_cache:
+                        if frame_data not in frame_pil_cache and frame_data not in frame_ready:
                             mm_uuid = hashlib.md5(raw_bytes, usedforsecurity=False).hexdigest()
+                            frame_ready[frame_data] = asyncio.Event()
 
                             async def _prewarm(b64: str, b: bytes, u: str) -> None:
+                                cancelled = False
                                 try:
                                     pil = await asyncio.to_thread(_decode_frame_bytes, b)
-                                    frame_pil_cache[b64] = (pil, u)
+                                    if b64 in frame_ready:
+                                        frame_pil_cache[b64] = (pil, u)
+                                except asyncio.CancelledError:
+                                    cancelled = True
+                                    raise
                                 except Exception:
+                                    if b64 not in frame_ready:
+                                        return
                                     frame_pil_cache[b64] = _BAD_FRAME
                                     logger.warning("prewarm decode failed for frame (len=%d)", len(b))
                                     try:
@@ -641,10 +684,18 @@ class OmniStreamingVideoHandler:
                                         logger.warning(
                                             "frame decode failure event dropped because message queue is full"
                                         )
+                                finally:
+                                    event = frame_ready.get(b64)
+                                    if event is not None:
+                                        event.set()
+                                    if not cancelled:
+                                        asyncio.get_running_loop().call_soon(_maybe_start_warmup)
 
                             task = asyncio.create_task(_prewarm(frame_data, raw_bytes, mm_uuid))
                             prewarm_tasks.add(task)
                             task.add_done_callback(prewarm_tasks.discard)
+                        elif frame_data in frame_pil_cache:
+                            frame_ready.setdefault(frame_data, asyncio.Event()).set()
 
                         is_generating = active_request_id is not None or (
                             query_task is not None and not query_task.done()
@@ -689,6 +740,7 @@ class OmniStreamingVideoHandler:
                         await _start_query_turn(query_text=query_text)
 
                     elif msg_type == "video.done":
+                        session_alive = False
                         if query_task is not None and not query_task.done():
                             await asyncio.gather(query_task, return_exceptions=True)
                             query_task = None
@@ -708,6 +760,7 @@ class OmniStreamingVideoHandler:
             try:
                 await _processor()
             finally:
+                session_alive = False
                 reader_task.cancel()
                 try:
                     await reader_task
@@ -853,9 +906,15 @@ class OmniStreamingVideoHandler:
             "continue_final_message": False,
             "add_special_tokens": False,
         }
-        # reuse: same kwargs as warmup so frame mm hashes stay a prefix.
-        # legacy: only when this query actually has input audio.
-        if config.use_audio_in_video and (reuse_active or len(audio_buffer) > 0):
+        # TODO(video-stream, use_audio_in_video):
+        # - Pair video.frame with audio.chunk (pts_ms on both, or 1:1).
+        # - Emit real video+audio items so Qwen can interleave; image_pil
+        #   + trailing input_audio does not run that path.
+        # - Eager prefill cannot frames-only warmup that layout (interleave
+        #   rewrites video tokens from the first frame). Reuse stays off.
+        # - Until then, reuse never sets this kwarg. Legacy still can when
+        #   the query has PCM.
+        if not reuse_active and config.use_audio_in_video and len(audio_buffer) > 0:
             request_kwargs["mm_processor_kwargs"] = {
                 "use_audio_in_video": True,
             }
@@ -1262,9 +1321,8 @@ class OmniStreamingVideoHandler:
             "continue_final_message": False,
             "add_special_tokens": False,
         }
-        if config.use_audio_in_video:
-            request_kwargs["mm_processor_kwargs"] = {"use_audio_in_video": True}
-
+        # Reuse warmup is frames-only. use_audio_in_video interleaves audio
+        # into video tokens and cannot share that prefix. See query-path TODO.
         chat_request = ChatCompletionRequest(**request_kwargs)
         engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
         result_gen = engine_client.generate(

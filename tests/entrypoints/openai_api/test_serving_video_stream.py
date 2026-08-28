@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import hashlib
 import io
 import json
 import threading
@@ -232,6 +233,7 @@ async def test_video_frames_consumed_is_emitted_after_engine_uses_frame_prompt()
 
 @pytest.mark.asyncio
 async def test_audio_in_video_sets_mm_processor_kwargs():
+    """Legacy (audio output): PCM + config true still sets the kwarg."""
     captured_requests = []
 
     class EmptyEngine:
@@ -269,6 +271,7 @@ async def test_audio_in_video_sets_mm_processor_kwargs():
 
 @pytest.mark.asyncio
 async def test_audio_in_video_disabled_omits_mm_processor_kwargs():
+    """Legacy: config false omits the kwarg even when the query has PCM."""
     captured_requests = []
 
     class EmptyEngine:
@@ -306,6 +309,7 @@ async def test_audio_in_video_disabled_omits_mm_processor_kwargs():
 
 @pytest.mark.asyncio
 async def test_query_inline_audio_data_sets_mm_processor_kwargs():
+    """Legacy session: inline query audio_data sets the kwarg."""
     captured_requests = []
 
     class EmptyEngine:
@@ -323,7 +327,13 @@ async def test_query_inline_audio_data_sets_mm_processor_kwargs():
 
     ws = MockWebSocket(
         [
-            json.dumps({"type": "session.config", "model": "test"}),
+            json.dumps(
+                {
+                    "type": "session.config",
+                    "model": "test",
+                    "modalities": ["text", "audio"],
+                }
+            ),
             json.dumps({"type": "video.frame", "data": _b64(_make_jpeg())}),
             json.dumps(
                 {
@@ -760,3 +770,360 @@ def test_build_frame_image_parts_requires_decoded_pil():
     )
 
     assert parts == [{"type": "image_pil", "image_pil": pil, "uuid": "ready-uuid"}]
+
+
+# ---------------------------------------------------------------------------
+# Eager prefill (warmup) lifecycle
+# ---------------------------------------------------------------------------
+
+
+class RecordingReuseEngine:
+    """Stage-0-APC-on engine stub; records generate() calls and aborts."""
+
+    def __init__(self, warmup_delay: float = 0.0, query_delay: float = 0.0):
+        self.requests: list[dict[str, Any]] = []
+        self.aborted: list[str] = []
+        self._warmup_delay = warmup_delay
+        self._query_delay = query_delay
+        self.engine = SimpleNamespace(
+            stage_vllm_configs=[SimpleNamespace(cache_config=SimpleNamespace(enable_prefix_caching=True))]
+        )
+
+    def warmup_ids(self) -> list[str]:
+        return [r["request_id"] for r in self.requests if r["request_id"].startswith("video-warmup-")]
+
+    def query_ids(self) -> list[str]:
+        return [r["request_id"] for r in self.requests if not r["request_id"].startswith("video-warmup-")]
+
+    def generate(self, **kwargs):
+        self.requests.append(kwargs)
+        is_warmup = kwargs["request_id"].startswith("video-warmup-")
+        delay = self._warmup_delay if is_warmup else self._query_delay
+
+        async def _gen():
+            if delay:
+                await asyncio.sleep(delay)
+            yield _text_result("ok")
+
+        return _gen()
+
+    async def abort(self, request_id: str) -> None:
+        self.aborted.append(request_id)
+
+
+class PromptRecordingHandler(QwenOmniStreamingVideoHandler):
+    """Records each query turn's user-message content and processor kwargs."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.query_contents: list[list[dict[str, Any]]] = []
+        self.warmup_contents: list[list[dict[str, Any]]] = []
+        self.mm_processor_kwargs: list[Any] = []
+
+    async def _preprocess_to_engine_prompt(self, request):
+        self.mm_processor_kwargs.append(getattr(request, "mm_processor_kwargs", None))
+        return {"prompt": "p"}
+
+    def build_engine_prompt(self, config, frame_buffer, audio_buffer, message_history, query_text, prewarmed_frames):
+        messages, user_message = super().build_engine_prompt(
+            config, frame_buffer, audio_buffer, message_history, query_text, prewarmed_frames
+        )
+        self.query_contents.append(list(user_message["content"]))
+        return messages, user_message
+
+    def build_engine_prompt_prefix(self, config, frame_buffer, message_history, prewarmed_frames):
+        messages = super().build_engine_prompt_prefix(config, frame_buffer, message_history, prewarmed_frames)
+        if messages:
+            self.warmup_contents.append(list(messages[-1]["content"]))
+        return messages
+
+
+async def _poll(predicate, timeout: float = 3.0) -> bool:
+    for _ in range(int(timeout / 0.01)):
+        if predicate():
+            return True
+        await asyncio.sleep(0.01)
+    return bool(predicate())
+
+
+@pytest.mark.asyncio
+async def test_warmup_fires_on_frame_and_query_cancels_it():
+    engine = RecordingReuseEngine(warmup_delay=10.0, query_delay=0.3)
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "modalities": ["text"], "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+
+    assert await _poll(lambda: engine.warmup_ids())
+    warmup_id = engine.warmup_ids()[0]
+    assert engine.requests[0]["sampling_params"].max_tokens == 1
+
+    ws.put({"type": "video.query", "text": "describe"})
+    assert await _poll(lambda: engine.query_ids())
+    # in-flight warmup was cancelled + aborted, and not restarted mid-query
+    assert warmup_id in engine.aborted
+    assert len(engine.warmup_ids()) == 1
+
+    assert await _poll(lambda: "response.text.done" in ws.sent_types())
+    # the committed turn changed the context -> a fresh warmup fires
+    assert await _poll(lambda: len(engine.warmup_ids()) == 2)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_audio_session_never_starts_warmup():
+    engine = RecordingReuseEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "modalities": ["text", "audio"], "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg(9, 9, 9))})
+    await asyncio.sleep(0.3)
+
+    assert engine.warmup_ids() == []
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_warmup_starts_only_after_frames_ready(monkeypatch):
+    decode_started = threading.Event()
+    release_decode = threading.Event()
+
+    def gated_decode(raw_bytes: bytes):
+        decode_started.set()
+        release_decode.wait(timeout=5.0)
+        return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+    monkeypatch.setattr(video_stream_base, "_decode_frame_bytes", gated_decode)
+    engine = RecordingReuseEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "modalities": ["text"], "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    assert await _poll(decode_started.is_set)
+    await asyncio.sleep(0.1)
+    assert engine.warmup_ids() == []
+
+    release_decode.set()
+    assert await _poll(lambda: engine.warmup_ids())
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_query_cancelling_warmup_keeps_prewarm_alive(monkeypatch):
+    """Cancel warmup during prefill must not drop a later frame still decoding."""
+    frame1 = _b64(_make_jpeg(1, 1, 1))
+    frame2 = _b64(_make_jpeg(2, 2, 2))
+    raw2 = base64.b64decode(frame2)
+    decode_started = threading.Event()
+    release_decode = threading.Event()
+
+    def gated_decode(raw_bytes: bytes):
+        if raw_bytes == raw2:
+            decode_started.set()
+            release_decode.wait(timeout=5.0)
+        return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+    monkeypatch.setattr(video_stream_base, "_decode_frame_bytes", gated_decode)
+    engine = RecordingReuseEngine(warmup_delay=10.0)
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "modalities": ["text"], "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": frame1})
+    assert await _poll(lambda: engine.warmup_ids())
+
+    ws.put({"type": "video.frame", "data": frame2})
+    assert await _poll(decode_started.is_set)
+
+    ws.put({"type": "video.query", "text": "describe"})
+    await asyncio.sleep(0.1)
+    release_decode.set()
+
+    assert await _poll(lambda: "response.text.done" in ws.sent_types())
+    assert len(handler.query_contents) == 1
+    image_parts = [p for p in handler.query_contents[0] if p.get("type") == "image_pil"]
+    assert len(image_parts) == 2
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_query_keeps_frames_evicted_while_pinned(monkeypatch):
+    """Regression: frames FIFO-evicted while an in-flight query awaits prewarm
+    must keep their PIL entries and stay in the query prompt."""
+    frame_a = _b64(_make_jpeg(1, 1, 1))
+    frame_a2 = _b64(_make_jpeg(2, 2, 2))
+    frame_b = _b64(_make_jpeg(3, 3, 3))
+    raw_a = base64.b64decode(frame_a)
+    decoded: list[bytes] = []
+    release_others = threading.Event()
+
+    def gated_decode(raw_bytes: bytes):
+        if raw_bytes != raw_a:
+            release_others.wait(timeout=5.0)
+        decoded.append(raw_bytes)
+        return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+    monkeypatch.setattr(video_stream_base, "_decode_frame_bytes", gated_decode)
+    engine = RecordingReuseEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "modalities": ["text"],
+            "max_frames": 2,
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": frame_a})
+    assert await _poll(lambda: raw_a in decoded)
+    ws.put({"type": "video.frame", "data": frame_a2})  # decode gated -> query will wait
+
+    ws.put({"type": "video.query", "text": "describe"})  # pins [a, a2]
+    await asyncio.sleep(0.1)
+    ws.put({"type": "video.frame", "data": frame_b})  # buffer full -> evicts pinned a
+    await asyncio.sleep(0.1)
+    release_others.set()
+
+    assert await _poll(lambda: "response.text.done" in ws.sent_types())
+    assert len(handler.query_contents) == 1
+    uuids = [p["uuid"] for p in handler.query_contents[0] if p.get("type") == "image_pil"]
+    expected = [hashlib.md5(base64.b64decode(f), usedforsecurity=False).hexdigest() for f in (frame_a, frame_a2)]
+    assert uuids == expected
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+def _mm_use_audio(value: Any) -> bool:
+    return isinstance(value, dict) and value.get("use_audio_in_video") is True
+
+
+@pytest.mark.asyncio
+async def test_reuse_process_query_omits_use_audio_in_video_even_with_pcm():
+    """Reuse query path must not set the kwarg when PCM is present; interleave
+    would void the frames-only warmup prefix."""
+    captured_requests = []
+
+    class CapturingHandler(QwenOmniStreamingVideoHandler):
+        async def _preprocess_to_engine_prompt(self, request):
+            captured_requests.append(request)
+            return {"prompt": "x"}
+
+    handler = CapturingHandler(
+        chat_service=object(),
+        engine_client=RecordingReuseEngine(),
+    )
+    config = StreamingVideoSessionConfig(model="test", modalities=["text"], use_audio_in_video=True)
+    await handler._process_query_engine(
+        TimedWebSocket(),
+        config,
+        [_b64(_make_jpeg())],
+        bytearray(b"\x00\x00"),
+        [],
+        "describe",
+        "req-reuse-1",
+        asyncio.Event(),
+        {},
+    )
+
+    assert captured_requests
+    assert captured_requests[0].mm_processor_kwargs is None
+
+
+@pytest.mark.asyncio
+async def test_reuse_omits_use_audio_in_video():
+    """Interleave is incompatible with frames-only warmup. Reuse must omit
+    the kwarg on both warmup and query even when session.config defaults true."""
+    engine = RecordingReuseEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "modalities": ["text"], "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    assert await _poll(lambda: engine.warmup_ids())
+
+    ws.put({"type": "video.query", "text": "describe"})
+    assert await _poll(lambda: engine.query_ids())
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert len(handler.mm_processor_kwargs) >= 2
+    assert handler.mm_processor_kwargs[0] is None
+    assert handler.mm_processor_kwargs[1] is None
+
+
+async def _run_frame_audio_query(modalities: list[str], frame: str, pcm: bytes) -> PromptRecordingHandler:
+    engine = RecordingReuseEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "modalities": modalities,
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": frame})
+    if "audio" not in modalities:
+        assert await _poll(lambda: engine.warmup_ids())
+    else:
+        await asyncio.sleep(0.05)
+        assert engine.warmup_ids() == []
+    ws.put({"type": "audio.chunk", "data": _b64(pcm)})
+    ws.put({"type": "video.query", "text": "describe"})
+    assert await _poll(lambda: engine.query_ids())
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+    return handler
+
+
+@pytest.mark.asyncio
+async def test_reuse_query_with_audio_matches_legacy_prompt():
+    """Current contract: PCM stays a query suffix of image_pil, not interleave.
+    Reuse omits use_audio_in_video; legacy with PCM still sets it."""
+    frame = _b64(_make_jpeg())
+    pcm = b"\x01\x00\x02\x00"
+    reuse = await _run_frame_audio_query(["text"], frame, pcm)
+    legacy = await _run_frame_audio_query(["text", "audio"], frame, pcm)
+
+    assert reuse.warmup_contents
+    assert all(part.get("type") != "input_audio" for part in reuse.warmup_contents[0])
+    assert [part.get("type") for part in reuse.warmup_contents[0]] == ["image_pil"]
+
+    assert reuse.query_contents and legacy.query_contents
+    reuse_q = reuse.query_contents[0]
+    legacy_q = legacy.query_contents[0]
+    assert [part.get("type") for part in reuse_q] == ["image_pil", "input_audio", "text"]
+    assert [part.get("type") for part in legacy_q] == ["image_pil", "input_audio", "text"]
+    assert reuse_q[0]["uuid"] == legacy_q[0]["uuid"]
+    assert reuse_q[1] == legacy_q[1]
+    assert reuse_q[2] == legacy_q[2] == {"type": "text", "text": "describe"}
+
+    assert reuse.mm_processor_kwargs[0] is None
+    assert reuse.mm_processor_kwargs[1] is None
+    assert _mm_use_audio(legacy.mm_processor_kwargs[0])
