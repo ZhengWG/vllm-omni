@@ -1,0 +1,93 @@
+# Qwen3-Omni-MoE hybrid GPU-direct deploy (Experimental).
+#
+# Same topology as qwen3_omni_moe.yaml, with one difference: the large
+# thinker -> talker prefill handoff (tens of MB at chat-sized prompts, and it
+# sits directly on the first-audio-packet path) rides TorchIpcConnector's
+# device-to-device plane instead of serialize + D2H + /dev/shm + H2D.  The
+# talker -> code2wav codec stream keeps SharedMemoryConnector: its payloads
+# are small per-chunk packets where a GPU data plane costs more in per-chunk
+# synchronization than the host bounce it removes.
+#
+# Placement is explicit and per-edge-stable: only the keys listed under
+# gpu_tensor_keys stay on GPU, and only above the size floor
+# (gpu_tensor_min_bytes, default 256 KiB) — per-token decode payloads always
+# take the existing async CPU pipeline.
+#
+# Requirements:
+#   * Both edge endpoints on the same host, worker in-process (TP=1 stages).
+#   * Stage devices either coincide (stages 1/2 share cuda:1 here) or have
+#     peer access (NVLink / PCIe P2P) between them for the 0 -> 1 edge.
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0,1 vllm serve <model> --omni \
+#       --deploy-config vllm_omni/deploy/qwen3_omni_moe_torch_ipc.yaml
+async_chunk: true
+
+connectors:
+  # Prefill handoff edge (thinker -> talker): GPU-direct for the big
+  # one-shot tensors, CPU pipeline for everything else.
+  connector_of_torch_ipc:
+    name: TorchIpcConnector
+    extra:
+      gpu_tensor_keys: ["embed.prefill", "hidden_states"]
+  # Codec stream edge (talker -> code2wav): unchanged SHM transport.
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      initial_codec_chunk_frames: 4
+      codec_chunk_frames: 25
+      codec_left_context_frames: 25
+
+stages:
+  - stage_id: 0
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.9
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "0"
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 2048
+
+  - stage_id: 1
+    max_num_batched_tokens: 32768
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.6
+    trust_remote_code: true
+    enable_prefix_caching: false
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_torch_ipc
+    default_sampling_params:
+      temperature: 0.9
+      top_k: 50
+      max_tokens: 4096
+      repetition_penalty: 1.05
+
+  - stage_id: 2
+    max_num_batched_tokens: 65536
+    max_num_seqs: 64
+    gpu_memory_utilization: 0.1
+    enforce_eager: false
+    trust_remote_code: true
+    enable_prefix_caching: false
+    enable_chunked_prefill: false
+    async_scheduling: false
+    devices: "1"
+    input_connectors:
+      from_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 65536
+      repetition_penalty: 1.1
+
+platforms:
+  # See qwen3_omni_moe.yaml: keep MRoPE on the CUDA path.
+  cuda:
+    stages:
+      - stage_id: 0
+        compilation_config:
+          custom_ops: ["+rotary_embedding"]

@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """Utilities for handling multimodal outputs / building multimodal output
 payloads, most of which are shared by the prefix cache / no prefix cache path.
 """
@@ -6,6 +9,11 @@ from collections.abc import Mapping
 
 import torch
 from vllm.logger import init_logger
+
+from vllm_omni.distributed.omni_connectors.connectors.gpu_placement import (
+    GPU_PLACEMENT_MIN_BYTES,
+    gpu_key_matches,
+)
 
 logger = init_logger(__name__)
 
@@ -78,7 +86,12 @@ def partition_payload_list(
     )
 
 
-def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
+def build_mm_cpu(
+    multimodal_outputs: dict,
+    gpu_keys: "frozenset[str] | None" = None,
+    skip_clone: bool = False,
+    gpu_min_bytes: int = GPU_PLACEMENT_MIN_BYTES,
+) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
 
@@ -87,6 +100,13 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
 
     Args:
         multimodal_outputs: Multimodal dict mapping strings to objects.
+        gpu_keys: Stable per-edge placement set: tensors under a listed key
+            stay on GPU for a GPU-direct connector edge instead of dropping
+            to CPU.  Client-facing output roots never stay on GPU — they
+            ride the msgpack wire to the API server.
+        skip_clone: If True, GPU-kept tensors are already independent
+            snapshot clones, so the defensive ``.clone()`` is skipped.
+        gpu_min_bytes: Per-tensor size floor for GPU placement.
     """
     if not multimodal_outputs:
         return {}
@@ -100,9 +120,12 @@ def build_mm_cpu(multimodal_outputs: dict) -> dict[str, object]:
         logger.warning("Multimodal outputs are not a dict and will not be passed")
 
     for k, v in multimodal_outputs.items():
-        cpu_v = _to_cpu(v)
-        if cpu_v is not None:
-            mm_cpu[k] = cpu_v
+        key_on_gpu = False
+        if gpu_keys is not None and isinstance(k, str) and k.split(".", 1)[0] not in _CLIENT_MM_ROOT_KEYS:
+            key_on_gpu = gpu_key_matches(k, gpu_keys)
+        converted = _detach_tensor(v, key_on_gpu, skip_clone, gpu_min_bytes)
+        if converted is not None:
+            mm_cpu[k] = converted
     return mm_cpu
 
 
@@ -160,21 +183,27 @@ def _snapshot_payload_value(value):
     return value
 
 
-def _to_cpu(value):
-    """Recursively detach + move tensors to CPU; preserve dict/list nesting."""
+def _detach_tensor(value, keep_on_gpu: bool = False, skip_clone: bool = False, min_bytes: int = 0):
+    """Recursively detach tensors; move to CPU unless ``keep_on_gpu``."""
     if isinstance(value, torch.Tensor):
+        if keep_on_gpu and value.is_cuda and value.numel() * value.element_size() >= min_bytes:
+            # GPU-direct edge: stay on device for D2D transport.  Clone
+            # defensively unless the caller already snapshot-cloned, so step
+            # buffer reuse can never corrupt the payload.
+            detached = value.detach()
+            return detached if skip_clone else detached.clone()
         return value.detach().to("cpu").contiguous()
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            cpu_v = _to_cpu(v)
-            if cpu_v is not None:
-                out[k] = cpu_v
+            converted = _detach_tensor(v, keep_on_gpu, skip_clone, min_bytes)
+            if converted is not None:
+                out[k] = converted
         return out or None
     if isinstance(value, list):
         if not value:
             return value
-        return [_to_cpu(v) for v in value]
+        return [_detach_tensor(v, keep_on_gpu, skip_clone, min_bytes) for v in value]
     return value
 
 
