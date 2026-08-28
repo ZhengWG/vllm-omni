@@ -115,6 +115,68 @@ def test_moss_tts_applies_request_max_new_tokens(adapter_cls):
     assert stage_defaults[0].max_tokens == 4096
 
 
+def _moss_adapter_for_build(adapter_cls):
+    async def _build_params(request, has_inline_ref_audio=False):
+        return {"text": [request.input]}
+
+    server = SimpleNamespace(
+        uploaded_speakers={},
+        _build_moss_tts_params=_build_params,
+    )
+    return adapter_cls(SimpleNamespace(server=server))
+
+
+def _moss_speech_request(*, seed: int | None):
+    return SimpleNamespace(
+        input="hello",
+        voice=None,
+        seed=seed,
+    )
+
+
+@pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
+def test_moss_tts_build_prefers_request_seed_over_stage_default(adapter_cls):
+    adapter = _moss_adapter_for_build(adapter_cls)
+    prepared = asyncio.run(
+        adapter.build(
+            _moss_speech_request(seed=111),
+            [SimpleNamespace(seed=42)],
+            False,
+        )
+    )
+
+    assert prepared.tts_params["seed"] == [111]
+    assert prepared.prompt["additional_information"]["seed"] == [111]
+
+
+@pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
+def test_moss_tts_build_falls_back_to_sampling_params_seed(adapter_cls):
+    adapter = _moss_adapter_for_build(adapter_cls)
+    prepared = asyncio.run(
+        adapter.build(
+            _moss_speech_request(seed=None),
+            [SimpleNamespace(seed=42)],
+            False,
+        )
+    )
+
+    assert prepared.tts_params["seed"] == [42]
+
+
+@pytest.mark.parametrize("adapter_cls", [MossTTSAdapter, MossTTSNanoAdapter])
+def test_moss_tts_build_omits_seed_when_unset(adapter_cls):
+    adapter = _moss_adapter_for_build(adapter_cls)
+    prepared = asyncio.run(
+        adapter.build(
+            _moss_speech_request(seed=None),
+            [SimpleNamespace(seed=None)],
+            False,
+        )
+    )
+
+    assert "seed" not in prepared.tts_params
+
+
 def test_qwen3_tts_metadata():
     assert Qwen3TTSAdapter.backend == "ar"
     assert issubclass(Qwen3TTSAdapter, ARTTSAdapter)
