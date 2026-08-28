@@ -118,7 +118,7 @@ class VideoStreamPipelineHooks(Protocol):
         """Prefix of the next :meth:`build_engine_prompt` through the last vision token.
 
         History plus arriving video frames, without query text or input audio.
-        Return None when there are no usable frames (or to disable eager prefill).
+        Return None when there are no usable frames (or to disable incremental prefill).
         """
         ...
 
@@ -159,8 +159,8 @@ class StreamingVideoSessionConfig(BaseModel):
     use_audio_in_video: bool = Field(
         default=True,
         description=(
-            "Legacy path only: pass mm_processor_kwargs.use_audio_in_video "
-            "when this query has input audio. Ignored under eager prefill."
+            "Pass use_audio_in_video to the processor when this is true and "
+            "(incremental prefill is active, or this query has input audio)."
         ),
     )
     sampling_params_list: list[dict[str, Any]] | None = Field(
@@ -277,7 +277,7 @@ class OmniStreamingVideoHandler:
         return []
 
     def _incremental_prefill_active(self, config: StreamingVideoSessionConfig) -> bool:
-        """Eager frame prefill: stage-0 prefix cache on, text-only output."""
+        """Incremental frame prefill: stage-0 prefix caching on, text-only output."""
         return self._incremental_prefill_supported and "audio" not in config.modalities
 
     def on_frame_buffered(
@@ -434,7 +434,7 @@ class OmniStreamingVideoHandler:
                         await asyncio.gather(query_task, return_exceptions=True)
                     query_task = None
 
-            # --- Eager prefill: keep the prefix cache warmed to the latest
+            # --- Incremental prefill: keep the prefix cache warmed to the latest
             # buffered frame so a query only pays for its own text suffix. ---
             warmup_task: asyncio.Task[Any] | None = None
             warmup_request_id: str | None = None
@@ -906,15 +906,9 @@ class OmniStreamingVideoHandler:
             "continue_final_message": False,
             "add_special_tokens": False,
         }
-        # TODO(video-stream, use_audio_in_video):
-        # - Pair video.frame with audio.chunk (pts_ms on both, or 1:1).
-        # - Emit real video+audio items so Qwen can interleave; image_pil
-        #   + trailing input_audio does not run that path.
-        # - Eager prefill cannot frames-only warmup that layout (interleave
-        #   rewrites video tokens from the first frame). Reuse stays off.
-        # - Until then, reuse never sets this kwarg. Legacy still can when
-        #   the query has PCM.
-        if not reuse_active and config.use_audio_in_video and len(audio_buffer) > 0:
+        # Incremental: same kwargs as warmup so frame mm hashes stay a prefix.
+        # Legacy: only when this query actually has input audio.
+        if config.use_audio_in_video and (reuse_active or len(audio_buffer) > 0):
             request_kwargs["mm_processor_kwargs"] = {
                 "use_audio_in_video": True,
             }
@@ -1293,7 +1287,7 @@ class OmniStreamingVideoHandler:
         return text, text
 
     # ------------------------------------------------------------------
-    # Eager prefill (context warmup)
+    # Incremental prefill (context warmup)
     # ------------------------------------------------------------------
 
     async def _prefill_context(
@@ -1321,8 +1315,10 @@ class OmniStreamingVideoHandler:
             "continue_final_message": False,
             "add_special_tokens": False,
         }
-        # Reuse warmup is frames-only. use_audio_in_video interleaves audio
-        # into video tokens and cannot share that prefix. See query-path TODO.
+        if config.use_audio_in_video:
+            request_kwargs["mm_processor_kwargs"] = {
+                "use_audio_in_video": True,
+            }
         chat_request = ChatCompletionRequest(**request_kwargs)
         engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
         result_gen = engine_client.generate(

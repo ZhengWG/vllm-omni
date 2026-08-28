@@ -22,7 +22,6 @@ from vllm_omni.entrypoints.openai.serving_video_stream import (
     StreamingVideoSessionConfig,
 )
 from vllm_omni.entrypoints.openai.video_stream_base import (
-    _BAD_FRAME,
     OmniStreamingVideoHandler,
 )
 from vllm_omni.outputs import OmniRequestOutput
@@ -233,7 +232,6 @@ async def test_video_frames_consumed_is_emitted_after_engine_uses_frame_prompt()
 
 @pytest.mark.asyncio
 async def test_audio_in_video_sets_mm_processor_kwargs():
-    """Legacy (audio output): PCM + config true still sets the kwarg."""
     captured_requests = []
 
     class EmptyEngine:
@@ -271,7 +269,6 @@ async def test_audio_in_video_sets_mm_processor_kwargs():
 
 @pytest.mark.asyncio
 async def test_audio_in_video_disabled_omits_mm_processor_kwargs():
-    """Legacy: config false omits the kwarg even when the query has PCM."""
     captured_requests = []
 
     class EmptyEngine:
@@ -309,7 +306,6 @@ async def test_audio_in_video_disabled_omits_mm_processor_kwargs():
 
 @pytest.mark.asyncio
 async def test_query_inline_audio_data_sets_mm_processor_kwargs():
-    """Legacy session: inline query audio_data sets the kwarg."""
     captured_requests = []
 
     class EmptyEngine:
@@ -327,13 +323,7 @@ async def test_query_inline_audio_data_sets_mm_processor_kwargs():
 
     ws = MockWebSocket(
         [
-            json.dumps(
-                {
-                    "type": "session.config",
-                    "model": "test",
-                    "modalities": ["text", "audio"],
-                }
-            ),
+            json.dumps({"type": "session.config", "model": "test"}),
             json.dumps({"type": "video.frame", "data": _b64(_make_jpeg())}),
             json.dumps(
                 {
@@ -755,30 +745,13 @@ def test_build_messages_keeps_recent_history_text_only():
     assert user_message["content"][-1] == {"type": "text", "text": "current question"}
 
 
-def test_build_frame_image_parts_requires_decoded_pil():
-    ready = _b64(_make_jpeg(1, 1, 1))
-    bad = _b64(_make_jpeg(3, 3, 3))
-    missing = _b64(_make_jpeg(4, 4, 4))
-    pil = Image.new("RGB", (8, 8), (1, 1, 1))
-
-    parts = OmniStreamingVideoHandler._build_frame_image_parts(
-        [ready, bad, missing],
-        {
-            ready: (pil, "ready-uuid"),
-            bad: _BAD_FRAME,
-        },
-    )
-
-    assert parts == [{"type": "image_pil", "image_pil": pil, "uuid": "ready-uuid"}]
-
-
 # ---------------------------------------------------------------------------
-# Eager prefill (warmup) lifecycle
+# Incremental prefill (warmup) lifecycle
 # ---------------------------------------------------------------------------
 
 
 class RecordingReuseEngine:
-    """Stage-0-APC-on engine stub; records generate() calls and aborts."""
+    """Engine stub with stage-0 prefix caching on; records generate() and abort()."""
 
     def __init__(self, warmup_delay: float = 0.0, query_delay: float = 0.0):
         self.requests: list[dict[str, Any]] = []
@@ -866,6 +839,10 @@ async def test_warmup_fires_on_frame_and_query_cancels_it():
     # in-flight warmup was cancelled + aborted, and not restarted mid-query
     assert warmup_id in engine.aborted
     assert len(engine.warmup_ids()) == 1
+    assert handler.mm_processor_kwargs[:2] == [
+        {"use_audio_in_video": True},
+        {"use_audio_in_video": True},
+    ]
 
     assert await _poll(lambda: "response.text.done" in ws.sent_types())
     # the committed turn changed the context -> a fresh warmup fires
@@ -1014,66 +991,6 @@ async def test_query_keeps_frames_evicted_while_pinned(monkeypatch):
     await asyncio.wait_for(task, timeout=2.0)
 
 
-def _mm_use_audio(value: Any) -> bool:
-    return isinstance(value, dict) and value.get("use_audio_in_video") is True
-
-
-@pytest.mark.asyncio
-async def test_reuse_process_query_omits_use_audio_in_video_even_with_pcm():
-    """Reuse query path must not set the kwarg when PCM is present; interleave
-    would void the frames-only warmup prefix."""
-    captured_requests = []
-
-    class CapturingHandler(QwenOmniStreamingVideoHandler):
-        async def _preprocess_to_engine_prompt(self, request):
-            captured_requests.append(request)
-            return {"prompt": "x"}
-
-    handler = CapturingHandler(
-        chat_service=object(),
-        engine_client=RecordingReuseEngine(),
-    )
-    config = StreamingVideoSessionConfig(model="test", modalities=["text"], use_audio_in_video=True)
-    await handler._process_query_engine(
-        TimedWebSocket(),
-        config,
-        [_b64(_make_jpeg())],
-        bytearray(b"\x00\x00"),
-        [],
-        "describe",
-        "req-reuse-1",
-        asyncio.Event(),
-        {},
-    )
-
-    assert captured_requests
-    assert captured_requests[0].mm_processor_kwargs is None
-
-
-@pytest.mark.asyncio
-async def test_reuse_omits_use_audio_in_video():
-    """Interleave is incompatible with frames-only warmup. Reuse must omit
-    the kwarg on both warmup and query even when session.config defaults true."""
-    engine = RecordingReuseEngine()
-    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
-
-    ws = TimedWebSocket()
-    task = asyncio.create_task(handler.handle_session(ws))
-    ws.put({"type": "session.config", "model": "test", "modalities": ["text"], "enable_frame_filter": False})
-    await asyncio.sleep(0)
-    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
-    assert await _poll(lambda: engine.warmup_ids())
-
-    ws.put({"type": "video.query", "text": "describe"})
-    assert await _poll(lambda: engine.query_ids())
-    ws.put({"type": "video.done"})
-    await asyncio.wait_for(task, timeout=2.0)
-
-    assert len(handler.mm_processor_kwargs) >= 2
-    assert handler.mm_processor_kwargs[0] is None
-    assert handler.mm_processor_kwargs[1] is None
-
-
 async def _run_frame_audio_query(modalities: list[str], frame: str, pcm: bytes) -> PromptRecordingHandler:
     engine = RecordingReuseEngine()
     handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
@@ -1104,8 +1021,7 @@ async def _run_frame_audio_query(modalities: list[str], frame: str, pcm: bytes) 
 
 @pytest.mark.asyncio
 async def test_reuse_query_with_audio_matches_legacy_prompt():
-    """Current contract: PCM stays a query suffix of image_pil, not interleave.
-    Reuse omits use_audio_in_video; legacy with PCM still sets it."""
+    """Incremental and legacy query prompts match; both set the processor kwarg."""
     frame = _b64(_make_jpeg())
     pcm = b"\x01\x00\x02\x00"
     reuse = await _run_frame_audio_query(["text"], frame, pcm)
@@ -1124,6 +1040,6 @@ async def test_reuse_query_with_audio_matches_legacy_prompt():
     assert reuse_q[1] == legacy_q[1]
     assert reuse_q[2] == legacy_q[2] == {"type": "text", "text": "describe"}
 
-    assert reuse.mm_processor_kwargs[0] is None
-    assert reuse.mm_processor_kwargs[1] is None
-    assert _mm_use_audio(legacy.mm_processor_kwargs[0])
+    assert reuse.mm_processor_kwargs[0] == {"use_audio_in_video": True}
+    assert reuse.mm_processor_kwargs[1] == {"use_audio_in_video": True}
+    assert legacy.mm_processor_kwargs[0] == {"use_audio_in_video": True}
