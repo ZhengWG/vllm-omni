@@ -15,7 +15,12 @@ from tests.diffusion.lora.helpers import (
     FakeLinearBase,
     fake_replace_submodule,
 )
-from vllm_omni.diffusion.lora.manager import DiffusionLoRAManager
+from vllm_omni.diffusion.lora.manager import (
+    DiffusionLoRAManager,
+    deinterleave_hi3_gqa_qkv,
+    hi3_qkv_layout,
+    is_hunyuan_image3_pipeline,
+)
 from vllm_omni.lora.request import LoRARequest
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
@@ -723,3 +728,154 @@ def test_lora_manager_discovers_unet_component(monkeypatch):
     assert "unet.down_block.proj" in manager._lora_modules
     # Verify the module was actually replaced in the tree (not just recorded)
     assert isinstance(pipeline.unet.down_block.proj, _DummyBaseLayerWithLoRA)
+
+
+class HunyuanImage3Pipeline(torch.nn.Module):
+    """Name-matched stand-in so HI3 detection does not import the real pipeline."""
+
+    def __init__(self, *, num_attention_heads=4, num_kv_heads=2, head_dim=2):
+        super().__init__()
+        self.transformer = torch.nn.Module()
+        self.transformer.config = SimpleNamespace(
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_kv_heads,
+            head_dim=head_dim,
+        )
+
+
+class _NamedLookupLM:
+    def __init__(self, loras: dict[str, LoRALayerWeights]):
+        self.loras = loras
+
+    def get_lora(self, key: str) -> LoRALayerWeights | None:
+        return self.loras.get(key)
+
+
+def _make_lora_weights(name: str, lora_a: torch.Tensor, lora_b: torch.Tensor) -> LoRALayerWeights:
+    return LoRALayerWeights(
+        module_name=name,
+        rank=lora_a.shape[0],
+        lora_alpha=lora_a.shape[0],
+        lora_a=lora_a,
+        lora_b=lora_b,
+    )
+
+
+def test_is_hunyuan_image3_pipeline_is_name_scoped():
+    assert is_hunyuan_image3_pipeline(HunyuanImage3Pipeline())
+    assert not is_hunyuan_image3_pipeline(_DummyPipeline())
+
+
+def test_deinterleave_hi3_gqa_qkv_matches_base_weight_permutation():
+    num_attention_heads, num_kv_heads, head_dim = 4, 2, 2
+    rank = 1
+    # Per KV head: [Q-group (2 heads), K, V], each head_dim rows.
+    interleaved = torch.arange(16, dtype=torch.float32).reshape(16, rank)
+    packed = deinterleave_hi3_gqa_qkv(interleaved, num_attention_heads, num_kv_heads, head_dim)
+    # Q rows from both KV groups, then K, then V.
+    expected = torch.tensor(
+        [[0], [1], [2], [3], [8], [9], [10], [11], [4], [5], [12], [13], [6], [7], [14], [15]],
+        dtype=torch.float32,
+    )
+    assert torch.equal(packed, expected)
+
+
+def test_hi3_qkv_layout_reads_transformer_config():
+    pipeline = HunyuanImage3Pipeline(num_attention_heads=8, num_kv_heads=2, head_dim=4)
+    assert hi3_qkv_layout(pipeline) == (8, 2, 4)
+    assert hi3_qkv_layout(_DummyPipeline()) is None
+
+
+def test_lora_manager_resolves_hi3_model_layers_namespace():
+    pipeline = HunyuanImage3Pipeline()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    lora_a = torch.ones((1, 4))
+    lora_b = torch.ones((4, 1))
+    weights = _make_lora_weights("qkv_proj", lora_a, lora_b)
+    lora_model = _NamedLookupLM({"model.layers.0.self_attn.qkv_proj": weights})
+
+    found = manager._get_lora_weights(lora_model, "transformer.layers.0.self_attn.qkv_proj")
+    assert found is weights
+
+
+def test_lora_manager_does_not_alias_model_layers_for_other_pipelines():
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    weights = _make_lora_weights("qkv_proj", torch.ones((1, 4)), torch.ones((4, 1)))
+    lora_model = _NamedLookupLM({"model.layers.0.self_attn.qkv_proj": weights})
+
+    assert manager._get_lora_weights(lora_model, "transformer.layers.0.self_attn.qkv_proj") is None
+
+
+def test_lora_manager_deinterleaves_hi3_fused_qkv_lora_b():
+    pipeline = HunyuanImage3Pipeline()
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    layer = _DummyLoRALayer(n_slices=3, output_slices=(8, 4, 4))
+    manager._lora_modules = {"transformer.layers.0.self_attn.qkv_proj": layer}
+
+    interleaved = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    weights = _make_lora_weights("qkv_proj", torch.ones((1, 4)), interleaved)
+    lora_model = _NamedLookupLM({"model.layers.0.self_attn.qkv_proj": weights})
+
+    manager._bind_adapter_weights(lora_model, scale=1.0)
+
+    assert layer.reset_calls == 0
+    assert len(layer.set_calls) == 1
+    lora_a_list, lora_b_list = layer.set_calls[0]
+    assert len(lora_b_list) == 3
+    packed = deinterleave_hi3_gqa_qkv(interleaved, 4, 2, 2)
+    assert torch.equal(lora_b_list[0], packed[:8])
+    assert torch.equal(lora_b_list[1], packed[8:12])
+    assert torch.equal(lora_b_list[2], packed[12:])
+    assert all(torch.equal(a, weights.lora_a) for a in lora_a_list)
+
+
+def test_lora_manager_skips_hi3_fused_qkv_when_layout_unknown():
+    pipeline = HunyuanImage3Pipeline()
+    del pipeline.transformer.config
+    manager = DiffusionLoRAManager(
+        pipeline=pipeline,
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    layer = _DummyLoRALayer(n_slices=3, output_slices=(8, 4, 4))
+    manager._lora_modules = {"transformer.layers.0.self_attn.qkv_proj": layer}
+    weights = _make_lora_weights("qkv_proj", torch.ones((1, 4)), torch.arange(16, dtype=torch.float32).reshape(16, 1))
+    lora_model = _NamedLookupLM({"model.layers.0.self_attn.qkv_proj": weights})
+
+    manager._bind_adapter_weights(lora_model, scale=1.0)
+
+    assert layer.set_calls == []
+    assert layer.reset_calls == 1
+
+
+def test_lora_manager_does_not_deinterleave_non_hi3_fused_qkv():
+    manager = DiffusionLoRAManager(
+        pipeline=_DummyPipeline(),
+        device=torch.device("cpu"),
+        dtype=torch.bfloat16,
+    )
+    layer = _DummyLoRALayer(n_slices=3, output_slices=(8, 4, 4))
+    manager._lora_modules = {"transformer.layers.0.self_attn.qkv_proj": layer}
+    packed = torch.arange(16, dtype=torch.float32).reshape(16, 1)
+    weights = _make_lora_weights("qkv_proj", torch.ones((1, 4)), packed)
+    lora_model = _NamedLookupLM({"transformer.layers.0.self_attn.qkv_proj": weights})
+
+    manager._bind_adapter_weights(lora_model, scale=1.0)
+
+    assert len(layer.set_calls) == 1
+    _, lora_b_list = layer.set_calls[0]
+    assert torch.equal(lora_b_list[0], packed[:8])
+    assert torch.equal(lora_b_list[1], packed[8:12])
+    assert torch.equal(lora_b_list[2], packed[12:])

@@ -32,6 +32,83 @@ from vllm_omni.lora.utils import stable_lora_int_id
 
 logger = init_logger(__name__)
 
+_HI3_PIPELINE_TYPE = "HunyuanImage3Pipeline"
+_HI3_TRANSFORMER_TYPE = "HunyuanImage3Model"
+_HI3_FUSED_QKV_SUFFIX = "qkv_proj"
+
+
+def is_hunyuan_image3_pipeline(pipeline: nn.Module) -> bool:
+    """True when *pipeline* is the HunyuanImage-3 DiT stack.
+
+    The DiT LoRA manager registers wrappers under ``transformer.layers.*``,
+    while HI3 PEFT adapters store the matching tensors under ``model.layers.*``.
+    Both the GQA de-interleave and that namespace fallback are HI3-specific.
+    """
+    if type(pipeline).__name__ == _HI3_PIPELINE_TYPE:
+        return True
+    for attr in ("transformer", "model"):
+        component = getattr(pipeline, attr, None)
+        if component is not None and type(component).__name__ == _HI3_TRANSFORMER_TYPE:
+            return True
+    return False
+
+
+def hi3_qkv_layout(pipeline: nn.Module) -> tuple[int, int, int] | None:
+    """Return ``(num_attention_heads, num_kv_heads, head_dim)`` for HI3, or None."""
+    transformer = getattr(pipeline, "transformer", None) or getattr(pipeline, "model", None)
+    config = getattr(transformer, "config", None)
+    if config is None:
+        return None
+    num_attention_heads = getattr(config, "num_attention_heads", None)
+    num_kv_heads = getattr(config, "num_key_value_heads", num_attention_heads)
+    if not num_attention_heads or not num_kv_heads:
+        return None
+    if num_attention_heads % num_kv_heads != 0:
+        return None
+    if getattr(config, "head_dim", None):
+        head_dim = config.head_dim
+    elif getattr(config, "attention_head_dim", None):
+        head_dim = config.attention_head_dim
+    elif getattr(config, "hidden_size", None):
+        head_dim = config.hidden_size // num_attention_heads
+    else:
+        return None
+    if head_dim <= 0:
+        return None
+    return int(num_attention_heads), int(num_kv_heads), int(head_dim)
+
+
+def deinterleave_hi3_gqa_qkv(
+    qkv: torch.Tensor,
+    num_attention_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> torch.Tensor:
+    """Convert HI3 GQA-interleaved QKV rows to ``[all Q; all K; all V]``.
+
+    Matches ``HunyuanImage3Model._split_qkv_weight``: checkpoint rows are packed
+    as ``[Q-group, K, V]`` per KV head. The last dimension is preserved so the
+    same permutation works for base weights (``hidden_size``) and LoRA-B (rank).
+    """
+    if qkv.ndim != 2:
+        raise ValueError(f"HI3 fused QKV tensor must be rank-2, got shape {tuple(qkv.shape)}")
+    if num_attention_heads % num_kv_heads != 0:
+        raise ValueError(
+            f"HI3 GQA layout is invalid: num_attention_heads={num_attention_heads} "
+            f"is not divisible by num_kv_heads={num_kv_heads}"
+        )
+    num_key_value_groups = num_attention_heads // num_kv_heads
+    expected_rows = (num_attention_heads + num_kv_heads * 2) * head_dim
+    if qkv.shape[0] != expected_rows:
+        raise ValueError(
+            f"HI3 fused QKV rows={qkv.shape[0]} do not match "
+            f"(num_attention_heads + 2 * num_kv_heads) * head_dim = {expected_rows}"
+        )
+    last_dim = qkv.shape[1]
+    packed = qkv.reshape(num_kv_heads, num_key_value_groups + 2, head_dim, last_dim)
+    q, k, v = torch.split(packed, (num_key_value_groups, 1, 1), dim=1)
+    return torch.concat((q.reshape(-1, last_dim), k.reshape(-1, last_dim), v.reshape(-1, last_dim)))
+
 
 class LoRABackend(str, Enum):
     PEFT = "peft"
@@ -537,8 +614,41 @@ class DiffusionLoRAManager:
         if lora_weights is not None:
             return lora_weights
 
+        # HI3 PEFT adapters live under model.layers.* while DiT wrappers are
+        # registered as transformer.layers.*. AR consumes the same adapter
+        # under the model. prefix, so this fallback is HI3-only.
+        if is_hunyuan_image3_pipeline(self.pipeline) and full_module_name.startswith("transformer."):
+            model_scoped_name = "model." + full_module_name.split(".", 1)[1]
+            lora_weights = lora_model.get_lora(model_scoped_name)
+            if lora_weights is not None:
+                return lora_weights
+
         module_suffix = full_module_name.split(".")[-1]
         return lora_model.get_lora(module_suffix)
+
+    def _convert_hi3_fused_qkv_lora_b(
+        self,
+        full_module_name: str,
+        lora_b: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """De-interleave an HI3 fused qkv_proj LoRA-B, or None to skip bind."""
+        if full_module_name.rsplit(".", 1)[-1] != _HI3_FUSED_QKV_SUFFIX:
+            return lora_b
+        if not is_hunyuan_image3_pipeline(self.pipeline):
+            return lora_b
+        layout = hi3_qkv_layout(self.pipeline)
+        if layout is None:
+            logger.error(
+                "Skipping LoRA for %s: HunyuanImage-3 fused qkv_proj requires "
+                "an established GQA layout before the interleaved LoRA-B can be applied",
+                full_module_name,
+            )
+            return None
+        try:
+            return deinterleave_hi3_gqa_qkv(lora_b, *layout)
+        except ValueError as exc:
+            logger.error("Skipping LoRA for %s: %s", full_module_name, exc)
+            return None
 
     def _is_active_at_scale(self, adapter_id: int, scale: float) -> bool:
         """True if the adapter_id is active and the current scale matches."""
@@ -637,17 +747,21 @@ class DiffusionLoRAManager:
                     continue
 
                 total = sum(output_slices)
-                if lora_weights.lora_b.shape[0] != total:
+                lora_b = self._convert_hi3_fused_qkv_lora_b(full_module_name, lora_weights.lora_b)
+                if lora_b is None:
+                    lora_layer.reset_lora(0)
+                    continue
+                if lora_b.shape[0] != total:
                     logger.warning(
                         "Skipping LoRA for %s due to shape mismatch: lora_b[0]=%d != sum(output_slices)=%d",
                         full_module_name,
-                        lora_weights.lora_b.shape[0],
+                        lora_b.shape[0],
                         total,
                     )
                     lora_layer.reset_lora(0)
                     continue
 
-                b_splits = list(torch.split(lora_weights.lora_b, list(output_slices), dim=0))
+                b_splits = list(torch.split(lora_b, list(output_slices), dim=0))
                 lora_a_list = [lora_weights.lora_a] * n_slices
                 lora_b_list = [b * scale for b in b_splits]
                 lora_layer.set_lora(index=0, lora_a=lora_a_list, lora_b=lora_b_list)
