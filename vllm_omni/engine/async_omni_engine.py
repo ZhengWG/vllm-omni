@@ -1351,6 +1351,9 @@ class AsyncOmniEngine:
                     has_stage_attention = (
                         hasattr(cfg.engine_args, "diffusion_attention_config")
                         and cfg.engine_args.diffusion_attention_config is not None
+                    ) or (
+                        hasattr(cfg.engine_args, "diffusion_attention_backend")
+                        and cfg.engine_args.diffusion_attention_backend is not None
                     )
                     if not has_stage_attention:
                         cfg.engine_args.diffusion_attention_config = parse_attention_config(
