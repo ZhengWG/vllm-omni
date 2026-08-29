@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Payload placement policy for GPU-direct (device-to-device) send edges.
 
@@ -18,17 +18,12 @@ construction, control flags) must stay on the CPU pipeline — moving it
 device-to-device only to bounce it back with a synchronous ``.cpu()`` on
 the receive thread would invert the win.
 
-Size is *not* part of the default policy: the GPU data plane shares
-handles instead of serializing tensor bytes and runs on dedicated streams
-on both ends, so small per-token packets pay no host synchronization and
-no compute-stream coupling.  ``gpu_tensor_min_bytes`` remains available as
-a tuning floor (default 0 = disabled) should a deployment measure a
-crossover.
-
-With a nonzero floor, placement becomes size-dependent, so any
-producer-side ``torch.cat`` across accumulated payload pieces must
-normalize devices at the cat site (see the Qwen3-Omni thinker chunk-0
-accumulation).  Consumers already normalize at use (``.to(device)``).
+Size is *not* part of the policy: the GPU data plane shares handles
+instead of serializing tensor bytes and runs on dedicated streams on both
+ends, so small per-token packets pay no host synchronization and no
+compute-stream coupling.  Key-only placement also keeps every key's device
+stable across chunks, which producer-side accumulation (``torch.cat``
+across cached pieces) and receiver-side stream concatenation rely on.
 """
 
 from typing import Any
@@ -36,19 +31,11 @@ from typing import Any
 import torch
 
 __all__ = [
-    "GPU_PLACEMENT_MIN_BYTES",
     "connector_gpu_keys",
-    "connector_gpu_min_bytes",
     "gpu_key_matches",
     "keep_tensor_on_gpu",
     "place_payload_tensor",
 ]
-
-# Default size floor for GPU placement: disabled.  The data plane is
-# handle-based and stream-decoupled, so listed keys ride it at any size;
-# set ``gpu_tensor_min_bytes`` per edge to reintroduce a floor if a
-# deployment measures a crossover.
-GPU_PLACEMENT_MIN_BYTES = 0
 
 
 def connector_gpu_keys(connector: Any) -> frozenset[str] | None:
@@ -60,14 +47,6 @@ def connector_gpu_keys(connector: Any) -> frozenset[str] | None:
     if not keys:
         return None
     return frozenset(str(k) for k in keys)
-
-
-def connector_gpu_min_bytes(connector: Any) -> int:
-    """Return the edge's GPU placement size floor in bytes."""
-    value = getattr(connector, "gpu_tensor_min_bytes", None)
-    if value is None:
-        return GPU_PLACEMENT_MIN_BYTES
-    return int(value)
 
 
 def gpu_key_matches(key: str, gpu_keys: frozenset[str] | None) -> bool:
@@ -85,14 +64,11 @@ def keep_tensor_on_gpu(
     tensor: torch.Tensor,
     key: str | None,
     gpu_keys: frozenset[str] | None,
-    min_bytes: int = GPU_PLACEMENT_MIN_BYTES,
 ) -> bool:
-    """Full placement predicate: listed key, CUDA tensor, above the floor."""
+    """Full placement predicate: CUDA tensor under a listed key."""
     if gpu_keys is None or key is None or not tensor.is_cuda:
         return False
-    if not gpu_key_matches(key, gpu_keys):
-        return False
-    return tensor.numel() * tensor.element_size() >= min_bytes
+    return gpu_key_matches(key, gpu_keys)
 
 
 def place_payload_tensor(tensor: torch.Tensor | None, keep_on_gpu: bool) -> torch.Tensor | None:

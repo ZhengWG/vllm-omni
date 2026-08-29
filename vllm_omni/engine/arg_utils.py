@@ -251,16 +251,6 @@ class OmniEngineArgs(EngineArgs):
 
         connector_extra = self.stage_connector_spec.get("extra")
         connector_role = connector_extra.get("role") if isinstance(connector_extra, dict) else None
-        if connector_role is None:
-            # Dual {"input","output"} spec shape: role lives on the
-            # per-direction sub-specs (input first, matching legacy
-            # from_stage_* precedence).
-            for sub in (self.stage_connector_spec.get("input"), self.stage_connector_spec.get("output")):
-                sub_extra = sub.get("extra") if isinstance(sub, dict) else None
-                sub_role = sub_extra.get("role") if isinstance(sub_extra, dict) else None
-                if isinstance(sub_role, str):
-                    connector_role = sub_role
-                    break
         needs_connector = bool(
             self.requires_full_payload_input or self.custom_process_next_stage_input_func or connector_role is not None
         )
@@ -314,11 +304,12 @@ class OmniEngineArgs(EngineArgs):
         # register omni models to avoid model not found error
         self._ensure_omni_models_registered()
 
-        # Build stage_connector_config from stage_connector_spec (legacy single
-        # or dual {"input","output"} shape — normalisation is connector-owned).
-        from vllm_omni.distributed.omni_connectors.utils.config import build_stage_connector_config
-
-        stage_connector_config = build_stage_connector_config(self.stage_connector_spec, self.stage_id)
+        # Build stage_connector_config from stage_connector_spec
+        stage_connector_config = {
+            "name": self.stage_connector_spec.get("name", "SharedMemoryConnector"),
+            "extra": self.stage_connector_spec.get("extra", {}).copy(),
+        }
+        stage_connector_config["extra"]["stage_id"] = self.stage_id
 
         hf_overrides = cast(dict[str, Any] | Callable[[Any], Any] | None, getattr(self, "hf_overrides", None))
         # If model_arch is specified, inject it into hf_overrides so vLLM can

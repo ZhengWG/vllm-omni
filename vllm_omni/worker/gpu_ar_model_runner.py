@@ -44,9 +44,7 @@ from vllm.v1.worker.utils import is_residual_scattered_for_sp
 
 from vllm_omni.data_entry_keys import flatten_payload
 from vllm_omni.distributed.omni_connectors.connectors.gpu_placement import (
-    GPU_PLACEMENT_MIN_BYTES,
     connector_gpu_keys,
-    connector_gpu_min_bytes,
     keep_tensor_on_gpu,
 )
 from vllm_omni.distributed.omni_connectors.kv_transfer_manager import OmniKVTransferManager
@@ -104,13 +102,12 @@ def _copy_tensor_payload_to_cpu(
     value: Any,
     pin_memory: bool,
     gpu_keys: frozenset[str] | None = None,
-    gpu_min_bytes: int = GPU_PLACEMENT_MIN_BYTES,
     key: str | None = None,
 ) -> Any:
     if isinstance(value, torch.Tensor):
         if value.device.type != "cuda":
             return value
-        if keep_tensor_on_gpu(value, key, gpu_keys, gpu_min_bytes):
+        if keep_tensor_on_gpu(value, key, gpu_keys):
             # GPU-direct connector edge: this clone stays on device for the
             # D2D data plane instead of taking the host round-trip.
             return value
@@ -119,13 +116,13 @@ def _copy_tensor_payload_to_cpu(
         return cpu
     if isinstance(value, dict):
         return {
-            k: _copy_tensor_payload_to_cpu(v, pin_memory, gpu_keys, gpu_min_bytes, k if isinstance(k, str) else key)
+            k: _copy_tensor_payload_to_cpu(v, pin_memory, gpu_keys, k if isinstance(k, str) else key)
             for k, v in value.items()
         }
     if isinstance(value, list):
-        return [_copy_tensor_payload_to_cpu(v, pin_memory, gpu_keys, gpu_min_bytes, key) for v in value]
+        return [_copy_tensor_payload_to_cpu(v, pin_memory, gpu_keys, key) for v in value]
     if isinstance(value, tuple):
-        return tuple(_copy_tensor_payload_to_cpu(v, pin_memory, gpu_keys, gpu_min_bytes, key) for v in value)
+        return tuple(_copy_tensor_payload_to_cpu(v, pin_memory, gpu_keys, key) for v in value)
     return value
 
 
@@ -156,7 +153,6 @@ def _snapshot_tensor_payload_to_cpu_async(
     copy_stream: torch.cuda.Stream,
     pin_memory: bool,
     gpu_keys: frozenset[str] | None = None,
-    gpu_min_bytes: int = GPU_PLACEMENT_MIN_BYTES,
 ) -> _AsyncCPUPayloadSnapshot:
     cuda_sources: list[torch.Tensor] = []
     cloned = _clone_cuda_tensor_payload(value, cuda_sources)
@@ -167,7 +163,7 @@ def _snapshot_tensor_payload_to_cpu_async(
     ready_event = torch.cuda.Event()
     with torch.cuda.stream(copy_stream):
         copy_stream.wait_stream(source_stream)
-        cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory, gpu_keys, gpu_min_bytes)
+        cpu_payload = _copy_tensor_payload_to_cpu(cloned, pin_memory, gpu_keys)
         ready_event.record(copy_stream)
     return _AsyncCPUPayloadSnapshot(cpu_payload, ready_event, cuda_sources)
 
@@ -1733,7 +1729,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 ),
                 copy_stream=self._get_or_create_omni_payload_copy_stream(),
                 gpu_keys=self._payload_gpu_keys,
-                gpu_min_bytes=self._payload_gpu_min_bytes,
                 # NOTE: vLLM v0.24.0's GPUModelRunner no longer exposes a
                 # ``self.pin_memory`` attribute (it uses a module-level
                 # ``PIN_MEMORY`` constant instead), so the old
@@ -1806,20 +1801,15 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         """Stage a hidden-states payload tensor for the connector.
 
         Follows the edge's GPU placement policy: kept on device when the
-        ``hidden_states`` key is listed and the tensor meets the size floor,
-        otherwise the classic contiguous host copy.  ``already_snapshot``
-        skips the defensive clone when the tensor is already an independent
-        async-output snapshot (live runner buffers are reused by the next
-        step, so the sync path must copy).
+        ``hidden_states`` key is listed, otherwise the classic contiguous
+        host copy.  ``already_snapshot`` skips the defensive clone when the
+        tensor is already an independent async-output snapshot (live runner
+        buffers are reused by the next step, so the sync path must copy).
         """
-        if keep_tensor_on_gpu(tensor, "hidden_states", self._payload_gpu_keys, self._payload_gpu_min_bytes):
+        if keep_tensor_on_gpu(tensor, "hidden_states", self._payload_gpu_keys):
             detached = tensor.detach()
             return detached if already_snapshot else detached.clone()
         return _to_cpu_contiguous(tensor)
-
-    @property
-    def _payload_gpu_min_bytes(self) -> int:
-        return connector_gpu_min_bytes(getattr(self, "_omni_connector", None))
 
     @property
     def _payload_gpu_keys(self) -> frozenset[str] | None:
@@ -1955,7 +1945,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                             flat_mm,
                             gpu_keys=self._payload_gpu_keys,
                             skip_clone=payload_is_snapshot,
-                            gpu_min_bytes=self._payload_gpu_min_bytes,
                         )
 
             with record_function_or_nullcontext("omni_output_builder:process_additional_information"):

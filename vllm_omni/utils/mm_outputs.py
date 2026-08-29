@@ -10,10 +10,7 @@ from collections.abc import Mapping
 import torch
 from vllm.logger import init_logger
 
-from vllm_omni.distributed.omni_connectors.connectors.gpu_placement import (
-    GPU_PLACEMENT_MIN_BYTES,
-    gpu_key_matches,
-)
+from vllm_omni.distributed.omni_connectors.connectors.gpu_placement import gpu_key_matches
 
 logger = init_logger(__name__)
 
@@ -90,7 +87,6 @@ def build_mm_cpu(
     multimodal_outputs: dict,
     gpu_keys: "frozenset[str] | None" = None,
     skip_clone: bool = False,
-    gpu_min_bytes: int = GPU_PLACEMENT_MIN_BYTES,
 ) -> dict[str, object]:
     """Pre-copies multimodal tensor to CPU once (not per-request) to avoid
     redundant D2H transfers when gpu_resident_buffer_keys keeps them on GPU.
@@ -106,7 +102,6 @@ def build_mm_cpu(
             ride the msgpack wire to the API server.
         skip_clone: If True, GPU-kept tensors are already independent
             snapshot clones, so the defensive ``.clone()`` is skipped.
-        gpu_min_bytes: Per-tensor size floor for GPU placement.
     """
     if not multimodal_outputs:
         return {}
@@ -123,7 +118,7 @@ def build_mm_cpu(
         key_on_gpu = False
         if gpu_keys is not None and isinstance(k, str) and k.split(".", 1)[0] not in _CLIENT_MM_ROOT_KEYS:
             key_on_gpu = gpu_key_matches(k, gpu_keys)
-        converted = _detach_tensor(v, key_on_gpu, skip_clone, gpu_min_bytes)
+        converted = _detach_tensor(v, key_on_gpu, skip_clone)
         if converted is not None:
             mm_cpu[k] = converted
     return mm_cpu
@@ -183,10 +178,10 @@ def _snapshot_payload_value(value):
     return value
 
 
-def _detach_tensor(value, keep_on_gpu: bool = False, skip_clone: bool = False, min_bytes: int = 0):
+def _detach_tensor(value, keep_on_gpu: bool = False, skip_clone: bool = False):
     """Recursively detach tensors; move to CPU unless ``keep_on_gpu``."""
     if isinstance(value, torch.Tensor):
-        if keep_on_gpu and value.is_cuda and value.numel() * value.element_size() >= min_bytes:
+        if keep_on_gpu and value.is_cuda:
             # GPU-direct edge: stay on device for D2D transport.  Clone
             # defensively unless the caller already snapshot-cloned, so step
             # buffer reuse can never corrupt the payload.
@@ -196,14 +191,14 @@ def _detach_tensor(value, keep_on_gpu: bool = False, skip_clone: bool = False, m
     if isinstance(value, dict):
         out = {}
         for k, v in value.items():
-            converted = _detach_tensor(v, keep_on_gpu, skip_clone, min_bytes)
+            converted = _detach_tensor(v, keep_on_gpu, skip_clone)
             if converted is not None:
                 out[k] = converted
         return out or None
     if isinstance(value, list):
         if not value:
             return value
-        return [_detach_tensor(v, keep_on_gpu, skip_clone, min_bytes) for v in value]
+        return [_detach_tensor(v, keep_on_gpu, skip_clone) for v in value]
     return value
 
 

@@ -54,54 +54,6 @@ class OmniConnectorFactory:
         """List all registered connector names."""
         return list(cls._registry.keys())
 
-    @classmethod
-    def create_stage_connector(cls, stage_connector_config: Any) -> OmniConnectorBase | None:
-        """Create a stage-level connector.
-
-        Supports all historical ``stage_connector_config`` formats:
-
-          - ``None``                              -> no connector
-          - object with ``.name`` / ``.extra``    -> single connector
-          - ``{"name": ..., "extra": ...}``       -> single connector (shared
-            by the stage's input and output edges)
-          - ``{"input": {...}, "output": {...}}`` -> ``EdgeRoutedConnector``
-            with per-direction backends (either side optional)
-        """
-        config = stage_connector_config
-        if config is None:
-            return None
-        if not isinstance(config, dict):
-            config = {
-                "name": getattr(config, "name", None),
-                "extra": getattr(config, "extra", None),
-            }
-
-        def _make(spec_dict: dict[str, Any]) -> OmniConnectorBase:
-            name = spec_dict.get("name") or "SharedMemoryConnector"
-            if not isinstance(name, str) or not name.strip():
-                raise RuntimeError("Invalid stage connector config: missing connector name")
-            extra = spec_dict.get("extra") or {}
-            if not isinstance(extra, dict):
-                raise RuntimeError(f"Invalid extra config for connector {name}: expected dict")
-            return cls.create_connector(ConnectorSpec(name=name.strip(), extra=dict(extra)))
-
-        if "input" in config or "output" in config:
-            backends: dict[str, OmniConnectorBase | None] = {}
-            for direction in ("input", "output"):
-                spec = config.get(direction)
-                if spec is not None and not isinstance(spec, dict):
-                    raise RuntimeError(
-                        f"Invalid {direction!r} connector spec: expected dict, got {type(spec).__name__}"
-                    )
-                backends[direction] = _make(spec) if spec else None
-            from .connectors.edge_routed_connector import EdgeRoutedConnector
-
-            connector = EdgeRoutedConnector(backends["input"], backends["output"])
-            logger.info(f"Created stage connector: {connector!r}")
-            return connector
-
-        return _make(config)
-
 
 # Register built-in connectors with lazy imports
 def _create_mooncake_store_connector(config: dict[str, Any]) -> OmniConnectorBase:

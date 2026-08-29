@@ -2,7 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from .connectors.base import OmniConnectorBase
-from .connectors.edge_routed_connector import EdgeRoutedConnector
 from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
 from .connectors.torch_ipc_connector import TorchIpcConnector
@@ -48,7 +47,6 @@ __all__ = [
     # Factory
     "OmniConnectorFactory",
     # Specific implementations
-    "EdgeRoutedConnector",
     "MooncakeConnector",  # compat alias → MooncakeStoreConnector
     "MooncakeStoreConnector",
     "MooncakeTransferEngineConnector",

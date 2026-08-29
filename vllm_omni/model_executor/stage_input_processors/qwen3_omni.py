@@ -123,18 +123,6 @@ def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | 
     return place_payload_tensor(tensor, keep_on_gpu)
 
 
-def _cat_device_aligned(saved: torch.Tensor, new: torch.Tensor) -> torch.Tensor:
-    """Concatenate accumulated payload pieces, aligning devices to the first.
-
-    GPU placement is size-floored, so the terminal piece of a chunked prefill
-    (a single decode row) may land on CPU while the accumulated prefix stayed
-    on GPU; align it before the cat.
-    """
-    if new.device != saved.device:
-        new = new.to(saved.device)
-    return torch.cat((saved, new), dim=0)
-
-
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
     try:
         token_id = int(token_id)
@@ -331,8 +319,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
                 if isinstance(saved_prefill, torch.Tensor) and isinstance(saved_output, torch.Tensor):
                     return OmniPayloadStruct(
                         meta=MetaStruct(finished=finished),
-                        embed=EmbeddingsStruct(prefill=_cat_device_aligned(saved_prefill, emb_cpu)),
-                        hidden_states=HiddenStatesStruct(output=_cat_device_aligned(saved_output, hid_cpu)),
+                        embed=EmbeddingsStruct(prefill=torch.cat((saved_prefill, emb_cpu), dim=0)),
+                        hidden_states=HiddenStatesStruct(output=torch.cat((saved_output, hid_cpu), dim=0)),
                         ids=IdsStruct(
                             all=save_payload.get("ids", {}).get("all"),
                             prompt=save_payload.get("ids", {}).get("prompt"),
@@ -517,11 +505,11 @@ def thinker2talker_async_chunk(
                 return None
         else:
             save_payload = transfer_manager.request_payload.pop(request_id)
-            payload.embed.prefill = _cat_device_aligned(
-                save_payload.get("embed", {}).get("prefill"), payload.embed.prefill
+            payload.embed.prefill = torch.cat(
+                (save_payload.get("embed", {}).get("prefill"), payload.embed.prefill), dim=0
             )
-            payload.hidden_states.output = _cat_device_aligned(
-                save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output
+            payload.hidden_states.output = torch.cat(
+                (save_payload.get("hidden_states", {}).get("output"), payload.hidden_states.output), dim=0
             )
             prefill_shape = payload.embed.prefill.shape[0]
             if not is_finished and prefill_shape <= len(prompt_token_ids):

@@ -116,12 +116,13 @@ connectors:
 | Connector class          | Use case                                                              | `extra` keys                                                                                                      |
 |--------------------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | `SharedMemoryConnector`  | Same-host KV transfer between stages (default for bundled YAMLs).     | None. All payloads use shared memory.                                                                             |
-| `TorchIpcConnector`      | *(Experimental)* Same-host GPU-direct edge: listed payload tensors move device-to-device via torch CUDA IPC on dedicated transfer streams; everything else uses shared memory. Endpoint devices must coincide or have peer access. | `gpu_tensor_keys` (payload key roots or dotted keys the downstream stage consumes on GPU), `gpu_tensor_min_bytes` (optional per-tensor size floor, default 0 = disabled), `local_device` (receiver device, default `auto`). |
+| `TorchIpcConnector`      | *(Experimental)* Same-host GPU-direct edge: listed payload tensors move device-to-device via torch CUDA IPC on dedicated transfer streams; everything else is a plain shared-memory payload (wire-compatible with `SharedMemoryConnector` in both directions). Endpoint devices must coincide or have peer access. | `gpu_tensor_keys` (payload key roots or dotted keys the downstream stage consumes on GPU), `local_device` (receiver device, default `auto`). |
 | `MooncakeStoreConnector` | Cross-host KV transfer over TCP. Required for multi-node deployments. | `host`, `metadata_server`, `master`, `segment` (int bytes), `localbuf` (int bytes), `proto` (`"tcp"` / `"rdma"`). |
 
-A stage may route each direction to a different connector (for example a
-GPU-direct input edge and a shared-memory output edge); see
-`vllm_omni/deploy/qwen3_omni_moe_torch_ipc.yaml` for a hybrid profile.
+Because `TorchIpcConnector` payloads without CUDA tensors are plain
+shared-memory payloads, it interoperates with `SharedMemoryConnector` peers
+per edge; see `vllm_omni/deploy/qwen3_omni_moe_torch_ipc.yaml` for a profile
+that enables the GPU plane on one edge only.
 
 A stage references a connector by name in its `input_connectors` / `output_connectors`:
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 """Same-node GPU-direct connector built on PyTorch's native CUDA IPC.
 
@@ -15,8 +15,15 @@ device-to-device data plane for large payload tensors:
 
 PyTorch owns all of the hard parts: CUDA IPC handle export/open (cached per
 allocator segment), producer-side event synchronization (recorded at share
-time, waited at rebuild time), and cross-process storage refcounting (the
-sender's storage stays alive until the receiver's rebuilt view is freed).
+time, waited at rebuild time), cross-process storage refcounting (the
+sender's storage stays alive until the receiver's rebuilt view is freed),
+and the handle serialization itself (``ForkingPickler`` with torch's CUDA
+reductions — the same path ``torch.multiprocessing`` queues use).
+
+Trust model: markers are deserialized only from the same key-addressed
+``/dev/shm`` segments the msgpack control plane already reads (same-user,
+mode 0600, written by sibling stage processes of one deployment) — the same
+trust domain as ``torch.multiprocessing`` queues.
 
 Placement contract
 ------------------
@@ -58,6 +65,7 @@ Deployment requirements (opt-in profile, enforced at runtime):
 """
 
 from collections import deque
+from multiprocessing.reduction import ForkingPickler
 from typing import Any
 
 import torch
@@ -99,70 +107,6 @@ def _payload_has_marker(value: Any) -> bool:
     return False
 
 
-# ---------------------------------------------------------------------- #
-#  Restricted codec for torch's CUDA-IPC reduce spec.
-#
-#  ``reduce_tensor`` returns ``(rebuild_cuda_tensor, args)`` where ``args``
-#  contains only primitives, bytes handles, ``torch.dtype``, sizes/strides,
-#  and a couple of torch classes.  Encoding these with a closed-world codec
-#  (instead of pickle) keeps deserialization of /dev/shm control payloads
-#  free of arbitrary-object construction, and a generic walk keeps the
-#  marker format independent of the exact tuple layout across torch
-#  versions.  Anything outside the whitelist aborts the export, and put()
-#  falls back to the host-copy path.
-# ---------------------------------------------------------------------- #
-
-
-def _reduce_spec_classes() -> dict[str, type]:
-    classes: dict[str, type] = {
-        "Tensor": torch.Tensor,
-        "Parameter": torch.nn.Parameter,
-        "UntypedStorage": torch.UntypedStorage,
-    }
-    typed_storage = getattr(torch, "TypedStorage", None)
-    if typed_storage is not None:
-        classes["TypedStorage"] = typed_storage
-    return classes
-
-
-_NAME_TO_CLASS = _reduce_spec_classes()
-_CLASS_TO_NAME = {cls: name for name, cls in _NAME_TO_CLASS.items()}
-
-
-def _encode_reduce_atom(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, float, str, bytes)):
-        return value
-    if isinstance(value, torch.dtype):
-        return {"__k": "dtype", "v": str(value).removeprefix("torch.")}
-    if isinstance(value, (tuple, list)):  # includes torch.Size
-        return {"__k": "seq", "v": [_encode_reduce_atom(v) for v in value]}
-    if isinstance(value, type):
-        name = _CLASS_TO_NAME.get(value)
-        if name is None:
-            raise TypeError(f"Unsupported class in CUDA IPC reduce spec: {value!r}")
-        return {"__k": "cls", "v": name}
-    raise TypeError(f"Unsupported value in CUDA IPC reduce spec: {type(value).__name__}")
-
-
-def _decode_reduce_atom(value: Any) -> Any:
-    if isinstance(value, dict):
-        kind = value.get("__k")
-        if kind == "dtype":
-            dtype = getattr(torch, value["v"], None)
-            if not isinstance(dtype, torch.dtype):
-                raise TypeError(f"Unknown dtype in CUDA IPC reduce spec: {value['v']!r}")
-            return dtype
-        if kind == "seq":
-            return tuple(_decode_reduce_atom(v) for v in value["v"])
-        if kind == "cls":
-            cls = _NAME_TO_CLASS.get(value["v"])
-            if cls is None:
-                raise TypeError(f"Unknown class in CUDA IPC reduce spec: {value['v']!r}")
-            return cls
-        raise TypeError(f"Unknown atom kind in CUDA IPC reduce spec: {kind!r}")
-    return value
-
-
 def _compact_for_share(tensor: torch.Tensor) -> torch.Tensor:
     """Return a tensor that owns exactly its own storage.
 
@@ -200,9 +144,6 @@ class TorchIpcConnector(SharedMemoryConnector):
     def __init__(self, config: dict[str, Any]):
         super().__init__(config)
         self._gpu_keys = frozenset(str(k) for k in (config.get("gpu_tensor_keys") or []))
-        # Per-tensor size floor for GPU placement (see gpu_placement module).
-        if config.get("gpu_tensor_min_bytes") is not None:
-            self.gpu_tensor_min_bytes = int(config["gpu_tensor_min_bytes"])
         self._local_device_cfg = config.get("local_device", "auto")
         self._local_device: torch.device | None = None
         if not torch.cuda.is_available():
@@ -274,15 +215,17 @@ class TorchIpcConnector(SharedMemoryConnector):
             return self._export_gpu_tensors(data)
 
     def _export_one(self, tensor: torch.Tensor) -> dict[str, Any]:
-        from torch.multiprocessing.reductions import rebuild_cuda_tensor, reduce_tensor
+        # Importing torch.multiprocessing registers the CUDA tensor
+        # reductions (reduce_tensor -> IPC handle + share event + refcount)
+        # on ForkingPickler — torch's maintained serialization for exactly
+        # this handle-passing use case.
+        import torch.multiprocessing  # noqa: F401
 
         compact = _compact_for_share(tensor)
-        rebuild_fn, args = reduce_tensor(compact)
-        if rebuild_fn is not rebuild_cuda_tensor:
-            raise TypeError(f"Unexpected CUDA IPC rebuild function: {rebuild_fn!r}")
+        buf = bytes(ForkingPickler.dumps(compact))
         self._metrics["ipc_tensors_shared"] += 1
         self._metrics["ipc_bytes_shared"] += compact.numel() * compact.element_size()
-        return {_TORCH_IPC_MARKER: True, "spec": [_encode_reduce_atom(a) for a in args]}
+        return {_TORCH_IPC_MARKER: True, "buf": buf}
 
     def _export_gpu_tensors(self, value: Any) -> Any:
         """Replace CUDA tensors with IPC markers (non-mutating walk)."""
@@ -373,11 +316,8 @@ class TorchIpcConnector(SharedMemoryConnector):
         return out
 
     def _import_one(self, marker: dict[str, Any], dsts: list[torch.Tensor], views: list[torch.Tensor]) -> torch.Tensor:
-        from torch.multiprocessing.reductions import rebuild_cuda_tensor
-
         try:
-            args = [_decode_reduce_atom(a) for a in marker["spec"]]
-            view = rebuild_cuda_tensor(*args)
+            view = ForkingPickler.loads(marker["buf"])
         except Exception as exc:
             raise RuntimeError(
                 "TorchIpcConnector: failed to open a CUDA IPC handle from the "
