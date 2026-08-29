@@ -2976,17 +2976,12 @@ async def _run_video_generation_job(
 
     started_at = time.perf_counter()
     try:
-
-        async def mark_inference_started() -> None:
-            await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
-
         video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
             request,
             video_id,
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
-            on_inference_start=mark_inference_started,
         )
 
         save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
@@ -3661,18 +3656,6 @@ async def retrieve_video(video_id: str) -> VideoResponse | JSONResponse:
     return job
 
 
-async def _abort_video_engine(handler: Any, request_id: str) -> None:
-    """Stop engine-side inference for ``request_id`` if the client supports abort."""
-    engine = getattr(handler, "_engine_client", None)
-    abort = getattr(engine, "abort", None)
-    if not callable(abort):
-        return
-    try:
-        await abort(request_id)
-    except Exception:
-        logger.exception("Failed to abort in-flight video request %s", request_id)
-
-
 @router.delete("/v1/videos/{video_id}")
 async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteResponse:
     """Delete a stored video job and any generated output.
@@ -3696,8 +3679,11 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
         raise HTTPException(status_code=404, detail="Video not found")
 
     if job.status in (VideoGenerationStatus.QUEUED, VideoGenerationStatus.IN_PROGRESS):
-        handler = getattr(raw_request.app.state, "openai_serving_video", None)
-        await _abort_video_engine(handler, video_id)
+        handler = raw_request.app.state.openai_serving_video
+        try:
+            await handler.abort_request(video_id)
+        except Exception:
+            logger.exception("Failed to abort in-flight video request %s", video_id)
         task = await VIDEO_TASKS.get(video_id)
         if task is not None:
             task.cancel()

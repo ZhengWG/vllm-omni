@@ -166,11 +166,8 @@ class BlockingVideoHandler:
         reference_image=None,
         reference_video=None,
         reference_audio=None,
-        on_inference_start=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio
-        if on_inference_start is not None:
-            await on_inference_start()
         self.started.set()
         try:
             await asyncio.Future()
@@ -178,16 +175,17 @@ class BlockingVideoHandler:
             self.cancelled.set()
             raise
 
+    async def abort_request(self, request_id):
+        del request_id
+
 
 class DelayedInferenceHandler:
-    """Stays in preprocessing until the test releases inference."""
+    """Parks in generate_video_bytes before the engine is entered."""
 
     def __init__(self):
         self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
         self.stage_configs = None
         self.job_started = threading.Event()
-        self.allow_inference = threading.Event()
-        self.inference_started = threading.Event()
 
     def set_stage_configs_if_missing(self, stage_configs):
         if self.stage_configs is None:
@@ -201,15 +199,13 @@ class DelayedInferenceHandler:
         reference_image=None,
         reference_video=None,
         reference_audio=None,
-        on_inference_start=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio
         self.job_started.set()
-        await asyncio.to_thread(self.allow_inference.wait, 5.0)
-        if on_inference_start is not None:
-            await on_inference_start()
-        self.inference_started.set()
         await asyncio.Future()
+
+    async def abort_request(self, request_id):
+        del request_id
 
 
 class AbortTrackingOmni(FakeAsyncOmni):
@@ -1935,11 +1931,6 @@ def test_async_video_stays_queued_until_inference_starts(test_client):
     queued = test_client.get(f"/v1/videos/{video_id}")
     assert queued.status_code == 200
     assert queued.json()["status"] == VideoGenerationStatus.QUEUED.value
-
-    handler.allow_inference.set()
-    assert handler.inference_started.wait(timeout=2.0)
-    running = _wait_for_status(test_client, video_id, VideoGenerationStatus.IN_PROGRESS.value)
-    assert running["status"] == VideoGenerationStatus.IN_PROGRESS.value
 
 
 def test_delete_aborts_engine_request_before_cancelling_task(test_client):
