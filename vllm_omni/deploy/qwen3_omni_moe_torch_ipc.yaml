@@ -1,17 +1,18 @@
-# Qwen3-Omni-MoE hybrid GPU-direct deploy (Experimental).
+# Qwen3-Omni-MoE GPU-direct deploy (Experimental).
 #
-# Same topology as qwen3_omni_moe.yaml, with one difference: the large
-# thinker -> talker prefill handoff (tens of MB at chat-sized prompts, and it
-# sits directly on the first-audio-packet path) rides TorchIpcConnector's
-# device-to-device plane instead of serialize + D2H + /dev/shm + H2D.  The
-# talker -> code2wav codec stream keeps SharedMemoryConnector: its payloads
-# are small per-chunk packets where a GPU data plane costs more in per-chunk
-# synchronization than the host bounce it removes.
+# Same topology as qwen3_omni_moe.yaml, with one difference: everything the
+# talker consumes on GPU (prefill embeddings + hidden states — tens of MB on
+# the first-audio-packet path — and the per-token decode embeddings) rides
+# TorchIpcConnector's device-to-device plane instead of
+# serialize + D2H + /dev/shm + H2D.  The plane is handle-based and runs on
+# dedicated streams at both ends, so per-token packets pay no host
+# synchronization and no compute-stream coupling.
 #
-# Placement is explicit and per-edge-stable: only the keys listed under
-# gpu_tensor_keys stay on GPU, and only above the size floor
-# (gpu_tensor_min_bytes, default 256 KiB) — per-token decode payloads always
-# take the existing async CPU pipeline.
+# gpu_tensor_keys is a consumer-locality contract, not a tuning knob: list
+# the payload keys the downstream stage consumes on GPU.  That is why the
+# talker -> code2wav edge stays on SharedMemoryConnector — its payload is
+# codec codes consumed as CPU token ids in prompt construction; a GPU plane
+# would only add a synchronous .cpu() on the receive thread.
 #
 # Requirements:
 #   * Both edge endpoints on the same host, worker in-process (TP=1 stages).
@@ -24,13 +25,15 @@
 async_chunk: true
 
 connectors:
-  # Prefill handoff edge (thinker -> talker): GPU-direct for the big
-  # one-shot tensors, CPU pipeline for everything else.
+  # Thinker -> talker edge: embeddings and hidden states are consumed on GPU
+  # by the talker, so the whole "embed" root (prefill, decode, tts_*) and
+  # "hidden_states" ride the D2D plane.
   connector_of_torch_ipc:
     name: TorchIpcConnector
     extra:
-      gpu_tensor_keys: ["embed.prefill", "hidden_states"]
-  # Codec stream edge (talker -> code2wav): unchanged SHM transport.
+      gpu_tensor_keys: ["embed", "hidden_states"]
+  # Codec stream edge (talker -> code2wav): codes are CPU-consumed token
+  # ids — SHM is the correct transport here, not a fallback.
   connector_of_shared_memory:
     name: SharedMemoryConnector
     extra:

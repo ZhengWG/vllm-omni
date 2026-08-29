@@ -11,23 +11,24 @@ edge?" decision.  Placement is keyed on two connector attributes:
 * ``gpu_tensor_keys`` — an explicit, per-edge-stable set of payload key
   roots (or full dotted keys) eligible to stay on GPU.
 
-A tensor stays on GPU only when its key is listed **and** it meets the size
-floor (``gpu_tensor_min_bytes``, default 256 KiB).  The rationale:
+The key set is a **consumer-locality contract**: list exactly the payload
+keys the downstream stage consumes on GPU (model embeddings, hidden
+states).  Data consumed on CPU (token ids, codec codes fed into prompt
+construction, control flags) must stay on the CPU pipeline — moving it
+device-to-device only to bounce it back with a synchronous ``.cpu()`` on
+the receive thread would invert the win.
 
-1. **Large tensors** (prefill handoffs, per-segment hidden states) are the
-   only payloads where a device-to-device plane beats the existing
-   async-materialization CPU pipeline; they are also the ones sitting on
-   the first-packet latency path.
-2. **Small tensors** (per-token decode embeddings, control flags) would pay
-   a *synchronous* device-to-host serialization on the connector send
-   thread — which can queue behind other requests' prefill kernels — for no
-   transport gain.  The size floor keeps them on the CPU pipeline, whose
-   device-to-host copy runs on a dedicated stream off the critical path.
+Size is *not* part of the default policy: the GPU data plane shares
+handles instead of serializing tensor bytes and runs on dedicated streams
+on both ends, so small per-token packets pay no host synchronization and
+no compute-stream coupling.  ``gpu_tensor_min_bytes`` remains available as
+a tuning floor (default 0 = disabled) should a deployment measure a
+crossover.
 
-Because the floor makes placement size-dependent, any producer-side
-``torch.cat`` across accumulated payload pieces must normalize devices at
-the cat site (see the Qwen3-Omni thinker chunk-0 accumulation).  Consumers
-already normalize at use (``.to(device)`` before model consumption).
+With a nonzero floor, placement becomes size-dependent, so any
+producer-side ``torch.cat`` across accumulated payload pieces must
+normalize devices at the cat site (see the Qwen3-Omni thinker chunk-0
+accumulation).  Consumers already normalize at use (``.to(device)``).
 """
 
 from typing import Any
@@ -43,10 +44,11 @@ __all__ = [
     "place_payload_tensor",
 ]
 
-# Default size floor for GPU placement.  Below this, the host round-trip is
-# cheaper than the per-tensor IPC export/import bookkeeping and never worth
-# a synchronous D2H on the send thread.
-GPU_PLACEMENT_MIN_BYTES = 256 * 1024
+# Default size floor for GPU placement: disabled.  The data plane is
+# handle-based and stream-decoupled, so listed keys ride it at any size;
+# set ``gpu_tensor_min_bytes`` per edge to reintroduce a floor if a
+# deployment measures a crossover.
+GPU_PLACEMENT_MIN_BYTES = 0
 
 
 def connector_gpu_keys(connector: Any) -> frozenset[str] | None:

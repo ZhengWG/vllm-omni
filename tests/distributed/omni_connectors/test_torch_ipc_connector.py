@@ -225,19 +225,37 @@ def test_import_gpu_tensors_rebuilds_markers_in_nested_payloads(mocker):
     connector = TorchIpcConnector({"stage_id": 1})
     try:
         sentinel = torch.full((2, 2), 7.0)
-        mocker.patch.object(connector, "_import_one", return_value=sentinel)
+        mocker.patch.object(connector, "_import_one", side_effect=lambda marker, dsts, views: sentinel)
         marker = {_TORCH_IPC_MARKER: True, "spec": []}
         payload = {
             "embed": {"prefill": marker, "decode": torch.zeros(1)},
             "list": [marker, "keep"],
             "tuple": (marker,),
         }
-        out = connector._import_gpu_tensors(payload)
+        out = connector._import_gpu_tensors(payload, [], [])
         assert torch.equal(out["embed"]["prefill"], sentinel)
         assert torch.equal(out["list"][0], sentinel)
         assert torch.equal(out["tuple"][0], sentinel)
         assert out["list"][1] == "keep"
         assert torch.equal(out["embed"]["decode"], torch.zeros(1))
+    finally:
+        connector.close()
+
+
+@CPU
+def test_get_skips_import_walk_for_marker_free_payloads(mocker):
+    """CPU-only payloads (or a CPU receiver of a CPU sender) never enter the
+    GPU import path at all."""
+    connector = TorchIpcConnector({"stage_id": 1})
+    try:
+        spy = mocker.spy(connector, "_import_payload")
+        payload = {"codes": {"audio": torch.zeros(4, dtype=torch.long)}, "ids": [1]}
+        key = _unique_key()
+        ok, _size, _meta = connector.put("0", "1", key, payload)
+        assert ok
+        result = connector.get("0", "1", key)
+        assert result is not None
+        spy.assert_not_called()
     finally:
         connector.close()
 
@@ -448,7 +466,7 @@ def test_torch_ipc_gpu_round_trip_across_processes():
             out = obj["hidden_states"]["output"]
             assert out.is_cuda
             expected = torch.arange(4096, dtype=torch.float32, device="cuda").reshape(4, 1024)
-            torch.cuda.synchronize()
+            torch.accelerator.synchronize()
             assert torch.equal(out, expected)
             assert obj["ids"] == [1, 2, 3]
         finally:
