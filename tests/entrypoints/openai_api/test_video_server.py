@@ -159,15 +159,73 @@ class BlockingVideoHandler:
             self.stage_configs = stage_configs
 
     async def generate_video_bytes(
-        self, request, reference_id, *, reference_image=None, reference_video=None, reference_audio=None
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_inference_start=None,
     ):
         del request, reference_id, reference_image, reference_video, reference_audio
+        if on_inference_start is not None:
+            await on_inference_start()
         self.started.set()
         try:
             await asyncio.Future()
         except asyncio.CancelledError:
             self.cancelled.set()
             raise
+
+
+class DelayedInferenceHandler:
+    """Stays in preprocessing until the test releases inference."""
+
+    def __init__(self):
+        self.model_name = "Wan-AI/Wan2.2-T2V-A14B-Diffusers"
+        self.stage_configs = None
+        self.job_started = threading.Event()
+        self.allow_inference = threading.Event()
+        self.inference_started = threading.Event()
+
+    def set_stage_configs_if_missing(self, stage_configs):
+        if self.stage_configs is None:
+            self.stage_configs = stage_configs
+
+    async def generate_video_bytes(
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_inference_start=None,
+    ):
+        del request, reference_id, reference_image, reference_video, reference_audio
+        self.job_started.set()
+        await asyncio.to_thread(self.allow_inference.wait, 5.0)
+        if on_inference_start is not None:
+            await on_inference_start()
+        self.inference_started.set()
+        await asyncio.Future()
+
+
+class AbortTrackingOmni(FakeAsyncOmni):
+    def __init__(self):
+        super().__init__()
+        self.aborted: list[str] = []
+        self.entered = threading.Event()
+
+    async def generate(self, prompt, request_id, sampling_params_list):
+        del prompt, request_id, sampling_params_list
+        self.entered.set()
+        await asyncio.Future()
+        yield MockVideoResult([object()])
+
+    async def abort(self, request_id):
+        self.aborted.append(request_id)
 
 
 class FakeServerSocket:
@@ -1862,6 +1920,46 @@ def test_delete_in_progress_job_cancels_task_and_removes_metadata(test_client):
 
     retrieve_resp = test_client.get(f"/v1/videos/{video_id}")
     assert retrieve_resp.status_code == 404
+
+
+def test_async_video_stays_queued_until_inference_starts(test_client):
+    handler = DelayedInferenceHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Queue then run"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert create_resp.json()["status"] == VideoGenerationStatus.QUEUED.value
+    assert handler.job_started.wait(timeout=2.0)
+
+    queued = test_client.get(f"/v1/videos/{video_id}")
+    assert queued.status_code == 200
+    assert queued.json()["status"] == VideoGenerationStatus.QUEUED.value
+
+    handler.allow_inference.set()
+    assert handler.inference_started.wait(timeout=2.0)
+    running = _wait_for_status(test_client, video_id, VideoGenerationStatus.IN_PROGRESS.value)
+    assert running["status"] == VideoGenerationStatus.IN_PROGRESS.value
+
+
+def test_delete_aborts_engine_request_before_cancelling_task(test_client):
+    engine = AbortTrackingOmni()
+    test_client.app.state.openai_serving_video = OmniOpenAIServingVideo.for_diffusion(
+        engine,
+        model_name="Wan-AI/Wan2.2-T2V-A14B-Diffusers",
+    )
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Abort this video"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert engine.entered.wait(timeout=2.0)
+    _wait_for_status(test_client, video_id, VideoGenerationStatus.IN_PROGRESS.value)
+
+    delete_resp = test_client.delete(f"/v1/videos/{video_id}")
+    assert delete_resp.status_code == 200
+    assert delete_resp.json()["deleted"] is True
+    _wait_until(lambda: engine.aborted == [video_id])
+    assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 
 
 def test_video_response_file_extension_is_robust():

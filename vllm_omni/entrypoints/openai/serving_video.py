@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import copy
 import time
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from functools import cached_property
 from http import HTTPStatus
@@ -46,6 +46,7 @@ from vllm_omni.outputs.output_metadata import (
 logger = init_logger(__name__)
 
 _VIDEO_RESPONSE_FRAME_CONVERSION_WORKERS = 8
+OnInferenceStart = Callable[[], Awaitable[None]]
 
 if TYPE_CHECKING:
     from vllm_omni.diffusion.data import OmniDiffusionConfig
@@ -189,6 +190,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_inference_start: OnInferenceStart | None = None,
     ) -> VideoGenerationArtifacts:
         """Run the generation pipeline and extract video/audio/profiler outputs."""
         prompt: OmniTextPrompt = OmniTextPrompt(prompt=request.prompt, modalities=["video"])
@@ -320,7 +322,9 @@ class OmniOpenAIServingVideo:
             gen_params.seed,
         )
 
-        result = await self._run_generation(prompt, gen_params, reference_id)
+        result = await self._run_generation(
+            prompt, gen_params, reference_id, on_inference_start=on_inference_start
+        )
         multimodal_output = self._extract_multimodal_output(result)
         metadata = multimodal_output.get("metadata") if isinstance(multimodal_output, dict) else {}
         common_metadata = metadata.get("common") if isinstance(metadata, dict) else {}
@@ -405,6 +409,7 @@ class OmniOpenAIServingVideo:
         reference_image: ReferenceImage | None = None,
         reference_video: ReferenceVideo | None = None,
         reference_audio: ReferenceAudio | None = None,
+        on_inference_start: OnInferenceStart | None = None,
     ) -> tuple[bytes, dict[str, float], float, VideoAction | None]:
         """Generate a video and return raw MP4 bytes, bypassing base64 encoding."""
         artifacts = await self._run_and_extract(
@@ -413,6 +418,7 @@ class OmniOpenAIServingVideo:
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            on_inference_start=on_inference_start,
         )
         if len(artifacts.videos) > 1:
             logger.warning(
@@ -497,6 +503,7 @@ class OmniOpenAIServingVideo:
         prompt: OmniTextPrompt,
         gen_params: OmniDiffusionSamplingParams,
         request_id: str,
+        on_inference_start: OnInferenceStart | None = None,
     ) -> object:
         stage_configs = self._stage_configs or getattr(self._engine_client, "stage_configs", None)
 
@@ -524,6 +531,8 @@ class OmniOpenAIServingVideo:
         )
 
         result = None
+        if on_inference_start is not None:
+            await on_inference_start()
         async for output in engine_client.generate(
             prompt=prompt,
             request_id=request_id,
