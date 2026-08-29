@@ -1266,30 +1266,48 @@ class AsyncOmni(EngineClient, OmniBase):
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache for all stages.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
+        """Reset the multi-modal cache on every AR/LLM stage EngineCore."""
+        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type()
+        if not ar_stage_ids:
+            return
+        await self._engine_core_rpc("reset_mm_cache", stage_ids=ar_stage_ids)
 
     async def reset_encoder_cache(self) -> None:
-        """Reset the encoder cache for all stages.
-
-        TODO: Forward to Orchestrator process via message.
-        """
-        logger.warning("[AsyncOmni] reset_encoder_cache not yet supported with Orchestrator process")
+        """Reset the encoder cache on every AR/LLM stage EngineCore."""
+        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type()
+        if not ar_stage_ids:
+            return
+        await self._engine_core_rpc("reset_encoder_cache", stage_ids=ar_stage_ids)
 
     async def reset_prefix_cache(
         self,
         reset_running_requests: bool = False,
         reset_connector: bool = False,
     ) -> bool:
-        """Reset the prefix cache for all stages.
+        """Reset the prefix cache on every AR/LLM stage EngineCore.
 
-        TODO: Forward to Orchestrator process via message.
+        Returns False when any AR replica reports that the reset did not
+        take effect. Diffusion stages are skipped because they do not share
+        vLLM prefix-cache semantics.
         """
-        logger.warning("[AsyncOmni] reset_prefix_cache not yet supported with Orchestrator process")
-        return True
+        ar_stage_ids, _diffusion_stage_ids = self._split_stage_ids_by_type()
+        if not ar_stage_ids:
+            return True
+        results = await self._engine_core_rpc(
+            "reset_prefix_cache",
+            stage_ids=ar_stage_ids,
+            kwargs={
+                "reset_running_requests": reset_running_requests,
+                "reset_connector": reset_connector,
+            },
+        )
+        successes: list[bool] = []
+        for result in results:
+            if isinstance(result, dict) and result.get("todo"):
+                successes.append(False)
+            else:
+                successes.append(self._coerce_stage_bool(result))
+        return all(successes)
 
     async def sleep(
         self, stage_ids: list[int] | None = None, level: int = 2, mode: PauseMode = "abort"
