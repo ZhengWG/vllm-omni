@@ -461,7 +461,7 @@ class MingFlashOmniTalkerForConditionalGeneration(nn.Module, CustomProcessMixin)
                 tokenizer=self.tokenizer,
                 embed_tokens=self.model.get_input_embeddings(),
                 device=self.device,
-                dtype=torch.bfloat16,
+                dtype=self.dtype,
                 text=segment,
                 prompt=params.prompt,
                 spk_emb=spk_emb,
