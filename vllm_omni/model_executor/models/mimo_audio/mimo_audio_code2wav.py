@@ -523,6 +523,8 @@ class MiMoAudioToken2WavForConditionalGenerationVLLM(nn.Module, SupportsPP):
             )
             raw_left = _DEFAULT_CODEC_LEFT_CONTEXT_FRAMES
         self._codec_left_context_frames = raw_left
+        # SupportsPP requires this hook; code2wav has no PP backbone.
+        self.make_empty_intermediate_tensors = lambda *args, **kwargs: None
 
     def load_weights(
         self,

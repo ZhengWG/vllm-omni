@@ -540,6 +540,10 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # hf_config=thinker_config.text_config,
             architectures=["Qwen2ForCausalLM"],
         )
+        # vLLM 0.28 load_model requires SupportsPP models to expose this hook.
+        # The stage wrapper copies it from this inner LLM; without the bind,
+        # engine-core startup fails with AttributeError during model load.
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
         self.device = current_omni_platform.get_torch_device()
         # global_sampler MUST stay greedy (do_sample=False) so its token decision
