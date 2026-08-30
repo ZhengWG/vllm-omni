@@ -7,7 +7,10 @@ from vllm.logger import init_logger
 
 from vllm_omni.entrypoints.openai.tts_adapters import register_tts_adapter
 from vllm_omni.entrypoints.openai.tts_adapters.base import ARTTSAdapter, PreparedRequest
-from vllm_omni.model_executor.models.ming_tts.constants import SPEAKER_EMBEDDING_DIM
+from vllm_omni.model_executor.models.ming_tts.constants import (
+    MIN_SERVABLE_DECODE_STEPS,
+    SPEAKER_EMBEDDING_DIM,
+)
 
 if TYPE_CHECKING:
     from vllm_omni.entrypoints.openai.protocol.audio import OpenAICreateSpeechRequest
@@ -27,6 +30,11 @@ class MingTTSAdapter(ARTTSAdapter):
     # this is an architecture *fallback*: it must run after every adapter that
     # owns a real stage key, or it would claim stages those adapters own.
     detect_priority = 200
+
+    # Stage-0 refuses to decode a window narrower than the stop head's warm-up
+    # (``_validate_ming_decode_window``), so anything below this can only fail
+    # once the request is already in the engine.
+    max_new_tokens_min = MIN_SERVABLE_DECODE_STEPS
 
     def validate(self, request: "OpenAICreateSpeechRequest") -> str | None:
         """Validate Ming TTS request parameters. Returns error message or None."""
