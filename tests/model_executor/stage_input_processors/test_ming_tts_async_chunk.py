@@ -100,3 +100,37 @@ def test_ming_async_chunk_flushes_leftover_after_initial_chunk():
     assert final.latent.shape == (2, PATCH_SIZE, LATENT_DIM)
     assert final.kv_metadata[MING_EMIT_PATCH_COUNT_KEY] == 2
     assert final.meta.finished.item() is True
+
+
+def test_ming_async_chunk_preserves_connector_owned_payload_keys():
+    """The connector shares request_payload[req_id]; we may only add our own key."""
+    tm = _make_transfer_manager(chunk_size=5, initial_chunk_size=2)
+    tm.request_payload["req"] = {"connector_owned": "keep me"}
+
+    assert _append_patch(tm, "req", 0) is None
+    assert _append_patch(tm, "req", 1) is not None
+
+    container = tm.request_payload["req"]
+    assert container["connector_owned"] == "keep me"
+    assert container["_ming_async_state"]["seen_patch_len"] == 2
+
+
+def test_ming_async_chunk_replaces_a_non_dict_payload_entry():
+    tm = _make_transfer_manager(chunk_size=5, initial_chunk_size=2)
+    tm.request_payload["req"] = "not a dict"
+
+    assert _append_patch(tm, "req", 0) is None
+    assert _append_patch(tm, "req", 1) is not None
+
+    assert tm.request_payload["req"]["_ming_async_state"]["seen_patch_len"] == 2
+
+
+def test_ming_async_chunk_state_is_per_request():
+    tm = _make_transfer_manager(chunk_size=5, initial_chunk_size=2)
+
+    assert _append_patch(tm, "a", 0) is None
+    assert _append_patch(tm, "b", 0) is None
+    assert _append_patch(tm, "a", 1) is not None
+
+    assert tm.request_payload["a"]["_ming_async_state"]["seen_patch_len"] == 2
+    assert tm.request_payload["b"]["_ming_async_state"]["seen_patch_len"] == 0
