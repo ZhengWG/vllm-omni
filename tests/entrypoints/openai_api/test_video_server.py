@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """
 Unit tests for OpenAI-compatible video generation endpoints.
 """
@@ -26,7 +26,7 @@ from pytest_mock import MockerFixture
 from vllm import envs
 
 from vllm_omni.diffusion.utils.media_utils import mux_video_audio_bytes
-from vllm_omni.entrypoints.openai import api_server, video_api_utils
+from vllm_omni.entrypoints.openai import api_server, serving_video, video_api_utils
 from vllm_omni.entrypoints.openai.api_server import router
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoGenerationRequest,
@@ -239,6 +239,9 @@ def isolated_video_backends(tmp_path, monkeypatch):
     tasks = TaskRegistry()
     storage = LocalStorageManager(storage_path=str(tmp_path / "storage"))
     monkeypatch.setattr(api_server, "VIDEO_STORE", store)
+    # serving_video imports VIDEO_STORE by name; _run_generation writes
+    # through that alias, so the fixture store must replace both bindings.
+    monkeypatch.setattr(serving_video, "VIDEO_STORE", store)
     monkeypatch.setattr(api_server, "VIDEO_TASKS", tasks)
     monkeypatch.setattr(api_server, "STORAGE_MANAGER", storage)
     return store, tasks, storage
@@ -577,12 +580,12 @@ def test_i2v_video_generation_resizes_input_to_requested_dimensions(test_client,
 
 def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
     engine = FakeAsyncOmni()
-    engine.get_diffusion_od_config = lambda: SimpleNamespace(
+    engine.get_diffusion_od_config = lambda: SimpleNamespace(  # type: ignore[method-assign]
         model="org/model",
         model_class_name="ExamplePipeline",
         revision="pinned-revision",
     )
-    captured = {}
+    captured: dict[str, str | None] = {}
 
     def fake_policy(model_class_name, *, model, revision=None):
         captured.update(
@@ -610,6 +613,7 @@ def test_i2v_resize_policy_can_defer_to_pipeline(monkeypatch):
         )
     )
 
+    assert engine.captured_prompt is not None
     input_image = engine.captured_prompt["multi_modal_data"]["image"]
     assert isinstance(input_image, Image.Image)
     assert input_image.size == (48, 32)
@@ -677,6 +681,7 @@ def test_video_generation_bridges_request_fields(generation_request, expected_nu
 
     asyncio.run(handler._run_and_extract(generation_request, "field-bridge"))
 
+    assert engine.captured_sampling_params_list is not None
     sampling = engine.captured_sampling_params_list[0]
     # Top-level ``seconds`` bridges into extra_args["duration"]; num_frames is
     # passed through (or derived as seconds x fps when omitted). No private
@@ -1380,7 +1385,7 @@ def test_video_generation_response_exposes_action_payload(mocker: MockerFixture)
             },
         )
 
-    engine.generate = _generate
+    engine.generate = _generate  # type: ignore[method-assign]
     mocker.patch(
         "vllm_omni.entrypoints.openai.serving_video.encode_video_base64",
         return_value="encoded-video",
