@@ -89,14 +89,8 @@ def parse_args() -> argparse.Namespace:
         "Qwen/Qwen-Image, Tongyi-MAI/Z-Image-Turbo, Qwen/Qwen-Image-2512, stepfun-ai/NextStep-1.1, "
         "black-forest-labs/FLUX.1-dev, black-forest-labs/FLUX.2-klein-9B, "
         "black-forest-labs/FLUX.2-dev, tencent/HunyuanImage-3.0-Instruct, "
-        "meituan-longcat/LongCat-Image, OvisAI/Ovis-Image, "
+        "HiDream-ai/HiDream-O1-Image, meituan-longcat/LongCat-Image, OvisAI/Ovis-Image, "
         "stabilityai/stable-diffusion-3.5-medium, Tongyi-MAI/Z-Image-Turbo and etc.",
-    )
-    parser.add_argument(
-        "--stage-configs-path",
-        type=str,
-        default=None,
-        help="[Deprecated] Path to a legacy stage_args-format YAML. Prefer --deploy-config.",
     )
     parser.add_argument(
         "--deploy-config",
@@ -475,8 +469,6 @@ def main():
         omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
-    if args.stage_configs_path:
-        omni_kwargs["stage_configs_path"] = args.stage_configs_path
     if args.deploy_config:
         omni_kwargs["deploy_config"] = args.deploy_config
     if use_nextstep:
@@ -515,8 +507,8 @@ def main():
     print(f"  Image size: {args.width}x{args.height}")
     if args.lora_path:
         print(f"  LoRA: scale={args.lora_scale}")
-    if args.stage_configs_path:
-        print(f"  stage-configs-path: {args.stage_configs_path}")
+    if args.deploy_config:
+        print(f"  deploy-config: {args.deploy_config}")
     print(f"{'=' * 60}\n")
 
     # Build LoRA request when --lora-path is set
@@ -607,17 +599,6 @@ def main():
             if args.seed is not None and hasattr(params, "seed"):
                 params.seed = args.seed
 
-            # MammothModa2's AR stage emits one visual token per grid cell,
-            # one EOL token per row, and one final look-ahead token whose hidden
-            # state is unavailable. Size the first stage from the prompt metadata
-            # instead of SamplingParams' default of 16 tokens.
-            prompt_info = prompt_dict.get("additional_information", {})
-            if idx == 0 and prompt_info.get("omni_task") == ["t2i"]:
-                ar_width = int(prompt_info.get("ar_width", [0])[0])
-                ar_height = int(prompt_info.get("ar_height", [0])[0])
-                if ar_width > 0 and ar_height > 0:
-                    params.max_tokens = ar_height * (ar_width + 1) + 1
-
     if not diffusion_replaced and len(sampling_params_list) == 1:
         sampling_params_list = [diffusion_params]
 
@@ -656,7 +637,7 @@ def main():
         images = getattr(output, "images", None)
         if images:
             break
-        req_out = getattr(output, "request_output", None)
+        req_out = output
         images = getattr(req_out, "images", None) if req_out is not None else None
         if images:
             break

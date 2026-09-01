@@ -17,8 +17,10 @@ from vllm_omni.model_extras import (
     build_x_to_text_prompt,
     get_extra_body_params,
     get_extra_output_params,
+    get_output_tensor_range,
     get_x_to_text_model_family,
     should_init_extra_args_for_non_diffusion_stages,
+    should_preserve_reference_image_size,
 )
 
 
@@ -29,7 +31,6 @@ from vllm_omni.model_extras import (
     [
         ({"model_type": "bagel"}, "bagel"),
         ({"architectures": ["HunyuanImage3ForConditionalGeneration"]}, "hunyuan_image3"),
-        ({"model_type": "mammothmoda2"}, "mammoth_moda2"),
         ({"model_type": "qwen2_vl"}, "generic"),
     ],
 )
@@ -45,22 +46,6 @@ def test_bagel_x_to_text_prompt_builder() -> None:
     assert prompt == {
         "prompt": "<|im_start|>user\n<|image_pad|>\nDescribe it.<|im_end|>\n<|im_start|>assistant\n",
         "modalities": ["text"],
-    }
-    assert stop_token_ids is None
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_mammoth_x_to_text_prompt_builder() -> None:
-    prompt, stop_token_ids = build_x_to_text_prompt("mammoth_moda2", "unused", "Hello.", has_image=False)
-    assert prompt == {
-        "prompt": (
-            "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n"
-            "<|im_start|>user\nHello.<|im_end|>\n"
-            "<|im_start|>assistant\n"
-        ),
-        "modalities": ["text"],
-        "additional_information": {"omni_task": ["chat"]},
     }
     assert stop_token_ids is None
 
@@ -134,6 +119,8 @@ def test_lingbot_extra_registry_declares_request_params() -> None:
         }
     )
     assert get_extra_output_params("LingBotVideoPipeline") == frozenset()
+    assert get_output_tensor_range("LingBotVideoPipeline") == "zero_to_one"
+    assert get_output_tensor_range("WanPipeline") == "negative_one_to_one"
     assert should_init_extra_args_for_non_diffusion_stages("LingBotVideoPipeline") is False
 
 
@@ -147,6 +134,7 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
             "max_sequence_length",
             "use_resolution_template",
             "use_duration_template",
+            "negative_metadata_mode",
             "use_system_prompt",
             "system_prompt",
             "negative_prompt",
@@ -191,23 +179,6 @@ def test_cosmos3_extra_registry_declares_request_and_response_params(pipeline_na
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_magi_human_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("MagiHumanPipeline") == frozenset(
-        {
-            "seconds",
-            "audio_path",
-            "image_path",
-            "sr_height",
-            "sr_width",
-            "sr_num_inference_steps",
-        }
-    )
-    assert get_extra_output_params("MagiHumanPipeline") == frozenset()
-    assert should_init_extra_args_for_non_diffusion_stages("MagiHumanPipeline") is False
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_ltx_extra_registry_declares_official_guidance_params() -> None:
     expected = frozenset(
         {
@@ -227,13 +198,60 @@ def test_ltx_extra_registry_declares_official_guidance_params() -> None:
             "audio_rescale_scale",
             "video_stg_blocks",
             "audio_stg_blocks",
+            "sigmas",
+            "stage_1_sigmas",
+            "stage_2_sigmas",
+            "image_crf",
         }
     )
 
-    assert get_extra_body_params("LTX2Pipeline") == expected
-    assert get_extra_output_params("LTX2Pipeline") == frozenset()
-    assert get_extra_body_params("LTX2DistilledPipeline") == expected
-    assert get_extra_output_params("LTX2DistilledPipeline") == frozenset()
+    for pipeline_name in (
+        "LTX2Pipeline",
+        "LTX2TwoStagePipeline",
+        "LTX2DistilledOneStagePipeline",
+        "LTX2DistilledTwoStagePipeline",
+        "LTX2DistilledPipeline",
+    ):
+        assert get_extra_body_params(pipeline_name) == expected
+        assert get_extra_output_params(pipeline_name) == frozenset()
+
+
+@pytest.mark.parametrize(
+    ("model_version", "expected"),
+    [("2", False), ("2.3", False), ("2.5", True)],
+)
+def test_ltx_reference_image_size_policy(tmp_path, model_version: str, expected: bool) -> None:
+    (tmp_path / "model_index.json").write_text(
+        '{"_class_name": "LTX2Pipeline", "model_version": "' + model_version + '"}'
+    )
+
+    assert (
+        should_preserve_reference_image_size(
+            None,
+            model=str(tmp_path),
+        )
+        is expected
+    )
+
+
+def test_reference_image_size_policy_threads_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = {}
+
+    def fake_policy(*, model, revision=None):
+        captured.update(model=model, revision=revision)
+        return True
+
+    monkeypatch.setattr(
+        "vllm_omni.diffusion.models.ltx2.ltx2_components.preserves_reference_image_size",
+        fake_policy,
+    )
+
+    assert should_preserve_reference_image_size(
+        "LTX2Pipeline",
+        model="org/model",
+        revision="pinned-revision",
+    )
+    assert captured == {"model": "org/model", "revision": "pinned-revision"}
 
 
 @pytest.mark.core_model
@@ -336,47 +354,6 @@ def test_ming_flash_omni_image_to_image_prompt_builder() -> None:
 
 @pytest.mark.core_model
 @pytest.mark.cpu
-def test_audiox_extra_registry_declares_request_and_response_params() -> None:
-    assert get_extra_body_params("AudioXPipeline") == frozenset(
-        {
-            "audiox_task",
-            "seconds_start",
-            "seconds_total",
-            "sigma_min",
-            "sigma_max",
-            "cfg_rescale",
-            "video_path",
-            "audio_path",
-        }
-    )
-    assert get_extra_output_params("AudioXPipeline") == frozenset({"audiox_task"})
-    assert should_init_extra_args_for_non_diffusion_stages("AudioXPipeline") is False
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_audiox_declared_extra_args_route_into_sampling_params() -> None:
-    params = OmniDiffusionSamplingParams()
-    declared = get_extra_body_params("AudioXPipeline")
-    apply_declared_extra_args(
-        params,
-        declared,
-        {
-            "audiox_task": "t2a",
-            "seconds_total": 10.0,
-            "sigma_min": 0.03,
-            "unknown": "ignored",
-        },
-    )
-    assert params.extra_args == {
-        "audiox_task": "t2a",
-        "seconds_total": 10.0,
-        "sigma_min": 0.03,
-    }
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
 def test_helios_extra_registry_declares_request_and_response_params() -> None:
     expected_body = frozenset(
         {
@@ -418,6 +395,13 @@ def test_vace_extra_registry_has_no_pipeline_params() -> None:
 def test_unknown_pipeline_has_empty_extra_registry() -> None:
     assert get_extra_body_params("UnknownPipeline") == frozenset()
     assert get_extra_output_params("UnknownPipeline") == frozenset()
+    assert (
+        should_preserve_reference_image_size(
+            "UnknownPipeline",
+            model="org/model",
+        )
+        is False
+    )
     assert should_init_extra_args_for_non_diffusion_stages("UnknownPipeline") is False
 
 
@@ -570,65 +554,4 @@ def test_declared_extra_args_apply_to_existing_sampling_params() -> None:
         "existing": 1,
         "cfg_text_scale": 4.0,
         "think": False,
-    }
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_mammothmoda2_extra_registry_declares_request_and_response_params() -> None:
-    for model_class_name in (
-        "MammothModa2DiTPipeline",
-        "MammothModa2ForConditionalGeneration",
-        "Mammothmoda2Model",
-    ):
-        assert get_extra_body_params(model_class_name) == frozenset(
-            {
-                "text_guidance_scale",
-                "cfg_range",
-                "num_inference_steps",
-            }
-        )
-        assert get_extra_output_params(model_class_name) == frozenset()
-        assert should_init_extra_args_for_non_diffusion_stages(model_class_name) is True
-
-    wrapper_prompt = build_text_to_image_prompt(
-        "MammothModa2ForConditionalGeneration",
-        {"prompt": "a cat", "modalities": ["image"]},
-        height=256,
-        width=256,
-    )
-    assert wrapper_prompt["additional_information"]["omni_task"] == ["t2i"]
-
-
-@pytest.mark.core_model
-@pytest.mark.cpu
-def test_mammothmoda2_text_to_image_prompt_builder() -> None:
-    # Image dims are converted to the AR grid (width/16 x height/16); the negative
-    # prompt is ignored (MammothModa2 t2i uses CFG, not an explicit negative path).
-    assert build_text_to_image_prompt(
-        "MammothModa2DiTPipeline",
-        {
-            "prompt": "a cat",
-            "modalities": ["image"],
-            "negative_prompt": "blurry",
-        },
-        height=512,
-        width=768,
-    ) == {
-        "prompt": (
-            "<|im_start|>system\nYou are a helpful image generator.<|im_end|>\n"
-            "<|im_start|>user\na cat<|im_end|>\n"
-            "<|im_start|>assistant\n"
-            "<|image start|>48*32<|image token|>"
-        ),
-        "additional_information": {
-            "omni_task": ["t2i"],
-            "ar_width": [48],
-            "ar_height": [32],
-            "image_height": [512],
-            "image_width": [768],
-            "eol_token_id": [152064],
-            "visual_token_start_id": [152072],
-            "visual_token_end_id": [168456],
-        },
     }
