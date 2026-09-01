@@ -756,6 +756,24 @@ def _ensure_remote_package(snapshot_dir: str) -> str:
         return package_name
 
 
+# MAGVITv2 remote ``modeling_utils.py`` still does
+# ``from diffusers.utils import FLAX_WEIGHTS_NAME``. Newer diffusers dropped
+# the Flax export, so trust_remote_code fails before the VQ model loads.
+_LEGACY_DIFFUSERS_UTILS_EXPORTS = {
+    "FLAX_WEIGHTS_NAME": "diffusion_flax_model.msgpack",
+}
+
+
+def _ensure_legacy_diffusers_utils_exports() -> None:
+    try:
+        import diffusers.utils as diffusers_utils
+    except Exception:
+        return
+    for name, value in _LEGACY_DIFFUSERS_UTILS_EXPORTS.items():
+        if not hasattr(diffusers_utils, name):
+            setattr(diffusers_utils, name, value)
+
+
 def _load_remote_module(
     *,
     module_name: str,
@@ -763,6 +781,7 @@ def _load_remote_module(
     revision: str | None,
     local_files_only: bool,
 ):
+    _ensure_legacy_diffusers_utils_exports()
     snapshot_dir = _resolve_remote_snapshot_dir(
         source=source,
         revision=revision,
