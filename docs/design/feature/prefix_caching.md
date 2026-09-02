@@ -1,6 +1,5 @@
 # Automatic Prefix Caching in Omni Models
 
-
 ---
 
 ## Table of Contents
@@ -29,6 +28,7 @@ vLLM implements automatic prefix caching for managing its kv-cache, which is bes
     This document describes vLLM-Omni's mechanism for caching tensor outputs that are meant to be passed between stages, when requests have common prefixes, similar to the way in which vLLM has prefix caching for the kv-cache. This works in conjunction with vLLM's multimodal encoder caching, but is distinct. See the final section for a concrete example for how they tie together in practice.
 
 ### High-Level Approach
+
 !!! note "Note 2"
     Prior to reading this section, it's recommended to take a look at the design documents in vLLM for [Automatic Prefix Caching](https://docs.vllm.ai/en/latest/features/automatic_prefix_caching/), which will make some of the concepts more clear.
 
@@ -40,8 +40,8 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
-
 ### Example
+
 !!! note "Note 3"
     Prefix caching in vLLM-Omni currently is only supported on AutoRegressive stages with one kv-cache group. Configure it with the pipeline-wide `enable_prefix_caching` field in the deploy config.
 
@@ -58,7 +58,7 @@ The prefix cache flow is then outlined below.
 
 2. Say we process the request `The quick brown fox was tired and slept beneath the shady tree`, which is 12 tokens and evenly divides into 3 blocks as shown below.
 
-```
+```text
          [  The quick brown fox  ] [  was tired and slept ] [beneath the shady tree ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -67,10 +67,9 @@ Block 3: |<------------------ prefix -------------------->| |<--- block tokens -
 
 When the request processes, we inspect the multimodal outputs and identify the `mm_feature` tensor, which will be of shape `(seq_len, feature_dim)`, i.e., `(12, 16)` in this example. We note that the first axis is dependent on the `seq_len` and add a new cache_tensor of shape `(num_blocks, block_size, feature_dim)` to our multimodal cache for tensors.
 
+1. If we lay out the cache as a 2D tensor of shape (`num_blocks`, `block_size`), we'll have something like the following:
 
-3. If we lay out the cache as a 2D tensor of shape (`num_blocks`, `block_size`), we'll have something like the following:
-
-```
+```text
 0: [  The quick brown fox  ]
 1: [  was tired and slept  ]
 2: [beneath the shady tree ]
@@ -80,7 +79,8 @@ When the request processes, we inspect the multimodal outputs and identify the `
 ```
 
 Or, if we flatten it down to 1D,
-```
+
+```text
 0: The
 1: quick
 2: brown
@@ -92,7 +92,8 @@ Or, if we flatten it down to 1D,
 ```
 
 which we can think of as row indices into the hidden states tensor if we view it as the 2D shape `(num_blocks x block_size, feature_dim)`. That is, the analogous flattened (from 3D -> 2D) mapping of the cache for hidden states becomes the following.
-```
+
+```text
 0: <hidden states vector of len 2 corresponding to 'The'>
 1: <hidden states vector of len 2 corresponding to 'quick'>
 2: <hidden states vector of len 2 corresponding to 'brown'>
@@ -105,10 +106,9 @@ which we can think of as row indices into the hidden states tensor if we view it
 
 Similarly, for the multimodal outputs cache, the flattened coordinates are the same, but the `mm_feature` maps to vectors of length `16` instead of the hidden size of `2`. Note that in practice, we may have multiple  multimodal output tensors per forward pass, which may have different names and different feature dimensions.
 
+1. Now, say that we receive a new request `The quick brown fox jumped over the dog`.
 
-4. Now, say that we receive a new request `The quick brown fox jumped over the dog`.
-
-```
+```text
          [  The quick brown fox  ] [  jumped over the dog ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -118,7 +118,7 @@ Here, we will have a cache hit for `Block 1` which will be detected by vLLM base
 
 Since we have the block indices / slot mappings from the kv cache manager, we can simply mirror the mappings and leverage the same indices for the cached hidden states and multimodal outputs. This allows us to look up the correct tensors from our externally maintained 3D caches.
 
-```
+```text
 0: [  The quick brown fox  ] < already in the cache
 1: [  was tired and slept  ]
 2: [beneath the shady tree ]
@@ -131,11 +131,11 @@ Since we have the block indices / slot mappings from the kv cache manager, we ca
 
 Finally, to pass the full hidden states and multimodal outputs to the next stage, we simply concatenate the cached contents with the corresponding new tensors computed from the current forward call.
 
-
 ### What About Multimodal Inputs?
+
 It's also useful to consider the case about how Omni prefix caching is handled when we have multimodal inputs that don't cleanly end on block boundaries, as well as how this works with multimodal encoder caching in vLLM. For example:
 
-```
+```text
          [   Im0  Im1  Im2  Im3  ] [ Im4  Im5 foo <empty> ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -149,9 +149,9 @@ In reality, this isn't a big problem for correctness, because vLLM also maintain
 - The hash describing the image data starting at position 0 and with length 6
 - In vLLM's encoder cache, a mapping from the image hash above to the encoder output
 
-
 To understand what happens, say we get the following input as a second request:
-```
+
+```text
          [   Im0  Im1  Im2  Im3  ] [  Im4  Im5 bar  baz  ]
 Block 1: |<--- block tokens ---->|
 Block 2: |<------- prefix ------>| |<--- block tokens --->|
@@ -177,17 +177,24 @@ Miss is not an error (this step's forward slice only). A hit span that
 resolves to absent slots is fatal. Abort still writes: once a hash entered
 this step's batch it must land in the cache.
 
-Schedule is a key split: hidden and non-deferred mm use `JOIN_NEXT_STEP`
-(D2H at save, join at the next save); `deferred_keys` use `JOIN_ON_FINISH`
-(committer copies the GPU freeze on finish/abort, or earlier under cap
-pressure).
+Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
-Hit reads follow the same split. A `JOIN_NEXT_STEP` in-transit span waits
-the owner's `done` (scatter, not just D2H), drains so occupancy flips to
-committed, then reads the pool. A `JOIN_ON_FINISH` in-transit span still
-uses `fetch_host` on the GPU freeze so a concurrent same-prefix hit does
-not force the whole deferred payload to disk. Staging-slot reader holders
-are gone: once scattered, pool rows persist across slot reuse.
+- Immediate (`JOIN_NEXT_STEP`): save launches a whole-step D2H into a
+  staging slot; the committer waits that event and scatters. Joined at
+  the next save (`host_ready`).
+- Deferred (`JOIN_ON_FINISH`): token-major mm stays on a per-request GPU
+  freeze; segments append across steps; escalate on finish/abort (or cap
+  pressure). One WriteTask per request — lifetime follows the request,
+  not the step.
+
+Token-major mm (`shape[0]` equal to the unpadded scheduled length *or*
+the CUDA-graph padded length) is registered on first sighting. Talker
+`codes.audio` is a cat of scheduled rows and stays unpadded while hidden
+is padded; both must open a pool key, whether immediate or deferred.
+Leftover mm (lists, `codes.ref`, any tensor whose first dim is not
+token-major) is copied to CPU at save without truncating that first dim.
+That leftover copy is the async-builder read replica for this step; it
+does not write the pool or carry abort/preempt occupancy.
 
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
@@ -199,9 +206,9 @@ outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 
 Each `sid` is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. `materialize` may run on the async output builder after the engine
-has entered the next step; leftover mm (deferred tails and uncached
-passthrough) is copied to CPU at `save_outputs` so the builder never reads
-live CUDA-graph buffers. See
+has entered the next step; leftover mm (uncached passthrough) is copied
+to CPU at `save_outputs` so the builder never reads live CUDA-graph
+buffers. See
 [Async Omni Output Materialization](omni_async_output_materialization.md).
 
 The cache is constructed only on the last pipeline-parallel rank

@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Interface types for the omni prefix cache.
 
 Naming aligns with vLLM's v1/core KV-cache design.
@@ -19,8 +21,8 @@ class WriteSchedule(Enum):
     # Immediately-cached keys: D2H launched at save into the staging
     # pool; committer waits that event and scatters. Joined at the next save.
     JOIN_NEXT_STEP = "join_next_step"
-    # Deferred mm: committer D2H + scatter. Escalated on finish/abort
-    # (cap pressure may spill it earlier).
+    # Deferred mm: stays on the GPU freeze until finish/abort (cap
+    # pressure may spill it earlier). One WriteTask per request.
     JOIN_ON_FINISH = "join_on_finish"
 
 
@@ -30,9 +32,7 @@ class PrefixCacheConfig:
 
     num_blocks: int
     block_size: int
-    hidden_size: int
-    hs_dtype: torch.dtype
-    # GPU staging byte budget; exceeding it force-flushes oldest entries.
+    # GPU freeze byte budget for JOIN_ON_FINISH; exceeding it force-flushes.
     gpu_staging_bytes: int = 512 * 1024 * 1024
     # D2H staging: circular slots, one whole step each (not per request).
     # Host memory per key ≈ staging_depth * staging_capacity_tokens * width * dtype.
@@ -48,8 +48,6 @@ class PrefixCacheConfig:
         *,
         num_blocks: int,
         block_size: int,
-        hidden_size: int,
-        hs_dtype: torch.dtype,
         scheduler_config: Any = None,
         model_config: Any = None,
     ) -> "PrefixCacheConfig":
@@ -65,6 +63,11 @@ class PrefixCacheConfig:
         step larger than capacity fail-fasts. A 16k-token thinking batch at
         hidden=2048 bf16 is ~256 MiB for hidden alone; each mm key adds
         another slab.
+
+        ``staging_depth`` is the dataclass default (4). There is no CLI or
+        deploy YAML knob — changing it is a code change. The same value
+        also bounds unconsumed step contexts; those are different failures
+        that share a number today.
         """
         batched = getattr(scheduler_config, "max_num_batched_tokens", None)
         model_len = getattr(scheduler_config, "max_model_len", None)
@@ -77,9 +80,6 @@ class PrefixCacheConfig:
         return cls(
             num_blocks=num_blocks,
             block_size=block_size,
-            hidden_size=hidden_size,
-            hs_dtype=hs_dtype,
-            staging_depth=4,
             staging_capacity_tokens=max(1, capacity),
         )
 

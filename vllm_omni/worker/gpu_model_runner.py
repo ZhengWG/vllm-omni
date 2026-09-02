@@ -38,6 +38,7 @@ from vllm_omni.core.prefix_cache import (
     OmniPrefixCacheManager,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
+    check_prefix_cache_kv_groups,
     get_prefix_cache_group_view,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
@@ -183,12 +184,12 @@ class OmniGPUModelRunner(GPUModelRunner):
         # Stage the omni prefix cache config; the manager is built lazily on
         # the first step so input_batch is guaranteed to exist. Non-CUDA
         # platforms run the Controller in eager mode (auto-selected).
+        # Group-spec check runs now: it only needs kv_cache_groups.
         if self.cache_config.enable_prefix_caching:
+            check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))
             self._omni_prefix_cache_cfg = PrefixCacheConfig.from_vllm_config(
                 num_blocks=kv_cache_config.num_blocks,
                 block_size=self.cache_config.block_size,
-                hidden_size=self.model_config.get_hidden_size(),
-                hs_dtype=self.dtype,
                 scheduler_config=self.scheduler_config,
                 model_config=self.model_config,
             )
@@ -215,16 +216,11 @@ class OmniGPUModelRunner(GPUModelRunner):
         view = get_prefix_cache_group_view(
             self.input_batch,
             cfg.block_size,
-            cfg.num_blocks,
             kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
         )
         if view is None:
-            # No usable full-attention group (hybrid/multi-group model).
-            # Serving prefix hits without the omni cache would hand
-            # downstream stages truncated conditioning, so refuse loudly
-            # instead of degrading.
             raise OmniPrefixCacheUnmatchError(
-                "omni prefix caching requires a single full-attention kv-cache group; "
+                "omni prefix caching requires a block table on the input batch; "
                 "disable enable_prefix_caching for this model"
             )
         manager = OmniPrefixCacheManager(cfg, view)

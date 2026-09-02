@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Omni prefix cache, manager side.
 
 Owns (slot, key) occupancy, the hit/span registry, per-step snapshots,
@@ -43,6 +45,7 @@ import threading
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -54,7 +57,6 @@ from vllm_omni.core.prefix_cache.controller import (
     WriteTask,
     _Segment,
 )
-from vllm_omni.core.prefix_cache.group_view import KVCacheGroupView
 from vllm_omni.core.prefix_cache.interface import (
     HIDDEN_KEY,
     ModelCachePolicy,
@@ -72,22 +74,56 @@ logger = logging.getLogger(__name__)
 _ABSENT, _IN_TRANSIT, _COMMITTED = 0, 1, 2
 
 
+class MmValueKind(Enum):
+    """How one ``mm_flat`` value relates to this step's scheduled tokens.
+
+    Shared by freeze, deferred, and leftover so the three sites cannot
+    drift onto different type/shape predicates.
+    """
+
+    # 2D+ tensor whose first dim is the unpadded *or* CUDA-graph padded length.
+    TOKEN_MAJOR = "token_major"
+    # Per-request list/tuple (Higgs ``codes.audio``). Not a pool key.
+    REQ_LIST = "req_list"
+    # Everything else: ``codes.ref``, 1D meta, dicts, scalars.
+    PASSTHROUGH = "passthrough"
+
+
+def classify_mm_value(
+    val: Any,
+    num_tokens_unpadded: int,
+    num_tokens_padded: int,
+) -> MmValueKind:
+    if isinstance(val, (list, tuple)):
+        return MmValueKind.REQ_LIST
+    if isinstance(val, torch.Tensor) and val.ndim >= 2:
+        rows = int(val.shape[0])
+        if rows == num_tokens_unpadded or rows == num_tokens_padded:
+            return MmValueKind.TOKEN_MAJOR
+    return MmValueKind.PASSTHROUGH
+
+
 def _snapshot_leftover_mm_cpu(
     mm_flat: dict[str, Any],
     frozen_keys: set[str],
     num_tokens_unpadded: int,
+    num_tokens_padded: int | None = None,
 ) -> dict[str, Any]:
-    """Copy leftover mm onto CPU. ``num_tokens_unpadded`` slices token-major tensors.
+    """Copy leftover mm onto CPU.
 
     Keys already in ``frozen_keys`` go through staging D2H. Everything else
-    (deferred tails, uncached passthrough) must be copied here: materialize
-    may run after the next forward has overwritten CUDA-graph static buffers.
+    (deferred tails + uncached passthrough) is copied here so materialize
+    never reads live graph buffers. Only ``TOKEN_MAJOR`` tensors whose
+    first dim equals ``num_tokens_unpadded`` are sliced; ``>= n`` would
+    truncate leftover tensors whose first dim is unrelated (``codes.ref``).
     """
+    n = num_tokens_unpadded
+    padded = n if num_tokens_padded is None else int(num_tokens_padded)
 
     def _copy(val: Any) -> Any:
         if isinstance(val, torch.Tensor):
-            n = num_tokens_unpadded
-            t = val[:n] if val.ndim >= 1 and n > 0 and val.shape[0] >= n else val
+            kind = classify_mm_value(val, n, padded)
+            t = val[:n] if kind is MmValueKind.TOKEN_MAJOR and int(val.shape[0]) == n else val
             copied = t.detach()
             # .cpu() copies device tensors; CPU/pinned views still share storage.
             copied = copied.cpu() if copied.device.type != "cpu" else copied.clone()
@@ -182,7 +218,7 @@ class OmniPrefixCacheManager:
     def __init__(
         self,
         config: PrefixCacheConfig,
-        view: KVCacheGroupView,
+        view: Any,
         *,
         eager: bool | None = None,
     ):
@@ -361,7 +397,15 @@ class OmniPrefixCacheManager:
                     "CPU-side slot derivation out of sync with the batch"
                 )
             frozen_rows = self._freeze_step_rows(hidden_states, mm_flat, num_tokens_unpadded, num_tokens_padded)
-            deferred_segs = self._build_deferred_segments(mm_flat, slots_cpu, req_order, num_sched, query_start)
+            deferred_segs = self._build_deferred_segments(
+                mm_flat,
+                slots_cpu,
+                req_order,
+                num_sched,
+                query_start,
+                num_tokens_unpadded,
+                num_tokens_padded,
+            )
 
             staged = [t for t in frozen_rows.values()] + [t for _, seg in deferred_segs for t in seg.tensors.values()]
             if staged:
@@ -377,7 +421,7 @@ class OmniPrefixCacheManager:
         # 4. Leftover mm D2H (unlocked). Keys already in frozen_rows go
         #    through staging; deferred tails and uncached passthrough must
         #    be on CPU before the next forward can overwrite graph buffers.
-        leftover_mm = _snapshot_leftover_mm_cpu(mm_flat, set(frozen_rows), num_tokens_unpadded)
+        leftover_mm = _snapshot_leftover_mm_cpu(mm_flat, set(frozen_rows), num_tokens_unpadded, num_tokens_padded)
 
         # 5. Fail-fast if the runner leaked prior step contexts *before*
         #    claiming a staging slot — otherwise a full pool raises a
@@ -533,7 +577,8 @@ class OmniPrefixCacheManager:
                     val = ctx.mm_cpu_snapshot.get(key)
                     if not isinstance(val, torch.Tensor):
                         continue
-                    cur = val[: ctx.num_tokens_unpadded] if val.shape[0] >= ctx.num_tokens_unpadded else val
+                    # Leftover snapshot already classified; do not re-slice.
+                    cur = val
                 mm_out[key] = {
                     req_id: self._merge_cached_for_req(ctx, req_id, key, cur, hit_sources) for req_id in req_ids
                 }
@@ -607,11 +652,11 @@ class OmniPrefixCacheManager:
     ) -> dict[str, torch.Tensor]:
         """D2D-clone this step's immediately-cached rows.
 
-        Three buckets (deferred keys are handled by ``_build_deferred_segments``):
-
-        * hidden: required by policy; always registered; too-short is fatal.
-        * mm, first padded sighting: register then clone ``[:unpadded]``.
-        * mm, already in the pool and long enough: clone. Otherwise passthrough.
+        Deferred keys stay on the GPU freeze (``_build_deferred_segments``).
+        Immediate mm is ``TOKEN_MAJOR`` only: first dim is unpadded *or*
+        CUDA-graph padded. Talker ``codes.audio`` is a cat of scheduled
+        rows and stays unpadded while hidden is padded; both must open a
+        pool key. Anything else is leftover passthrough.
         """
         n = num_tokens_unpadded
         out: dict[str, torch.Tensor] = {}
@@ -624,13 +669,12 @@ class OmniPrefixCacheManager:
 
         reserved = self._policy.deferred_keys | {HIDDEN_KEY}
         for key, val in mm_flat.items():
-            if key in reserved or not isinstance(val, torch.Tensor) or val.ndim < 2:
+            if key in reserved:
                 continue
-            # CUDA-graph buffers are padded; that first sighting opens the key.
-            if val.shape[0] == num_tokens_padded:
-                self._pool.ensure_key(key, val.dtype, int(val.shape[-1]))
-            if self._pool.has_key(key) and val.shape[0] >= n:
-                out[key] = val[:n].clone()
+            if classify_mm_value(val, n, num_tokens_padded) is not MmValueKind.TOKEN_MAJOR:
+                continue
+            self._pool.ensure_key(key, val.dtype, int(val.shape[-1]))
+            out[key] = val[:n].clone()
         return out
 
     def _build_deferred_segments(
@@ -640,10 +684,25 @@ class OmniPrefixCacheManager:
         req_order: list[str],
         num_sched: dict[str, int],
         query_start: dict[str, int],
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
     ) -> list[tuple[str, _Segment]]:
-        """Clone this step's deferred rows (build phase, no lock held)."""
-        deferred_keys = [k for k in self._policy.deferred_keys if isinstance(mm_flat.get(k), torch.Tensor)]
-        if not deferred_keys:
+        """Clone this step's deferred rows (build phase, no lock held).
+
+        One whole-step D2D per token-major key, then per-req views — same
+        pattern as the immediate freeze. List-valued deferred keys
+        (Higgs ``codes.audio``) are ``REQ_LIST`` and stay leftover.
+        """
+        n = num_tokens_unpadded
+        step_rows: dict[str, torch.Tensor] = {}
+        for key in self._policy.deferred_keys:
+            val = mm_flat.get(key)
+            if classify_mm_value(val, n, num_tokens_padded) is not MmValueKind.TOKEN_MAJOR:
+                continue
+            if not self._pool.has_key(key):
+                self._pool.ensure_key(key, val.dtype, int(val.shape[-1]))
+            step_rows[key] = val[:n].clone()
+        if not step_rows:
             return []
         segs: list[tuple[str, _Segment]] = []
         for req_id in req_order:
@@ -652,16 +711,15 @@ class OmniPrefixCacheManager:
                 continue
             start = query_start[req_id]
             end = start + sched
-            tensors: dict[str, torch.Tensor] = {}
-            for key in deferred_keys:
-                val = mm_flat[key]
-                if val.ndim < 2 or val.shape[0] < end:
-                    continue
-                if not self._pool.has_key(key):
-                    self._pool.ensure_key(key, val.dtype, int(val.shape[-1]))
-                tensors[key] = val[start:end].clone()
-            if tensors:
-                segs.append((req_id, _Segment(slots_cpu=slots_cpu[start:end], tensors=tensors)))
+            segs.append(
+                (
+                    req_id,
+                    _Segment(
+                        slots_cpu=slots_cpu[start:end],
+                        tensors={k: v[start:end] for k, v in step_rows.items()},
+                    ),
+                )
+            )
         return segs
 
     def _submit_step_writes(
@@ -839,10 +897,12 @@ class OmniPrefixCacheManager:
         return ctx
 
     def _raise_if_unconsumed_ctxs_at_capacity(self) -> None:
-        """The async builder runs at most one step behind; `staging_depth`
-        unconsumed contexts means the runner skipped both materialize and
-        discard_step. Checked before claiming a staging slot so a full
-        pool does not hide the leaked ids.
+        """Unconsumed contexts at `staging_depth` means the runner skipped
+        both materialize and discard_step. Checked before claiming a
+        staging slot so a full pool does not hide the leaked ids.
+
+        This bound currently equals the slot-pool depth (same config field).
+        They are different failures; splitting them is a follow-up.
         """
         with self._state_lock:
             if len(self._step_ctxs) >= self._config.staging_depth:

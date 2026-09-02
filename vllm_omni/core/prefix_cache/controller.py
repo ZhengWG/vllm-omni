@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Runs WriteTasks and the step D2H staging pool.
 
 The manager owns request/slot identity and when to submit. This class
@@ -278,7 +280,10 @@ class OmniPrefixCacheController:
             )
         slot = self._staging_pool.try_claim(step_holder)
         if slot is None:
-            raise OmniPrefixCacheUnmatchError("D2H staging pool exhausted; unconsumed steps or leaked holders")
+            raise OmniPrefixCacheUnmatchError(
+                "D2H staging pool exhausted; unconsumed steps, leaked holders, "
+                f"or committer backlog (in_flight_tasks={len(self._tasks)})"
+            )
         try:
             pin = not self._eager
             views: dict[str, torch.Tensor] = {}

@@ -1,32 +1,23 @@
-"""KV-cache group access seam for the omni prefix cache.
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""KV-cache group access for the omni prefix cache.
 
 The sole path through which the prefix cache touches vLLM scheduler
-internals (block tables, slot mappings). Hybrid-attention models plug in
-by providing another view implementation; no usable group => the factory
-returns None and the feature self-disables.
+internals (block tables, slot mappings). Group-spec rejection happens
+at kv-cache init via ``check_prefix_cache_kv_groups``; the factory only
+returns None when the input batch has no block table.
 """
 
 from __future__ import annotations
 
-import logging
-from typing import TYPE_CHECKING, Protocol, runtime_checkable
+from typing import TYPE_CHECKING
 
 import torch
 
+from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError
+
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
-
-logger = logging.getLogger(__name__)
-
-
-@runtime_checkable
-class KVCacheGroupView(Protocol):
-    block_size: int
-    num_blocks: int
-
-    def step_slots_cpu(self, req_ids: list[str], num_scheduled: dict[str, int]) -> torch.Tensor: ...
-
-    def batch_req_ids(self) -> list[str]: ...
 
 
 class FullAttentionGroupView:
@@ -36,10 +27,9 @@ class FullAttentionGroupView:
     device slot_mapping.
     """
 
-    def __init__(self, input_batch: InputBatch, block_size: int, num_blocks: int):
+    def __init__(self, input_batch: InputBatch, block_size: int):
         self._input_batch = input_batch
         self.block_size = block_size
-        self.num_blocks = num_blocks
 
     def _block_table_cpu(self) -> torch.Tensor:
         return self._input_batch.block_table[0].block_table.cpu
@@ -76,31 +66,42 @@ class FullAttentionGroupView:
         return torch.cat(parts) if parts else torch.empty((0,), dtype=torch.long)
 
 
-def get_prefix_cache_group_view(
-    input_batch: InputBatch,
-    block_size: int,
-    num_blocks: int,
-    kv_cache_groups: object = None,
-) -> KVCacheGroupView | None:
-    """Build the group view for a runner's input batch; None means no
-    usable group (the caller fails fast rather than serving hits without
-    cached tensors).
+def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
+    """Reject hybrid / multi-group models at kv-cache init, not first step.
 
-    Selection is by kv-cache group SPEC, not by counting block tables: a
-    hybrid model's group 0 is not necessarily full attention, and a
-    narrower per-group table would make step_slots_cpu silently clamp.
+    Only needs ``kv_cache_config.kv_cache_groups``. ``FullAttentionSpec``
+    is imported here so ``tests/core`` can load this module without vllm.
     """
-    block_tables = getattr(input_batch.block_table, "block_tables", None)
-    if not block_tables:
-        return None
     groups = list(kv_cache_groups or ())
     if len(groups) != 1:
-        logger.warning("Omni prefix caching needs exactly one kv-cache group, found %d.", len(groups))
-        return None
+        raise OmniPrefixCacheUnmatchError(
+            "omni prefix caching requires a single full-attention kv-cache group; "
+            f"found {len(groups)}. disable enable_prefix_caching for this model"
+        )
     from vllm.v1.kv_cache_interface import FullAttentionSpec
 
     spec = getattr(groups[0], "kv_cache_spec", None)
     if not isinstance(spec, FullAttentionSpec):
-        logger.warning("Omni prefix caching needs a full-attention group 0, found %s.", type(spec).__name__)
+        raise OmniPrefixCacheUnmatchError(
+            "omni prefix caching requires a single full-attention kv-cache group; "
+            f"found {type(spec).__name__}. disable enable_prefix_caching for this model"
+        )
+
+
+def get_prefix_cache_group_view(
+    input_batch: InputBatch,
+    block_size: int,
+    kv_cache_groups: object = None,
+) -> FullAttentionGroupView | None:
+    """Build the group view; None only if the batch has no block table.
+
+    Group spec is checked first (raises). Selection is by spec, not by
+    counting block tables: a hybrid model's group 0 is not necessarily
+    full attention, and a narrower per-group table would make
+    step_slots_cpu silently clamp.
+    """
+    check_prefix_cache_kv_groups(kv_cache_groups)
+    block_tables = getattr(input_batch.block_table, "block_tables", None)
+    if not block_tables:
         return None
-    return FullAttentionGroupView(input_batch, block_size, num_blocks)
+    return FullAttentionGroupView(input_batch, block_size)

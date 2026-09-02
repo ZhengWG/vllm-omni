@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """PrefixBlockPool: pinned CPU block mirror (mirrors vLLM BlockPool).
 
 Storage is (num_blocks, block_size, feat) per key, viewed flat as
@@ -17,7 +19,6 @@ logger = logging.getLogger(__name__)
 class PrefixBlockPool:
     def __init__(self, config: PrefixCacheConfig):
         self._config = config
-        self.num_slots = config.num_blocks * config.block_size
         self._caches: dict[str, torch.Tensor] = {}
 
     def _alloc(self, dtype: torch.dtype, feat: int) -> torch.Tensor:

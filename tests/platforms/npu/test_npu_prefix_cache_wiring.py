@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """NPU prefix-cache wiring: save_outputs -> sid -> materialize on CPU.
 
 The NPU runner consumes the prefix cache in eager mode (no CUDA streams) and
@@ -76,7 +76,7 @@ def test_execute_model_state_keeps_prefix_cache_sid_last():
 
 
 class _FakeView:
-    """Minimal KVCacheGroupView double (mirrors tests/core/test_prefix_cache)."""
+    """Minimal group-view double (mirrors tests/core/test_prefix_cache)."""
 
     def __init__(self):
         self.block_size = BLOCK_SIZE
@@ -133,7 +133,7 @@ def _make_npu_mode_manager(monkeypatch) -> tuple[OmniPrefixCacheManager, _FakeVi
     # npu_model_runner builds the manager with the default eager=None.
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
     view = _FakeView()
-    config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, hidden_size=HIDDEN, hs_dtype=DTYPE)
+    config = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
     return OmniPrefixCacheManager(config, view), view
 
 

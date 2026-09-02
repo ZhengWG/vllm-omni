@@ -20,6 +20,8 @@ from vllm_ascend.ops.rotary_embedding import update_cos_sin
 from vllm_ascend.utils import enable_sp, lmhead_tp_enable
 from vllm_ascend.worker.model_runner_v1 import SEQ_LEN_WITH_MAX_PA_WORKSPACE
 
+from vllm_omni.core.prefix_cache.group_view import check_prefix_cache_kv_groups
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
 from vllm_omni.model_executor.models.output_templates import OmniOutput
 from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.worker.gpu_model_runner import OmniGPUModelRunner
@@ -42,16 +44,13 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             # deepcopies the config it was handed, so the value it stored is the
             # authoritative one, not our caller's argument.
             num_blocks = self.kv_cache_config.num_blocks
-            from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
-
             # Controller runs in eager mode on NPU (no CUDA streams:
             # submit() completes the copy+scatter synchronously). Built once
             # on the first step via the inherited _ensure_omni_prefix_cache.
+            check_prefix_cache_kv_groups(getattr(self.kv_cache_config, "kv_cache_groups", None))
             self._omni_prefix_cache_cfg = PrefixCacheConfig.from_vllm_config(
                 num_blocks=num_blocks,
                 block_size=self.cache_config.block_size,
-                hidden_size=self.model_config.get_hidden_size(),
-                hs_dtype=self.dtype,
                 scheduler_config=self.scheduler_config,
                 model_config=self.model_config,
             )
