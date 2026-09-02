@@ -2976,12 +2976,17 @@ async def _run_video_generation_job(
 
     started_at = time.perf_counter()
     try:
+
+        async def _mark_started() -> None:
+            await VIDEO_STORE.update_fields(video_id, {"status": VideoGenerationStatus.IN_PROGRESS})
+
         video_bytes, stage_durations, peak_memory_mb, action = await handler.generate_video_bytes(
             request,
             video_id,
             reference_image=reference_image,
             reference_video=reference_video,
             reference_audio=reference_audio,
+            on_started=_mark_started,
         )
 
         save_context = await STORAGE_MANAGER.save(video_bytes, video_id)
