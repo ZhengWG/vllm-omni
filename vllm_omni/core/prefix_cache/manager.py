@@ -55,6 +55,7 @@ from vllm_omni.core.prefix_cache.controller import (
     OmniPrefixCacheController,
     StagingBufferHolder,
     WriteTask,
+    _GpuFreezeAlloc,
     _Segment,
 )
 from vllm_omni.core.prefix_cache.interface import (
@@ -412,11 +413,16 @@ class OmniPrefixCacheManager:
                 if torch.cuda.is_available() and any(t.is_cuda for t in staged):
                     freeze_event = torch.cuda.Event()
                     freeze_event.record()
+                # Charge unique allocations: immediate clones + one deferred
+                # C→1 clone. Do not sum per-req views — they share storage.
+                immediate_bytes = sum(t.numel() * t.element_size() for t in frozen_rows.values())
+                deferred_alloc = deferred_segs[0][1].gpu_alloc if deferred_segs else None
+                deferred_bytes = deferred_alloc.nbytes if deferred_alloc is not None else 0
                 # Cap reservation may block on a flush: outside the lock. The
                 # flush must not close the deferred entries we are about to
                 # append to (main-thread-only reads, safe unlocked).
                 exclude = {self._deferred_tasks[r].tid for r, _ in deferred_segs if r in self._deferred_tasks}
-                self._controller.reserve(sum(t.numel() * t.element_size() for t in staged), exclude=exclude)
+                self._controller.reserve(immediate_bytes + deferred_bytes, exclude=exclude)
 
         # 4. Leftover mm D2H (unlocked). Keys already in frozen_rows go
         #    through staging; deferred tails and uncached passthrough must
@@ -704,6 +710,7 @@ class OmniPrefixCacheManager:
             step_rows[key] = val[:n].clone()
         if not step_rows:
             return []
+        alloc = _GpuFreezeAlloc(nbytes=sum(t.numel() * t.element_size() for t in step_rows.values()))
         segs: list[tuple[str, _Segment]] = []
         for req_id in req_order:
             sched = num_sched[req_id]
@@ -717,6 +724,7 @@ class OmniPrefixCacheManager:
                     _Segment(
                         slots_cpu=slots_cpu[start:end],
                         tensors={k: v[start:end] for k, v in step_rows.items()},
+                        gpu_alloc=alloc,
                     ),
                 )
             )
@@ -796,6 +804,8 @@ class OmniPrefixCacheManager:
                 self._deferred_tasks[req_id] = task
                 self._req_tasks.setdefault(req_id, set()).add(task.tid)
                 self._controller.submit(task, queued=False)
+            if seg.gpu_alloc is not None:
+                self._controller.pin_gpu_freeze(seg.gpu_alloc, task.tid)
             # Block reuse across deferred tenants (preemption path) is
             # handled inside _map_slots: the old tenant's rows are skipped.
             self._map_slots(seg.slots_cpu, task.tid, seg.tensors.keys())

@@ -7,6 +7,7 @@ vLLM runtime is required (runnable without a vllm install via
 ``pytest --confcutdir=tests/core``).
 """
 
+import ast
 import logging
 import sys
 import threading
@@ -167,6 +168,35 @@ def _assert_leftover_shapes(inp, got, n: int) -> None:
         assert len(got) == len(inp)
         for a, b in zip(inp, got):
             _assert_leftover_shapes(a, b, n)
+
+
+def _module_scope_imported_modules(path: Path) -> list[str]:
+    """Top-level import module names, skipping ``if TYPE_CHECKING`` blocks."""
+    tree = ast.parse(path.read_text())
+    names: list[str] = []
+
+    def _from_stmt(node: ast.AST) -> None:
+        if isinstance(node, ast.Import):
+            names.extend(alias.name for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module:
+            names.append(node.module)
+
+    for node in tree.body:
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "TYPE_CHECKING":
+            continue
+        _from_stmt(node)
+    return names
+
+
+def test_prefix_cache_package_has_no_module_scope_vllm_import():
+    """This package must import without vllm. See the package docstring."""
+    pkg = Path(__file__).resolve().parents[2] / "vllm_omni" / "core" / "prefix_cache"
+    leaked: list[str] = []
+    for path in sorted(pkg.glob("*.py")):
+        for mod in _module_scope_imported_modules(path):
+            if mod == "vllm" or mod.startswith("vllm."):
+                leaked.append(f"{path.name}: {mod}")
+    assert not leaked, leaked
 
 
 def test_no_hit_passthrough():
@@ -391,6 +421,30 @@ def test_deferred_key_accumulates_and_flushes_on_finish():
     mgr.materialize(sid, ["z"])
     mirror = mgr._pool.rows("codes.audio", slots)
     assert torch.equal(mirror[:, 0], torch.tensor([1.0, 2.0]))
+
+
+def test_deferred_gpu_bytes_held_until_last_view_drops():
+    """C→1 clone is one allocation; finishing the first co-scheduled
+    request must not drop ``_staged_bytes`` while the other still pins it."""
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
+    mgr, view = make_manager(policy=policy)
+    feat = 2
+    n = 4
+    s1 = run_step(
+        mgr,
+        view,
+        {"a": ([0], 0, 2), "b": ([1], 0, 2)},
+        mm={"k": torch.zeros(n, feat)},
+    )
+    mgr.materialize(s1, ["a", "b"])
+    clone_bytes = n * feat * 4  # float32
+    assert mgr._controller._staged_bytes == clone_bytes
+    s2 = run_step(mgr, view, {"z": ([9], 0, 1)}, finished=["a"])
+    mgr.materialize(s2, ["z"])
+    assert mgr._controller._staged_bytes == clone_bytes
+    s3 = run_step(mgr, view, {"z2": ([9], 1, 1)}, finished=["b"])
+    mgr.materialize(s3, ["z2"])
+    assert mgr._controller._staged_bytes == 0
 
 
 def test_cap_forces_flush_of_deferred():

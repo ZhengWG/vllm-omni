@@ -60,6 +60,19 @@ class StagingBufferHolder(NamedTuple):
 
 
 @dataclass
+class _GpuFreezeAlloc:
+    """One unique GPU freeze allocation (a whole-step clone).
+
+    C→1 hangs per-req views on this storage. Charge ``_staged_bytes``
+    once; release when the last holder tid drops. Same refcount idea as
+    ``StagingBufferHolder``, but this is the GPU freeze, not a host slot.
+    """
+
+    nbytes: int
+    holders: set[int] = field(default_factory=set)
+
+
+@dataclass
 class _Segment:
     """One contiguous save's rows: slots + per-key frozen tensors."""
 
@@ -69,6 +82,9 @@ class _Segment:
     # still be in flight; wait `host_event`). JOIN_ON_FINISH: owned CPU
     # tensor written by the committer after its D2H.
     host: dict[str, torch.Tensor] = field(default_factory=dict)
+    # Shared C→1 clone this view hangs on (deferred). None on the
+    # immediate path, which still charges/releases via ``task.nbytes``.
+    gpu_alloc: _GpuFreezeAlloc | None = None
 
 
 @dataclass
@@ -324,7 +340,11 @@ class OmniPrefixCacheController:
         Caller must reserve() the task bytes first (cap flush can block;
         the manager does that outside the state lock).
         """
-        task.nbytes = sum(t.numel() * t.element_size() for s in task.segments for t in s.tensors.values())
+        # Immediate (no gpu_alloc): charge/release via task.nbytes.
+        # Deferred C→1 views: charge the shared alloc once at reserve().
+        task.nbytes = sum(
+            t.numel() * t.element_size() for s in task.segments if s.gpu_alloc is None for t in s.tensors.values()
+        )
         task.enqueued_time = time.monotonic()
         with self._lock:
             self._tasks[task.tid] = task
@@ -352,13 +372,43 @@ class OmniPrefixCacheController:
                 return False
             task.segments.append(seg)
             task._slot_to_row = None
-            task.nbytes += nbytes
+            # Shared clones are charged on the alloc, not per-view.
+            if seg.gpu_alloc is None:
+                task.nbytes += nbytes
         return True
+
+    def pin_gpu_freeze(self, alloc: _GpuFreezeAlloc, tid: int) -> None:
+        """Record that ``tid`` holds a view of this step's deferred clone."""
+        with self._lock:
+            alloc.holders.add(tid)
 
     def reserve(self, nbytes: int, exclude: set[int] | None = None) -> None:
         """Public cap reservation; blocking flush happens here, so callers
         must not hold the manager's state lock."""
         self._reserve_bytes(nbytes, exclude=exclude)
+
+    def _release_staged_bytes(self, task: WriteTask) -> None:
+        """Drop this task's GPU-freeze charge.
+
+        Shared C→1 clones release only when the last holder tid drops.
+        Immediate tasks (no ``gpu_alloc``) still release ``task.nbytes``.
+        """
+        allocs: list[_GpuFreezeAlloc] = []
+        seen: set[int] = set()
+        for seg in task.segments:
+            alloc = seg.gpu_alloc
+            if alloc is not None and id(alloc) not in seen:
+                seen.add(id(alloc))
+                allocs.append(alloc)
+        with self._wake:
+            if allocs:
+                for alloc in allocs:
+                    if task.tid in alloc.holders:
+                        alloc.holders.discard(task.tid)
+                        if not alloc.holders:
+                            self._staged_bytes -= alloc.nbytes
+            else:
+                self._staged_bytes -= task.nbytes
 
     def _reserve_bytes(self, nbytes: int, exclude: set[int] | None = None) -> None:
         # Cap backpressure: force-flush oldest pending tasks until under
@@ -567,8 +617,7 @@ class OmniPrefixCacheController:
                 for k, t in seg.tensors.items():
                     seg.host[k] = t.detach().cpu() if t.device.type != "cpu" else t.clone()
         task.host_ready.set()
-        with self._lock:
-            self._staged_bytes -= task.nbytes
+        self._release_staged_bytes(task)
         for seg in task.segments:
             seg.tensors = {}
         self._scatter(task)
@@ -621,8 +670,7 @@ class OmniPrefixCacheController:
             # refs, done.
             task.host_event.synchronize()
             task.host_ready.set()
-            with self._wake:
-                self._staged_bytes -= task.nbytes
+            self._release_staged_bytes(task)
             for seg in task.segments:
                 seg.tensors = {}
             return
@@ -653,8 +701,7 @@ class OmniPrefixCacheController:
         for seg, k, cpu in pending_host:
             seg.host[k] = cpu
         task.host_ready.set()
-        with self._wake:
-            self._staged_bytes -= task.nbytes
+        self._release_staged_bytes(task)
         for seg in task.segments:
             seg.tensors = {}
 
@@ -669,9 +716,9 @@ class OmniPrefixCacheController:
         if task is None or task.done.is_set():
             return
         task.failed = True
+        if not task.host_ready.is_set():
+            self._release_staged_bytes(task)
         with self._wake:
-            if not task.host_ready.is_set():
-                self._staged_bytes = max(0, self._staged_bytes - task.nbytes)
             if tid in self._blocked:
                 self._blocked.remove(tid)
         for seg in task.segments:
