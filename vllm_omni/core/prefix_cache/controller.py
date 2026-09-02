@@ -80,7 +80,8 @@ class _Segment:
     tensors: dict[str, torch.Tensor]  # frozen (GPU) or eager CPU tensors
     # JOIN_NEXT_STEP: view into the staging page, hung at save (D2H may
     # still be in flight; wait `host_event`). JOIN_ON_FINISH: owned CPU
-    # tensor written by the committer after its D2H.
+    # tensor written by the committer after its D2H. Resolve with
+    # `host.get(k)` then `tensors.get(k)` — `or` would bool() a Tensor.
     host: dict[str, torch.Tensor] = field(default_factory=dict)
     # Shared C→1 clone this view hangs on (deferred). None on the
     # immediate path, which still charges/releases via ``task.nbytes``.
@@ -116,10 +117,10 @@ class WriteTask:
     unfinished task with the oldest `enqueued_time`.
 
     Concurrent readers/writers:
-    - Staging readers (materialize clone, fetch_host, committer scatter)
-      all wait the same `host_event` before touching the view.
-      `d2h_claimed` is the single-claimer so only one `_copy_task`
-      runs; it does not publish host on this path.
+    - Staging readers (materialize clone, committer scatter) all wait
+      the same `host_event` before touching the view. `d2h_claimed` is
+      the single-claimer so only one `_copy_task` runs; it does not
+      publish host on this path.
     - Remount: a later task taking the same (slot, key) pushes those
       rows into `skip`; the old scatter omits them so the two writes
       stay disjoint (no join edge).
@@ -166,9 +167,6 @@ class WriteTask:
     # for multi-segment tasks; scatter uses slot, the tensor uses row.
     _slot_to_row: dict[int, tuple[int, int]] | None = None
 
-    def num_rows(self) -> int:
-        return sum(int(s.slots_cpu.numel()) for s in self.segments)
-
     def add_skip(self, key: str, slots: torch.Tensor) -> None:
         with self.lock:
             prev = self.skip.get(key)
@@ -194,9 +192,7 @@ class StagingBufferPool:
     """Reusable pinned landing zone for ONE whole-step D2H at save.
 
     Per-task `seg.host` is a row-range view into a slot, so the committer
-    skips per-task D2H. Readers (materialize, committer, fetch_host) all
-    wait the same `host_event` before touching the view. Slots recycle;
-    this is not the CPU block pool.
+    skips per-task D2H. Slots recycle; this is not the CPU block pool.
 
     A slot is busy while any StagingBufferHolder is in `_busy`: one per
     WriteTask (freed when the manager drains its completion) and one for
@@ -508,14 +504,11 @@ class OmniPrefixCacheController:
 
     @torch.inference_mode()
     def fetch_host(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
-        """Rows for `slots` of one in-flight task.
+        """Rows for `slots` of one in-flight JOIN_ON_FINISH task.
 
-        JOIN_NEXT_STEP hangs `seg.host` as a staging view at save, before
-        D2H finishes. Wait that step's `host_event` (same event materialize
-        and the committer wait; record-once, wait-many) so a prefetch
-        cannot slice a half-written page. No `host_event` means either
-        eager (copy already done) or deferred (empty host falls through
-        to a sync D2H from the GPU freeze).
+        `_plan_rows` puts JOIN_NEXT_STEP owners in `join_tids` (join then
+        pool). This path reads committer-written `seg.host`, or the GPU
+        freeze if that D2H has not landed.
         """
         if task.host_event is not None:
             task.host_event.synchronize()
@@ -536,9 +529,6 @@ class OmniPrefixCacheController:
             pos += 1
         for si, items in seg_groups.items():
             seg = task.segments[si]
-            # Staging: host[k] is a view hung at save (waited above).
-            # Deferred: host[k] is set only after the committer D2H; else
-            # the GPU freeze. (`or` would bool() a Tensor and raise.)
             src = seg.host.get(key)
             if src is None:
                 src = seg.tensors.get(key)
@@ -558,9 +548,6 @@ class OmniPrefixCacheController:
     def _rows_single_segment(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
         """Map `slots` to rows in this task's one packed segment."""
         seg = task.segments[0]
-        # Staging: host[k] is a view hung at save (waited above).
-        # Deferred: host[k] is set only after the committer D2H; else
-        # the GPU freeze. (`or` would bool() a Tensor and raise.)
         src = seg.host.get(key)
         if src is None:
             src = seg.tensors.get(key)

@@ -45,7 +45,7 @@ import threading
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -70,9 +70,22 @@ from vllm_omni.core.prefix_cache.interface import (
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
+    from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
+
 logger = logging.getLogger(__name__)
 
-_ABSENT, _IN_TRANSIT, _COMMITTED = 0, 1, 2
+
+class _Occupancy(IntEnum):
+    ABSENT = 0
+    IN_TRANSIT = 1
+    COMMITTED = 2
+
+
+_ABSENT, _IN_TRANSIT, _COMMITTED = (
+    _Occupancy.ABSENT,
+    _Occupancy.IN_TRANSIT,
+    _Occupancy.COMMITTED,
+)
 
 
 class MmValueKind(Enum):
@@ -219,7 +232,7 @@ class OmniPrefixCacheManager:
     def __init__(
         self,
         config: PrefixCacheConfig,
-        view: Any,
+        view: FullAttentionGroupView,
         *,
         eager: bool | None = None,
     ):
@@ -505,8 +518,6 @@ class OmniPrefixCacheManager:
         source (task refs + masks, absent checks included) — the storage
         tier is NOT baked in. Unlocked: wait this step's `host_event`,
         clone the staging views (then drop the step holder), and merge.
-        In-transit hits go through fetch_host, which waits that task's
-        `host_event` (staging) or sync-D2Hs the GPU freeze (deferred).
         The engine thread never waits on this thread's PCIe.
         """
         ctx = None
@@ -953,10 +964,11 @@ class OmniPrefixCacheManager:
             # Same-step prefetch hits this before save registers the rows;
             # prefetch swallows it. materialize owns the fail-fast log.
             absent = slots[states == _ABSENT]
+            named = [_Occupancy(int(s)).name for s in states[:64].tolist()]
             raise OmniPrefixCacheUnmatchError(
                 f"hit span for req {req_id} key={key} hit_upto={hit_upto} "
                 f"resolved to {int((states == _ABSENT).sum())} absent slots "
-                f"(absent={absent[:32].tolist()}, states={states[:64].tolist()})"
+                f"(absent={absent[:32].tolist()}, states={named})"
             )
 
         return self._plan_rows(slots, key, strict, req_id, states)
