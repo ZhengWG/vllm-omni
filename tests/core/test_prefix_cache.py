@@ -607,7 +607,7 @@ def test_tenant_succession_mm_key():
 
 
 def test_slot_reuse_pushes_skip_to_old_task():
-    """Reassignment = task swap. Keep the old write in-transit so skip fires."""
+    """Reassignment = task swap. Keep the old write in-transit so remount records it."""
     mgr, view = make_manager()
 
     def register_only(task):
@@ -623,9 +623,9 @@ def test_slot_reuse_pushes_skip_to_old_task():
     old_tid = next(iter(mgr._req_tasks["a"]))
     old_task = mgr._controller.get_task(old_tid)
     s2 = run_step(mgr, view, {"b": ([2], 0, 2)}, mm={"k": torch.full((2, 2), 2.0)})
-    assert old_task is not None and "k" in old_task.skip
+    assert old_task is not None and "k" in old_task.reassigned
     reused = view.slots_for("b", 0, 1)
-    assert bool(torch.isin(reused, old_task.skip["k"]).all())
+    assert bool(torch.isin(reused, old_task.reassigned["k"]).all())
     mgr.materialize(s2, ["b"])
 
 
@@ -948,9 +948,8 @@ def test_save_releases_staging_if_commit_drained_writes_fails():
     mgr.materialize(sid, ["a"])
 
 
-def test_fetch_host_fast_path_matches_general_path():
-    """Single-segment fetch matches the general path for this-step identity,
-    a shorter prefix hit, and a gapped subsequence."""
+def test_fetch_host_maps_slots_across_layouts():
+    """Identity, prefix, gapped, and a two-segment gather."""
     from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
     from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController, WriteTask, _Segment
 
@@ -961,28 +960,37 @@ def test_fetch_host_fast_path_matches_general_path():
 
     slots = torch.tensor([40, 41, 42, 43, 44], dtype=torch.int64)
     rows = torch.arange(slots.numel() * HIDDEN, dtype=DTYPE).reshape(slots.numel(), HIDDEN)
-    task = WriteTask(
+
+    def _expect(want):
+        return torch.stack([rows[(slots == s).nonzero()[0, 0]] for s in want.tolist()])
+
+    one = WriteTask(
         tid=1,
         req_id="r",
         write_n=1,
-        schedule=WriteSchedule.JOIN_NEXT_STEP,
+        schedule=WriteSchedule.JOIN_ON_FINISH,
         segments=[_Segment(slots_cpu=slots, tensors={HIDDEN_KEY: rows})],
     )
-    ctrl.reserve(rows.numel() * rows.element_size())
-    ctrl.submit(task)
-
     for want in (slots, slots[:3], slots[[0, 1, 3, 4]]):
-        fast = ctrl.fetch_host(task, want, HIDDEN_KEY)
-        s2r = task.slot_to_row()
-        general = ctrl._rows_from(task, [s2r[int(s)] for s in want.tolist()], HIDDEN_KEY)
-        assert torch.equal(fast, general), (want, fast, general)
-        expect = torch.stack([rows[(slots == s).nonzero()[0, 0]] for s in want.tolist()])
-        assert torch.equal(fast, expect)
+        assert torch.equal(ctrl.fetch_host(one, want, HIDDEN_KEY), _expect(want))
+
+    two = WriteTask(
+        tid=2,
+        req_id="r",
+        write_n=2,
+        schedule=WriteSchedule.JOIN_ON_FINISH,
+        segments=[
+            _Segment(slots_cpu=slots[:3], tensors={HIDDEN_KEY: rows[:3]}),
+            _Segment(slots_cpu=slots[3:], tensors={HIDDEN_KEY: rows[3:]}),
+        ],
+    )
+    want = slots[[0, 3, 1, 4]]
+    assert torch.equal(ctrl.fetch_host(two, want, HIDDEN_KEY), _expect(want))
 
 
-def test_fetch_host_waits_staging_host_event():
+def test_fetch_host_waits_staging_step_d2h_event():
     """JOIN_NEXT_STEP hangs seg.host as a staging view; fetch_host waits
-    host_event before slicing. Production JOIN_NEXT_STEP hits join scatter
+    step_d2h_event before slicing. Production JOIN_NEXT_STEP hits join scatter
     instead; this is the unit-level wait contract for that branch."""
     from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
     from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController, WriteTask, _Segment
@@ -1012,7 +1020,7 @@ def test_fetch_host_waits_staging_host_event():
         schedule=WriteSchedule.JOIN_NEXT_STEP,
         segments=[seg],
         staging_slot=0,
-        host_event=event,
+        step_d2h_event=event,
     )
     rows = ctrl.fetch_host(task, slots, HIDDEN_KEY)
     assert event.n == 1

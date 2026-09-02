@@ -1,11 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""PrefixBlockPool: pinned CPU block mirror (mirrors vLLM BlockPool).
-
-Storage is (num_blocks, block_size, feat) per key, viewed flat as
-(num_slots, feat) so vLLM slot ids index rows directly. Write access is
-single-writer (the controller committer thread); readers take row views.
-"""
+"""Pinned CPU block mirror (mirrors vLLM BlockPool)."""
 
 import logging
 
@@ -17,6 +12,22 @@ logger = logging.getLogger(__name__)
 
 
 class PrefixBlockPool:
+    """Durable CPU mirror of vLLM KV slots, one slab per tensor name.
+
+    Storage is ``(num_blocks, block_size, feat)`` per key, viewed flat as
+    ``(num_slots, feat)`` so vLLM slot ids index rows directly. Write
+    access is single-writer (the controller committer thread); readers
+    take row views.
+
+    ``_caches`` is not an unbounded store and has no LRU. Dict keys are
+    tensor names (``__hidden_states__`` plus token-major mm fields),
+    opened once by ``ensure_key`` and never dropped — a model emits a
+    handful of those names, not a per-request set. Each value is a
+    fixed slab sized to the same ``num_blocks`` as the upstream KV
+    pool. Rows *are* those kv slots: when vLLM recycles a block, the
+    next scatter overwrites that row. Slot reuse is the eviction.
+    """
+
     def __init__(self, config: PrefixCacheConfig):
         self._config = config
         self._caches: dict[str, torch.Tensor] = {}

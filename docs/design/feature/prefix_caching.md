@@ -220,13 +220,13 @@ Threads, locks, and what each may block on:
 | Thread | Role | May block on | Must not hold while blocked |
 | --- | --- | --- | --- |
 | Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` cap flush | `_state_lock` |
-| Async output builder | `materialize` (may overlap the next engine step) | this step's `host_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
-| Committer | `_worker_loop`: wait D2H / deferred copy / scatter | `_wake.wait`; `host_event` or copy-stream sync | never takes `_state_lock` |
+| Async output builder | `materialize` (may overlap the next engine step) | this step's `step_d2h_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
+| Committer | `_worker_loop`: wait D2H / deferred copy / scatter | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
 | Prefetch pool | hit-span gather during forward | `join_host_ready`; deferred `fetch_host` | `_state_lock` |
 
 | Lock | Covers | Does not cover |
 | --- | --- | --- |
-| manager `_state_lock` | occupancy tables, step contexts, hit spans | join, cap flush, copy, `host_event` wait |
+| manager `_state_lock` | occupancy tables, step contexts, hit spans | join, cap flush, copy, `step_d2h_event` wait |
 | controller `_lock` / `_wake` | task registry, queues, GPU-freeze byte cap | D2H / scatter body (released before `synchronize`) |
 | `WriteTask.lock` | `skip`, `d2h_claimed`, `append_segment` | `host_ready` / `done` (those are events) |
 

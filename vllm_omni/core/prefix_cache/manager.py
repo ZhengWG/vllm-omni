@@ -20,7 +20,7 @@ Two write paths (schedule is the key split, not token count):
 
     JOIN_NEXT_STEP      immediately-cached keys. D2H is already in
                         flight at submit; the committer waits
-                        `host_event` then H2H-scatters. Joined at the
+                        `step_d2h_event` then H2H-scatters. Joined at the
                         next save (`host_ready` only).
     JOIN_ON_FINISH      deferred mm. Stays on the GPU freeze; the
                         committer does that D2H, then scatters.
@@ -450,13 +450,13 @@ class OmniPrefixCacheManager:
         self._raise_if_unconsumed_ctxs_at_capacity()
         staging_slot: int | None = None
         host_views: dict[str, torch.Tensor] | None = None
-        host_event = None
+        step_d2h_event = None
         step_holder = StagingBufferHolder.for_step(self._next_step_id)
         transferred = False
         bound_tids: list[int] = []
         try:
             if frozen_rows:
-                staging_slot, host_views, host_event = self._controller.stage_step_host(
+                staging_slot, host_views, step_d2h_event = self._controller.stage_step_host(
                     frozen_rows, num_tokens_unpadded, freeze_event, step_holder
                 )
 
@@ -474,10 +474,10 @@ class OmniPrefixCacheManager:
                         host_views,
                         freeze_event,
                         staging_slot,
-                        host_event,
+                        step_d2h_event,
                         bound_tids,
                     )
-                    d2h = _StepD2HClaim(slot=staging_slot, views=host_views, event=host_event)
+                    d2h = _StepD2HClaim(slot=staging_slot, views=host_views, event=step_d2h_event)
 
                 self._stage_deferred(deferred_segs, freeze_event)
 
@@ -516,7 +516,7 @@ class OmniPrefixCacheManager:
 
         Two phases: under the lock, drain completions and pin every row
         source (task refs + masks, absent checks included) — the storage
-        tier is NOT baked in. Unlocked: wait this step's `host_event`,
+        tier is NOT baked in. Unlocked: wait this step's `step_d2h_event`,
         clone the staging views (then drop the step holder), and merge.
         The engine thread never waits on this thread's PCIe.
         """
@@ -751,7 +751,7 @@ class OmniPrefixCacheManager:
         host_views: dict[str, torch.Tensor],
         freeze_event,
         staging_slot: int,
-        host_event,
+        step_d2h_event,
         bound_tids: list[int],
     ) -> None:
         """One queued WriteTask per request (locked phase).
@@ -779,7 +779,7 @@ class OmniPrefixCacheManager:
                 segments=[seg],
                 freeze_event=freeze_event,
                 staging_slot=staging_slot,
-                host_event=host_event,
+                step_d2h_event=step_d2h_event,
             )
             self._map_slots(slots_cpu[start:end], tid, req_rows.keys())
             # Bind before submit: the slot must never be holder-free
@@ -795,14 +795,9 @@ class OmniPrefixCacheManager:
         reserved by save_outputs)."""
         for req_id, seg in segs:
             task = self._deferred_tasks.get(req_id)
-            if task is not None and not self._controller.append_segment(task, seg):
+            if task is not None and not self._controller.append_segment(task, seg, freeze_event):
                 # Entry closed under us (cap flush / escalation): start a new one.
                 task = None
-            if task is not None and freeze_event is not None:
-                # Events on one compute stream are ordered: the newest freeze
-                # event also covers every earlier segment's clone, so the
-                # background copy never races this step's in-flight D2D.
-                task.freeze_event = freeze_event
             if task is None:
                 task = WriteTask(
                     tid=self._alloc_task_id(),
@@ -857,7 +852,7 @@ class OmniPrefixCacheManager:
                 for old in {int(o) for o in cur[stale].tolist()}:
                     old_task = self._controller.get_task(old)
                     if old_task is not None:
-                        old_task.add_skip(key, slots[stale & (cur == old)])
+                        old_task.add_reassigned(key, slots[stale & (cur == old)])
             state[slots] = _IN_TRANSIT
             owner[slots] = tid
         prev = self._task_slots.get(tid)
