@@ -1614,7 +1614,7 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
 
         Plain-text path: builds ``[tts, text, tokens, audio]``.
         Voice-clone path: encodes reference audio, applies delay pattern,
-        builds ``[tts, (ref_text, tokens,) ref_audio, -100xN, text, tokens, audio]``.
+        builds ``[tts, (ref_text, tokens,) ref_audio, ref_audio x N, text, tokens, audio]``.
         """
         adapter = await self._resolve_higgs_audio_v3_adapter()
 
