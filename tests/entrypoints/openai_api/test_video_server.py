@@ -190,6 +190,49 @@ class BlockingVideoHandler:
         del request_id
 
 
+class HangingAbortHandler(BlockingVideoHandler):
+    """Engine abort never returns; DELETE must time out and still cancel."""
+
+    async def abort_request(self, request_id):
+        del request_id
+        await asyncio.sleep(30)
+
+
+class CompletingDuringAbortHandler(BlockingVideoHandler):
+    """Finishes and persists output while DELETE is still awaiting abort."""
+
+    def __init__(self):
+        super().__init__()
+        self._finish = asyncio.Event()
+
+    async def generate_video_bytes(
+        self,
+        request,
+        reference_id,
+        *,
+        reference_image=None,
+        reference_video=None,
+        reference_audio=None,
+        on_started=None,
+    ):
+        del request, reference_image, reference_video, reference_audio
+        if on_started is not None:
+            await on_started()
+        self.started.set()
+        await self._finish.wait()
+        return b"late-complete", {}, 0.0, None
+
+    async def abort_request(self, request_id):
+        self._finish.set()
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            job = await api_server.VIDEO_STORE.get(request_id)
+            if job is not None and job.status is VideoGenerationStatus.COMPLETED and job.file_name is not None:
+                return
+            await asyncio.sleep(0.01)
+        raise RuntimeError(f"video job {request_id} did not complete during abort")
+
+
 class SchedulerQueuedVideoHandler(BlockingVideoHandler):
     """Parks after engine submission but before scheduler admission."""
 
@@ -1957,6 +2000,38 @@ def test_async_video_stays_queued_until_scheduler_admission(test_client):
     assert in_progress.json()["status"] == VideoGenerationStatus.IN_PROGRESS.value
 
     assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
+
+
+def test_delete_times_out_engine_abort_and_still_cancels(test_client, monkeypatch):
+    monkeypatch.setattr(api_server, "VIDEO_ABORT_TIMEOUT_S", 0.05)
+    handler = HangingAbortHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Hang abort"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert handler.started.wait(timeout=2.0)
+
+    started = time.monotonic()
+    delete_resp = test_client.delete(f"/v1/videos/{video_id}")
+    assert time.monotonic() - started < 2.0
+    assert delete_resp.status_code == 200
+    assert handler.cancelled.wait(timeout=2.0)
+
+
+def test_delete_removes_artifact_if_job_completes_during_abort(test_client):
+    handler = CompletingDuringAbortHandler()
+    test_client.app.state.openai_serving_video = handler
+
+    create_resp = test_client.post("/v1/videos", data={"prompt": "Complete during delete"})
+    assert create_resp.status_code == 200
+    video_id = create_resp.json()["id"]
+    assert handler.started.wait(timeout=2.0)
+
+    assert test_client.delete(f"/v1/videos/{video_id}").status_code == 200
+    file_path = os.path.join(api_server.STORAGE_MANAGER.storage_path, video_id)
+    assert not os.path.exists(file_path)
+    assert asyncio.run(api_server.VIDEO_STORE.get(video_id)) is None
 
 
 def test_delete_aborts_engine_request_before_cancelling_task(test_client):

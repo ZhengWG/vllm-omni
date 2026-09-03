@@ -38,7 +38,8 @@ def get_fake_add_request(submitted_request_ids, submitted_lora_requests=None):
 
 
 def get_fake_abort(aborted_request_batches):
-    async def fake_abort_async(request_ids):
+    async def fake_abort_async(request_ids, timeout=None):
+        del timeout
         aborted_request_batches.append(list(request_ids))
 
     return fake_abort_async
@@ -196,8 +197,8 @@ def test_abort_keeps_request_states_until_generate_cleanup():
         release = asyncio.Event()
         seen_during_wait: list[int] = []
 
-        async def slow_abort_async(request_ids):
-            del request_ids
+        async def slow_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             seen_during_wait.append(len(omni.request_states))
             await release.wait()
 
@@ -224,8 +225,8 @@ def test_abort_keeps_request_states_until_generate_cleanup():
 @pytest.mark.cpu
 def test_abort_propagates_engine_errors_without_popping_state():
     async def run():
-        async def failing_abort_async(request_ids):
-            del request_ids
+        async def failing_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             raise RuntimeError("orchestrator abort failed")
 
         omni = get_async_omni_instance(fake_abort_request=failing_abort_async)
@@ -253,7 +254,8 @@ def test_abort_enqueues_prefix_tokens_from_engine():
 
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def abort_with_prefix(request_ids):
+        async def abort_with_prefix(request_ids, timeout=None):
+            del timeout
             rid = request_ids[0]
             engine_output = OmniRequestOutput(
                 request_id=rid,
@@ -308,8 +310,8 @@ def test_abort_enqueues_synthetic_finished_when_engine_returns_empty():
     async def run():
         queue: asyncio.Queue = asyncio.Queue()
 
-        async def empty_abort_async(request_ids):
-            del request_ids
+        async def empty_abort_async(request_ids, timeout=None):
+            del request_ids, timeout
             return []
 
         omni = get_async_omni_instance(fake_abort_request=empty_abort_async)

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -184,7 +185,12 @@ class OmniOpenAIServingVideo:
 
     async def abort_request(self, request_id: str) -> None:
         abort = getattr(self._engine_client, "abort", None)
-        if callable(abort):
+        if not callable(abort):
+            return
+        timeout = float(os.environ.get("VLLM_OMNI_VIDEO_ABORT_TIMEOUT", 2.0))
+        try:
+            await abort(request_id, timeout=timeout)
+        except TypeError:
             await abort(request_id)
 
     async def _run_and_extract(

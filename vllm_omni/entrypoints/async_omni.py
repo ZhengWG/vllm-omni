@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 """
 AsyncOmni - Refactored async orchestrator using AsyncOmniEngine.
 
@@ -1125,14 +1128,14 @@ class AsyncOmni(EngineClient, OmniBase):
             return all(bool(item) for item in result)
         return bool(result)
 
-    async def abort(self, request_id: str | Iterable[str]) -> None:
+    async def abort(self, request_id: str | Iterable[str], *, timeout: float | None = None) -> None:
         """Abort request(s) via the Orchestrator."""
         request_ids = [request_id] if isinstance(request_id, str) else list(request_id)
         # Map the external user request IDs to internal IDs used by the Orchestrator.
         # NOTE: If the user request_id matches multiple requests, all of them will be
         # aborted. This is also what happens in this case in vLLM's output processor.
         internal_ids = [s.request_id for s in self.request_states.values() if s.external_request_id in request_ids]
-        await self._abort(internal_ids)
+        await self._abort(internal_ids, timeout=timeout)
 
     async def submit_interaction_async(
         self,
@@ -1183,7 +1186,7 @@ class AsyncOmni(EngineClient, OmniBase):
         internal_req_ids = [rid for rid in request_ids if rid in self.request_states]
         await self._abort(internal_req_ids)
 
-    async def _abort(self, request_ids: list[str]) -> None:
+    async def _abort(self, request_ids: list[str], *, timeout: float | None = None) -> None:
         """Abort request IDs via the engine and enqueue terminal abort outputs.
 
         Waits for orchestrator abort acknowledgment, enqueues any AR terminal
@@ -1196,7 +1199,7 @@ class AsyncOmni(EngineClient, OmniBase):
         registered yet, unbound replica, or orchestrator id drop), enqueue a
         synthetic finished abort so ``generate()`` cannot hang on ``queue.get``.
         """
-        abort_outputs = await self.engine.abort_async(request_ids) or []
+        abort_outputs = await self.engine.abort_async(request_ids, timeout=timeout) or []
         delivered: set[str] = set()
         for output_msg in abort_outputs:
             req_id = getattr(output_msg, "request_id", None)
