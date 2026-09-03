@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 from __future__ import annotations
 
 import asyncio
@@ -51,7 +54,7 @@ def client(mock_engine):
     with patch.object(InlineStageDiffusionClient, "_enrich_config"):
         od_config = MagicMock(spec=OmniDiffusionConfig)
         od_config.streaming_output = False
-        c = InlineStageDiffusionClient(model="test_model", od_config=od_config, metadata=metadata, batch_size=1)
+        c = InlineStageDiffusionClient(model="test_model", od_config=od_config, metadata=metadata)
         yield c
         c.shutdown()
 
@@ -275,5 +278,4 @@ def test_inline_client_requires_replica_id(mock_engine):
                 model="test_model",
                 od_config=od_config,
                 metadata=metadata,
-                batch_size=1,
             )
