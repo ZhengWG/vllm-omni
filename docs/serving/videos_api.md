@@ -107,6 +107,10 @@ curl -L "http://localhost:8091/v1/videos/${video_id}/content" -o output.mp4
 The final content is available from `/v1/videos/{video_id}/content` after the
 job status becomes `completed`.
 
+`queued` means the request is still waiting for diffusion scheduler admission.
+The status changes to `in_progress` when the scheduler first selects the
+request for execution.
+
 ### Synchronous Response
 
 `POST /v1/videos/sync` blocks until generation finishes and returns raw video
