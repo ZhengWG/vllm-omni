@@ -105,7 +105,7 @@ from vllm_omni.config.endpoint_policy import (
     shutdown_unsupported_routes,
 )
 from vllm_omni.diffusion.models.interface import ReferenceVideoDecodeSpec
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.batch_serving import OmniOpenAIServingChatBatch
 from vllm_omni.entrypoints.openai.duplex_capability import should_enable_duplex_endpoint
 from vllm_omni.entrypoints.openai.errors import InvalidInputReferenceError
@@ -3042,7 +3042,7 @@ async def _run_video_generation_job(
 
 
 VIDEO_SYNC_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_SYNC_TIMEOUT", 600.0))
-VIDEO_ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_VIDEO_ABORT_TIMEOUT", 2.0))
+VIDEO_ABORT_TIMEOUT_S = ABORT_TIMEOUT_S
 
 
 async def _persist_uploaded_video_references(uploads: list[UploadFile]) -> list[str]:
@@ -3694,7 +3694,8 @@ async def delete_video(video_id: str, raw_request: Request) -> VideoDeleteRespon
         if task is not None:
             task.cancel()
             try:
-                await asyncio.wait_for(task, timeout=2.0)
+                # Cancel cleanup may spend a full abort budget; +2s covers scheduling slack.
+                await asyncio.wait_for(task, timeout=VIDEO_ABORT_TIMEOUT_S + 2.0)
             except asyncio.TimeoutError:
                 raise HTTPException(status_code=409, detail="Cancellation in progress. Please try again later.")
             except asyncio.CancelledError:

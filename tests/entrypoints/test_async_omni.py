@@ -12,6 +12,7 @@ from vllm.sampling_params import RequestOutputKind, SamplingParams
 from tests.helpers.mark import hardware_test
 from tests.helpers.stage_config import get_deploy_config_path
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
+from vllm_omni.entrypoints import async_omni as async_omni_mod
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -381,8 +382,9 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
 
 @pytest.mark.cpu
-def test_generate_cancel_bounds_cleanup_abort():
+def test_generate_cancel_bounds_cleanup_abort(monkeypatch):
     """Cancelled generate() must not wait forever on a wedged orchestrator abort."""
+    monkeypatch.setattr(async_omni_mod, "ABORT_TIMEOUT_S", 0.05)
 
     async def run():
         seen_timeouts: list[float | None] = []
@@ -390,9 +392,7 @@ def test_generate_cancel_bounds_cleanup_abort():
         async def hanging_abort_async(request_ids, timeout=None):
             del request_ids
             seen_timeouts.append(timeout)
-            if timeout is None:
-                await asyncio.Event().wait()
-            raise TimeoutError("abort timed out")
+            await asyncio.Event().wait()
 
         omni = get_async_omni_instance(fake_abort_request=hanging_abort_async)
 
@@ -411,7 +411,7 @@ def test_generate_cancel_bounds_cleanup_abort():
         with pytest.raises(asyncio.CancelledError):
             await asyncio.wait_for(task, timeout=1.0)
         assert seen_timeouts
-        assert seen_timeouts[-1] is not None
+        assert seen_timeouts[-1] == 0.05
         assert omni.request_states == {}
 
     asyncio.run(run())

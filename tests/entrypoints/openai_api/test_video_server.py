@@ -102,6 +102,9 @@ class FakeAsyncOmni:
         videos = [object() for _ in range(num_outputs)]
         yield MockVideoResult(videos)
 
+    async def abort(self, request_id, *, timeout=None):
+        del request_id, timeout
+
 
 def test_raw_and_base64_encoders_receive_persistent_converter(mocker: MockerFixture):
     engine = FakeAsyncOmni()
@@ -280,7 +283,8 @@ class AbortTrackingOmni(FakeAsyncOmni):
         )
         await asyncio.Future()
 
-    async def abort(self, request_id):
+    async def abort(self, request_id, *, timeout=None):
+        assert timeout is not None
         self.aborted.append(request_id)
 
 

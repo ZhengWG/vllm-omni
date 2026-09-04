@@ -112,10 +112,10 @@ The status changes to `in_progress` when the scheduler first selects the
 request for execution.
 
 `DELETE /v1/videos/{video_id}` issues a bounded engine abort
-(`VLLM_OMNI_VIDEO_ABORT_TIMEOUT`, default 2s), then cancels the frontend
-task. Task-cancellation cleanup also uses a bounded orchestrator abort
-so a wedged engine cannot strand the job. The job is then re-read so a
-completed save is not orphaned.
+(`VLLM_OMNI_ABORT_TIMEOUT`, default 2s), then cancels the frontend
+task. Cancellation cleanup is also bounded and best-effort: it confirms
+the abort was queued, and the current request batch may still drain.
+The job is then re-read so a completed save is not orphaned.
 
 ### Synchronous Response
 

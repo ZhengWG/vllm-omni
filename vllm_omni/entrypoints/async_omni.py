@@ -11,6 +11,7 @@ StageEngineCoreClient instances) instead of OmniStage with worker processes.
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping, Sequence
@@ -61,8 +62,8 @@ _FINAL_OUTPUT_IDLE_SLEEP_S = 0.001
 # the janus queue's condition variable; this timeout only bounds how often the
 # orchestrator liveness check runs while the pipeline is idle.
 _FINAL_OUTPUT_BLOCKING_WAIT_S = 1.0
-# generate() cancel/error cleanup must not wait forever on a wedged orchestrator.
-_ABORT_CLEANUP_TIMEOUT_S = 2.0
+# Shared DELETE / generate() cleanup abort bound. Env is the documented knob.
+ABORT_TIMEOUT_S = float(os.environ.get("VLLM_OMNI_ABORT_TIMEOUT", 2.0))
 
 
 class AsyncEventResolver:
@@ -671,12 +672,12 @@ class AsyncOmni(EngineClient, OmniBase):
 
         except (asyncio.CancelledError, GeneratorExit):
             self._record_request_failure_once(request_id, reason="client_disconnect")
-            await self._abort_internal_requests(request_id, timeout=_ABORT_CLEANUP_TIMEOUT_S)
+            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} aborted.")
             raise
         except Exception as e:
             self._record_request_failure_once(request_id, reason="stage_error")
-            await self._abort_internal_requests(request_id, timeout=_ABORT_CLEANUP_TIMEOUT_S)
+            await self._abort_internal_requests(request_id, timeout=ABORT_TIMEOUT_S)
             logger.info(f"[AsyncOmni] Request {request_id} failed (input error): {e}")
             raise
         finally:
@@ -1183,7 +1184,7 @@ class AsyncOmni(EngineClient, OmniBase):
         self,
         request_id: str | Iterable[str],
         *,
-        timeout: float | None = None,
+        timeout: float = ABORT_TIMEOUT_S,
     ):
         """Abort request(s) via the Orchestrator given internal request IDs,
         which take the format <external_request_id>-<UUID>.
@@ -1192,7 +1193,8 @@ class AsyncOmni(EngineClient, OmniBase):
         # Request IDs are already internal, so we just need to get the matching states.
         internal_req_ids = [rid for rid in request_ids if rid in self.request_states]
         try:
-            await self._abort(internal_req_ids, timeout=timeout)
+            # Unbind generate() if abort_async blocks in the executor.
+            await asyncio.wait_for(self._abort(internal_req_ids, timeout=timeout), timeout=timeout)
         except TimeoutError:
             logger.warning(
                 "[AsyncOmni] Timed out aborting %s after %.1fs; "

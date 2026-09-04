@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import copy
-import os
 import time
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
@@ -20,7 +19,7 @@ from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import is_diffusion_request_started_output
 from vllm_omni.diffusion.model_metadata import get_diffusion_model_metadata
-from vllm_omni.entrypoints.async_omni import AsyncOmni
+from vllm_omni.entrypoints.async_omni import ABORT_TIMEOUT_S, AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.videos import (
     VideoAction,
     VideoData,
@@ -184,14 +183,7 @@ class OmniOpenAIServingVideo:
         self._video_frame_converter.shutdown()
 
     async def abort_request(self, request_id: str) -> None:
-        abort = getattr(self._engine_client, "abort", None)
-        if not callable(abort):
-            return
-        timeout = float(os.environ.get("VLLM_OMNI_VIDEO_ABORT_TIMEOUT", 2.0))
-        try:
-            await abort(request_id, timeout=timeout)
-        except TypeError:
-            await abort(request_id)
+        await self._engine_client.abort(request_id, timeout=ABORT_TIMEOUT_S)
 
     async def _run_and_extract(
         self,
