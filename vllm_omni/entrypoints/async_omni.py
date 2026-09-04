@@ -1266,11 +1266,20 @@ class AsyncOmni(EngineClient, OmniBase):
         return await self.collective_rpc(method="profile", args=(False, None), stage_ids=stages)
 
     async def reset_mm_cache(self) -> None:
-        """Reset the multi-modal cache for all stages.
+        """Reset the frontend multimodal processor cache.
 
-        TODO: Forward to Orchestrator process via message.
+        ``EngineCore.sleep(level>=1)`` already clears the engine-side copy.
+        The live frontend cache hangs off the renderer, not
+        ``input_processor.mm_processor_cache`` (that attribute does not exist).
+        Clearing via ``renderer.clear_mm_cache_async()`` keeps hash-only
+        follow-up requests from finishing empty after sleep/wake.
         """
-        logger.warning("[AsyncOmni] reset_mm_cache not yet supported with Orchestrator process")
+        processor = getattr(self, "input_processor", None)
+        renderer = getattr(processor, "renderer", None) if processor is not None else None
+        clear = getattr(renderer, "clear_mm_cache_async", None) if renderer is not None else None
+        if not callable(clear):
+            return
+        await clear()
 
     async def reset_encoder_cache(self) -> None:
         """Reset the encoder cache for all stages.
