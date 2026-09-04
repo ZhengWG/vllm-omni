@@ -308,3 +308,31 @@ def test_pause_then_sleep_wake_keeps_admission_paused_for_diffusion():
         assert omni._paused is False
 
     asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_mm_cache_clears_renderer():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        clear = AsyncMock()
+        omni.input_processor = SimpleNamespace(renderer=SimpleNamespace(clear_mm_cache_async=clear))
+        await omni.reset_mm_cache()
+        clear.assert_awaited_once()
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
+def test_reset_mm_cache_noops_without_renderer():
+    async def run() -> None:
+        omni = _make_omni(stage_types=["llm"])
+        omni.input_processor = None
+        await omni.reset_mm_cache()
+
+        omni.input_processor = SimpleNamespace(renderer=None)
+        await omni.reset_mm_cache()
+
+        omni.input_processor = SimpleNamespace(renderer=SimpleNamespace())
+        await omni.reset_mm_cache()
+
+    asyncio.run(run())
