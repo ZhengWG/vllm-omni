@@ -381,6 +381,43 @@ def test_generate_accepts_request_after_repeated_cancellations():
 
 
 @pytest.mark.cpu
+def test_generate_cancel_bounds_cleanup_abort():
+    """Cancelled generate() must not wait forever on a wedged orchestrator abort."""
+
+    async def run():
+        seen_timeouts: list[float | None] = []
+
+        async def hanging_abort_async(request_ids, timeout=None):
+            del request_ids
+            seen_timeouts.append(timeout)
+            if timeout is None:
+                await asyncio.Event().wait()
+            raise TimeoutError("abort timed out")
+
+        omni = get_async_omni_instance(fake_abort_request=hanging_abort_async)
+
+        async def collect():
+            async for _ in omni.generate(
+                prompt={"prompt": "prompt"},
+                request_id="cancel-hang-abort",
+                sampling_params_list=[SimpleNamespace()],
+                output_modalities=["image"],
+            ):
+                pass
+
+        task = asyncio.create_task(collect())
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=1.0)
+        assert seen_timeouts
+        assert seen_timeouts[-1] is not None
+        assert omni.request_states == {}
+
+    asyncio.run(run())
+
+
+@pytest.mark.cpu
 def test_generate_cancellation_converges_after_engine_shutdown_starts(mocker):
     async def run_test():
         submitted_request_ids: list[str] = []
