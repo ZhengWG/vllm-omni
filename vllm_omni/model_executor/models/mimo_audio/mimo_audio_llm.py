@@ -543,6 +543,10 @@ class MiMoAudioLLMForConditionalGeneration(nn.Module, SupportsMultiModal, Suppor
             # hf_config=thinker_config.text_config,
             architectures=["Qwen2ForCausalLM"],
         )
+        # vLLM 0.28 load_model requires SupportsPP models to expose this hook.
+        # The stage wrapper copies it from this inner LLM; without the bind,
+        # engine-core startup fails with AttributeError during model load.
+        self.make_empty_intermediate_tensors = self.model.make_empty_intermediate_tensors
 
         # vLLM 0.28 turned SupportsPP.make_empty_intermediate_tensors from a
         # method into a bare annotation, so declaring SupportsPP no longer
