@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 """Unified data-plane communication mixin for Model Runners.
 
 All connector.put()/get() calls are consolidated here. Background I/O
@@ -289,6 +289,12 @@ class OmniConnectorModelRunnerMixin:
         saves is added to ``_deferred_send_cleanup`` so the bg save's
         decrement path drains it without leaving orphans.
         """
+        conn = getattr(self, "_omni_connector", None)
+        if conn is not None and getattr(conn, "request_scoped_cleanup", False):
+            try:
+                conn.cleanup(req_id)
+            except Exception:
+                logger.debug("connector cleanup failed for %s", req_id, exc_info=True)
         # Force-flush any pending full-payload accumulator entry before
         # cleanup proceeds.  Without this, finished requests with no
         # downstream consumer (e.g. text-only on multi-modal arch) leave

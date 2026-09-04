@@ -118,7 +118,13 @@ connectors:
 | Connector class          | Use case                                                              | `extra` keys                                                                                                      |
 |--------------------------|-----------------------------------------------------------------------|-------------------------------------------------------------------------------------------------------------------|
 | `SharedMemoryConnector`  | Same-host KV transfer between stages (default for bundled YAMLs).     | None. All payloads use shared memory.                                                                             |
+| `TorchIpcConnector`      | *(Experimental)* Same-host GPU-direct edge: listed payload tensors move device-to-device via torch CUDA IPC on dedicated transfer streams; everything else is a plain shared-memory payload (wire-compatible with `SharedMemoryConnector` in both directions). Endpoint devices must coincide or have peer access. | `gpu_tensor_keys` (payload key roots or dotted keys the downstream stage consumes on GPU), `local_device` (receiver device, default `auto`). |
 | `MooncakeStoreConnector` | Cross-host KV transfer over TCP. Required for multi-node deployments. | `host`, `metadata_server`, `master`, `segment` (int bytes), `localbuf` (int bytes), `proto` (`"tcp"` / `"rdma"`). |
+
+Because `TorchIpcConnector` payloads without CUDA tensors are plain
+shared-memory payloads, it interoperates with `SharedMemoryConnector` peers
+per edge; see `vllm_omni/deploy/qwen3_omni_moe_torch_ipc.yaml` for a profile
+that enables the GPU plane on one edge only.
 
 A stage references a connector by name in its `input_connectors` / `output_connectors`:
 

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 # Copyright 2025 The Qwen team.
 """Stage input processor for Qwen3 Omni MoE: Thinker → Talker transition."""
 
@@ -20,6 +20,11 @@ from vllm_omni.data_entry_keys import (
     OmniPayload,
     OmniPayloadStruct,
     to_dict,
+)
+from vllm_omni.distributed.omni_connectors.connectors.gpu_placement import (
+    connector_gpu_keys,
+    gpu_key_matches,
+    place_payload_tensor,
 )
 from vllm_omni.engine import OmniEngineCoreRequest
 from vllm_omni.inputs.data import OmniTokensPrompt
@@ -109,12 +114,13 @@ def _ensure_list(x):
     return list(x)
 
 
-def _as_tensor_or_none(value: Any) -> torch.Tensor | None:
+def _as_tensor_or_none(value: Any, keep_on_gpu: bool = False) -> torch.Tensor | None:
+    tensor: torch.Tensor | None = None
     if isinstance(value, torch.Tensor):
-        return value.detach().cpu()
-    if isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
-        return value[0].detach().cpu()
-    return None
+        tensor = value
+    elif isinstance(value, list) and value and isinstance(value[0], torch.Tensor):
+        tensor = value[0]
+    return place_payload_tensor(tensor, keep_on_gpu)
 
 
 def _is_valid_qwen3_codec_token_id(token_id: Any) -> bool:
@@ -267,6 +273,7 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     thinker_emb,
     thinker_hid,
     transfer_manager,
+    gpu_keys: "frozenset[str] | None" = None,
 ) -> OmniPayloadStruct | None:
     """Build Thinker -> Talker payloads for realtime streaming input chunks.
 
@@ -283,8 +290,8 @@ def _construct_thinker2talker_streaming_input_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
     finished = torch.tensor(is_finished, dtype=torch.bool)
-    emb_cpu = thinker_emb.detach().cpu()
-    hid_cpu = thinker_hid.detach().cpu()
+    emb_cpu = place_payload_tensor(thinker_emb, gpu_key_matches("embed.prefill", gpu_keys))
+    hid_cpu = place_payload_tensor(thinker_hid, gpu_key_matches("hidden_states.output", gpu_keys))
 
     if output_token_ids:
         if thinker_emb.shape[0] > 1:
@@ -467,20 +474,26 @@ def thinker2talker_async_chunk(
     speaker = extract_speaker_from_request(request)
     language = extract_language_from_request(request)
 
-    def _maybe_cpu(t: Any) -> torch.Tensor | None:
-        return t.detach().cpu() if isinstance(t, torch.Tensor) else None
+    # Send-edge GPU placement policy: a GPU-direct output connector keeps
+    # listed payload keys on device (see gpu_placement module).
+    _gpu_keys = connector_gpu_keys(getattr(transfer_manager, "connector", None))
+
+    def _place(t: Any, key: str) -> torch.Tensor | None:
+        if not isinstance(t, torch.Tensor):
+            return None
+        return place_payload_tensor(t, gpu_key_matches(key, _gpu_keys))
 
     if chunk_id == 0:
         all_token_ids = _ensure_list(request.all_token_ids)
         prompt_token_ids = _ensure_list(request.prompt_token_ids)
         payload = OmniPayloadStruct(
             embed=EmbeddingsStruct(
-                prefill=thinker_emb.detach().cpu(),
-                tts_bos=_maybe_cpu(thinker_embed.get("tts_bos")),
-                tts_eos=_maybe_cpu(thinker_embed.get("tts_eos")),
-                tts_pad=_maybe_cpu(thinker_embed.get("tts_pad")),
+                prefill=_place(thinker_emb, "embed.prefill"),
+                tts_bos=_place(thinker_embed.get("tts_bos"), "embed.tts_bos"),
+                tts_eos=_place(thinker_embed.get("tts_eos"), "embed.tts_eos"),
+                tts_pad=_place(thinker_embed.get("tts_pad"), "embed.tts_pad"),
             ),
-            hidden_states=HiddenStatesStruct(output=thinker_hid.detach().cpu()),
+            hidden_states=HiddenStatesStruct(output=_place(thinker_hid, "hidden_states.output")),
             ids=IdsStruct(all=all_token_ids, prompt=prompt_token_ids),
             meta=MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool)),
             speaker=speaker,
@@ -505,7 +518,7 @@ def thinker2talker_async_chunk(
     else:
         if request.resumable:
             return _construct_thinker2talker_streaming_input_async_chunk(
-                is_finished, request, thinker_emb, thinker_hid, transfer_manager
+                is_finished, request, thinker_emb, thinker_hid, transfer_manager, gpu_keys=_gpu_keys
             )
         if thinker_emb.shape[0] > 1:
             logger.warning(
@@ -520,7 +533,7 @@ def thinker2talker_async_chunk(
         meta = MetaStruct(finished=torch.tensor(is_finished, dtype=torch.bool))
         payload = OmniPayloadStruct(
             meta=meta,
-            embed=EmbeddingsStruct(decode=thinker_emb.detach().cpu()),
+            embed=EmbeddingsStruct(decode=_place(thinker_emb, "embed.decode")),
             speaker=speaker,
             language=language,
         )
@@ -593,14 +606,25 @@ def thinker2talker_full_payload(
         )
         return None
 
+    # Send-edge GPU placement policy for the terminal full payload.
+    _gpu_keys = connector_gpu_keys(getattr(transfer_manager, "connector", None))
+
     payload: OmniPayload = {
         "embed": {
-            "prefill": thinker_emb_prefill.detach().cpu(),
-            "tts_bos": _as_tensor_or_none(pooling_output.get("embed.tts_bos")),
-            "tts_eos": _as_tensor_or_none(pooling_output.get("embed.tts_eos")),
-            "tts_pad": _as_tensor_or_none(pooling_output.get("embed.tts_pad")),
+            "prefill": place_payload_tensor(thinker_emb_prefill, gpu_key_matches("embed.prefill", _gpu_keys)),
+            "tts_bos": _as_tensor_or_none(
+                pooling_output.get("embed.tts_bos"), gpu_key_matches("embed.tts_bos", _gpu_keys)
+            ),
+            "tts_eos": _as_tensor_or_none(
+                pooling_output.get("embed.tts_eos"), gpu_key_matches("embed.tts_eos", _gpu_keys)
+            ),
+            "tts_pad": _as_tensor_or_none(
+                pooling_output.get("embed.tts_pad"), gpu_key_matches("embed.tts_pad", _gpu_keys)
+            ),
         },
-        "hidden_states": {"output": thinker_hid_prefill.detach().cpu()},
+        "hidden_states": {
+            "output": place_payload_tensor(thinker_hid_prefill, gpu_key_matches("hidden_states.output", _gpu_keys))
+        },
         "ids": {"all": list(all_token_ids), "prompt": list(prompt_token_ids)},
         "meta": {"finished": torch.tensor(True, dtype=torch.bool)},
     }

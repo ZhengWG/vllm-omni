@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 from .connectors.base import OmniConnectorBase
 from .connectors.mooncake_store_connector import MooncakeStoreConnector
 from .connectors.shm_connector import SharedMemoryConnector
+from .connectors.torch_ipc_connector import TorchIpcConnector
 from .connectors.yuanrong_connector import YuanrongConnector
 
 try:
@@ -51,6 +52,7 @@ __all__ = [
     "MooncakeTransferEngineConnector",
     "MoriTransferEngineConnector",
     "SharedMemoryConnector",
+    "TorchIpcConnector",
     "YuanrongConnector",
     "YuanrongTransferEngineConnector",
     # Utilities

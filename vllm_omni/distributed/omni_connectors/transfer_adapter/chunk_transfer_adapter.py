@@ -818,6 +818,15 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         self._discard_from_chunk_deque(self.waiting_for_chunk_running_requests, request_id)
         self._discard_from_chunk_deque(self._held_non_active, request_id)
 
+        # request_scoped_cleanup is opt-in: only connectors holding
+        # per-request receive-side resources (e.g. pending IPC views)
+        # participate.
+        try:
+            if self.connector is not None and getattr(self.connector, "request_scoped_cleanup", False):
+                self.connector.cleanup(request_id)
+        except Exception:
+            logger.warning("connector cleanup failed for %s", request_id, exc_info=True)
+
         self._cancelled_load_reqs.add(request_id)
         self._finished_load_reqs.discard(request_id)
         self._waiting_since.pop(request_id, None)

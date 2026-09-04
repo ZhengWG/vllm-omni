@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
 import os
 from collections.abc import Callable
@@ -114,6 +114,12 @@ def _create_mooncake_transfer_engine_connector(config: dict[str, Any]) -> OmniCo
     return MooncakeTransferEngineConnector(config)
 
 
+def _create_torch_ipc_connector(config: dict[str, Any]) -> OmniConnectorBase:
+    from .connectors.torch_ipc_connector import TorchIpcConnector
+
+    return TorchIpcConnector(config)
+
+
 def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnectorBase:
     try:
         from .connectors.mori_transfer_engine_connector import MoriTransferEngineConnector
@@ -129,6 +135,7 @@ def _create_mori_transfer_engine_connector(config: dict[str, Any]) -> OmniConnec
 OmniConnectorFactory.register_connector("MooncakeStoreConnector", _create_mooncake_store_connector)
 OmniConnectorFactory.register_connector("MooncakeTransferEngineConnector", _create_mooncake_transfer_engine_connector)
 OmniConnectorFactory.register_connector("SharedMemoryConnector", _create_shm_connector)
+OmniConnectorFactory.register_connector("TorchIpcConnector", _create_torch_ipc_connector)
 OmniConnectorFactory.register_connector("YuanrongConnector", _create_yuanrong_connector)
 OmniConnectorFactory.register_connector("YuanrongTransferEngineConnector", _create_yuanrong_transfer_engine_connector)
 OmniConnectorFactory.register_connector("MoriTransferEngineConnector", _create_mori_transfer_engine_connector)

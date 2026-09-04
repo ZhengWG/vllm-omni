@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+
 import pytest
 import torch
 
@@ -52,7 +55,7 @@ def test_build_mm_cpu_d2h_count_grows_per_request(num_requests, mocker):
     K tensors makes ``call_count == K`` true by construction, since build_mm_cpu
     is a loop over items. Only the per-request list can move this number.
     """
-    spy = mocker.spy(mm_outputs_mod, "_to_cpu")
+    spy = mocker.spy(mm_outputs_mod, "_detach_tensor")
 
     result = build_mm_cpu(multimodal_outputs=make_talker_passthrough_payload(num_requests))
 
@@ -105,7 +108,7 @@ def test_build_mm_cpu_moves_a_gpu_payload_off_the_device():
 
 
 def test_build_mm_cpu_empty_input_is_a_noop(mocker):
-    spy = mocker.spy(mm_outputs_mod, "_to_cpu")
+    spy = mocker.spy(mm_outputs_mod, "_detach_tensor")
 
     assert build_mm_cpu(multimodal_outputs={}) == {}
     spy.assert_not_called()
