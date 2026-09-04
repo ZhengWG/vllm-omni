@@ -83,6 +83,7 @@ class TestHiggsAudioV3Config:
         assert config.tts_token_id is None
         assert config.text_token_id is None
         assert config.audio_continuation_id is None
+        assert config.ref_audio_token_id is None
 
     def test_hidden_size_from_text_config(self):
         from vllm_omni.transformers_utils.configs.higgs_audio_v3 import (
@@ -1544,6 +1545,116 @@ class TestPromptBuilder:
         # Should not contain ref_audio or ref_text token IDs
         assert 151703 not in ids  # <|ref_audio|>
         assert 151704 not in ids  # <|ref_text|>
+
+    def test_voice_clone_prompt_ids_are_in_vocab(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        tok = self._make_mock_tokenizer()
+        adapter = HiggsAudioV3TokenizerAdapter(tok)
+        num_ref_tokens = 4
+        ids = adapter.build_prompt("Hello world", num_ref_tokens=num_ref_tokens)
+        assert all(t >= 0 for t in ids)
+        assert -100 not in ids
+        assert ids[0] == 151700  # <|tts|>
+        assert ids[1] == 151703  # boundary <|ref_audio|>
+        assert ids.count(151703) == 1 + num_ref_tokens
+        assert ids[-1] == 151702  # <|audio|>
+
+    def test_voice_clone_with_ref_text_prompt_ids_are_in_vocab(self):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_tokenizer import (
+            HiggsAudioV3TokenizerAdapter,
+        )
+
+        tok = self._make_mock_tokenizer()
+        adapter = HiggsAudioV3TokenizerAdapter(tok)
+        num_ref_tokens = 3
+        ids = adapter.build_prompt(
+            "Hello",
+            num_ref_tokens=num_ref_tokens,
+            reference_text="speaker transcript here",
+        )
+        assert all(t >= 0 for t in ids)
+        assert -100 not in ids
+        assert ids[0] == 151700  # <|tts|>
+        assert ids[1] == 151704  # <|ref_text|>
+        assert ids.count(151703) == 1 + num_ref_tokens
+        assert ids[-1] == 151702  # <|audio|>
+
+
+class TestRefAudioPlaceholderMask:
+    def _make_talker(self, ref_audio_id: int | None = 151703):
+        from vllm_omni.model_executor.models.higgs_audio_v3.higgs_audio_v3_talker import (
+            HiggsAudioV3TalkerForConditionalGeneration,
+        )
+
+        talker = HiggsAudioV3TalkerForConditionalGeneration.__new__(
+            HiggsAudioV3TalkerForConditionalGeneration
+        )
+        talker._ref_audio_id = ref_audio_id
+        return talker
+
+    def test_skips_leading_ref_audio_marker(self):
+        talker = self._make_talker(151703)
+        ids = torch.tensor([151700, 151703, 151703, 151703, 100, 200])
+        mask = talker._ref_audio_placeholder_mask(ids)
+        assert mask.tolist() == [False, False, True, True, False, False]
+
+    def test_leftover_negative_placeholders_without_skip(self):
+        talker = self._make_talker(151703)
+        ids = torch.tensor([151700, 151703, -100, -100, 100])
+        mask = talker._ref_audio_placeholder_mask(ids)
+        assert mask.tolist() == [False, False, True, True, False]
+
+    def test_no_ref_id_only_matches_negative(self):
+        talker = self._make_talker(None)
+        ids = torch.tensor([151700, 151703, -100, 151703])
+        mask = talker._ref_audio_placeholder_mask(ids)
+        assert mask.tolist() == [False, False, True, False]
+
+    def test_apply_substitution_skips_boundary_token(self):
+        talker = self._make_talker(151703)
+        hidden = torch.ones(6, 4)
+        input_ids = torch.tensor([151700, 151703, 151703, 151703, 100, 200])
+        codes = torch.zeros(2, 8, dtype=torch.long)
+        talker.multimodal_embedding = lambda c: torch.full((c.shape[0], 4), 7.0)
+        talker._last_step_query_start_loc = torch.tensor([0, 6])
+        info_dicts = [
+            {
+                "audio_input_ids": codes,
+                "audio_input_ids_mask": torch.ones(2, dtype=torch.bool),
+            }
+        ]
+
+        out = talker._apply_ref_audio_substitution(hidden, input_ids, info_dicts)
+        # Boundary <|ref_audio|> at index 1 keeps the original embedding.
+        assert torch.equal(out[0], torch.ones(4))
+        assert torch.equal(out[1], torch.ones(4))
+        assert torch.equal(out[2], torch.full((4,), 7.0))
+        assert torch.equal(out[3], torch.full((4,), 7.0))
+        assert torch.equal(out[4], torch.ones(4))
+        assert torch.equal(out[5], torch.ones(4))
+
+    def test_resolve_token_ids_reads_ref_audio_from_config(self):
+        talker = self._make_talker(None)
+        talker._audio_continuation_id = None
+        talker._eos_token_id = None
+        talker._resolved_tokens = False
+        talker.config = type(
+            "C",
+            (),
+            {
+                "audio_continuation_id": 151702,
+                "eos_token_id": 151643,
+                "ref_audio_token_id": 151703,
+            },
+        )()
+        talker.vllm_config = type("V", (), {"model_config": type("M", (), {"model": None})()})()
+        talker._resolve_token_ids()
+        assert talker._audio_continuation_id == 151702
+        assert talker._ref_audio_id == 151703
+        assert talker._eos_token_id == 151643
 
 
 class TestVoiceCloneReferenceCache:

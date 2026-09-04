@@ -180,6 +180,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         # marker during audio generation (equivalent to v2's audio_token_id).
         self._audio_continuation_id: int | None = None
         self._eos_token_id: int | None = None
+        # Voice-clone boundary / in-vocab placeholder id (<|ref_audio|>).
+        self._ref_audio_id: int | None = None
         self._resolved_tokens = False
 
         self._last_logits_hidden: torch.Tensor | None = None
@@ -291,7 +293,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             )
 
     def _resolve_token_ids(self) -> None:
-        """Resolve <|audio|> and eos token IDs.
+        """Resolve <|audio|>, <|ref_audio|>, and eos token IDs.
 
         Prefers config's pre-resolved IDs (from ``resolve_special_tokens()``),
         falls back to loading the HF tokenizer directly.
@@ -303,20 +305,27 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         # Try config first (populated by resolve_special_tokens or from_pretrained)
         cfg_audio = getattr(self.config, "audio_continuation_id", None)
         cfg_eos = getattr(self.config, "eos_token_id", None)
+        cfg_ref = getattr(self.config, "ref_audio_token_id", None)
         if cfg_audio is not None:
             self._audio_continuation_id = int(cfg_audio)
         if cfg_eos is not None:
             self._eos_token_id = int(cfg_eos)
+        if cfg_ref is not None:
+            self._ref_audio_id = int(cfg_ref)
 
-        if self._audio_continuation_id is not None:
+        missing_audio = self._audio_continuation_id is None
+        missing_ref = self._ref_audio_id is None
+        if not missing_audio and not missing_ref:
             logger.info(
-                "Resolved v3 token IDs from config: audio_continuation=%s, eos=%s",
+                "Resolved v3 token IDs from config: audio_continuation=%s, ref_audio=%s, eos=%s",
                 self._audio_continuation_id,
+                self._ref_audio_id,
                 self._eos_token_id,
             )
             return
 
-        # Fallback: load tokenizer directly
+        # Fallback: load tokenizer to fill any IDs still missing (including
+        # <|ref_audio|> when the config only had audio_continuation_id).
         model_path = getattr(self.vllm_config.model_config, "model", None)
         if model_path is None:
             return
@@ -325,13 +334,16 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
 
             tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
             vocab = dict(tokenizer.get_added_vocab())
-            if "<|audio|>" in vocab:
+            if missing_audio and "<|audio|>" in vocab:
                 self._audio_continuation_id = vocab["<|audio|>"]
-            if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
+            if missing_ref and "<|ref_audio|>" in vocab:
+                self._ref_audio_id = vocab["<|ref_audio|>"]
+            if cfg_eos is None and hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
                 self._eos_token_id = int(tokenizer.eos_token_id)
             logger.info(
-                "Resolved v3 token IDs from tokenizer: audio_continuation=%s, eos=%s",
+                "Resolved v3 token IDs from tokenizer: audio_continuation=%s, ref_audio=%s, eos=%s",
                 self._audio_continuation_id,
+                self._ref_audio_id,
                 self._eos_token_id,
             )
         except Exception as exc:
@@ -502,7 +514,8 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
                 and not self._is_single_token_decode_step(int(hidden_states.shape[0]))
             )
         if is_prefill and info_dicts:
-            # Voice clone: replace -100 placeholder positions with ref audio embeddings
+            # Voice clone: replace in-vocab (or leftover -100) placeholder
+            # positions with fused ref-audio embeddings.
             hidden_states = self._apply_ref_audio_substitution(hidden_states, input_ids, info_dicts)
 
         # Audio feedback at decode: replace continuation token embeddings
@@ -640,14 +653,33 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         self._last_step_query_start_loc = buf[:numel]
 
     # ------------------------------------------------------------------ ref audio substitution
+    def _ref_audio_placeholder_mask(self, ids_i: torch.Tensor) -> torch.Tensor:
+        """True at voice-clone fill positions, not the leading <|ref_audio|> marker.
+
+        Prompts repeat the in-vocab ``<|ref_audio|>`` id as fillers so vLLM's
+        vocab check accepts them. The first match in the request span is the
+        boundary token and must keep its embedding. Leftover ``-100`` ids from
+        older prompts are treated as fillers without skipping.
+        """
+        matches = ids_i == -100
+        ref_id = getattr(self, "_ref_audio_id", None)
+        if ref_id is not None and int(ref_id) >= 0:
+            ref_matches = ids_i == int(ref_id)
+            if bool(ref_matches.any()):
+                first = int(ref_matches.nonzero(as_tuple=True)[0][0].item())
+                ref_matches = ref_matches.clone()
+                ref_matches[first] = False
+            matches = matches | ref_matches
+        return matches
+
     def _apply_ref_audio_substitution(
         self,
         hidden_states: torch.Tensor,
         input_ids: torch.Tensor,
         info_dicts: list[dict[str, Any]] | None,
     ) -> torch.Tensor:
-        """Replace -100 placeholder positions with fused multi-codebook embeddings
-        of the delay-pattern-encoded reference audio codes.
+        """Replace voice-clone placeholder positions with fused multi-codebook
+        embeddings of the delay-pattern-encoded reference audio codes.
 
         Called at prefill to inject voice clone reference. ``info_dicts`` is a
         list of per-request dicts from ``model_intermediate_buffer``, each
@@ -657,10 +689,11 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
         if not info_dicts:
             return hidden_states
 
-        PLACEHOLDER = -100
         flat_ids = input_ids.reshape(-1)
-        placeholder_mask = flat_ids == PLACEHOLDER
-        if not placeholder_mask.any():
+        leftover_mask = flat_ids == -100
+        ref_id = getattr(self, "_ref_audio_id", None)
+        has_ref = ref_id is not None and int(ref_id) >= 0 and bool((flat_ids == int(ref_id)).any())
+        if not bool(leftover_mask.any()) and not has_ref:
             return hidden_states
 
         # Use query_start_loc to map placeholders to per-request spans
@@ -710,7 +743,7 @@ class HiggsAudioV3TalkerForConditionalGeneration(nn.Module):
             if e - s <= 1:
                 continue  # Decode step, skip
 
-            span_mask = placeholder_mask[s:e]
+            span_mask = self._ref_audio_placeholder_mask(flat_ids[s:e])
             placeholders = span_mask.nonzero(as_tuple=True)[0]
             n_codes = int(codes.shape[0])
 

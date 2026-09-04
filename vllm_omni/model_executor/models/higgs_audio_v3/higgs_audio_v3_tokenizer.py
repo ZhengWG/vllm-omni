@@ -6,12 +6,14 @@ Prompt formats:
   Zero-shot:
     <|tts|> <|text|> {text tokens} <|audio|>
   Voice clone (no ref text):
-    <|tts|> <|ref_audio|> [-100]×N <|text|> {text tokens} <|audio|>
+    <|tts|> <|ref_audio|> <|ref_audio|>×N <|text|> {text tokens} <|audio|>
   Voice clone (with ref text):
-    <|tts|> <|ref_text|> {ref text tokens} <|ref_audio|> [-100]×N <|text|> {text tokens} <|audio|>
+    <|tts|> <|ref_text|> {ref text tokens} <|ref_audio|> <|ref_audio|>×N <|text|> {text tokens} <|audio|>
 
--100 placeholders are replaced at prefill time with fused multi-codebook
-embeddings of the delay-pattern-encoded reference audio codes.
+The first <|ref_audio|> is the boundary marker. The following N copies are
+in-vocab fillers so vLLM's add_request vocab check accepts the prompt. The
+talker skips the first occurrence and replaces the rest at prefill with fused
+multi-codebook embeddings of the delay-pattern-encoded reference audio codes.
 """
 
 from __future__ import annotations
@@ -127,7 +129,11 @@ class HiggsAudioV3TokenizerAdapter:
             if self.ref_audio_id is None:
                 raise ValueError("Tokenizer missing <|ref_audio|> for voice clone")
             ids.append(self.ref_audio_id)
-            ids.extend([AUDIO_PLACEHOLDER_ID] * num_ref_tokens)
+            # Repeat <|ref_audio|> as in-vocab fillers. Negative ids such as
+            # AUDIO_PLACEHOLDER_ID (-100) fail vLLM vocab checks at add_request,
+            # before the talker can rewrite them. The talker skips the first
+            # occurrence (this boundary marker) and substitutes the rest.
+            ids.extend([self.ref_audio_id] * num_ref_tokens)
 
         ids.append(self.text_id)
         ids.extend(self._tok.encode(text, add_special_tokens=False))

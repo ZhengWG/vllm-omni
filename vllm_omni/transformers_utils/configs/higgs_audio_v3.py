@@ -3,9 +3,10 @@
 """Configuration class for higgs-audio v3 (HiggsMultimodalQwen3) in vllm-omni.
 
 ``HiggsAudioV3Config.from_pretrained(model_path)`` returns a config with
-``tts_token_id``, ``text_token_id``, ``audio_continuation_id``, and
-``eos_token_id`` already resolved from the checkpoint tokenizer. If the
-tokenizer is unavailable or missing required specials, the load raises.
+``tts_token_id``, ``text_token_id``, ``audio_continuation_id``,
+``ref_audio_token_id``, and ``eos_token_id`` already resolved from the
+checkpoint tokenizer. If the tokenizer is unavailable or missing required
+specials, the load raises.
 """
 
 from __future__ import annotations
@@ -72,7 +73,8 @@ class HiggsAudioV3Config(PretrainedConfig):
     """Typed config for higgs-audio v3 (HiggsMultimodalQwen3).
 
     ``from_pretrained()`` automatically resolves ``<|tts|>``, ``<|text|>``,
-    ``<|audio|>`` and ``eos_token_id`` from the checkpoint tokenizer.
+    ``<|audio|>``, ``<|ref_audio|>`` and ``eos_token_id`` from the checkpoint
+    tokenizer.
     """
 
     model_type: str = "higgs_multimodal_qwen3"
@@ -93,6 +95,7 @@ class HiggsAudioV3Config(PretrainedConfig):
         tts_token_id: int | None = None,
         text_token_id: int | None = None,
         audio_continuation_id: int | None = None,
+        ref_audio_token_id: int | None = None,
         enable_flashinfer_api_unwrap: bool = True,
         enable_mlp_cudagraph: bool = True,
         **kwargs: Any,
@@ -129,6 +132,7 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.tts_token_id = tts_token_id
         self.text_token_id = text_token_id
         self.audio_continuation_id = audio_continuation_id
+        self.ref_audio_token_id = ref_audio_token_id
         self.enable_flashinfer_api_unwrap = bool(enable_flashinfer_api_unwrap)
         self.enable_mlp_cudagraph = bool(enable_mlp_cudagraph)
 
@@ -160,10 +164,11 @@ class HiggsAudioV3Config(PretrainedConfig):
         return self.text_config.hidden_size
 
     def resolve_special_tokens(self, model_path: str) -> None:
-        """Resolve <|tts|>, <|text|>, <|audio|> and eos from the HF tokenizer.
+        """Resolve <|tts|>, <|text|>, <|audio|>, <|ref_audio|> and eos from the HF tokenizer.
 
         Raises ``ValueError`` if any of the 3 required specials is missing
-        from the tokenizer's added vocabulary.
+        from the tokenizer's added vocabulary. ``<|ref_audio|>`` is optional
+        (zero-shot TTS does not need it) and is left unset when absent.
         """
         from transformers import AutoTokenizer
 
@@ -181,6 +186,8 @@ class HiggsAudioV3Config(PretrainedConfig):
         self.tts_token_id = vocab["<|tts|>"]
         self.text_token_id = vocab["<|text|>"]
         self.audio_continuation_id = vocab["<|audio|>"]
+        if "<|ref_audio|>" in vocab:
+            self.ref_audio_token_id = vocab["<|ref_audio|>"]
 
         if hasattr(tokenizer, "eos_token_id") and tokenizer.eos_token_id is not None:
             self.eos_token_id = int(tokenizer.eos_token_id)
