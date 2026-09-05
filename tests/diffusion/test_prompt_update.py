@@ -506,8 +506,8 @@ class TestPromptUpdateIntegration:
         def is_alive(self) -> bool:
             return self._fixture.thread.is_alive()
 
-        async def abort_async(self, request_ids: list[str]) -> None:
-            del request_ids
+        async def abort_async(self, request_ids: list[str], timeout: float | None = None) -> None:
+            del request_ids, timeout
 
     class _PromptUpdateEngine:
         """DiffusionEngine stand-in that streams chunks and routes prompt_update to a runner."""

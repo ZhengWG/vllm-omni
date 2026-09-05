@@ -1523,6 +1523,18 @@ class OmniDiffusionConfig:
         return instance
 
 
+DIFFUSION_REQUEST_LIFECYCLE_KEY = "_diffusion_request_lifecycle"
+DIFFUSION_REQUEST_STARTED = "started"
+
+
+def is_diffusion_request_started_output(output: Any) -> bool:
+    custom_output = getattr(output, "custom_output", None)
+    return (
+        isinstance(custom_output, dict)
+        and custom_output.get(DIFFUSION_REQUEST_LIFECYCLE_KEY) == DIFFUSION_REQUEST_STARTED
+    )
+
+
 @dataclass
 class DiffusionOutput:
     """
@@ -1570,6 +1582,9 @@ class DiffusionOutput:
     # the output is shipped across process boundaries (e.g. step-execution
     # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
+
+    # Internal control-plane event emitted on first scheduler admission.
+    request_started: bool = False
 
     def __post_init__(self) -> None:
         if not self.to_cpu:

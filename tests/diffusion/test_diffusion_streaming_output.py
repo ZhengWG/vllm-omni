@@ -409,8 +409,8 @@ class TestPipelineStreamingOutputToEntrypoint:
         def is_alive(self) -> bool:
             return self._fixture.thread.is_alive()
 
-        async def abort_async(self, request_ids: list[str]) -> None:
-            del request_ids
+        async def abort_async(self, request_ids: list[str], timeout: float | None = None) -> None:
+            del request_ids, timeout
 
     @classmethod
     def _make_inline_pipeline_client(cls, pipeline: _StepStreamingPipeline) -> InlineStageDiffusionClient:
