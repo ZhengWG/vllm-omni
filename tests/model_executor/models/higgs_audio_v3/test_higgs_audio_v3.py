@@ -10,6 +10,7 @@ without requiring the actual checkpoint or GPU.
 import asyncio
 import json
 import os
+import threading
 import time
 from collections import OrderedDict, defaultdict
 from types import SimpleNamespace
@@ -1660,4 +1661,74 @@ class TestVoiceCloneReferenceCache:
         assert calls == 1
         assert cache_hit is True
         assert inflight_wait is False
+        assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
+
+    def test_higgs_v3_ref_code_inflight_survives_request_cancel(self):
+        from vllm_omni.entrypoints.openai.serving_speech import OmniOpenAIServingSpeech
+
+        serving = object.__new__(OmniOpenAIServingSpeech)
+        serving._higgs_audio_v3_ref_code_cache = OrderedDict()
+        serving._higgs_audio_v3_ref_code_cache_bytes = 0
+        serving._higgs_audio_v3_ref_code_inflight = {}
+        calls = 0
+        started = threading.Event()
+        release = threading.Event()
+
+        def encode_reference_audio(_wav, _sr):
+            nonlocal calls
+            calls += 1
+            started.set()
+            assert release.wait(timeout=2.0)
+            return torch.arange(16, dtype=torch.long).reshape(2, 8)
+
+        def apply_delay_pattern(codes):
+            return codes + 1
+
+        async def run():
+            creator = asyncio.create_task(
+                serving._resolve_higgs_audio_v3_ref_codes(
+                    "ref-a",
+                    object(),
+                    24000,
+                    encode_reference_audio,
+                    apply_delay_pattern,
+                )
+            )
+            await asyncio.to_thread(started.wait, 2.0)
+            waiter1 = asyncio.create_task(
+                serving._resolve_higgs_audio_v3_ref_codes(
+                    "ref-a",
+                    object(),
+                    24000,
+                    encode_reference_audio,
+                    apply_delay_pattern,
+                )
+            )
+            waiter2 = asyncio.create_task(
+                serving._resolve_higgs_audio_v3_ref_codes(
+                    "ref-a",
+                    object(),
+                    24000,
+                    encode_reference_audio,
+                    apply_delay_pattern,
+                )
+            )
+            await asyncio.sleep(0.05)
+            waiter1.cancel()
+            creator.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter1
+            with pytest.raises(asyncio.CancelledError):
+                await creator
+            release.set()
+            return await waiter2
+
+        codes, cache_hit, inflight_wait = asyncio.run(run())
+        assert calls == 1
+        assert cache_hit is False
+        assert inflight_wait is True
+        assert torch.equal(codes, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)
+        assert "ref-a" not in serving._higgs_audio_v3_ref_code_inflight
+        cached = serving._get_higgs_audio_v3_ref_codes("ref-a")
+        assert cached is not None
         assert torch.equal(cached, torch.arange(16, dtype=torch.long).reshape(2, 8) + 1)

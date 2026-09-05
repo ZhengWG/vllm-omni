@@ -1711,23 +1711,27 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
             return apply_delay_pattern(ref_codes_raw), False, False
 
         task = self._higgs_audio_v3_ref_code_inflight.get(artifact_key)
-        if task is not None:
-            return (await task).clone(), False, True
+        inflight_wait = task is not None
+        if task is None:
 
-        async def _encode_and_cache() -> torch.Tensor:
-            ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, sr)
-            delayed = apply_delay_pattern(ref_codes_raw)
-            self._put_higgs_audio_v3_ref_codes(artifact_key, delayed)
-            cached = self._get_higgs_audio_v3_ref_codes(artifact_key)
-            return cached if cached is not None else delayed.detach().to("cpu", dtype=torch.long).contiguous()
+            async def _encode_and_cache() -> torch.Tensor:
+                try:
+                    ref_codes_raw = await asyncio.to_thread(encode_reference_audio, wav, sr)
+                    delayed = apply_delay_pattern(ref_codes_raw)
+                    self._put_higgs_audio_v3_ref_codes(artifact_key, delayed)
+                    cached = self._get_higgs_audio_v3_ref_codes(artifact_key)
+                    return cached if cached is not None else delayed.detach().to("cpu", dtype=torch.long).contiguous()
+                finally:
+                    if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is asyncio.current_task():
+                        self._higgs_audio_v3_ref_code_inflight.pop(artifact_key, None)
 
-        task = asyncio.create_task(_encode_and_cache())
-        self._higgs_audio_v3_ref_code_inflight[artifact_key] = task
-        try:
-            return (await task).clone(), False, False
-        finally:
-            if self._higgs_audio_v3_ref_code_inflight.get(artifact_key) is task:
-                self._higgs_audio_v3_ref_code_inflight.pop(artifact_key, None)
+            task = asyncio.create_task(_encode_and_cache())
+            self._higgs_audio_v3_ref_code_inflight[artifact_key] = task
+
+        # Shield so cancelling one request cannot cancel the shared encode
+        # (asyncio cancellation of `await task` propagates to `task`).
+        codes = await asyncio.shield(task)
+        return codes.clone(), False, inflight_wait
 
     def _get_higgs_audio_v3_ref_codes(self, artifact_key: str | None) -> torch.Tensor | None:
         if not artifact_key:
