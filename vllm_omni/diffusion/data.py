@@ -631,10 +631,14 @@ def resolve_model_class_name(
     """
     from vllm.transformers_utils.config import get_hf_file_to_dict
 
-    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+    from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index, resolve_native_diffusion_model_class
 
     if not model:
         return None
+    native_model_class = resolve_native_diffusion_model_class(model)
+    if native_model_class is not None:
+        return native_model_class
+
     is_lance_subfolder = os.path.basename(str(model).rstrip("/")) in {"Lance_3B", "Lance_3B_Video"}
 
     # Diffusers models: read _class_name from the pipeline index. Missing
@@ -1332,7 +1336,10 @@ class OmniDiffusionConfig:
         """
         from vllm.transformers_utils.config import get_hf_file_to_dict
 
-        from vllm_omni.diffusion.utils.hf_utils import get_diffusion_model_index
+        from vllm_omni.diffusion.utils.hf_utils import (
+            get_diffusion_model_index,
+            resolve_native_diffusion_model_class,
+        )
 
         assert self.model is not None
         try:
@@ -1398,6 +1405,12 @@ class OmniDiffusionConfig:
             else:
                 cfg = get_hf_file_to_dict("config.json", self.model, revision=self.revision)
                 if cfg is None:
+                    native_model_class = resolve_native_diffusion_model_class(self.model)
+                    if native_model_class is not None:
+                        self.model_class_name = native_model_class
+                        self.set_tf_model_config(TransformerConfig())
+                        self.update_multimodal_support()
+                        return
                     # Lance ships its top-level config.json one directory above
                     # the per-checkpoint subfolders (``Lance_3B/`` or
                     # ``Lance_3B_Video/``).  Try to recover that case before
@@ -1510,6 +1523,18 @@ class OmniDiffusionConfig:
         return instance
 
 
+DIFFUSION_REQUEST_LIFECYCLE_KEY = "_diffusion_request_lifecycle"
+DIFFUSION_REQUEST_STARTED = "started"
+
+
+def is_diffusion_request_started_output(output: Any) -> bool:
+    custom_output = getattr(output, "custom_output", None)
+    return (
+        isinstance(custom_output, dict)
+        and custom_output.get(DIFFUSION_REQUEST_LIFECYCLE_KEY) == DIFFUSION_REQUEST_STARTED
+    )
+
+
 @dataclass
 class DiffusionOutput:
     """
@@ -1557,6 +1582,9 @@ class DiffusionOutput:
     # the output is shipped across process boundaries (e.g. step-execution
     # mode) and the receiving side must not initialise a stray CUDA context.
     to_cpu: bool = False
+
+    # Internal control-plane event emitted on first scheduler admission.
+    request_started: bool = False
 
     def __post_init__(self) -> None:
         if not self.to_cpu:
