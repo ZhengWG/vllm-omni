@@ -45,14 +45,13 @@ already in the next step. Warmup/dummy runs are never fed.
 
 from __future__ import annotations
 
-import logging
 import threading
 from collections import deque
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
 
 import torch
 
@@ -84,8 +83,6 @@ if TYPE_CHECKING:
 
     from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
 
-logger = logging.getLogger(__name__)
-
 
 class _Occupancy(IntEnum):
     ABSENT = 0
@@ -100,6 +97,10 @@ def _is_step_token_tensor(val: Any, n: int, padded: int) -> bool:
     lists, and other shapes are False.
     """
     return isinstance(val, torch.Tensor) and val.ndim >= 2 and int(val.shape[0]) in (n, padded)
+
+
+def _raise_unreadable_hit(req_id: str, key: str, why: str) -> NoReturn:
+    raise OmniPrefixCacheUnmatchError(f"hit span for req {req_id} key={key} is not readable ({why})")
 
 
 def _snapshot_leftover_mm_cpu(
@@ -422,7 +423,12 @@ class OmniPrefixCacheManager:
                     raise OmniPrefixCacheUnmatchError(
                         f"prefix hit for req {req_id} ({num_computed} tokens) carries no block_ids"
                     )
-                hit_blocks = list(blocks[: num_computed // self._config.block_size])
+                bs = self._config.block_size
+                if num_computed % bs != 0:
+                    raise OmniPrefixCacheUnmatchError(
+                        f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
+                    )
+                hit_blocks = list(blocks[: num_computed // bs])
                 self._hit_spans[req_id] = (num_computed, hit_blocks)
 
         # 4. Gather those spans on the prefetch thread; overlaps this forward.
@@ -611,24 +617,20 @@ class OmniPrefixCacheManager:
                 cached_keys = ctx.cached_keys
 
                 hit_sources: dict[tuple[str, str], _SlotRef | Future] = {}
-                try:
-                    for req_id in req_ids:
-                        hit = ctx.hits.get(req_id)
-                        if not hit:
+                for req_id in req_ids:
+                    hit = ctx.hits.get(req_id)
+                    if not hit:
+                        continue
+                    hit_upto, hit_blocks = hit
+                    prefetched = ctx.hit_prefetch.get(req_id, {})
+                    slots = self._get_hit_slots(hit_upto, hit_blocks)
+                    keys = self._policy.get_hit_keys(cached_keys)
+                    for key in keys:
+                        fut = prefetched.get(key)
+                        if fut is not None:
+                            hit_sources[(req_id, key)] = fut
                             continue
-                        hit_upto, hit_blocks = hit
-                        prefetched = ctx.hit_prefetch.get(req_id, {})
-                        slots = self._get_hit_slots(req_id, hit_upto, hit_blocks)
-                        keys = self._policy.get_hit_keys(cached_keys)
-                        for key in keys:
-                            fut = prefetched.get(key)
-                            if fut is not None:
-                                hit_sources[(req_id, key)] = fut
-                                continue
-                            hit_sources[(req_id, key)] = self._slot_ref(slots, key, req_id)
-                except Exception:
-                    logger.critical("omni prefix cache unmatch during materialize", exc_info=True)
-                    raise
+                        hit_sources[(req_id, key)] = self._slot_ref(slots, key, req_id)
 
             # ---- unlocked: data movement + merge ----
             current: dict[str, torch.Tensor] = {}
@@ -702,12 +704,12 @@ class OmniPrefixCacheManager:
         keys = self._policy.get_hit_keys(self._pool.keys())
         for req_id, (hit_upto, hit_blocks) in self._hit_spans.items():
             n_new = int(self._cur_num_scheduled.get(req_id, 0))
-            slots = self._get_hit_slots(req_id, hit_upto, hit_blocks)
+            slots = self._get_hit_slots(hit_upto, hit_blocks)
             futs: dict[str, Future] = {}
             for key in keys:
                 try:
                     src = self._slot_ref(slots, key, req_id)
-                except (OmniPrefixCacheUnmatchError, KeyError):
+                except OmniPrefixCacheUnmatchError:
                     continue
                 fut = self._prefetch_pool.submit(self._prefetch_hit, src, n_new)
                 self._prefetch_queue.append((fut, src))
@@ -764,7 +766,6 @@ class OmniPrefixCacheManager:
         """
         self._commit_drained_writes()
         if device_snapshot:
-            assert slots_cpu is not None and d2h_claim is not None
             self._submit_step_writes(
                 req_order,
                 query_start,
@@ -1029,15 +1030,11 @@ class OmniPrefixCacheManager:
 
     # -------------------------------------------------- slot ref / fetch
 
-    def _get_hit_slots(self, req_id: str, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
-        """Prefix-hit block ids → KV slot ids. No table access; does not
-        require ``_state_lock``.
+    def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
+        """Prefix-hit block ids → KV slot ids. Alignment is checked at
+        ``new_step_starts``. Does not require ``_state_lock``.
         """
         bs = self._config.block_size
-        assert hit_upto % bs == 0, (
-            f"prefix hit not block aligned (req={req_id}, hit_upto={hit_upto}, block_size={bs}); "
-            "vLLM invariant violated"
-        )
         block_ids = torch.tensor(hit_blocks, dtype=torch.int64)
         return (block_ids.unsqueeze(1) * bs + torch.arange(bs)).reshape(-1)[:hit_upto]
 
@@ -1050,7 +1047,7 @@ class OmniPrefixCacheManager:
         fetch). JOIN_ON_FINISH tasks stay as refs for fetch_host.
 
         Hidden rejects any ABSENT hole (prefetch swallows; materialize
-        logs). Other keys only need a source — holes fall to the mirror.
+        fail-fasts). Other keys only need a source — holes fall to the mirror.
         """
         status = self._slot_status.get_slot_status(key)
         states = status.state[slots]
@@ -1062,9 +1059,7 @@ class OmniPrefixCacheManager:
         for tid in {int(t) for t in tids[staged_mask].tolist()}:
             task = self._controller.get_task(tid) if tid != 0 else None
             if task is None:
-                raise OmniPrefixCacheUnmatchError(
-                    f"(slot, {key}) rows of req {req_id} are in-transit but entry {tid} cannot serve them"
-                )
+                _raise_unreadable_hit(req_id, key, f"in-transit entry {tid} cannot serve them")
             if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
                 join_tids.append(task.tid)
             else:
@@ -1075,11 +1070,7 @@ class OmniPrefixCacheManager:
         if is_hidden_key(key):
             n_abs = int((states == _Occupancy.ABSENT).sum())
             if n_abs or not has_source:
-                raise OmniPrefixCacheUnmatchError(
-                    f"hit span for req {req_id} key={key} is not readable ({n_abs} absent slots)"
-                )
-        elif not has_source:
-            raise KeyError(f"key {key} has no cache mirror")
+                _raise_unreadable_hit(req_id, key, f"{n_abs} absent slots")
         return _SlotRef(
             slots=slots,
             key=key,
@@ -1097,9 +1088,6 @@ class OmniPrefixCacheManager:
         ``done``, drain, read the pool. Deferred: pool rows already
         scattered, overlay ``fetch_host`` on the in-transit mask.
         """
-        assert not (src.join_tids and src.staged_list), (
-            f"{src.key}: JOIN_NEXT_STEP and JOIN_ON_FINISH in-transit on the same span"
-        )
         # For JOIN_NEXT_STEP, wait `done`, drain, read the pool
         if src.join_tids:
             self._controller.join(src.join_tids)
@@ -1119,15 +1107,18 @@ class OmniPrefixCacheManager:
             try:
                 rows = self._controller.fetch_host(task, src.slots[mask], src.key)
             except KeyError:
-                raise OmniPrefixCacheUnmatchError(
-                    f"(slot, {src.key}) rows of req {src.req_id} are staged in entry "
-                    f"{task.tid} (req {task.req_id}, write_n {task.write_n}) but the task cannot serve them"
-                ) from None
+                _raise_unreadable_hit(
+                    src.req_id,
+                    src.key,
+                    f"entry {task.tid} (req {task.req_id}, write_n {task.write_n}) cannot serve them",
+                )
             if out is None:
                 out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
             out[mask] = rows
             in_transit = mask if in_transit is None else in_transit | mask
         self._ensure_not_reassigned(src.slots, src.key, in_transit_mask=in_transit, req_id=src.req_id)
+        if out is None:
+            _raise_unreadable_hit(src.req_id, src.key, "no source")
         return out
 
     def _ensure_not_reassigned(
@@ -1149,10 +1140,7 @@ class OmniPrefixCacheManager:
             if in_transit_mask is not None:
                 violated &= ~in_transit_mask
             if bool(violated.any()):
-                raise OmniPrefixCacheUnmatchError(
-                    f"(slot, {key}) rows of req {req_id} were reassigned to a new entry during "
-                    f"materialize ({int(violated.sum())} slots; block reuse mid-read)"
-                )
+                _raise_unreadable_hit(req_id, key, f"reassigned during materialize ({int(violated.sum())} slots)")
 
     # ---------------------------------------------------------- merge
 
@@ -1169,10 +1157,6 @@ class OmniPrefixCacheManager:
         No hit → this step's slice only. Prefetch Future → write the
         slice into the reserved tail. Else cat(fetch, new).
         """
-        if req_id not in ctx.spans:
-            # The caller passed a req the step context never saw: a silent
-            # empty slice here would ship a zero-row payload downstream.
-            raise OmniPrefixCacheUnmatchError(f"req {req_id} not in this step's context (had {list(ctx.spans)[:8]})")
         start, end = ctx.spans[req_id]
         new_rows = current_cpu[start:end]
         src = hit_sources.get((req_id, key))

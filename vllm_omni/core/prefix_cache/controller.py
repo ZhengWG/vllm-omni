@@ -400,16 +400,12 @@ class OmniPrefixCacheController:
     ) -> StepD2HClaim:
         """Launch ONE whole-step D2H into a staging slot, ahead of consumption.
 
-        Returns the claim (slot + host views [0:n) + d2h event). The
-        caller only invokes this for a non-empty packed step. Too large a
-        step, or no free slot, is a contract break — not a second D2H
-        path. The caller binds task holders after submit; `step_holder`
+        Returns the claim (slot + host views [0:n) + d2h event). A step
+        larger than the page overflows the next slot — that is a config
+        break. A full pool currently raises (wait+timeout is TODO).
+        The caller binds task holders after submit; `step_holder`
         is released by materialize/discard via staging_release.
         """
-        if not tensors or n <= 0:
-            raise OmniPrefixCacheUnmatchError(
-                f"stage_step_host called with n={n} keys={list(tensors)}; only a non-empty packed step may launch D2H"
-            )
         if n > self._staging_pool.capacity:
             raise OmniPrefixCacheUnmatchError(
                 f"step has {n} tokens; staging capacity is {self._staging_pool.capacity} "
@@ -417,6 +413,8 @@ class OmniPrefixCacheController:
             )
         slot = self._staging_pool.try_claim(step_holder)
         if slot is None:
+            # TODO: wait for materialize/discard to free a slot; timeout then
+            # error. Same in-flight ticket as leftover-only save (manager).
             raise OmniPrefixCacheUnmatchError(
                 "D2H staging pool exhausted; unconsumed steps, leaked holders, "
                 f"or committer backlog (in_flight_tasks={len(self._tasks)})"
@@ -431,7 +429,6 @@ class OmniPrefixCacheController:
                     v.copy_(src)
                     views[key] = v
             else:
-                assert self._copy_stream is not None
 
                 def _copy_to_staging() -> None:
                     for key, src in tensors.items():
@@ -624,10 +621,7 @@ class OmniPrefixCacheController:
     def _rows_from(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
         """Map `slots` to rows across one or more `_WriteChunk`s; preserve caller order."""
         s2r = task.slot_to_row()
-        try:
-            idx = [s2r[int(s)] for s in slots.tolist()]
-        except KeyError:
-            raise KeyError(f"slots not covered by task {task.tid}") from None
+        idx = [s2r[int(s)] for s in slots.tolist()]
         parts: list[torch.Tensor] = []
         order: list[int] = []
         pos = 0
@@ -665,16 +659,14 @@ class OmniPrefixCacheController:
             return _pick()
         if self._read_stream is None:
             return _pick().detach().cpu()
-        cpu: torch.Tensor | None = None
+        copied: list[torch.Tensor] = []
 
         def _copy_to_cpu() -> None:
-            nonlocal cpu
-            cpu = _pick().to("cpu", non_blocking=True)
+            copied.append(_pick().to("cpu", non_blocking=True))
 
         ev = self._d2h_on_stream(self._read_stream, task.freeze_event, _copy_to_cpu)
         ev.synchronize()
-        assert cpu is not None
-        return cpu
+        return copied[0]
 
     # ------------------------------------------------------------ eager mode
 
@@ -746,7 +738,6 @@ class OmniPrefixCacheController:
             task.mark_host_ready()
             self._release_staged_bytes(task)
             return
-        assert self._copy_stream is not None
         chunk_bytes = self._config.copy_chunk_bytes
         pending_host: list[tuple[_WriteChunk, str, torch.Tensor]] = []
         pending_cats: list[tuple[_WriteChunk, str, list[torch.Tensor]]] = []

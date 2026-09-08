@@ -276,11 +276,11 @@ def test_absent_hit_fails_fast():
         assert not mgr._controller._staging_pool._busy[d2h.staging_slot]
 
 
-def test_hit_not_block_aligned_asserts():
+def test_hit_not_block_aligned_fails_at_register():
     mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
     mgr.materialize(s1, ["a"])
-    with pytest.raises(AssertionError, match="prefix hit not block aligned"):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="prefix hit not block aligned"):
         run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 6})
 
 
