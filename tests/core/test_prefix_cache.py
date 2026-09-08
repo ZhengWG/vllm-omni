@@ -339,6 +339,40 @@ def test_unpadded_mm_registers_on_padded_step():
     assert torch.equal(merged[8:], torch.full((4, 2), 3.0))
 
 
+def test_split_step_outputs_routes_immediate_deferred_leftover():
+    """One split: immediate D2H, deferred write + leftover read, leftover-only."""
+    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"codes.audio"}))
+    mgr, view = make_manager(policy=policy)
+    view.order = ["a"]
+    view.req_blocks["a"] = [0]
+    view.computed["a"] = 0
+    n = 4
+    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": n}))
+    hidden = torch.ones(n, HIDDEN)
+    mm = {
+        "codes.audio": torch.full((n, 2), 5.0),
+        "codes.ref": torch.zeros(15, 2),
+        "tok": torch.full((n, 2), 7.0),
+    }
+    step_outputs = mgr._split_step_outputs(
+        hidden,
+        mm,
+        n,
+        n,
+        slots_cpu=view.step_slots_cpu(["a"], {"a": n}),
+        req_order=["a"],
+        num_sched={"a": n},
+        query_start={"a": 0},
+    )
+    assert HIDDEN_KEY in step_outputs.immediate and "tok" in step_outputs.immediate
+    assert "codes.audio" not in step_outputs.immediate and "codes.ref" not in step_outputs.immediate
+    assert "codes.audio" in step_outputs.leftover and "codes.ref" in step_outputs.leftover
+    assert "tok" not in step_outputs.leftover
+    assert len(step_outputs.deferred_chunks) == 1
+    assert step_outputs.deferred_chunks[0][0] == "a"
+    assert "codes.audio" in step_outputs.deferred_chunks[0][1].tensors
+
+
 def test_leftover_snapshot_preserves_non_token_major_shapes():
     """P1: leftover copy must not use `shape[0] >= n` as a slice predicate.
 
