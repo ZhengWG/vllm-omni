@@ -171,8 +171,8 @@ The block/slot model is `vllm_omni/core/prefix_cache/`.
 `OmniPrefixCacheManager` owns slot occupancy, the request-task table,
 hit spans, and merge.
 `OmniPrefixCacheController` moves data: a reusable `StagingBufferPool` for
-this step's D2H, and scatter into the durable `PrefixBlockPool`. The state
-lock covers those tables only.
+this step's device→host copy, and writes into the durable `PrefixBlockPool`.
+The state lock covers those tables only.
 
 Miss is not an error (this step's forward slice only). A hit span that
 resolves to absent slots is fatal. Abort still writes: once a hash entered
@@ -180,21 +180,21 @@ this step's batch it must land in the cache.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
-- Immediate (`JOIN_NEXT_STEP`): save launches a whole-step D2H into a
-  staging slot; the committer waits that event and scatters. Joined at
-  the next save (`host_ready`).
-- Deferred (`JOIN_ON_FINISH`): token-major mm stays on a per-request device
-  freeze; `_WriteChunk`s append across steps; escalate on finish/abort (or cap
-  pressure). One WriteTask per request — lifetime follows the request,
-  not the step.
+- Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into
+  a staging slot; the committer waits that event and writes the CPU pool.
+  The next save waits `host_ready`.
+- Deferred (`JOIN_ON_FINISH`): mm whose first dim is this step's token count
+  stays on a per-request GPU clone; `_WriteChunk`s append across steps;
+  finish/abort (or GPU-byte-budget pressure) forces the copy. One WriteTask
+  per request — lifetime follows the request, not the step.
 
-Token-major mm (`shape[0]` equal to the unpadded scheduled length *or*
-the CUDA-graph padded length) is registered on first sighting. Talker
-`codes.audio` is a cat of scheduled rows and stays unpadded while hidden
-is padded; both must open a pool key, whether immediate or deferred.
-Leftover mm (lists, `codes.ref`, any tensor whose first dim is not
-token-major) is copied to CPU at save without truncating that first dim.
-That leftover copy is the async-builder read replica for this step; it
+Mm whose first dim equals the unpadded scheduled length *or* the CUDA-graph
+padded length is registered on first sighting. Talker `codes.audio` is a
+cat of scheduled rows and stays unpadded while hidden is padded; both must
+open a pool key, whether immediate or deferred.
+Leftover mm (lists, `codes.ref`, any tensor whose first dim is not this
+step's token count) is copied to CPU at save without truncating that first
+dim. That leftover copy is the async-builder read replica for this step; it
 does not write the pool or carry abort/preempt occupancy.
 
 ```python
@@ -205,13 +205,13 @@ sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
 
-Each `sid` is consumed exactly once. `req_ids` must be a subset of the save
-snapshot. At most `staging_depth` unconsumed sids may be in flight: every
+Each step id is consumed exactly once. `req_ids` must be a subset of the save
+snapshot. At most `staging_depth` unused step ids may exist at once: every
 `save_outputs` claims one staging slot, including leftover-only saves
-that copy no D2H page. A later save waits for `materialize`/`discard_step`
-to free a slot; `staging_claim_timeout_s` then errors with the unconsumed
+that copy no device→host page. A later save waits for `materialize`/`discard_step`
+to free a slot; `staging_claim_timeout_s` then errors with the unused
 ids. `materialize` may run on the async output builder after the engine
-has entered the next step; leftover mm (uncached passthrough) is copied
+has entered the next step; leftover mm (not written to the pool) is copied
 to CPU at `save_outputs` so the builder never reads live CUDA-graph
 buffers. See
 [Async Omni Output Materialization](omni_async_output_materialization.md).
@@ -224,15 +224,15 @@ Threads, locks, and what each may block on:
 
 | Thread | Role | May block on | Must not hold while blocked |
 | --- | --- | --- | --- |
-| Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` cap flush; staging-slot claim | `_state_lock` |
+| Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` GPU-byte flush; staging-slot claim | `_state_lock` |
 | Async output builder | `materialize` (may overlap the next engine step) | this step's `step_d2h_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
-| Committer | `_worker_loop`: wait D2H / deferred copy / scatter | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
+| Committer | `_worker_loop`: wait device→host / deferred copy / pool write | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
 | Prefetch pool | hit-span gather during forward | `join_host_ready`; deferred `fetch_host` | `_state_lock` |
 
 | Lock | Covers | Does not cover |
 | --- | --- | --- |
-| manager `_state_lock` | occupancy tables, step contexts, hit spans | join, cap flush, copy, `step_d2h_event` wait |
-| controller `_lock` / `_wake` | task registry, queues, device-freeze byte cap | D2H / scatter body (released before `synchronize`) |
+| manager `_state_lock` | occupancy tables, step contexts, hit spans | join, GPU-byte flush, copy, `step_d2h_event` wait |
+| controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
 | `WriteTask.lock` | `skip`, `d2h_claimed`, `append_chunk` | `host_ready` / `done` (those are events) |
 
 ### Related Files

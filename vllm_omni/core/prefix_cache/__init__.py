@@ -15,8 +15,8 @@ the repo-wide ``init_logger`` — ``init_logger`` comes from
 
 ``_merge_uncached_mm`` is the exception at *call* time: it lazily
 imports ``vllm_omni.utils.mm_outputs``, which pulls in vllm. Import
-of this package still succeeds without vllm; leftover materialize
-of uncached mm does not.
+of this package still succeeds without vllm; materialize of leftover
+(uncached) mm does not.
 """
 
 from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool

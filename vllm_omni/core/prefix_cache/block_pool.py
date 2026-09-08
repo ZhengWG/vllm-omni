@@ -20,7 +20,7 @@ class PrefixBlockPool:
     take row views.
 
     ``_caches`` is not an unbounded store and has no LRU. Dict keys are
-    tensor names (``__hidden_states__`` plus token-major mm fields),
+    tensor names (``__hidden_states__`` plus mm whose first dim is tokens),
     opened once by ``ensure_key`` and never dropped — a model emits a
     handful of those names, not a per-request set. Each value is a
     fixed slab sized to the same ``num_blocks`` as the upstream KV

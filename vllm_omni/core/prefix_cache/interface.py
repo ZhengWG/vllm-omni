@@ -16,7 +16,7 @@ import torch
 #   TensorName  which cached tensor (hidden / mm), not a prefix hash
 #   ReqId       vLLM request id
 #   Tid         WriteTask handle
-#   StepId      save_outputs id; materialize XOR discard exactly once
+#   StepId      save_outputs id; materialize or discard exactly once
 TensorName: TypeAlias = str
 ReqId: TypeAlias = str
 Tid: TypeAlias = int
@@ -32,18 +32,19 @@ def is_hidden_key(key: TensorName) -> bool:
 
 
 def without_hidden(keys: Iterable[TensorName]) -> set[TensorName]:
-    """Drop the reserved hidden identity; leftover is mm."""
+    """Drop the reserved hidden identity; the rest are mm names."""
     return {k for k in keys if k != HIDDEN_KEY}
 
 
 class WriteSchedule(Enum):
     """Write scheduling policy for one WriteTask."""
 
-    # Immediately-cached keys: D2H launched at save into the staging
-    # pool; committer waits that event and scatters. Joined at the next save.
+    # Immediately-cached keys: device→host launched at save into the
+    # staging pool; committer waits that event and writes the CPU pool.
+    # The next save waits host_ready.
     JOIN_NEXT_STEP = "join_next_step"
-    # Deferred mm: stays on the GPU freeze until finish/abort (cap
-    # pressure may spill it earlier). One WriteTask per request.
+    # Deferred mm: stays on the GPU clone until finish/abort (GPU-byte
+    # budget may force a copy earlier). One WriteTask per request.
     JOIN_ON_FINISH = "join_on_finish"
 
 
@@ -53,16 +54,16 @@ class PrefixCacheConfig:
 
     num_blocks: int
     block_size: int
-    # GPU freeze byte budget for JOIN_ON_FINISH; exceeding it force-flushes.
+    # GPU-clone byte budget for JOIN_ON_FINISH; exceeding it forces a copy.
     gpu_staging_bytes: int = 512 * 1024 * 1024
-    # D2H staging: circular slots, one whole step each (not per request).
+    # Device→host staging: circular slots, one whole step each (not per request).
     # Host memory per key ≈ staging_depth * staging_capacity_tokens * width * dtype.
     # Prefer from_vllm_config so staging_capacity_tokens tracks max_num_batched_tokens.
     staging_depth: int = 4
     staging_capacity_tokens: int = 1024
-    # How long save waits for a free in-flight slot (materialize/discard).
+    # How long save waits for a free staging slot (materialize/discard).
     staging_claim_timeout_s: float = 30.0
-    # D2H chunk size for the JOIN_ON_FINISH trickle.
+    # Device→host chunk size for the JOIN_ON_FINISH trickle.
     copy_chunk_bytes: int = 16 * 1024 * 1024
 
     @classmethod
@@ -74,23 +75,24 @@ class PrefixCacheConfig:
         scheduler_config: Any = None,
         model_config: Any = None,
     ) -> "PrefixCacheConfig":
-        """Size D2H staging from the running scheduler.
+        """Size device→host staging from the running scheduler.
 
         A slot holds one *step* (the whole batch), not one request:
         ``staging_capacity_tokens`` is ``max_num_batched_tokens`` (falls back
-        to ``max_model_len``); ``staging_depth`` is the in-flight step bound,
-        not ``max_num_seqs``.
+        to ``max_model_len``); ``staging_depth`` is how many unconsumed
+        step ids may exist at once, not ``max_num_seqs``.
 
         Pinned staging is allocated lazily per key at
         ``depth * capacity_tokens * width * dtype``. There is no clamp: a
-        step larger than capacity fail-fasts. A 16k-token thinking batch at
+        step larger than capacity raises. A 16k-token thinking batch at
         hidden=2048 bf16 is ~256 MiB for hidden alone; each mm key adds
         another slab.
 
         ``staging_depth`` is the dataclass default (4). There is no CLI or
-        deploy YAML knob — changing it is a code change. Every sid-issuing
-        save claims one slot (leftover-only included). A full pool waits
-        for materialize/discard; ``staging_claim_timeout_s`` then errors.
+        deploy YAML knob — changing it is a code change. Every save that
+        issues a step id claims one slot (leftover-only included). A full
+        pool waits for materialize/discard; ``staging_claim_timeout_s``
+        then errors.
         """
         batched = getattr(scheduler_config, "max_num_batched_tokens", None)
         model_len = getattr(scheduler_config, "max_model_len", None)
@@ -112,7 +114,7 @@ class StageCacheOutputs(NamedTuple):
 
     # req -> full-prompt hidden states (None when policy skips them)
     hidden_states: dict[ReqId, torch.Tensor] | None
-    # tensor name -> req -> payload element (req-major)
+    # tensor name -> req -> payload element
     mm_outputs: dict[TensorName, dict[ReqId, Any]]
 
 
@@ -120,13 +122,14 @@ class OmniPrefixCacheUnmatchError(RuntimeError):
     """Fail-fast contract, config, or KV-occupancy error.
 
     Includes hit spans that resolve to absent slots (omni cache diverged
-    from vLLM KV), consume-exactly-once violations, a step larger than
-    the staging page, and poisoned saves. Never a degrade path.
+    from vLLM KV), a step id consumed twice or never saved, a step larger
+    than the staging page, and a failed write. Do not pretend these
+    were a miss.
     """
 
 
 class OmniPrefixCacheStagingTimeoutError(OmniPrefixCacheUnmatchError):
-    """Save waited for a free in-flight staging slot and timed out."""
+    """Save waited for a free staging slot and timed out."""
 
 
 @dataclass(frozen=True)
@@ -138,8 +141,9 @@ class ModelCachePolicy:
     """
 
     needs_full_hidden_states: bool = True
-    # Token-major mm that stays on the GPU freeze until finish/abort
-    # (JOIN_ON_FINISH). Also skipped by the immediate freeze/D2H path.
+    # Mm whose first dim is this step's token count; stays on the GPU
+    # clone until finish/abort (JOIN_ON_FINISH). Also skipped by the
+    # immediate on-device clone / device→host path.
     deferred_keys: frozenset[TensorName] = frozenset()
 
     @property
@@ -153,7 +157,7 @@ class ModelCachePolicy:
         return [HIDDEN_KEY, *mm] if self.needs_full_hidden_states else mm
 
     def skip_immediate_mm(self, key: TensorName) -> bool:
-        """Immediate freeze must not take hidden or deferred keys from mm."""
+        """Immediate on-device clone must not take hidden or deferred keys from mm."""
         return is_hidden_key(key) or key in self.deferred_keys
 
     @classmethod
