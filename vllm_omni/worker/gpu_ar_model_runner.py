@@ -727,6 +727,11 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         # req list must be (a subset of) the save-time snapshot; the manager
         # debug-asserts that contract.
         outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
+        # Contract: ``mm_outputs`` is all-or-nothing. Non-empty means the
+        # manager merged every mm key (cached + leftover) and the runner's
+        # own mm copy is ignored; empty means the manager skipped the merge
+        # (hidden not cached, no hit) and the caller falls back to that copy.
+        # A partial dict would silently drop the missing keys.
         return hidden_states_cpu, outs.hidden_states, (outs.mm_outputs or None)
 
     def _build_omni_pooler_payload(

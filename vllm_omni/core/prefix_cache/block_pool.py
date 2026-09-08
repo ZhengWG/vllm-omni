@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 
 class PrefixBlockPool:
-    """Durable CPU mirror of vLLM KV slots, one slab per tensor name.
+    """Durable CPU mirror of vLLM KV slots, one tensor per name.
 
     Storage is ``(num_blocks, block_size, feat)`` per key, viewed flat as
     ``(num_slots, feat)`` so vLLM slot ids index rows directly. Write
@@ -23,9 +23,9 @@ class PrefixBlockPool:
     tensor names (``__hidden_states__`` plus mm whose first dim is tokens),
     opened once by ``ensure_key`` and never dropped — a model emits a
     handful of those names, not a per-request set. Each value is a
-    fixed slab sized to the same ``num_blocks`` as the upstream KV
+    fixed tensor sized to the same ``num_blocks`` as the upstream KV
     pool. Rows *are* those kv slots: when vLLM recycles a block, the
-    next scatter overwrites that row. Slot reuse is the eviction.
+    next pool write overwrites that row. Slot reuse is the eviction.
     """
 
     def __init__(self, config: PrefixCacheConfig):
@@ -37,8 +37,8 @@ class PrefixBlockPool:
             (self._config.num_blocks, self._config.block_size, feat),
             dtype=dtype,
             device="cpu",
-            # Pinning enables true async D2H and fast scatter; unsupported on
-            # CPU-only builds where the async pipeline is off anyway.
+            # Pinning lets device→host overlap compute; unsupported on
+            # CPU-only builds where that overlap is off anyway.
             pin_memory=torch.cuda.is_available(),
         )
 
@@ -63,7 +63,7 @@ class PrefixBlockPool:
         return self._flat(key).index_select(0, slots)
 
     def write(self, key: str, slots: torch.Tensor, src_cpu: torch.Tensor) -> None:
-        """Row scatter; caller (committer thread) is the single writer."""
+        """Write rows into the pool; caller (committer thread) is the single writer."""
         if slots.dtype != torch.int64:
             slots = slots.to(torch.int64)
         # index_copy_ dispatches to a faster single-dim CPU path than

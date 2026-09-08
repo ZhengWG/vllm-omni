@@ -189,7 +189,7 @@ class _SlotRef:
       drains, then reads the pool. Staging views are never sliced.
     - JOIN_ON_FINISH in-transit: ``staged_list`` task refs. Fetch uses
       ``fetch_host`` (device freeze / committer host).
-    - Already scattered: ``already_staged`` → pool.
+    - Already in the CPU pool: ``already_staged`` → pool.
 
     A JOIN_NEXT_STEP task may disappear between plan and join (another
     entry already published it into the pool); ``join`` no-ops and the
@@ -226,12 +226,11 @@ class _StepContext:
 
     # Key split frozen at save: recompute at materialize races ensure_key.
     cached_keys: set[TensorName] = field(default_factory=set)
-    # Leftover mm copied to CPU at save (deferred tails + mm that is
-    # not written to the pool). Never live graph-buffer refs: materialize
-    # may run after the next forward has overwritten those buffers.
+    # Leftover mm copied to CPU at save (this-step deferred rows + mm
+    # that is not written to the pool).
     mm_cpu_snapshot: dict[TensorName, Any] = field(default_factory=dict)
 
-    # Staging slot for this step id (empty views when leftover-only).
+    # Staging slot for this step id (empty views when only leftover mm).
     d2h: StepD2HClaim | None = None
 
 
@@ -246,9 +245,10 @@ class _SlotStatusTable:
     """Per (KV slot, tensor name): empty, being written, or already in the pool.
 
     Hidden and a deferred mm field on the same slot are independent.
-    ``map_slots`` marks a write in flight; if another task still owns the
-    slot, the manager tells that task to skip those rows. ``commit``
-    runs after the pool write: still-owned slots become committed.
+    ``map_slots`` marks a write in progress; if another task still owns
+    the slot, the manager records those rows as no longer owned by it.
+    ``commit`` runs after the pool write: still-owned slots become
+    committed.
     """
 
     def __init__(self, num_slots: int) -> None:
@@ -487,13 +487,14 @@ class OmniPrefixCacheManager:
         device→host into the staging pool, then one JOIN_NEXT_STEP
         WriteTask per request whose `chunk.host` is a view of that page.
         Deferred rows stay on the device clone (JOIN_ON_FINISH); the
-        committer copies them later. Leftover mm (deferred tails + mm
-        not written to the pool) is copied to CPU here so materialize
+        committer copies them later. Leftover mm (this-step deferred rows
+        + mm not written to the pool) is copied to CPU here so materialize
         never reads live graph buffers.
         Snapshots everything materialize needs. The returned step id MUST
         be consumed exactly once — by materialize() or discard_step().
-        Every step id claims one staging slot (leftover-only included); a
-        later save waits for a free slot and times out if none return.
+        Every step id claims one staging slot (saves with only leftover mm
+        included); a later save waits for a free slot and times out if
+        none return.
 
         The state lock never covers a blocking wait: the previous step's
         JOIN_NEXT_STEP wait, the clone build, the GPU-byte-budget reserve
@@ -539,7 +540,7 @@ class OmniPrefixCacheManager:
             query_start=query_start,
         )
 
-        # 4. Freeze the device clones and reserve the byte cap (unlocked).
+        # 4. Freeze the device clones and reserve the GPU-byte budget (unlocked).
         freezed_tensors = [t for t in step_outputs.immediate.values()] + [
             t for _, chunk in step_outputs.deferred_chunks for t in chunk.tensors.values()
         ]
@@ -565,8 +566,8 @@ class OmniPrefixCacheManager:
             self._controller.reserve(immediate_bytes + deferred_bytes, exclude=exclude)
 
         # 5. Claim a staging slot (unlocked), optional device→host into it,
-        #    then submit + store the step snapshot (locked). Leftover-only
-        #    still claims. Full pool waits; timeout lists unused step ids.
+        #    then submit + store the step snapshot (locked). Saves with only
+        #    leftover mm still claim. Full pool waits; timeout lists unused step ids.
         d2h_claim: StepD2HClaim | None = None
         step_holder = StagingBufferHolder.for_step(self._next_step_id)
         transferred = False
@@ -603,7 +604,7 @@ class OmniPrefixCacheManager:
         Any thread. `req_ids` must be (a subset of) the save-time snapshot;
         an outside id means the caller is reading the live batch.
         A request without a hit is a plain miss and gets exactly
-        this step's rows — normal path, nothing logged.         A hit span that
+        this step's rows — normal path, nothing logged. A hit span that
         resolves to absent rows raises OmniPrefixCacheUnmatchError: fatal
         by contract (do not pretend it was a miss).
 
@@ -630,8 +631,12 @@ class OmniPrefixCacheManager:
                 )
 
                 if self._policy.hidden_key is None and not ctx.hits:
-                    # Nothing will read the views; drop the step holder here
-                    # or the slot leaks (consume-exactly-once ends with us).
+                    # Hidden not cached and no hit: the merge would be an
+                    # identity, so skip it. Empty ``mm_outputs`` tells the
+                    # runner to use its own CPU copy of this step's mm
+                    # (``outs.mm_outputs or None``). Both the staging page
+                    # and the leftover snapshot are dropped here; the step
+                    # holder must still be released or the slot leaks.
                     self._release_step_staging(ctx, step_id)
                     step_released = True
                     return StageCacheOutputs(hidden_states=None, mm_outputs={})
@@ -699,7 +704,7 @@ class OmniPrefixCacheManager:
         """Consume the step context when nothing will materialize it.
 
         Any thread; same exactly-once contract as materialize (unknown or
-        duplicate id fails fast). Only the read-side snapshot is dropped —
+        duplicate id raises). Only the read-side snapshot is dropped —
         the cache write proceeds unchanged.
         """
         ctx = self._take_step_ctx(step_id)
@@ -721,7 +726,7 @@ class OmniPrefixCacheManager:
         """Caller holds ``_state_lock``. Plan each hit span and gather it on
         the prefetch thread, overlapping the forward. A span that fails to
         plan — same-step hits resolve rows this step's save has not
-        registered yet — is left to materialize, which owns the fail-fast.
+        registered yet — is left to materialize, which raises if unread.
         """
         keys = self._policy.get_hit_keys(self._pool.keys())
         for req_id, (hit_upto, hit_blocks) in self._hit_spans.items():
@@ -848,11 +853,12 @@ class OmniPrefixCacheManager:
     ) -> _StepOutputs:
         """Split this step's outputs into immediate / deferred / leftover.
 
-        Unlocked. One pass over ``mm_outputs``. ``n==0`` is leftover-only
-        (no device clones). A deferred key whose first dim is this step's
-        token count is cloned for the JOIN_ON_FINISH write and CPU-copied
-        into leftover for this-step materialize. Talker ``codes.audio``
-        stays unpadded while hidden is padded; both must open a pool key.
+        Unlocked. One pass over ``mm_outputs``. ``n==0`` has only leftover
+        mm (no device clones). A deferred key whose first dim is this
+        step's token count is cloned for the JOIN_ON_FINISH write and
+        CPU-copied into leftover for this-step materialize. Talker
+        ``codes.audio`` stays unpadded while hidden is padded; both must
+        open a pool key.
         Lists and other shapes stay leftover.
         """
         n = num_tokens_unpadded
@@ -929,7 +935,7 @@ class OmniPrefixCacheManager:
         """Caller holds ``_state_lock``. One queued WriteTask per request.
 
         Per-req views of the shared device snapshot: one on-device clone, req-scoped
-        finish/abort, skip masks, and completion. Appends bound tids to
+        finish/abort, reassigned rows, and completion. Appends bound tids to
         `bound_tids` as it goes so a mid-loop raise still unwinds holders.
         """
         for req_id in req_order:
@@ -1023,7 +1029,7 @@ class OmniPrefixCacheManager:
     # --------------------------------------------------- consume-once
 
     def _take_step_ctx(self, step_id: int) -> _StepContext:
-        """Pop the context for this step id (consume-exactly-once). Caller holds ``_state_lock``."""
+        """Pop the context for this step id (exactly once). Caller holds ``_state_lock``."""
         ctx = self._step_ctxs.pop(step_id, None)
         if ctx is None:
             raise OmniPrefixCacheUnmatchError(
@@ -1110,7 +1116,7 @@ class OmniPrefixCacheManager:
         One key is one schedule: ``join_tids`` (JOIN_NEXT_STEP) and
         ``staged_list`` (JOIN_ON_FINISH) do not coexist. Immediate: wait
         ``done``, drain, read the pool. Deferred: pool rows already
-        scattered, overlay ``fetch_host`` on the in-transit mask.
+        written, overlay ``fetch_host`` on the still-in-progress mask.
         """
         # For JOIN_NEXT_STEP, wait `done`, drain, read the pool
         if src.join_tids:
@@ -1121,7 +1127,7 @@ class OmniPrefixCacheManager:
             self._ensure_not_reassigned(src.slots, src.key, req_id=src.req_id)
             return out
 
-        # For JOIN_ON_FINISH, pool rows already scattered, overlay `fetch_host` on the in-transit mask
+        # For JOIN_ON_FINISH, pool rows already written, overlay `fetch_host` on the still-in-progress mask
         n = int(src.slots.numel())
         out: torch.Tensor | None = None
         if src.already_staged:
@@ -1190,7 +1196,7 @@ class OmniPrefixCacheManager:
         if isinstance(src, Future):
             # Prefetched during the forward, prefix already in place; only
             # this step's rows land here. result() re-raises fetch/validation
-            # errors — the fail-fast contract survives the thread hop.
+            # errors — unread hits still raise after the thread hop.
             merged = src.result()
             merged[merged.shape[0] - new_rows.shape[0] :] = new_rows
             return merged
@@ -1204,20 +1210,20 @@ class OmniPrefixCacheManager:
         cached_keys: set[str],
         mm_out: dict[str, dict[str, Any]],
     ) -> None:
-        """Write mm keys that are not in the prefix cache into mm_out.
+        """Write leftover mm that is not a pool key into mm_out.
 
         No hit concat: leftover mm was already copied to CPU at save
         (``ctx.mm_cpu_snapshot``). cached_keys already went through
         _merge_cached_for_req. ``req_ids`` is a subset of ``ctx.spans``.
         """
-        uncached = {k: v for k, v in ctx.mm_cpu_snapshot.items() if k not in cached_keys and not is_hidden_key(k)}
-        if not uncached:
+        leftover = {k: v for k, v in ctx.mm_cpu_snapshot.items() if k not in cached_keys and not is_hidden_key(k)}
+        if not leftover:
             return
         from vllm_omni.utils.mm_outputs import to_payload_element
 
         order = list(ctx.spans)
         total_length = sum(e - s for s, e in ctx.spans.values())
-        for key, val in uncached.items():
+        for key, val in leftover.items():
             per_req: dict[str, Any] = {}
             for req_id in req_ids:
                 idx = order.index(req_id)

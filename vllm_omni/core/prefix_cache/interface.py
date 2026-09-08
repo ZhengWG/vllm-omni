@@ -63,7 +63,7 @@ class PrefixCacheConfig:
     staging_capacity_tokens: int = 1024
     # How long save waits for a free staging slot (materialize/discard).
     staging_claim_timeout_s: float = 30.0
-    # Device→host chunk size for the JOIN_ON_FINISH trickle.
+    # Device→host chunk size for JOIN_ON_FINISH (copied a piece at a time).
     copy_chunk_bytes: int = 16 * 1024 * 1024
 
     @classmethod
@@ -86,13 +86,13 @@ class PrefixCacheConfig:
         ``depth * capacity_tokens * width * dtype``. There is no clamp: a
         step larger than capacity raises. A 16k-token thinking batch at
         hidden=2048 bf16 is ~256 MiB for hidden alone; each mm key adds
-        another slab.
+        another pool tensor.
 
         ``staging_depth`` is the dataclass default (4). There is no CLI or
         deploy YAML knob — changing it is a code change. Every save that
-        issues a step id claims one slot (leftover-only included). A full
-        pool waits for materialize/discard; ``staging_claim_timeout_s``
-        then errors.
+        issues a step id claims one slot, including saves with only leftover
+        mm. A full pool waits for materialize/discard;
+        ``staging_claim_timeout_s`` then errors.
         """
         batched = getattr(scheduler_config, "max_num_batched_tokens", None)
         model_len = getattr(scheduler_config, "max_model_len", None)
@@ -119,7 +119,7 @@ class StageCacheOutputs(NamedTuple):
 
 
 class OmniPrefixCacheUnmatchError(RuntimeError):
-    """Fail-fast contract, config, or KV-occupancy error.
+    """Contract, config, or KV-occupancy error that must raise.
 
     Includes hit spans that resolve to absent slots (omni cache diverged
     from vLLM KV), a step id consumed twice or never saved, a step larger

@@ -153,7 +153,7 @@ def plan_fetch(mgr, slots, key, *, req_id):
 
 
 def _assert_leftover_shapes(inp, got, n: int) -> None:
-    """Every leftover tensor keeps its shape unless it is exactly token-major."""
+    """Every leftover tensor keeps its shape unless dim0 is this step's token count."""
     if isinstance(inp, torch.Tensor):
         if inp.ndim >= 1 and n > 0 and inp.shape[0] == n:
             assert got.shape == (n, *inp.shape[1:])
@@ -221,7 +221,7 @@ def test_hit_merge_from_mirror():
 
 def test_join_next_step_hit_waits_done_then_reads_pool():
     """CPU stand-in for the non-eager path: submit registers but does not
-    scatter. A same-step hit must join(done), drain, then read the pool."""
+    write the pool. A same-step hit must join(done), drain, then read the pool."""
     mgr, view = make_manager()
     held: list = []
     real_run = mgr._controller._run_eager
@@ -302,7 +302,7 @@ def test_mm_cached_key_merge():
 
 
 def test_codes_audio_matches_ordinary_mm_key():
-    """Without a deferred policy, codes.audio is an ordinary token-major mm key."""
+    """Without a deferred policy, codes.audio is an ordinary mm key (dim0 = tokens)."""
     mgr, view = make_manager()
     step1 = torch.arange(8 * 2, dtype=DTYPE).reshape(8, 2)
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)}, mm={"codes.audio": step1})
@@ -340,7 +340,7 @@ def test_unpadded_mm_registers_on_padded_step():
 
 
 def test_split_step_outputs_routes_immediate_deferred_leftover():
-    """One split: immediate D2H, deferred write + leftover read, leftover-only."""
+    """One split: immediate device→host, deferred write + leftover read, leftover only."""
     policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"codes.audio"}))
     mgr, view = make_manager(policy=policy)
     view.order = ["a"]
@@ -376,9 +376,9 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
 def test_leftover_snapshot_preserves_non_token_major_shapes():
     """P1: leftover copy must not use `shape[0] >= n` as a slice predicate.
 
-    Token-major tensors (`shape[0] == n`) may be sliced; every other tensor
-    — including `codes.ref` with ref_len >> n, and list-held tensors —
-    must keep the input shape.
+    Tensors whose first dim is this step's token count (`shape[0] == n`)
+    may be sliced; every other tensor — including `codes.ref` with
+    ref_len >> n, and list-held tensors — must keep the input shape.
     """
     n = 4
     mm = {
@@ -463,8 +463,9 @@ def test_deferred_key_accumulates_and_flushes_on_finish():
 
 
 def test_deferred_gpu_bytes_held_until_last_view_drops():
-    """C→1 clone is one allocation; finishing the first co-scheduled
-    request must not drop ``_staged_bytes`` while the other still pins it."""
+    """Shared deferred clone is one allocation; finishing the first
+    co-scheduled request must not drop ``_staged_bytes`` while the other
+    still pins it."""
     policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
     feat = 2
@@ -646,7 +647,8 @@ def test_tenant_succession_mm_key():
 
 
 def test_slot_reuse_pushes_skip_to_old_task():
-    """Reassignment = task swap. Keep the old write in-transit so remount records it."""
+    """Reassignment = task swap. Keep the old write in progress so the
+    new write records those rows as no longer owned by it."""
     mgr, view = make_manager()
 
     def register_only(task):
@@ -957,7 +959,7 @@ def test_join_next_step_hit_survives_task_already_drained():
 
 
 def test_leftover_mm_snapshot_survives_live_overwrite():
-    """Uncached passthrough is copied at save; mutating the live buffer
+    """Leftover mm is copied at save; mutating the live buffer
     afterwards must not change the snapshot."""
     mgr, view = make_manager()
     live = [torch.arange(10, dtype=DTYPE)]
@@ -1065,9 +1067,9 @@ def test_fetch_host_maps_slots_across_layouts():
 
 
 def test_fetch_host_waits_staging_step_d2h_event():
-    """JOIN_NEXT_STEP hangs chunk.host as a staging view; fetch_host waits
-    step_d2h_event before slicing. Production JOIN_NEXT_STEP hits join scatter
-    instead; this is the unit-level wait contract for that branch."""
+    """JOIN_NEXT_STEP stores chunk.host as a staging view; fetch_host waits
+    step_d2h_event before slicing. Production JOIN_NEXT_STEP hits wait for
+    the pool write instead; this is the unit-level wait contract for that branch."""
     from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
     from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController, WriteTask, _WriteChunk
 

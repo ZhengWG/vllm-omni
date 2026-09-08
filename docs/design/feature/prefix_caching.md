@@ -207,8 +207,8 @@ outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 
 Each step id is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. At most `staging_depth` unused step ids may exist at once: every
-`save_outputs` claims one staging slot, including leftover-only saves
-that copy no device→host page. A later save waits for `materialize`/`discard_step`
+`save_outputs` claims one staging slot, including saves with only leftover
+mm that copy no device→host page. A later save waits for `materialize`/`discard_step`
 to free a slot; `staging_claim_timeout_s` then errors with the unused
 ids. `materialize` may run on the async output builder after the engine
 has entered the next step; leftover mm (not written to the pool) is copied
@@ -233,7 +233,7 @@ Threads, locks, and what each may block on:
 | --- | --- | --- |
 | manager `_state_lock` | occupancy tables, step contexts, hit spans | join, GPU-byte flush, copy, `step_d2h_event` wait |
 | controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
-| `WriteTask.lock` | `skip`, `d2h_claimed`, `append_chunk` | `host_ready` / `done` (those are events) |
+| `WriteTask.lock` | `reassigned`, `d2h_claimed`, `append_chunk` | `host_ready` / `done` (those are events) |
 
 ### Related Files
 

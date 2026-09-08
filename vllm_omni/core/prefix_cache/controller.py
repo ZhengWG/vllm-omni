@@ -47,7 +47,7 @@ logger = logging.getLogger(__name__)
 
 
 class StagingBufferHolder(NamedTuple):
-    """One holder of a D2H staging-buffer slot. The slot is free when none remain.
+    """One owner of a staging-buffer slot. The slot is free when none remain.
 
     Not a buffer state — concurrent owners share the same slot:
     - for_step: claimed at save, released when materialize/discard consumes the ctx
@@ -107,9 +107,9 @@ class WriteTask:
 
         queued / device-staged
             -> copy claimed (`d2h_claimed`)
-            -> `host_ready`  (D2H complete; device freeze refs may drop)
-            -> scatter
-            -> `done`        (in the CPU mirror; `failed` instead on error)
+            -> `host_ready`  (device→host complete; device clone refs may drop)
+            -> write CPU pool
+            -> `done`        (in the CPU pool; `failed` instead on error)
 
     How `host_ready` is reached:
     - JOIN_NEXT_STEP: `chunk.host` is a staging view set at save.
@@ -164,14 +164,14 @@ class WriteTask:
     done: threading.Event = field(default_factory=threading.Event)
     # Guards reassigned / d2h_claimed / append / host↔freeze. Not host_ready or done.
     lock: threading.Lock = field(default_factory=threading.Lock)
-    # time.monotonic() at submit; cap flush picks the smallest of these.
+    # time.monotonic() at submit; GPU-byte flush picks the oldest of these.
     enqueued_time: float = field(default_factory=time.monotonic)
     # Immediate path: this write's view into the shared step staging page.
     staging_slot: int | None = None
     # Immediate path: this step's CUDA device→host event (shared). None if deferred.
     step_d2h_event: object | None = None
     # slot -> (which chunk, row in that tensor). Built on demand
-    # when a write has more than one `_WriteChunk`; scatter uses slot, the tensor uses row.
+    # when a write has more than one `_WriteChunk`; pool write uses slot, the tensor uses row.
     _slot_to_row: dict[int, tuple[int, int]] | None = None
 
     def add_reassigned(self, key: str, slots: torch.Tensor) -> None:
@@ -233,14 +233,14 @@ class WriteTask:
         self.host_ready.set()
 
     def mark_host_ready(self) -> None:
-        """Host already written (staging views). Wait the step D2H, drop freeze."""
+        """Host already written (staging views). Wait the step device→host, drop freeze."""
         if self.step_d2h_event is not None:
             self.step_d2h_event.synchronize()
         self.clear_tensors()
         self.host_ready.set()
 
     def mark_failed(self) -> None:
-        """Unblock joiners. Host may be missing; manager fail-fasts."""
+        """Unblock joiners. Host may be missing; manager raises on next entry."""
         self.failed = True
         self.clear_tensors()
         self.host_ready.set()
@@ -296,20 +296,20 @@ class StagingBufferPool:
     """Reusable pinned landing zone for ONE whole-step device→host at save.
 
     Per-task `chunk.host` is a row-range view into a slot, so the committer
-    skips per-task D2H. Slots recycle; this is not the CPU block pool.
+    skips a per-task device→host. Slots recycle; this is not the CPU block pool.
 
     A slot stays busy while anyone still holds it: the step (until
     materialize/discard) and each immediate write that views the page
     (until that write is retired). Prefix hits do not hold a slot —
-    they wait for scatter and read the durable pool.
+    they wait for the pool write and read the durable pool.
 
-    Leftover-only saves still claim a slot (empty views) so every step
-    id shares this bound. A full pool waits; timeout then errors.
+    Saves with only leftover mm still claim a slot (empty views) so
+    every step id shares this bound. A full pool waits; timeout then errors.
     """
 
     def __init__(self, depth: int, capacity: int):
         self.depth = depth
-        self.capacity = capacity  # rows per slot; a larger step fails fast
+        self.capacity = capacity  # rows per slot; a larger step raises
         self._bufs: dict[TensorName, torch.Tensor] = {}  # [depth*capacity, width]
         self._busy: list[set[StagingBufferHolder]] = [set() for _ in range(depth)]
         self._slot_free_condition = threading.Condition()
@@ -364,7 +364,7 @@ class StagingBufferPool:
 class StepD2HClaim:
     """One whole-step landing in StagingBufferPool.
 
-    Return of ``stage_step_host``. The manager hangs this on
+    Return of ``stage_step_host``. The manager stores this on
     ``_StepContext`` until materialize/discard releases the step holder.
     """
 
@@ -384,8 +384,8 @@ class OmniPrefixCacheController:
         self._config = config
         self._eager = (not torch.cuda.is_available()) if eager is None else eager
         self._tasks: dict[Tid, WriteTask] = {}
-        self._completed: deque[Tid] = deque()  # scattered, awaiting manager drain
-        self._failed: deque[Tid] = deque()  # write failed; manager must fail-fast
+        self._completed: deque[Tid] = deque()  # pool write done, awaiting manager drain
+        self._failed: deque[Tid] = deque()  # write failed; manager raises on next entry
         self._staged_bytes = 0
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
@@ -411,7 +411,7 @@ class OmniPrefixCacheController:
         freeze_event: object | None,
         copy: Callable[[], None],
     ) -> torch.cuda.Event:
-        """Issue D2H on `stream` after freeze; return the done event."""
+        """Issue device→host on `stream` after freeze; return the done event."""
         with torch.cuda.stream(stream):
             if freeze_event is not None:
                 stream.wait_event(freeze_event)
@@ -536,8 +536,8 @@ class OmniPrefixCacheController:
                 self._staged_bytes -= task.nbytes
 
     def _reserve_bytes(self, nbytes: int, exclude: set[int] | None = None) -> None:
-        # Cap backpressure: force-flush oldest pending tasks until under
-        # budget. Bounded block: their D2H has usually long completed.
+        # GPU-byte budget: force-copy oldest pending tasks until under
+        # budget. Bounded wait: their device→host has usually long completed.
         exclude = exclude or set()
         while True:
             with self._lock:
@@ -570,24 +570,25 @@ class OmniPrefixCacheController:
                     self._queue_lo.remove(tid)
                     self._queue_hi.appendleft(tid)
                 except ValueError:
-                    # Not in the lazy queue: either an unqueued deferred
-                    # task (queue it now) or already claimed/queued-hi.
+                    # Not in the low-priority queue: either a deferred
+                    # task not queued yet (queue it now) or already on
+                    # the high-priority / copy-done lists.
                     if tid not in self._queue_hi and tid not in self._blocked and not task.d2h_claimed:
                         self._queue_hi.appendleft(tid)
             self._wake.notify_all()
 
     def join(self, tids: list[int]) -> None:
-        """Block until each task has finished scatter (or failed)."""
+        """Block until each task has finished the CPU-pool write (or failed)."""
         for tid in tids:
             task = self._tasks.get(tid)
             if task is not None:
                 task.done.wait()
 
     def join_host_ready(self, tids: list[int]) -> None:
-        """Block until each task's D2H is complete (`host_ready`).
+        """Block until each task's device→host is complete (`host_ready`).
 
         Staging: committer has waited `step_d2h_event`. Deferred: committer
-        has written `chunk.host`. Does not wait scatter.
+        has written `chunk.host`. Does not wait for the CPU-pool write.
         """
         for tid in tids:
             task = self._tasks.get(tid)
@@ -595,11 +596,12 @@ class OmniPrefixCacheController:
                 task.host_ready.wait()
 
     def drain_completed(self) -> list[int]:
-        """Pop scattered tasks from `_completed` and drop them from `_tasks`.
+        """Pop pool-written tasks from `_completed` and drop them from `_tasks`.
 
         WriteTask holders release HERE — the same locked drain that flips
-        state to committed — not at scatter: a hit plan that still sees rows
-        in-transit must be able to hold the slot before it is reclaimable.
+        state to committed — not at the pool write: a hit plan that still
+        sees rows in transit must be able to hold the slot before it is
+        reclaimable.
         """
         out: list[int] = []
         with self._lock:
@@ -634,11 +636,11 @@ class OmniPrefixCacheController:
 
     @torch.inference_mode()
     def fetch_host(self, task: WriteTask, slots: torch.Tensor, key: str) -> torch.Tensor:
-        """Rows for `slots` of one in-flight JOIN_ON_FINISH task.
+        """Rows for `slots` of one not-yet-done JOIN_ON_FINISH task.
 
-        `_slot_ref` puts JOIN_NEXT_STEP tids in `join_tids` (join then
+        `_slot_ref` puts JOIN_NEXT_STEP tids in `join_tids` (wait then
         pool). This path reads committer-written `chunk.host`, or the
-        device freeze if that D2H has not landed.
+        device clone if that device→host has not landed.
         """
         if task.step_d2h_event is not None:
             task.step_d2h_event.synchronize()
@@ -752,15 +754,15 @@ class OmniPrefixCacheController:
 
     @torch.inference_mode()
     def _copy_task(self, task: WriteTask) -> None:
-        """Reach `host_ready`. Staging: wait the save-time D2H event.
-        Deferred: this is the D2H into owned `chunk.host` tensors.
+        """Reach `host_ready`. Staging: wait the save-time device→host event.
+        Deferred: this is the device→host into owned `chunk.host` tensors.
         """
         if not task.try_claim_d2h():
             return
         if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
-            # `chunk.host` is already a staging view; D2H flew at save.
+            # `chunk.host` is already a staging view; device→host ran at save.
             # `mark_host_ready` waits `step_d2h_event` if one was recorded.
-            # No per-task copy. Scatter is `_scatter_host_ready`.
+            # No per-task copy. Pool write is `_scatter_host_ready`.
             task.mark_host_ready()
             self._release_staged_bytes(task)
             return
