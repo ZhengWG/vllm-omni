@@ -6,7 +6,7 @@ import logging
 
 import torch
 
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig
+from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, TensorName
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,7 @@ class PrefixBlockPool:
 
     def __init__(self, config: PrefixCacheConfig):
         self._config = config
-        self._caches: dict[str, torch.Tensor] = {}
+        self._caches: dict[TensorName, torch.Tensor] = {}
 
     def _alloc(self, dtype: torch.dtype, feat: int) -> torch.Tensor:
         return torch.zeros(
@@ -51,7 +51,7 @@ class PrefixBlockPool:
     def has_key(self, key: str) -> bool:
         return key in self._caches
 
-    def keys(self) -> set[str]:
+    def keys(self) -> set[TensorName]:
         return set(self._caches.keys())
 
     def _flat(self, key: str) -> torch.Tensor:

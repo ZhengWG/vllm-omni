@@ -168,7 +168,8 @@ Finally, we look up the output hidden states/multimodal tensors corresponding to
 ### Implementation
 
 The block/slot model is `vllm_omni/core/prefix_cache/`.
-`OmniPrefixCacheManager` owns `(slot, key)` occupancy, hit spans, and merge.
+`OmniPrefixCacheManager` owns slot occupancy, the request-task table,
+hit spans, and merge.
 `OmniPrefixCacheController` moves data: a reusable `StagingBufferPool` for
 this step's D2H, and scatter into the durable `PrefixBlockPool`. The state
 lock covers those tables only.
@@ -182,8 +183,8 @@ Two write paths, split by `ModelCachePolicy.deferred_keys`:
 - Immediate (`JOIN_NEXT_STEP`): save launches a whole-step D2H into a
   staging slot; the committer waits that event and scatters. Joined at
   the next save (`host_ready`).
-- Deferred (`JOIN_ON_FINISH`): token-major mm stays on a per-request GPU
-  freeze; segments append across steps; escalate on finish/abort (or cap
+- Deferred (`JOIN_ON_FINISH`): token-major mm stays on a per-request device
+  freeze; `_WriteChunk`s append across steps; escalate on finish/abort (or cap
   pressure). One WriteTask per request — lifetime follows the request,
   not the step.
 
@@ -199,7 +200,7 @@ does not write the pool or carry abort/preempt occupancy.
 ```python
 cache.register_policy(ModelCachePolicy.from_model(model))   # load_model
 cache.new_step_starts(scheduler_output)   # before _update_states
-sid = cache.save_outputs(hidden, mm_flat, num_tokens_unpadded=n,
+sid = cache.save_outputs(hidden, mm_outputs, num_tokens_unpadded=n,
                          num_tokens_padded=n_pad)
 outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
@@ -227,8 +228,8 @@ Threads, locks, and what each may block on:
 | Lock | Covers | Does not cover |
 | --- | --- | --- |
 | manager `_state_lock` | occupancy tables, step contexts, hit spans | join, cap flush, copy, `step_d2h_event` wait |
-| controller `_lock` / `_wake` | task registry, queues, GPU-freeze byte cap | D2H / scatter body (released before `synchronize`) |
-| `WriteTask.lock` | `skip`, `d2h_claimed`, `append_segment` | `host_ready` / `done` (those are events) |
+| controller `_lock` / `_wake` | task registry, queues, device-freeze byte cap | D2H / scatter body (released before `synchronize`) |
+| `WriteTask.lock` | `skip`, `d2h_claimed`, `append_chunk` | `host_ready` / `done` (those are events) |
 
 ### Related Files
 

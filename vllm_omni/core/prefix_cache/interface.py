@@ -5,14 +5,35 @@
 Naming aligns with vLLM's v1/core KV-cache design.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, TypeAlias
 
 import torch
 
+# Four identities (still str/int at runtime, not interchangeable):
+#   TensorName  which cached tensor (hidden / mm), not a prefix hash
+#   ReqId       vLLM request id
+#   Tid         WriteTask handle
+#   StepId      save_outputs id; materialize XOR discard exactly once
+TensorName: TypeAlias = str
+ReqId: TypeAlias = str
+Tid: TypeAlias = int
+StepId: TypeAlias = int
+
 # Reserved pool key for hidden states (mm keys are flat dotted names).
-HIDDEN_KEY = "__hidden_states__"
+# Identity only — whether a model caches it lives on ModelCachePolicy.
+HIDDEN_KEY: TensorName = "__hidden_states__"
+
+
+def is_hidden_key(key: TensorName) -> bool:
+    return key == HIDDEN_KEY
+
+
+def without_hidden(keys: Iterable[TensorName]) -> set[TensorName]:
+    """Drop the reserved hidden identity; leftover is mm."""
+    return {k for k in keys if k != HIDDEN_KEY}
 
 
 class WriteSchedule(Enum):
@@ -87,10 +108,10 @@ class PrefixCacheConfig:
 class StageCacheOutputs(NamedTuple):
     """Plain value object: per-request merged stage outputs."""
 
-    # req_id -> full-prompt hidden states (None when policy skips them)
-    hidden_states: dict[str, torch.Tensor] | None
-    # mm_key -> req_id -> payload element (req-major)
-    mm_outputs: dict[str, dict[str, Any]]
+    # req -> full-prompt hidden states (None when policy skips them)
+    hidden_states: dict[ReqId, torch.Tensor] | None
+    # tensor name -> req -> payload element (req-major)
+    mm_outputs: dict[TensorName, dict[ReqId, Any]]
 
 
 class OmniPrefixCacheUnmatchError(RuntimeError):
@@ -104,12 +125,30 @@ class OmniPrefixCacheUnmatchError(RuntimeError):
 
 @dataclass(frozen=True)
 class ModelCachePolicy:
-    """Replaces getattr probing on models for cache behavior decisions."""
+    """Replaces getattr probing on models for cache behavior decisions.
+
+    Hidden's *name* is ``HIDDEN_KEY`` (shared identity). This object
+    answers whether this model caches it, and which mm keys are deferred.
+    """
 
     needs_full_hidden_states: bool = True
     # Token-major mm that stays on the GPU freeze until finish/abort
     # (JOIN_ON_FINISH). Also skipped by the immediate freeze/D2H path.
-    deferred_keys: frozenset[str] = frozenset()
+    deferred_keys: frozenset[TensorName] = frozenset()
+
+    @property
+    def hidden_key(self) -> TensorName | None:
+        """Pool key for hidden, or None when this model opts out."""
+        return HIDDEN_KEY if self.needs_full_hidden_states else None
+
+    def get_hit_keys(self, keys: Iterable[TensorName]) -> list[TensorName]:
+        """Keys to plan/prefetch for a hit: hidden first (if cached), then mm."""
+        mm = sorted(without_hidden(keys))
+        return [HIDDEN_KEY, *mm] if self.needs_full_hidden_states else mm
+
+    def skip_immediate_mm(self, key: TensorName) -> bool:
+        """Immediate freeze must not take hidden or deferred keys from mm."""
+        return is_hidden_key(key) or key in self.deferred_keys
 
     @classmethod
     def from_model(cls, model: Any) -> "ModelCachePolicy":
