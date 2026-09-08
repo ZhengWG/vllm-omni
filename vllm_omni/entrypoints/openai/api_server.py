@@ -156,7 +156,12 @@ from vllm_omni.entrypoints.openai.stage_params import (
 )
 from vllm_omni.entrypoints.openai.storage import STORAGE_MANAGER, FileStorageHandle
 from vllm_omni.entrypoints.openai.stores import VIDEO_STORE, VIDEO_TASKS
-from vllm_omni.entrypoints.openai.utils import get_stage_type, parse_lora_request
+from vllm_omni.entrypoints.openai.utils import (
+    get_stage_type,
+    image_generation_stage_index,
+    parse_lora_request,
+    pipeline_supports_image_generations,
+)
 from vllm_omni.entrypoints.openai.video_api_utils import (
     VideoFrames,
     decode_audio_url,
@@ -1995,7 +2000,8 @@ async def generate_images(
     """Generate images from text prompts using diffusion models.
 
     OpenAI DALL-E compatible endpoint for text-to-image generation.
-    Only supports multi-stage omni mode with diffusion stages.
+    Accepts multi-stage omni pipelines with a diffusion stage or an LLM
+    generation stage that declares a final image output.
 
     Args:
         request: Image generation request with prompt and parameters
@@ -2321,14 +2327,14 @@ async def edit_images(
         # 3.0 Init with system default values
         app_state_args = getattr(raw_request.app.state, "args", None)
         default_sample_param = getattr(app_state_args, "default_sampling_params", None)
-        # Currently only have one diffusion stage.
-        diffusion_stage_ids = [i for i, cfg in enumerate(stage_configs) if get_stage_type(cfg) == "diffusion"]
-        if not diffusion_stage_ids:
+        # Prefer a diffusion stage; LLM image-output stages (MammothModa2 DiT)
+        # are also valid for default sampling lookup.
+        diffusion_stage_id = image_generation_stage_index(stage_configs)
+        if diffusion_stage_id is None:
             raise HTTPException(
                 status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-                detail="No diffusion stage found in multi-stage pipeline.",
+                detail="No image generation stage found in multi-stage pipeline.",
             )
-        diffusion_stage_id = diffusion_stage_ids[0]
         apply_stage_default_sampling_params(
             default_sample_param,
             gen_params,
@@ -2571,9 +2577,9 @@ def _get_engine_and_model(raw_request: Request):
             detail="Multi-stage engine not initialized. Start server with a multi-stage omni model.",
         )
 
-    # Check if there's a diffusion stage.
-    # Prefer app state (compat layer populated at startup), then fall back to
-    # the engine client's stage configs for refactored AsyncOmni paths.
+    # Check if the pipeline can produce images. Prefer app state (compat
+    # layer populated at startup), then fall back to the engine client's
+    # stage configs for refactored AsyncOmni paths.
     stage_configs = getattr(raw_request.app.state, "stage_configs", None)
     if not stage_configs:
         stage_configs = getattr(engine_client, "stage_configs", None)
@@ -2584,12 +2590,10 @@ def _get_engine_and_model(raw_request: Request):
         )
 
     normalized_stage_configs = list(stage_configs)
-    has_diffusion_stage = any(get_stage_type(stage_cfg) == "diffusion" for stage_cfg in normalized_stage_configs)
-
-    if not has_diffusion_stage:
+    if not pipeline_supports_image_generations(normalized_stage_configs):
         raise HTTPException(
             status_code=HTTPStatus.SERVICE_UNAVAILABLE.value,
-            detail="No diffusion stage found in multi-stage pipeline.",
+            detail="No image generation stage found in multi-stage pipeline.",
         )
 
     # Get server's loaded model name

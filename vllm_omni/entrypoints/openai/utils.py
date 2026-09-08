@@ -20,25 +20,63 @@ def get_stage_type(stage_cfg: Any) -> str:
     return getattr(stage_cfg, "stage_type", "llm")
 
 
+def _stage_final_output(stage: Any) -> tuple[bool, str | None]:
+    """Return ``(final_output, final_output_type)`` from a stage config."""
+    if isinstance(stage, dict):
+        return bool(stage.get("final_output", False)), stage.get("final_output_type")
+    if hasattr(stage, "get"):
+        try:
+            return bool(stage.get("final_output", False)), stage.get("final_output_type")
+        except Exception:
+            pass
+    return bool(getattr(stage, "final_output", False)), getattr(stage, "final_output_type", None)
+
+
 def is_video_generation_pipeline(stage_configs: list[Any] | None) -> bool:
     """Return whether a pipeline declares a final video output stage."""
     for stage in stage_configs or ():
-        if isinstance(stage, dict):
-            final_output = stage.get("final_output", False)
-            final_output_type = stage.get("final_output_type")
-        elif hasattr(stage, "get"):
-            try:
-                final_output = stage.get("final_output", False)
-                final_output_type = stage.get("final_output_type")
-            except Exception:
-                final_output = getattr(stage, "final_output", False)
-                final_output_type = getattr(stage, "final_output_type", None)
-        else:
-            final_output = getattr(stage, "final_output", False)
-            final_output_type = getattr(stage, "final_output_type", None)
+        final_output, final_output_type = _stage_final_output(stage)
         if final_output and final_output_type in {"video", "videos"}:
             return True
     return False
+
+
+def is_image_generation_pipeline(stage_configs: list[Any] | None) -> bool:
+    """Return whether a pipeline declares a final image output stage."""
+    for stage in stage_configs or ():
+        final_output, final_output_type = _stage_final_output(stage)
+        if final_output and final_output_type in {"image", "images"}:
+            return True
+    return False
+
+
+def pipeline_supports_image_generations(stage_configs: list[Any] | None) -> bool:
+    """Return whether ``/v1/images/*`` can accept this pipeline.
+
+    Diffusion-typed stages keep the historical serving path. LLM generation
+    stages that declare a final image output (for example MammothModa2 DiT or
+    Dynin token2image) are also accepted.
+    """
+    for stage in stage_configs or ():
+        if get_stage_type(stage) == "diffusion":
+            return True
+    return is_image_generation_pipeline(stage_configs)
+
+
+def image_generation_stage_index(stage_configs: list[Any] | None) -> int | None:
+    """Return the stage used for image default sampling, if any.
+
+    Prefer a diffusion-typed stage, then a declared final image-output stage.
+    """
+    stages = list(stage_configs or ())
+    for i, stage in enumerate(stages):
+        if get_stage_type(stage) == "diffusion":
+            return i
+    for i, stage in enumerate(stages):
+        final_output, final_output_type = _stage_final_output(stage)
+        if final_output and final_output_type in {"image", "images"}:
+            return i
+    return None
 
 
 def parse_lora_request(lora_body: Any) -> tuple[LoRARequest | None, float | None]:
