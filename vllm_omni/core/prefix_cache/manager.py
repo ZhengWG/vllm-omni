@@ -631,12 +631,8 @@ class OmniPrefixCacheManager:
                 )
 
                 if self._policy.hidden_key is None and not ctx.hits:
-                    # Hidden not cached and no hit: the merge would be an
-                    # identity, so skip it. Empty ``mm_outputs`` tells the
-                    # runner to use its own CPU copy of this step's mm
-                    # (``outs.mm_outputs or None``). Both the staging page
-                    # and the leftover snapshot are dropped here; the step
-                    # holder must still be released or the slot leaks.
+                    # Merge would be an identity; empty mm_outputs tells the runner
+                    # to use its own mm copy. Still release the slot or it leaks.
                     self._release_step_staging(ctx, step_id)
                     step_released = True
                     return StageCacheOutputs(hidden_states=None, mm_outputs={})
@@ -687,7 +683,7 @@ class OmniPrefixCacheManager:
                     val = ctx.mm_cpu_snapshot.get(key)
                     if not isinstance(val, torch.Tensor):
                         continue
-                    # Leftover snapshot already sliced at save; do not re-slice.
+                    # Leftover snapshot; spans stay within [0, n), no re-slice.
                     cur = val
                 mm_out[key] = {
                     req_id: self._merge_cached_for_req(ctx, req_id, key, cur, hit_sources) for req_id in req_ids

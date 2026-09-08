@@ -174,9 +174,16 @@ hit spans, and merge.
 this step's device→host copy, and writes into the durable `PrefixBlockPool`.
 The state lock covers those tables only.
 
-Miss is not an error (this step's forward slice only). A hit span that
-resolves to absent slots is fatal. Abort still writes: once a hash entered
-this step's batch it must land in the cache.
+Miss is not an error (this step's forward slice only). A hit span whose
+hidden rows are absent is fatal. For mm keys the rule is looser: a model may
+emit a key only for some requests, so a hit span with no rows behind an mm key
+reads zeros from the pool for those positions rather than raising. Abort still
+writes: once a hash entered this step's batch it must land in the cache.
+
+`enable_prefix_caching` is refused on KV-consumer stages (`kv_role` of
+`kv_consumer` or `kv_both`). KV received from a producer is reported as
+`num_computed_tokens` too, and the manager cannot tell it from a local hit.
+Producer-only stages are unaffected.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 

@@ -181,11 +181,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                                 device=sm.device,
                             )
 
-        # Stage the omni prefix cache config; the manager is built lazily on
-        # the first step so input_batch is guaranteed to exist. Non-CUDA
-        # platforms run the Controller in eager mode (auto-selected).
-        # Group-spec check runs now: it only needs kv_cache_groups.
-        if self.cache_config.enable_prefix_caching:
+        # Stage the config; the manager is built on the first step once
+        # input_batch exists. Pooling stages never save, so no cache for them.
+        if self.cache_config.enable_prefix_caching and not self.is_pooling_model:
+            kv_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
+            if kv_cfg is not None and getattr(kv_cfg, "is_kv_consumer", False):
+                # KV loaded from a producer also shows up as num_computed_tokens; the
+                # manager would read it as a local hit with no rows behind it.
+                raise OmniPrefixCacheUnmatchError(
+                    "omni prefix caching cannot tell locally cached tokens from KV received "
+                    "through a KV connector; disable enable_prefix_caching on kv_consumer / "
+                    "kv_both stages"
+                )
             check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))
             self._omni_prefix_cache_cfg = PrefixCacheConfig.from_vllm_config(
                 num_blocks=kv_cache_config.num_blocks,

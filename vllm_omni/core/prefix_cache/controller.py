@@ -745,7 +745,8 @@ class OmniPrefixCacheController:
                     if task is not None:
                         self._copy_task(task)
                         with self._wake:
-                            if tid not in self._blocked:
+                            # escalate may re-queue a tid we just popped; skip if already written.
+                            if tid not in self._blocked and not task.is_done():
                                 self._blocked.append(tid)
                 self._scatter_host_ready()
             except BaseException:
@@ -822,7 +823,7 @@ class OmniPrefixCacheController:
                 self._blocked.remove(tid)
         for tid in ready:
             task = self._tasks.get(tid)
-            if task is None:
+            if task is None or task.is_done():
                 continue
             try:
                 self._scatter(task)

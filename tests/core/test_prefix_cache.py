@@ -1105,6 +1105,36 @@ def test_fetch_host_waits_staging_step_d2h_event():
     assert torch.equal(rows, src)
 
 
+def test_scatter_host_ready_skips_already_done_task():
+    """A tid re-queued by escalate after its pool write finished must not be
+    written a second time or reported completed twice."""
+    from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
+    from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController, WriteTask, _WriteChunk
+
+    cfg = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
+    pool = PrefixBlockPool(cfg)
+    pool.ensure_key(HIDDEN_KEY, DTYPE, HIDDEN)
+    ctrl = OmniPrefixCacheController(pool, cfg, eager=True)
+
+    slots = torch.tensor([0, 1], dtype=torch.int64)
+    first = torch.ones(2, HIDDEN)
+    chunk = _WriteChunk(slots_cpu=slots, tensors={})
+    chunk.host = {HIDDEN_KEY: first}
+    task = WriteTask(tid=7, req_id="r", write_n=1, schedule=WriteSchedule.JOIN_NEXT_STEP, chunks=[chunk])
+    ctrl._tasks[task.tid] = task
+    task.host_ready.set()
+    task.mark_done()
+    ctrl._completed.clear()
+    # Simulate the stale second pass: overwrite the pool rows out of band,
+    # then let the committer see the done task in `_blocked`.
+    pool.write(HIDDEN_KEY, slots, torch.full((2, HIDDEN), 5.0))
+    ctrl._blocked.append(task.tid)
+    ctrl._scatter_host_ready()
+    assert ctrl._blocked == []
+    assert list(ctrl._completed) == []
+    assert torch.equal(pool.rows(HIDDEN_KEY, slots), torch.full((2, HIDDEN), 5.0))
+
+
 def test_from_vllm_config_uses_batched_tokens():
     cfg = PrefixCacheConfig.from_vllm_config(
         num_blocks=NUM_BLOCKS,

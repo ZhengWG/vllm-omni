@@ -722,16 +722,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if hidden_states_cpu is None and staged_hidden_states_cpu is not None:
                 hidden_states_cpu = staged_hidden_states_cpu
             return hidden_states_cpu, None, None
-        # The manager decides read-vs-nothing by policy/hits; the return is
-        # already assembled per request — no runner-side re-stitching. The
-        # req list must be (a subset of) the save-time snapshot; the manager
-        # debug-asserts that contract.
         outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
-        # Contract: ``mm_outputs`` is all-or-nothing. Non-empty means the
-        # manager merged every mm key (cached + leftover) and the runner's
-        # own mm copy is ignored; empty means the manager skipped the merge
-        # (hidden not cached, no hit) and the caller falls back to that copy.
-        # A partial dict would silently drop the missing keys.
+        # mm_outputs is all-or-nothing: empty means "not merged, use the runner's own mm copy".
         return hidden_states_cpu, outs.hidden_states, (outs.mm_outputs or None)
 
     def _build_omni_pooler_payload(
