@@ -206,7 +206,11 @@ outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 ```
 
 Each `sid` is consumed exactly once. `req_ids` must be a subset of the save
-snapshot. `materialize` may run on the async output builder after the engine
+snapshot. At most `staging_depth` unconsumed sids may be in flight: every
+`save_outputs` claims one staging slot, including leftover-only saves
+that copy no D2H page. A later save waits for `materialize`/`discard_step`
+to free a slot; `staging_claim_timeout_s` then errors with the unconsumed
+ids. `materialize` may run on the async output builder after the engine
 has entered the next step; leftover mm (uncached passthrough) is copied
 to CPU at `save_outputs` so the builder never reads live CUDA-graph
 buffers. See
@@ -220,7 +224,7 @@ Threads, locks, and what each may block on:
 
 | Thread | Role | May block on | Must not hold while blocked |
 | --- | --- | --- | --- |
-| Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` cap flush | `_state_lock` |
+| Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` cap flush; staging-slot claim | `_state_lock` |
 | Async output builder | `materialize` (may overlap the next engine step) | this step's `step_d2h_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
 | Committer | `_worker_loop`: wait D2H / deferred copy / scatter | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
 | Prefetch pool | hit-span gather during forward | `join_host_ready`; deferred `fetch_host` | `_state_lock` |

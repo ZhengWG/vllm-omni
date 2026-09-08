@@ -60,6 +60,8 @@ class PrefixCacheConfig:
     # Prefer from_vllm_config so staging_capacity_tokens tracks max_num_batched_tokens.
     staging_depth: int = 4
     staging_capacity_tokens: int = 1024
+    # How long save waits for a free in-flight slot (materialize/discard).
+    staging_claim_timeout_s: float = 30.0
     # D2H chunk size for the JOIN_ON_FINISH trickle.
     copy_chunk_bytes: int = 16 * 1024 * 1024
 
@@ -86,9 +88,9 @@ class PrefixCacheConfig:
         another slab.
 
         ``staging_depth`` is the dataclass default (4). There is no CLI or
-        deploy YAML knob — changing it is a code change. The same value
-        also bounds unconsumed step contexts; those are different failures
-        that share a number today.
+        deploy YAML knob — changing it is a code change. Every sid-issuing
+        save claims one slot (leftover-only included). A full pool waits
+        for materialize/discard; ``staging_claim_timeout_s`` then errors.
         """
         batched = getattr(scheduler_config, "max_num_batched_tokens", None)
         model_len = getattr(scheduler_config, "max_model_len", None)
@@ -118,9 +120,13 @@ class OmniPrefixCacheUnmatchError(RuntimeError):
     """Fail-fast contract, config, or KV-occupancy error.
 
     Includes hit spans that resolve to absent slots (omni cache diverged
-    from vLLM KV), consume-exactly-once violations, staging capacity /
-    pool exhaustion, and poisoned saves. Never a degrade path.
+    from vLLM KV), consume-exactly-once violations, a step larger than
+    the staging page, and poisoned saves. Never a degrade path.
     """
+
+
+class OmniPrefixCacheStagingTimeoutError(OmniPrefixCacheUnmatchError):
+    """Save waited for a free in-flight staging slot and timed out."""
 
 
 @dataclass(frozen=True)

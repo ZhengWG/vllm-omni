@@ -32,6 +32,7 @@ import torch
 
 from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
 from vllm_omni.core.prefix_cache.interface import (
+    OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
     ReqId,
@@ -297,6 +298,9 @@ class StagingBufferPool:
     materialize/discard) and each immediate write that views the page
     (until that write is retired). Prefix hits do not hold a slot —
     they wait for scatter and read the durable pool.
+
+    Leftover-only saves still claim a slot (empty views) so every sid
+    shares this in-flight bound. A full pool waits; timeout then errors.
     """
 
     def __init__(self, depth: int, capacity: int):
@@ -304,7 +308,8 @@ class StagingBufferPool:
         self.capacity = capacity  # rows per slot; a larger step fails fast
         self._bufs: dict[TensorName, torch.Tensor] = {}  # [depth*capacity, width]
         self._busy: list[set[StagingBufferHolder]] = [set() for _ in range(depth)]
-        self._lock = threading.Lock()
+        self._slot_free_condition = threading.Condition()
+        self._closed = False
 
     def _buf(self, key: str, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
         buf = self._bufs.get(key)
@@ -313,22 +318,38 @@ class StagingBufferPool:
             self._bufs[key] = buf
         return buf
 
-    def try_claim(self, holder: StagingBufferHolder) -> int | None:
-        """Grab a free slot for `holder` (the step holder); None if all busy."""
-        with self._lock:
-            for slot in range(self.depth):
-                if not self._busy[slot]:
-                    self._busy[slot].add(holder)
-                    return slot
-        return None
+    def claim(self, holder: StagingBufferHolder, timeout: float) -> int:
+        """Grab a free slot for `holder`. Waits until one is free, then
+        times out. ``timeout<=0`` fails immediately if none are free.
+        """
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._slot_free_condition:
+            while True:
+                if self._closed:
+                    raise OmniPrefixCacheUnmatchError("staging pool shut down while waiting for a slot")
+                for slot in range(self.depth):
+                    if not self._busy[slot]:
+                        self._busy[slot].add(holder)
+                        return slot
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise OmniPrefixCacheStagingTimeoutError(f"timed out waiting for a staging slot after {timeout}s")
+                self._slot_free_condition.wait(timeout=remaining)
 
     def bind(self, slot: int, holder: StagingBufferHolder) -> None:
-        with self._lock:
+        with self._slot_free_condition:
             self._busy[slot].add(holder)
 
     def release(self, slot: int, holder: StagingBufferHolder) -> None:
-        with self._lock:
+        with self._slot_free_condition:
             self._busy[slot].discard(holder)
+            if not self._busy[slot]:
+                self._slot_free_condition.notify()
+
+    def close(self) -> None:
+        with self._slot_free_condition:
+            self._closed = True
+            self._slot_free_condition.notify_all()
 
     def views(self, slot: int, key: str, n: int, width: int, dtype: torch.dtype, pin: bool) -> torch.Tensor:
         base = slot * self.capacity
@@ -398,27 +419,27 @@ class OmniPrefixCacheController:
     def stage_step_host(
         self, tensors: dict[str, torch.Tensor], n: int, freeze_event: object | None, step_holder: StagingBufferHolder
     ) -> StepD2HClaim:
-        """Launch ONE whole-step D2H into a staging slot, ahead of consumption.
+        """Claim a staging slot and, when `tensors` is non-empty, launch
+        ONE whole-step D2H into it.
 
-        Returns the claim (slot + host views [0:n) + d2h event). A step
+        Leftover-only saves pass empty `tensors` and still take a slot
+        (empty views) so every sid shares the in-flight bound. A full
+        pool waits for materialize/discard; timeout then errors. A step
         larger than the page overflows the next slot — that is a config
-        break. A full pool currently raises (wait+timeout is TODO).
-        The caller binds task holders after submit; `step_holder`
+        break. The caller binds task holders after submit; `step_holder`
         is released by materialize/discard via staging_release.
         """
-        if n > self._staging_pool.capacity:
+        if tensors and n > self._staging_pool.capacity:
             raise OmniPrefixCacheUnmatchError(
                 f"step has {n} tokens; staging capacity is {self._staging_pool.capacity} "
                 "(size staging_capacity_tokens to max_num_batched_tokens)"
             )
-        slot = self._staging_pool.try_claim(step_holder)
-        if slot is None:
-            # TODO: wait for materialize/discard to free a slot; timeout then
-            # error. Same in-flight ticket as leftover-only save (manager).
-            raise OmniPrefixCacheUnmatchError(
-                "D2H staging pool exhausted; unconsumed steps, leaked holders, "
-                f"or committer backlog (in_flight_tasks={len(self._tasks)})"
-            )
+        try:
+            slot = self._staging_pool.claim(step_holder, self._config.staging_claim_timeout_s)
+        except OmniPrefixCacheStagingTimeoutError as e:
+            raise OmniPrefixCacheStagingTimeoutError(
+                f"{e}; leaked holders or committer backlog (in_flight_tasks={len(self._tasks)})"
+            ) from e
         try:
             pin = not self._eager
             views: dict[str, torch.Tensor] = {}
@@ -598,6 +619,7 @@ class OmniPrefixCacheController:
         return self._tasks.get(tid)
 
     def shutdown(self) -> None:
+        self._staging_pool.close()
         with self._wake:
             self._shutdown = True
             self._wake.notify_all()

@@ -29,6 +29,7 @@ from vllm_omni.core.prefix_cache.group_view import (
 from vllm_omni.core.prefix_cache.interface import (
     HIDDEN_KEY,
     ModelCachePolicy,
+    OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
     StageCacheOutputs,
@@ -42,6 +43,7 @@ __all__ = [
     "ModelCachePolicy",
     "OmniPrefixCacheController",
     "OmniPrefixCacheManager",
+    "OmniPrefixCacheStagingTimeoutError",
     "OmniPrefixCacheUnmatchError",
     "StageCacheOutputs",
     "PrefixBlockPool",

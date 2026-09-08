@@ -11,6 +11,7 @@ import ast
 import logging
 import sys
 import threading
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,7 @@ from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView, check
 from vllm_omni.core.prefix_cache.interface import (
     HIDDEN_KEY,
     ModelCachePolicy,
+    OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
     WriteSchedule,
@@ -685,11 +687,48 @@ def test_step_context_exactly_once():
         mgr.discard_step(sid)
 
 
-def test_unconsumed_contexts_overflow_fails_fast():
-    mgr, view = make_manager()
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="unconsumed step contexts"):
+def test_unconsumed_contexts_timeout():
+    mgr, view = make_manager(staging_claim_timeout_s=0.0)
+    with pytest.raises(OmniPrefixCacheStagingTimeoutError, match="unconsumed step contexts"):
         for pos in range(8):
             run_step(mgr, view, {"a": ([0, 1, 2, 3], pos, 1)})
+
+
+def test_save_waits_until_a_slot_is_consumed():
+    mgr, view = make_manager(staging_depth=2, staging_claim_timeout_s=2.0)
+    s0 = run_step(mgr, view, {"a": ([0], 0, 1)})
+    s1 = run_step(mgr, view, {"a": ([0], 1, 1)})
+    err: list[BaseException] = []
+    sid_holder: list[int] = []
+
+    def _blocked_save() -> None:
+        try:
+            sid_holder.append(run_step(mgr, view, {"a": ([0], 2, 1)}))
+        except BaseException as e:
+            err.append(e)
+
+    t = threading.Thread(target=_blocked_save, daemon=True)
+    t.start()
+    time.sleep(0.1)
+    assert t.is_alive()
+    mgr.discard_step(s0)
+    t.join(timeout=1.0)
+    assert not t.is_alive()
+    assert not err
+    mgr.discard_step(s1)
+    mgr.discard_step(sid_holder[0])
+
+
+def test_leftover_only_save_claims_staging_slot():
+    policy = ModelCachePolicy(needs_full_hidden_states=False)
+    mgr, view = make_manager(policy=policy, staging_depth=2, staging_claim_timeout_s=0.0)
+    leftover = {"codes.ref": torch.zeros(3, 2)}
+    s0 = run_step(mgr, view, {"a": ([0], 0, 1)}, mm=leftover)
+    s1 = run_step(mgr, view, {"a": ([0], 1, 1)}, mm=leftover)
+    assert mgr._step_ctxs[s0].d2h is not None and mgr._step_ctxs[s0].d2h.views == {}
+    assert mgr._step_ctxs[s1].d2h is not None and mgr._step_ctxs[s1].d2h.views == {}
+    with pytest.raises(OmniPrefixCacheStagingTimeoutError, match="unconsumed step contexts"):
+        run_step(mgr, view, {"a": ([0], 2, 1)}, mm=leftover)
 
 
 def test_save_slot_mismatch_fails_fast():

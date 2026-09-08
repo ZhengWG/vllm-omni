@@ -66,6 +66,7 @@ from vllm_omni.core.prefix_cache.controller import (
 )
 from vllm_omni.core.prefix_cache.interface import (
     ModelCachePolicy,
+    OmniPrefixCacheStagingTimeoutError,
     OmniPrefixCacheUnmatchError,
     PrefixCacheConfig,
     ReqId,
@@ -181,8 +182,9 @@ class _StepContext:
 
     Built on the engine thread in save_outputs so materialize (possibly on
     the async builder) never reads the live batch. Host rows live on `d2h`
-    (None only if the step had no rows). materialize XOR discard_step pops
-    it; leaking contexts fails fast at a later save.
+    (empty views when leftover-only). materialize XOR discard_step pops
+    it and returns the in-flight slot. A later save waits if all slots
+    are still held.
     """
 
     # Packed layout in batch order: req -> [start, end) of this step's rows.
@@ -201,7 +203,7 @@ class _StepContext:
     # after the next forward has overwritten those buffers.
     mm_cpu_snapshot: dict[TensorName, Any] = field(default_factory=dict)
 
-    # Staging claim if this step had rows.
+    # Staging claim for this sid (empty views when leftover-only).
     d2h: StepD2HClaim | None = None
 
 
@@ -457,12 +459,13 @@ class OmniPrefixCacheManager:
         Leftover mm (deferred tails, uncached passthrough) is copied to
         CPU here so materialize never reads live graph buffers.
         Snapshots everything materialize needs. The returned step id MUST
-        be consumed exactly once — by materialize() or discard_step();
-        leaking contexts fails fast at a later save.
+        be consumed exactly once — by materialize() or discard_step().
+        Every sid claims one staging slot (leftover-only included); a
+        later save waits for a free slot and times out if none return.
 
         The state lock never covers a blocking wait: the previous step's
-        JOIN_NEXT_STEP join, the clone build, and the cap reservation (which may
-        flush) all run unlocked.
+        JOIN_NEXT_STEP join, the clone build, the cap reservation (which may
+        flush), and the staging-slot claim all run unlocked.
         """
         # 1. Join the previous step's host copies (unlocked).
         self._wait_for_host_ready()
@@ -535,23 +538,15 @@ class OmniPrefixCacheManager:
             mm_outputs, set(device_snapshot), num_tokens_unpadded, num_tokens_padded
         )
 
-        # 5. Bound unconsumed step ctxs *before* claiming a staging slot —
-        #    otherwise a full pool raises holder-exhaustion and hides the ids.
-        #    Then optional D2H (unlocked), then submit + hang ctx (locked).
-        #
-        # TODO: every sid-issuing save should claim an in-flight ticket
-        # (leftover-only included). Full → wait for materialize/discard,
-        # timeout then error. Then delete this raise.
-        self._raise_if_unconsumed_ctxs_at_capacity()
+        # 5. Claim an in-flight slot (unlocked), optional D2H into it,
+        #    then submit + hang ctx (locked). Leftover-only still claims.
+        #    Full pool waits; timeout lists the unconsumed sids.
         d2h_claim: StepD2HClaim | None = None
         step_holder = StagingBufferHolder.for_step(self._next_step_id)
         transferred = False
         bound_tids: list[int] = []
         try:
-            if device_snapshot:
-                d2h_claim = self._controller.stage_step_host(
-                    device_snapshot, num_tokens_unpadded, freeze_event, step_holder
-                )
+            d2h_claim = self._stage_step_host(device_snapshot, num_tokens_unpadded, freeze_event, step_holder)
 
             step_id = self._publish_saved_step(
                 req_order=req_order,
@@ -729,6 +724,25 @@ class OmniPrefixCacheManager:
         return out
 
     # ---------------------------------------------------------- save
+
+    def _stage_step_host(
+        self,
+        device_snapshot: dict[str, torch.Tensor],
+        num_tokens_unpadded: int,
+        freeze_event: object | None,
+        step_holder: StagingBufferHolder,
+    ) -> StepD2HClaim:
+        """Claim a staging slot (wait + timeout) and D2H if this step has rows.
+
+        Unlocked. Timeout is annotated with the unconsumed sids so a
+        leaked consume is visible; other UnmatchErrors pass through.
+        """
+        try:
+            return self._controller.stage_step_host(device_snapshot, num_tokens_unpadded, freeze_event, step_holder)
+        except OmniPrefixCacheStagingTimeoutError as e:
+            with self._state_lock:
+                ids = sorted(self._step_ctxs)
+            raise OmniPrefixCacheStagingTimeoutError(f"{e}; unconsumed step contexts (ids={ids})") from e
 
     def _wait_for_host_ready(self) -> None:
         """Pop last step's join worklists, then wait ``host_ready`` unlocked.
@@ -989,23 +1003,6 @@ class OmniPrefixCacheManager:
                 f"step context {step_id} missing (have {sorted(self._step_ctxs)}); already consumed or never saved"
             )
         return ctx
-
-    def _raise_if_unconsumed_ctxs_at_capacity(self) -> None:
-        """Takes ``_state_lock``. Unconsumed contexts at `staging_depth` means
-        the runner skipped both materialize and discard_step. Checked
-        before claiming a staging slot so a full pool does not hide the
-        leaked ids.
-
-        This bound currently equals the slot-pool depth (same config field).
-        They are different failures. TODO: claim a ticket on every sid
-        save (including leftover-only); wait + timeout instead of raise.
-        """
-        with self._state_lock:
-            if len(self._step_ctxs) >= self._config.staging_depth:
-                raise OmniPrefixCacheUnmatchError(
-                    f"{len(self._step_ctxs)} unconsumed step contexts (ids={sorted(self._step_ctxs)}); "
-                    "runner violated the consume-exactly-once contract"
-                )
 
     def _release_step_staging_slot(self, slot: int, step_id: int) -> None:
         self._controller.staging_release(slot, StagingBufferHolder.for_step(step_id))
