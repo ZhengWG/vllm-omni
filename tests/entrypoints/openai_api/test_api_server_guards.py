@@ -638,6 +638,49 @@ def test_images_generation_without_multistage_chat_handler_preserves_unavailable
     assert exc_info.value.detail == "openai_serving_chat is not initialized for multi-stage image generation."
 
 
+def test_images_generation_accepts_llm_final_image_stage() -> None:
+    """LLM generation stages that declare image output must not 503 as 'no diffusion'."""
+    app = FastAPI()
+    stage_configs = [
+        SimpleNamespace(stage_type="llm", final_output=False, final_output_type=None),
+        SimpleNamespace(stage_type="llm", final_output=True, final_output_type="image"),
+    ]
+    app.state.engine_client = SimpleNamespace(stage_configs=stage_configs)
+    app.state.stage_configs = stage_configs
+    app.state.openai_serving_models = SimpleNamespace(base_model_paths=[SimpleNamespace(name="demo-model")])
+    app.state.openai_serving_chat = None
+    app.state.args = SimpleNamespace(max_generated_image_size=None)
+
+    raw_request = _request_for(app, method="POST", path="/v1/images/generations")
+    request = api_server.ImageGenerationRequest(prompt="a cat", model="demo-model")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api_server.generate_images(request, raw_request))
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "openai_serving_chat is not initialized for multi-stage image generation."
+
+
+def test_images_generation_rejects_text_only_llm_pipeline() -> None:
+    """Text-only LLM pipelines still fail the images-generation capability check."""
+    app = FastAPI()
+    stage_configs = [
+        SimpleNamespace(stage_type="llm", final_output=True, final_output_type="text"),
+    ]
+    app.state.engine_client = SimpleNamespace(stage_configs=stage_configs)
+    app.state.stage_configs = stage_configs
+    app.state.openai_serving_models = SimpleNamespace(base_model_paths=[SimpleNamespace(name="demo-model")])
+
+    raw_request = _request_for(app, method="POST", path="/v1/images/generations")
+    request = api_server.ImageGenerationRequest(prompt="a cat", model="demo-model")
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(api_server.generate_images(request, raw_request))
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "No image generation stage found in multi-stage pipeline."
+
+
 def test_speech_without_handler_preserves_not_found_http_error() -> None:
     """Lock speech HTTP when ``openai_serving_speech`` is unset.
 
