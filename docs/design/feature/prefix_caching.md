@@ -168,8 +168,13 @@ Finally, we look up the output hidden states/multimodal tensors corresponding to
 ### Implementation
 
 The block/slot model is `vllm_omni/core/prefix_cache/`.
-`OmniPrefixCacheManager` owns slot occupancy, the request-task table,
-hit spans, and merge.
+`OmniPrefixCacheManager` owns the request-task table, hit spans, step
+snapshots, and merge; `SlotStatusTable` (`occupancy.py`) is its per
+(slot, key) occupancy. `HitRecaller` (`recall.py`) reads hits back out in two
+typed phases: `plan()` runs under the state lock and pins row sources into a
+`RecallPlan`; `recall(plan)` runs without it and does the waiting and
+reading. A plan is the only way to get rows, and the lock is the only place
+one is built.
 `OmniPrefixCacheController` moves data: a reusable `StagingBufferPool` for
 this step's device→host copy, and writes into the durable `PrefixBlockPool`.
 The state lock covers those tables only.

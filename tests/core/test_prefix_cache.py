@@ -147,9 +147,9 @@ def expected_rows(slots: torch.Tensor) -> torch.Tensor:
 
 def plan_fetch(mgr, slots, key, *, req_id):
     with mgr._state_lock:
-        src = mgr._slot_ref(slots, key, req_id)
+        plan = mgr._recaller.plan(slots, key, req_id)
     with torch.inference_mode():
-        return mgr._fetch_source(src)
+        return mgr._recaller.recall(plan)
 
 
 def _assert_leftover_shapes(inp, got, n: int) -> None:
@@ -1017,14 +1017,14 @@ def test_join_next_step_hit_survives_task_already_drained():
     view.req_blocks["a"] = [0, 1]
     sid = run_step(mgr, view, {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8})
     with mgr._state_lock:
-        src = mgr._slot_ref(view.slots_for("b", 0, 8), HIDDEN_KEY, "b")
-    for tid in src.join_tids:
+        plan = mgr._recaller.plan(view.slots_for("b", 0, 8), HIDDEN_KEY, "b")
+    for tid in plan.join_tids:
         mgr._controller._run_eager(mgr._controller.get_task(tid))
     with torch.inference_mode():
         with mgr._state_lock:
             mgr._commit_drained_writes()
-        assert mgr._controller.get_task(src.join_tids[0]) is None
-        assert torch.equal(mgr._fetch_source(src), expected_rows(view.slots_for("b", 0, 8)))
+        assert mgr._controller.get_task(plan.join_tids[0]) is None
+        assert torch.equal(mgr._recaller.recall(plan), expected_rows(view.slots_for("b", 0, 8)))
     mgr.materialize(sid, ["a", "b"])
 
 

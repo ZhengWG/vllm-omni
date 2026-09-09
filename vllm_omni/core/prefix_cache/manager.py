@@ -55,8 +55,7 @@ from collections import deque
 from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from enum import IntEnum
-from typing import TYPE_CHECKING, Any, NamedTuple, NoReturn
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -83,6 +82,8 @@ from vllm_omni.core.prefix_cache.interface import (
     is_hidden_key,
     without_hidden,
 )
+from vllm_omni.core.prefix_cache.occupancy import SlotStatusTable
+from vllm_omni.core.prefix_cache.recall import HitRecaller, RecallPlan
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
@@ -92,12 +93,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class _Occupancy(IntEnum):
-    ABSENT = 0
-    IN_TRANSIT = 1
-    COMMITTED = 2
-
-
 def _is_step_token_tensor(val: Any, n: int, padded: int) -> bool:
     """2D+ tensor whose first dim is this step's token count (``n`` or padded).
 
@@ -105,10 +100,6 @@ def _is_step_token_tensor(val: Any, n: int, padded: int) -> bool:
     lists, and other shapes are False.
     """
     return isinstance(val, torch.Tensor) and val.ndim >= 2 and int(val.shape[0]) in (n, padded)
-
-
-def _raise_unreadable_hit(req_id: str, key: str, why: str) -> NoReturn:
-    raise OmniPrefixCacheUnmatchError(f"hit span for req {req_id} key={key} is not readable ({why})")
 
 
 def _snapshot_leftover_mm_cpu(
@@ -199,30 +190,6 @@ def _locked(fn):
     return wrapper
 
 
-@dataclass
-class _SlotRef:
-    """Where one (req, key) span's slots live: planned under the lock, fetched outside it.
-
-    Schedule split, not a single read tier:
-    - JOIN_NEXT_STEP in-transit: ``join_tids``. Fetch waits ``done``,
-      drains, then reads the pool. Staging views are never sliced.
-    - JOIN_ON_FINISH in-transit: ``staged_list`` task refs. Fetch uses
-      ``fetch_host`` (device freeze / committer host).
-    - Already in the CPU pool: ``already_staged`` → pool.
-
-    A JOIN_NEXT_STEP task may disappear between plan and join (another
-    entry already published it into the pool); ``join`` no-ops and the
-    pool rows persist.
-    """
-
-    slots: torch.Tensor  # KV slot ids (PrefixBlockPool rows)
-    key: TensorName
-    req_id: ReqId
-    already_staged: bool  # this key is already in the CPU pool
-    staged_list: list[tuple[WriteTask, torch.Tensor]]  # JOIN_ON_FINISH only
-    join_tids: list[Tid] = field(default_factory=list)  # JOIN_NEXT_STEP in-transit
-
-
 @dataclass(kw_only=True)
 class _StepContext:
     """Save-time snapshot of one step; consumed exactly once.
@@ -251,82 +218,6 @@ class _StepContext:
 
     # Staging slot for this step id (empty views when only leftover mm).
     d2h: StepD2HClaim | None = None
-
-
-class _SlotStatus(NamedTuple):
-    """Occupancy row for one tensor name (views into the table, not copies)."""
-
-    state: torch.Tensor  # int8[num_slots]
-    tids: torch.Tensor  # Tid per kv slot; 0 = none
-
-
-class _SlotStatusTable:
-    """Per (KV slot, tensor name): empty, being written, or already in the pool.
-
-    Hidden and a deferred mm field on the same slot are independent.
-    ``map_slots`` marks a write in progress; if another task still owns
-    the slot, the manager records those rows as no longer owned by it.
-    ``commit`` runs after the pool write: still-owned slots become
-    committed.
-    """
-
-    def __init__(self, num_slots: int) -> None:
-        self.num_slots = num_slots
-        self.state: dict[TensorName, torch.Tensor] = {}  # int8[num_slots]
-        self.tids: dict[TensorName, torch.Tensor] = {}  # Tid per kv slot; 0 = none
-        self.task_slots: dict[Tid, torch.Tensor] = {}  # kv slots
-        self.task_keys: dict[Tid, tuple[TensorName, ...]] = {}
-
-    def init_table(self, key: TensorName) -> None:
-        """Allocate occupancy tensors for ``key`` if they do not exist."""
-        if key in self.state:
-            return
-        self.state[key] = torch.zeros(self.num_slots, dtype=torch.int8)
-        self.tids[key] = torch.zeros(self.num_slots, dtype=torch.int64)
-
-    def get_slot_status(self, key: TensorName) -> _SlotStatus:
-        """Occupancy tensors for ``key``. ``init_table`` must have run."""
-        return _SlotStatus(state=self.state[key], tids=self.tids[key])
-
-    def map_slots(
-        self, slots: torch.Tensor, tid: Tid, keys: Iterable[TensorName]
-    ) -> list[tuple[Tid, TensorName, torch.Tensor]]:
-        """Record ``tid`` on these (slot, key). Return in-transit rows
-        another write still owned (caller marks them skipped on it)."""
-        keys = tuple(keys)
-        stolen: list[tuple[Tid, TensorName, torch.Tensor]] = []
-        for key in keys:
-            status = self.get_slot_status(key)
-            cur = status.tids[slots]
-            stale = (status.state[slots] == _Occupancy.IN_TRANSIT) & (cur != tid) & (cur != 0)
-            if bool(stale.any()):
-                for old in {int(o) for o in cur[stale].tolist()}:
-                    stolen.append((old, key, slots[stale & (cur == old)]))
-            status.state[slots] = _Occupancy.IN_TRANSIT
-            status.tids[slots] = tid
-        prev = self.task_slots.get(tid)
-        if prev is None:
-            self.task_slots[tid] = slots
-            self.task_keys[tid] = keys
-        else:
-            # Deferred tasks grow one `_WriteChunk` per step.
-            self.task_slots[tid] = torch.cat([prev, slots])
-            self.task_keys[tid] = tuple(dict.fromkeys(self.task_keys[tid] + keys))
-        return stolen
-
-    def commit(self, tids: Iterable[Tid]) -> None:
-        """Flip still-owned slots to COMMITTED and drop the reverse index."""
-        for tid in tids:
-            slots = self.task_slots.pop(tid, None)
-            keys = self.task_keys.pop(tid, ())
-            if slots is None:
-                continue
-            for key in keys:
-                status = self.get_slot_status(key)
-                still_ours = status.tids[slots] == tid
-                idx = slots[still_ours]
-                status.state[idx] = _Occupancy.COMMITTED
-                status.tids[idx] = 0
 
 
 class _RequestTaskTable:
@@ -390,11 +281,20 @@ class OmniPrefixCacheManager:
         # a wait-for-copy, GPU-byte-budget flush, or device→host copy.
         self._state_lock = threading.Lock()
 
-        self._slot_status = _SlotStatusTable(config.num_blocks * config.block_size)
+        self._slot_status = SlotStatusTable(config.num_blocks * config.block_size)
         # Hidden is known from the default policy; mm rows at init_table.
         if (hk := self._policy.hidden_key) is not None:
             self._slot_status.init_table(hk)
         self._request_tasks = _RequestTaskTable()
+        # Read path: plan() under _state_lock, recall() outside it.
+        self._recaller = HitRecaller(
+            pool=self._pool,
+            slot_status=self._slot_status,
+            controller=self._controller,
+            lock=self._state_lock,
+            publish_writes=self._commit_drained_writes,
+            block_size=config.block_size,
+        )
         # Join worklists — not occupancy, not the request-task table.
         self._join_next_step_tids: list[Tid] = []
         self._join_finished_tids: set[Tid] = set()  # escalated on finish/abort
@@ -407,7 +307,7 @@ class OmniPrefixCacheManager:
         # Prefix gather during forward (CPU work releases the GIL).
         # One worker: complete in submit order; pop finished work from the head.
         self._prefetch_pool = ThreadPoolExecutor(1, thread_name_prefix="omni-prefix-cache-prefetch")
-        self._prefetch_queue: deque[tuple[Future, _SlotRef]] = deque()
+        self._prefetch_queue: deque[tuple[Future, RecallPlan]] = deque()
 
         # One snapshot per step id; consume with materialize or discard_step.
         self._next_step_id: StepId = 1
@@ -649,21 +549,21 @@ class OmniPrefixCacheManager:
 
                 cached_keys = ctx.cached_keys
 
-                hit_sources: dict[tuple[str, str], _SlotRef | Future] = {}
+                hit_sources: dict[tuple[str, str], RecallPlan | Future] = {}
                 for req_id in req_ids:
                     hit = ctx.hits.get(req_id)
                     if not hit:
                         continue
                     hit_upto, hit_blocks = hit
                     prefetched = ctx.hit_prefetch.get(req_id, {})
-                    slots = self._get_hit_slots(hit_upto, hit_blocks)
+                    slots = self._recaller.hit_slots(hit_upto, hit_blocks)
                     keys = self._policy.get_hit_keys(cached_keys)
                     for key in keys:
                         fut = prefetched.get(key)
                         if fut is not None:
                             hit_sources[(req_id, key)] = fut
                             continue
-                        hit_sources[(req_id, key)] = self._slot_ref(slots, key, req_id)
+                        hit_sources[(req_id, key)] = self._recaller.plan(slots, key, req_id)
 
             # ---- unlocked: data movement + merge ----
             current: dict[str, torch.Tensor] = {}
@@ -737,26 +637,26 @@ class OmniPrefixCacheManager:
         keys = self._policy.get_hit_keys(self._pool.keys())
         for req_id, (hit_upto, hit_blocks) in self._hit_spans.items():
             n_new = int(self._cur_num_scheduled.get(req_id, 0))
-            slots = self._get_hit_slots(hit_upto, hit_blocks)
+            slots = self._recaller.hit_slots(hit_upto, hit_blocks)
             futs: dict[str, Future] = {}
             for key in keys:
                 try:
-                    src = self._slot_ref(slots, key, req_id)
+                    plan = self._recaller.plan(slots, key, req_id)
                 except OmniPrefixCacheUnmatchError:
                     continue
-                fut = self._prefetch_pool.submit(self._prefetch_hit, src, n_new)
-                self._prefetch_queue.append((fut, src))
+                fut = self._prefetch_pool.submit(self._prefetch_hit, plan, n_new)
+                self._prefetch_queue.append((fut, plan))
                 futs[key] = fut
             if futs:
                 self._hit_prefetch[req_id] = futs
 
     @torch.inference_mode()
-    def _prefetch_hit(self, src: _SlotRef, n_new: int) -> torch.Tensor:
+    def _prefetch_hit(self, plan: RecallPlan, n_new: int) -> torch.Tensor:
         """Prefetch thread: gather the hit span and pre-build the merged
         buffer with the prefix filled. materialize writes only this step's
         rows at the tail — the gather AND the prefix copy both happen while
         the forward runs, and the cat leaves the critical path."""
-        rows = self._fetch_source(src)
+        rows = self._recaller.recall(plan)
         out = torch.empty((rows.shape[0] + n_new, rows.shape[-1]), dtype=rows.dtype)
         out[: rows.shape[0]] = rows
         return out
@@ -1090,121 +990,6 @@ class OmniPrefixCacheManager:
         for tid in bound_tids:
             self._controller.staging_release(slot, StagingBufferHolder.for_task(tid))
 
-    # -------------------------------------------------- slot ref / fetch
-
-    def _get_hit_slots(self, hit_upto: int, hit_blocks: list[int]) -> torch.Tensor:
-        """Prefix-hit block ids → KV slot ids. Alignment is checked at
-        ``new_step_starts``. Does not require ``_state_lock``.
-        """
-        bs = self._config.block_size
-        block_ids = torch.tensor(hit_blocks, dtype=torch.int64)
-        return (block_ids.unsqueeze(1) * bs + torch.arange(bs)).reshape(-1)[:hit_upto]
-
-    def _slot_ref(self, slots: torch.Tensor, key: str, req_id: str) -> _SlotRef:
-        """Caller holds ``_state_lock``. Pin a ``_SlotRef`` for `slots` (no data movement).
-
-        Rows still being written win over the CPU pool: they may not have
-        landed yet, and a pool read would return zero/stale values.
-        JOIN_NEXT_STEP tasks go in ``join_tids`` (wait-then-pool at
-        fetch). JOIN_ON_FINISH tasks stay as refs for fetch_host.
-
-        Hidden rejects any empty hole (prefetch skips; materialize
-        raises). Other keys only need a source — holes fall to the pool.
-        """
-        status = self._slot_status.get_slot_status(key)
-        states = status.state[slots]
-        tids = status.tids[slots]
-        staged_mask = states == _Occupancy.IN_TRANSIT
-
-        staged: list[tuple[WriteTask, torch.Tensor]] = []
-        join_tids: list[int] = []
-        for tid in {int(t) for t in tids[staged_mask].tolist()}:
-            task = self._controller.get_task(tid) if tid != 0 else None
-            if task is None:
-                _raise_unreadable_hit(req_id, key, f"in-transit entry {tid} cannot serve them")
-            if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
-                join_tids.append(task.tid)
-            else:
-                staged.append((task, staged_mask & (tids == tid)))
-
-        already_staged = self._pool.has_key(key)
-        has_source = already_staged or bool(staged) or bool(join_tids)
-        if is_hidden_key(key):
-            n_abs = int((states == _Occupancy.ABSENT).sum())
-            if n_abs or not has_source:
-                _raise_unreadable_hit(req_id, key, f"{n_abs} absent slots")
-        return _SlotRef(
-            slots=slots,
-            key=key,
-            req_id=req_id,
-            already_staged=already_staged,
-            staged_list=staged,
-            join_tids=join_tids,
-        )
-
-    def _fetch_source(self, src: _SlotRef) -> torch.Tensor:
-        """Fetch a planned row source (execute phase, no lock).
-
-        One key is one schedule: ``join_tids`` (JOIN_NEXT_STEP) and
-        ``staged_list`` (JOIN_ON_FINISH) do not coexist. Immediate: wait
-        ``done``, drain, read the pool. Deferred: pool rows already
-        written, overlay ``fetch_host`` on the still-in-progress mask.
-        """
-        # For JOIN_NEXT_STEP, wait `done`, drain, read the pool
-        if src.join_tids:
-            self._controller.join(src.join_tids)
-            with self._state_lock:
-                self._commit_drained_writes()
-            out = self._pool.rows(src.key, src.slots)
-            self._ensure_not_reassigned(src.slots, src.key, req_id=src.req_id)
-            return out
-
-        # For JOIN_ON_FINISH, pool rows already written, overlay `fetch_host` on the still-in-progress mask
-        n = int(src.slots.numel())
-        out: torch.Tensor | None = None
-        if src.already_staged:
-            out = self._pool.rows(src.key, src.slots)
-        in_transit = None
-        for task, mask in src.staged_list:
-            try:
-                rows = self._controller.fetch_host(task, src.slots[mask], src.key)
-            except KeyError:
-                _raise_unreadable_hit(
-                    src.req_id,
-                    src.key,
-                    f"entry {task.tid} (req {task.req_id}, write_n {task.write_n}) cannot serve them",
-                )
-            if out is None:
-                out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
-            out[mask] = rows
-            in_transit = mask if in_transit is None else in_transit | mask
-        self._ensure_not_reassigned(src.slots, src.key, in_transit_mask=in_transit, req_id=src.req_id)
-        if out is None:
-            _raise_unreadable_hit(src.req_id, src.key, "no source")
-        return out
-
-    def _ensure_not_reassigned(
-        self,
-        slots: torch.Tensor,
-        key: str,
-        *,
-        in_transit_mask: torch.Tensor | None = None,
-        req_id: str = "?",
-    ) -> None:
-        """Takes ``_state_lock``. Post-fetch check: pool rows read unlocked
-        may have been given to a newer write mid-read (block reuse). A torn
-        pool read must raise. JOIN_ON_FINISH slots already in-transit at
-        plan time are excluded; JOIN_NEXT_STEP slots must be COMMITTED
-        after the wait-then-publish.
-        """
-        with self._state_lock:
-            status = self._slot_status.get_slot_status(key)
-            violated = status.state[slots] == _Occupancy.IN_TRANSIT
-            if in_transit_mask is not None:
-                violated &= ~in_transit_mask
-            if bool(violated.any()):
-                _raise_unreadable_hit(req_id, key, f"reassigned during materialize ({int(violated.sum())} slots)")
-
     # ---------------------------------------------------------- merge
 
     def _merge_cached_for_req(
@@ -1213,12 +998,12 @@ class OmniPrefixCacheManager:
         req_id: str,
         key: str,
         current_cpu: torch.Tensor,
-        hit_sources: dict[tuple[str, str], _SlotRef | Future],
+        hit_sources: dict[tuple[str, str], RecallPlan | Future],
     ) -> torch.Tensor:
         """Hit prefix + this step's rows for one (req, key).
 
         No hit → this step's slice only. Prefetch Future → write the
-        slice into the reserved tail. Else cat(fetch, new).
+        slice into the reserved tail. Else cat(recall, new).
         """
         start, end = ctx.spans[req_id]
         new_rows = current_cpu[start:end]
@@ -1232,7 +1017,7 @@ class OmniPrefixCacheManager:
             merged = src.result()
             merged[merged.shape[0] - new_rows.shape[0] :] = new_rows
             return merged
-        cached = self._fetch_source(src)
+        cached = self._recaller.recall(src)
         return torch.cat([cached, new_rows], dim=0)
 
     def _merge_uncached_mm(
