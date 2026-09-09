@@ -897,16 +897,79 @@ def test_oversized_step_fails_fast():
         run_step(mgr, view, {"a": ([0, 1], 0, 8)})
 
 
-def test_staging_task_slot_held_until_drain():
+def test_staging_slot_eager_save_leaves_only_step_holder():
+    """Eager submit writes the pool inline, so the task holder is bound and
+    released inside save; materialize then empties the slot."""
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
     ctx = mgr._step_ctxs[sid]
-    tid = next(iter(mgr._request_tasks.tasks["p"]))
     assert ctx.d2h is not None
     busy = mgr._controller._staging_pool._busy[ctx.d2h.staging_slot]
-    assert StagingBufferHolder.for_task(tid) in busy and StagingBufferHolder.for_step(sid) in busy
+    assert busy == {StagingBufferHolder.for_step(sid)}
     mgr.materialize(sid, ["p"])
     assert not busy
+
+
+def _hold_writes(mgr) -> None:
+    """Non-eager stand-in: register the task with device→host done, but
+    leave the pool write to the caller (`mgr._controller._scatter`)."""
+
+    def submit(task, queued=True):
+        with mgr._controller._lock:
+            mgr._controller._tasks[task.tid] = task
+        task.try_claim_d2h()
+        task.mark_host_ready()
+
+    mgr._controller.submit = submit
+
+
+def test_staging_task_slot_released_at_pool_write_not_drain():
+    mgr, view = make_manager()
+    _hold_writes(mgr)
+    sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
+    ctx = mgr._step_ctxs[sid]
+    tid = next(iter(mgr._request_tasks.tasks["p"]))
+    busy = mgr._controller._staging_pool._busy[ctx.d2h.staging_slot]
+    assert StagingBufferHolder.for_task(tid) in busy and StagingBufferHolder.for_step(sid) in busy
+    task = mgr._controller.get_task(tid)
+    mgr._controller._scatter(task)
+    # Released by the committer's pool write; the manager has not drained yet.
+    assert busy == {StagingBufferHolder.for_step(sid)}
+    assert mgr._controller.get_task(tid) is not None
+    mgr.materialize(sid, ["p"])
+    assert not busy
+    assert mgr._controller.get_task(tid) is None
+
+
+def test_blocked_save_is_released_by_pool_write_alone():
+    """All step contexts consumed, the only slot held by a pending write:
+    the committer finishing that write must unblock the waiting save."""
+    mgr, view = make_manager(staging_depth=1, staging_claim_timeout_s=2.0)
+    _hold_writes(mgr)
+    s0 = run_step(mgr, view, {"a": ([0], 0, 1)})
+    tid = next(iter(mgr._request_tasks.tasks["a"]))
+    mgr.materialize(s0, ["a"])
+    slot = mgr._step_ctxs.get(s0)  # consumed
+    assert slot is None
+    assert mgr._controller._staging_pool._busy[0] == {StagingBufferHolder.for_task(tid)}
+    err: list[BaseException] = []
+    sid_holder: list[int] = []
+
+    def _blocked_save() -> None:
+        try:
+            sid_holder.append(run_step(mgr, view, {"a": ([0], 1, 1)}))
+        except BaseException as e:
+            err.append(e)
+
+    t = threading.Thread(target=_blocked_save, daemon=True)
+    t.start()
+    time.sleep(0.1)
+    assert t.is_alive()
+    mgr._controller._scatter(mgr._controller.get_task(tid))
+    t.join(timeout=1.0)
+    assert not t.is_alive()
+    assert not err
+    mgr.discard_step(sid_holder[0])
 
 
 def test_hit_prefetch_prebuilds_merged_buffer():

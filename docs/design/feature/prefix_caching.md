@@ -215,10 +215,12 @@ outs = cache.materialize(sid, req_ids)    # or discard_step(sid)
 Each step id is consumed exactly once. `req_ids` must be a subset of the save
 snapshot. At most `staging_depth` unused step ids may exist at once: every
 `save_outputs` claims one staging slot, including saves with only leftover
-mm that copy no device→host page. A later save waits for `materialize`/`discard_step`
-to free a slot; `staging_claim_timeout_s` then errors with the unused
-ids. `materialize` may run on the async output builder after the engine
-has entered the next step; leftover mm (not written to the pool) is copied
+mm that copy no device→host page. A slot is also held by each immediate
+write that views it, until the committer's pool write. A later save waits
+for `materialize`/`discard_step` or that pool write to free a slot;
+`staging_claim_timeout_s` then errors with the unused ids and the task count.
+`materialize` may run on the async output builder after the engine has
+entered the next step; leftover mm (not written to the pool) is copied
 to CPU at `save_outputs` so the builder never reads live CUDA-graph
 buffers. See
 [Async Omni Output Materialization](omni_async_output_materialization.md).
@@ -234,7 +236,7 @@ Threads, locks, and what each may block on:
 | Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` GPU-byte flush; staging-slot claim | `_state_lock` |
 | Async output builder | `materialize` (may overlap the next engine step) | this step's `step_d2h_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
 | Committer | `_worker_loop`: wait device→host / deferred copy / pool write | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
-| Prefetch pool | hit-span gather during forward | `join_host_ready`; deferred `fetch_host` | `_state_lock` |
+| Prefetch pool | hit-span gather during forward | `join` (`done`); deferred `fetch_host` | `_state_lock` |
 
 | Lock | Covers | Does not cover |
 | --- | --- | --- |

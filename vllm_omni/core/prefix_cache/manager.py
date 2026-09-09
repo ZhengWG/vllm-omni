@@ -762,15 +762,18 @@ class OmniPrefixCacheManager:
     ) -> StepD2HClaim:
         """Claim a staging slot (wait + timeout) and copy device→host if this step has rows.
 
-        Unlocked. Timeout is annotated with the unconsumed sids so a
-        leaked consume is visible; other UnmatchErrors pass through.
+        Unlocked. Timeout is annotated with the unconsumed sids and the
+        task count so a leaked consume or a stuck write is visible.
         """
         try:
             return self._controller.stage_step_host(device_snapshot, num_tokens_unpadded, freeze_event, step_holder)
         except OmniPrefixCacheStagingTimeoutError as e:
             with self._state_lock:
                 ids = sorted(self._step_ctxs)
-            raise OmniPrefixCacheStagingTimeoutError(f"{e}; unconsumed step contexts (ids={ids})") from e
+            raise OmniPrefixCacheStagingTimeoutError(
+                f"{e}; unconsumed step contexts (ids={ids}) or a stuck write "
+                f"(in_flight_tasks={self._controller.in_flight_tasks()})"
+            ) from e
 
     def _wait_for_host_ready(self) -> None:
         """Pop last step's join worklists, then wait ``host_ready`` unlocked.
@@ -957,7 +960,7 @@ class OmniPrefixCacheManager:
             )
             self._map_slots(slots_cpu[start:end], tid, tensors.keys())
             # Bind before submit: the slot must never be holder-free
-            # while the task is live (freed at completion drain).
+            # while the task is live (released at its pool write).
             self._controller.staging_bind(staging_slot, StagingBufferHolder.for_task(tid))
             bound_tids.append(tid)
             self._controller.submit(task)
@@ -1039,7 +1042,7 @@ class OmniPrefixCacheManager:
     def _release_step_staging(self, ctx: _StepContext, step_id: int) -> None:
         """Drop this step's staging hold. Does not require ``_state_lock``.
 
-        materialize/discard: task holds leave with drain.
+        materialize/discard: task holds leave at their pool write.
         """
         if ctx.d2h is not None:
             self._release_step_staging_slot(ctx.d2h.staging_slot, step_id)

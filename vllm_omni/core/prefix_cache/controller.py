@@ -300,7 +300,7 @@ class StagingBufferPool:
 
     A slot stays busy while anyone still holds it: the step (until
     materialize/discard) and each immediate write that views the page
-    (until that write is retired). Prefix hits do not hold a slot —
+    (until its pool write). Prefix hits do not hold a slot —
     they wait for the pool write and read the durable pool.
 
     Saves with only leftover mm still claim a slot (empty views) so
@@ -438,12 +438,7 @@ class OmniPrefixCacheController:
                 f"step has {n} tokens; staging capacity is {self._staging_pool.capacity} "
                 "(size staging_capacity_tokens to max_num_batched_tokens)"
             )
-        try:
-            slot = self._staging_pool.claim(step_holder, self._config.staging_claim_timeout_s)
-        except OmniPrefixCacheStagingTimeoutError as e:
-            raise OmniPrefixCacheStagingTimeoutError(
-                f"{e}; leaked slot owners or committer backlog (in_flight_tasks={len(self._tasks)})"
-            ) from e
+        slot = self._staging_pool.claim(step_holder, self._config.staging_claim_timeout_s)
         try:
             pin = not self._eager
             views: dict[str, torch.Tensor] = {}
@@ -472,6 +467,15 @@ class OmniPrefixCacheController:
 
     def staging_release(self, slot: int, holder: StagingBufferHolder) -> None:
         self._staging_pool.release(slot, holder)
+
+    def _release_task_slot(self, task: WriteTask) -> None:
+        """Drop the task's staging hold at a terminal state (pool write or failure)."""
+        if task.staging_slot is not None:
+            self._staging_pool.release(task.staging_slot, StagingBufferHolder.for_task(task.tid))
+
+    def in_flight_tasks(self) -> int:
+        """Registered tasks not yet drained (diagnostics only)."""
+        return len(self._tasks)
 
     # ------------------------------------------------------------------ submit
 
@@ -597,20 +601,13 @@ class OmniPrefixCacheController:
 
     def drain_completed(self) -> list[int]:
         """Pop pool-written tasks from `_completed` and drop them from `_tasks`.
-
-        WriteTask holders release HERE — the same locked drain that flips
-        state to committed — not at the pool write: a hit plan that still
-        sees rows in transit must be able to hold the slot before it is
-        reclaimable.
-        """
+        Staging holders were already released at the pool write."""
         out: list[int] = []
         with self._lock:
             while self._completed:
                 out.append(self._completed.popleft())
-            tasks = [self._tasks.pop(tid, None) for tid in out]
-        for task in tasks:
-            if task is not None and task.staging_slot is not None:
-                self._staging_pool.release(task.staging_slot, StagingBufferHolder.for_task(task.tid))
+            for tid in out:
+                self._tasks.pop(tid, None)
         return out
 
     def drain_failed(self) -> list[int]:
@@ -806,8 +803,7 @@ class OmniPrefixCacheController:
             if tid in self._blocked:
                 self._blocked.remove(tid)
         task.mark_failed()
-        if task.staging_slot is not None:
-            self._staging_pool.release(task.staging_slot, StagingBufferHolder.for_task(task.tid))
+        self._release_task_slot(task)
         with self._lock:
             # Publish the failure: rows behind already-published block hashes
             # never landed, which the manager must raise on (hiding it would
@@ -840,5 +836,8 @@ class OmniPrefixCacheController:
         for key, slots, host in task.scatter_rows():
             self._pool.write(key, slots, host)
         task.mark_done()
+        # This write was the staging page's last reader. Release before
+        # publishing so a join() that sees `done` never sees a busy slot.
+        self._release_task_slot(task)
         with self._lock:
             self._completed.append(task.tid)
