@@ -169,6 +169,16 @@ def test_init_group_keys_fixed_for_parallel_remote_and_diffusion():
     assert keys == ["parallel:0:0", "parallel:0:1", "remote:1:0", "inline:diffusion"]
 
 
+def test_unresolved_devices_collapse_serial_groups_and_warn(caplog):
+    runtime = _runtime(parallel_stage_init=False)
+    with caplog.at_level("WARNING"):
+        keys = runtime._init_group_keys([_llm_replica(0, 0, "0"), _llm_replica(1, 0, "GPU-uuid")])
+
+    assert keys == ["device-group:*", "device-group:*"]
+    assert "Stage-1 replica 0" in caplog.text
+    assert "GPU-uuid" in caplog.text
+
+
 def _stage_plans(*devices: str) -> list[LogicalStageInitPlan]:
     return [
         LogicalStageInitPlan(stage_idx=i, stage_id=i, replicas=[_llm_replica(i, 0, dev)])

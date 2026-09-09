@@ -589,19 +589,8 @@ class StageRuntime:
                 # fails admission (fail-closed in check_admission).
                 return ADMISSION_EXEMPT
             resolved = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
-            if not resolved:
-                return None
-            ids: list[int] = []
-            for tok in str(resolved).split(","):
-                tok = tok.strip()
-                if not tok:
-                    continue
-                try:
-                    ids.append(int(tok))
-                except ValueError:
-                    # Non-integer visibility (UUID / MIG) can't be reasoned about.
-                    return None
-            return ids or None
+            parsed = parse_physical_device_ids(resolved)
+            return sorted(parsed) if parsed else None
 
         def _visible_ordinal(physical_id: int) -> int:
             """Translate a physical device id to this process's visible ordinal.
@@ -676,12 +665,20 @@ class StageRuntime:
         """
         keys = [self._init_group_key_override(replica) for replica in replicas]
         pending = [i for i, key in enumerate(keys) if key is None]
-        device_sets = [
-            parse_physical_device_ids(
-                self._resolve_replica_physical_devices(replicas[i].metadata.stage_id, replicas[i].metadata.runtime_cfg)
-            )
-            for i in pending
-        ]
+        device_sets: list[frozenset[int] | None] = []
+        for i in pending:
+            replica = replicas[i]
+            physical = self._resolve_replica_physical_devices(replica.metadata.stage_id, replica.metadata.runtime_cfg)
+            parsed = parse_physical_device_ids(physical)
+            if parsed is None:
+                logger.warning(
+                    "[stage_init] Stage-%s replica %s physical devices %r are not integer GPU ids; "
+                    "all serial LLM replicas will share one init group",
+                    replica.metadata.stage_id,
+                    replica.replica_id,
+                    physical,
+                )
+            device_sets.append(parsed)
         for i, key in zip(pending, device_overlap_group_keys(device_sets), strict=True):
             keys[i] = key
         return cast(list[str], keys)
