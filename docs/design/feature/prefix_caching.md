@@ -195,6 +195,18 @@ Two write paths, split by `ModelCachePolicy.deferred_keys`:
   finish/abort (or GPU-byte-budget pressure) forces the copy. One WriteTask
   per request — lifetime follows the request, not the step.
 
+A `WriteTask` moves through `TaskState` only via `transition()`, one step at
+a time along a strict chain:
+`PENDING` (registered, not queued) → `QUEUED` (on a copy queue) →
+`COPYING` (one thread owns the copy stage) → `HOST_READY` (host rows ready) →
+`WRITTEN` (in the CPU pool); `FAILED` is reachable from any non-terminal
+state. Skipping a step raises. The worker claims `COPYING` in the same `_wake`
+critical section as the queue pop, so `escalate` never re-queues a task it can
+see is already claimed. `host_ready` / `done` are wait primitives set by the
+transitions into `HOST_READY` / `WRITTEN` / `FAILED`. GPU-clone bytes are
+charged once per clone on a `_BudgetTicket` pinned by every task that views
+it, and uncharged when the last holder releases (idempotent per tid).
+
 Mm whose first dim equals the unpadded scheduled length *or* the CUDA-graph
 padded length is registered on first sighting. Talker `codes.audio` is a
 cat of scheduled rows and stays unpadded while hidden is padded; both must
@@ -242,7 +254,7 @@ Threads, locks, and what each may block on:
 | --- | --- | --- |
 | manager `_state_lock` | occupancy tables, step contexts, hit spans | join, GPU-byte flush, copy, `step_d2h_event` wait |
 | controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
-| `WriteTask.lock` | `reassigned`, `d2h_claimed`, `append_chunk` | `host_ready` / `done` (those are events) |
+| `WriteTask.lock` | `state`, `reassigned`, `append_chunk` | waiting on `host_ready` / `done` (those are events) |
 
 ### Related Files
 

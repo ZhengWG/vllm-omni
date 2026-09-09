@@ -28,6 +28,7 @@ import time
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Literal, NamedTuple
 
 import torch
@@ -67,16 +68,27 @@ class StagingBufferHolder(NamedTuple):
 
 
 @dataclass
-class _SnapshotHolder:
-    """GPU-byte-budget charge + refcount for one shared device clone.
+class _BudgetTicket:
+    """GPU-byte-budget charge for one device clone shared by several writes.
 
-    Does not store tensors (those live on ``_WriteChunk.tensors``). Several
-    writes share one clone: charge ``nbytes`` once, release when the last
-    ``tids`` drops. Immediate writes do not use this.
+    Charged once at ``reserve()``; freed when the last pinned tid releases.
+    Immediate: the whole-step clone, pinned by that step's JOIN_NEXT_STEP
+    tasks. Deferred: the shared deferred clone, pinned by every task a
+    chunk of it was appended to. Does not store tensors.
     """
 
     nbytes: int
     tids: set[Tid] = field(default_factory=set)
+    _freed: bool = False
+
+    def release(self, tid: Tid) -> int:
+        """Drop `tid`; return the bytes to uncharge (nbytes once, when the
+        last holder leaves; 0 otherwise). Idempotent per tid."""
+        self.tids.discard(tid)
+        if self.tids or self._freed:
+            return 0
+        self._freed = True
+        return self.nbytes
 
 
 @dataclass
@@ -90,9 +102,53 @@ class _WriteChunk:
     slots_cpu: torch.Tensor  # int64 flat row ids, in token order
     tensors: dict[TensorName, torch.Tensor]  # freeze (device or eager CPU)
     host: dict[TensorName, torch.Tensor] = field(default_factory=dict)  # host view of rows [0:n)
-    # Deferred: chunks from the same save share this GPU-byte charge.
-    # Immediate: None (bytes tracked on the WriteTask).
-    snapshot_holder: _SnapshotHolder | None = None
+    # GPU-byte charge of the clone these tensors view; shared across the
+    # chunks cut from one save. None for chunks with no device clone.
+    budget: _BudgetTicket | None = None
+
+
+class TaskState(Enum):
+    """WriteTask lifecycle: a strict chain, plus FAILED from any non-terminal.
+
+        PENDING -> QUEUED -> COPYING -> HOST_READY -> WRITTEN
+
+    PENDING     registered, not on a copy queue (deferred: waiting for
+                finish / budget pressure)
+    QUEUED      on a copy queue
+    COPYING     one thread owns the copy stage (staging: waits the step
+                device→host; deferred: copies the device clone)
+    HOST_READY  host rows ready (`host_ready` set); device clone dropped
+    WRITTEN     in the CPU pool (`done` set)
+    FAILED      committer could not finish (`host_ready` + `done` set;
+                manager raises on next entry)
+
+    Moves only through `WriteTask.transition`; skipping a step is illegal.
+    """
+
+    PENDING = auto()
+    QUEUED = auto()
+    COPYING = auto()
+    HOST_READY = auto()
+    WRITTEN = auto()
+    FAILED = auto()
+
+    @property
+    def is_terminal(self) -> bool:
+        return self in (TaskState.WRITTEN, TaskState.FAILED)
+
+
+# The one legal forward move from each non-terminal state.
+_CHAIN: dict[TaskState, TaskState] = {
+    TaskState.PENDING: TaskState.QUEUED,
+    TaskState.QUEUED: TaskState.COPYING,
+    TaskState.COPYING: TaskState.HOST_READY,
+    TaskState.HOST_READY: TaskState.WRITTEN,
+}
+_NOT_YET_COPYING = frozenset({TaskState.PENDING, TaskState.QUEUED})
+
+
+def _is_legal_move(frm: TaskState, to: TaskState) -> bool:
+    return (to is TaskState.FAILED and not frm.is_terminal) or _CHAIN.get(frm) is to
 
 
 @dataclass
@@ -103,39 +159,28 @@ class WriteTask:
     `req_id` + `write_n` mark whose write this is and the nth time that
     request opened a write. One write may cover several keys.
 
-    Pipeline:
+    `state` is the single source of truth for where the write is (see
+    `TaskState`). `host_ready` / `done` are wait primitives set by the
+    transitions into HOST_READY / WRITTEN / FAILED, never directly.
 
-        queued / device-staged
-            -> copy claimed (`d2h_claimed`)
-            -> `host_ready`  (device→host complete; device clone refs may drop)
-            -> write CPU pool
-            -> `done`        (in the CPU pool; `failed` instead on error)
+    How HOST_READY is reached:
+    - JOIN_NEXT_STEP: `chunk.host` is a staging view set at save; the
+      copy stage only waits `step_d2h_event`.
+    - JOIN_ON_FINISH: the copy stage copies device→host into `chunk.host`.
 
-    How `host_ready` is reached:
-    - JOIN_NEXT_STEP: `chunk.host` is a staging view set at save.
-      `_copy_task` only waits `step_d2h_event` (does not write host).
-    - JOIN_ON_FINISH: committer copies device→host into `chunk.host`,
-      then sets `host_ready`.
-
-    `JOIN_NEXT_STEP` starts on the high-priority copy queue; the next
-    save waits `host_ready` only. `JOIN_ON_FINISH` stays on the
-    low-priority queue, or not queued yet (`submit(queued=False)`),
-    until finish or GPU-byte-budget pressure moves it to high-priority
-    — once. Budget flush takes the unfinished task with the oldest
-    `enqueued_time`.
+    `JOIN_NEXT_STEP` is queued at submit. `JOIN_ON_FINISH` stays
+    PENDING until finish or GPU-byte-budget pressure escalates it;
+    budget flush takes the unfinished task with the oldest `enqueued_time`.
 
     Concurrent readers/writers:
     - Staging readers (materialize clone, committer pool write) all wait
       the same `step_d2h_event` before touching the view.
     - A later task taking the same (slot, key) records those rows in
-      `reassigned`; the old pool write skips them so the two writes do
-      not overlap.
-    - Append: `append_chunk` loses if copy already claimed or `done`
-      — caller opens a fresh task rather than mutating a closed one.
-    - `lock` covers `reassigned` / `d2h_claimed` / `append_chunk` /
-      host↔freeze / `slot_to_row`. `host_ready` and `done` are their
-      own events (`set_host_tensor` / `mark_host_ready` / `mark_failed` /
-      `mark_done`). `scatter_rows` snapshots `reassigned`.
+      `reassigned`; the old pool write skips them.
+    - `append_chunk` is refused once the copy stage is claimed; the caller
+      opens a fresh task rather than mutating a closed one.
+    - `lock` covers `state` / `reassigned` / `append_chunk` / host↔freeze /
+      `slot_to_row`. `scatter_rows` snapshots `reassigned`.
     """
 
     tid: Tid
@@ -147,22 +192,14 @@ class WriteTask:
     # must wait this before touching `chunks[].tensors`, or they can read
     # the next CUDA-graph static-buffer overwrite.
     freeze_event: object | None = None
-    nbytes: int = 0  # GPU-byte-budget accounting only; not a correctness signal
-    # Moved from the low-priority queue onto the high-priority one
-    # (finish / budget). Once.
-    escalated: bool = False
-    # Only one thread may run the copy stage. Staging: wait `step_d2h_event`.
-    # Deferred: committer writes `chunk.host`.
-    d2h_claimed: bool = False
-    # Committer could not finish the write; manager raises on next entry.
-    failed: bool = False
+    state: TaskState = TaskState.PENDING
     # Slots this write no longer owns (a newer write took them over).
     reassigned: dict[TensorName, torch.Tensor] = field(default_factory=dict)
-    # Per-write CPU event: this write's host rows are ready (`join_host_ready`).
+    # Set on entering HOST_READY (or FAILED): this write's host rows are ready.
     host_ready: threading.Event = field(default_factory=threading.Event)
-    # Write into the CPU pool has finished (strictly after host_ready).
+    # Set on entering WRITTEN (or FAILED): the CPU-pool write is over.
     done: threading.Event = field(default_factory=threading.Event)
-    # Guards reassigned / d2h_claimed / append / host↔freeze. Not host_ready or done.
+    # Guards state / reassigned / append / host↔freeze.
     lock: threading.Lock = field(default_factory=threading.Lock)
     # time.monotonic() at submit; GPU-byte flush picks the oldest of these.
     enqueued_time: float = field(default_factory=time.monotonic)
@@ -179,41 +216,56 @@ class WriteTask:
             prev = self.reassigned.get(key)
             self.reassigned[key] = slots.clone() if prev is None else torch.cat([prev, slots])
 
-    def try_claim_d2h(self) -> bool:
-        """Only one thread may run the copy stage. True if this caller won."""
+    # ------------------------------------------------------------ lifecycle
+
+    def transition(self, to: TaskState) -> None:
+        """Move to `to`; raises unless it is the next chain step or FAILED."""
         with self.lock:
-            if self.d2h_claimed:
+            self._transition_locked(to)
+
+    def try_transition(self, to: TaskState) -> bool:
+        """Move to `to` if legal from the current state. True if moved."""
+        with self.lock:
+            if not _is_legal_move(self.state, to):
                 return False
-            self.d2h_claimed = True
+            self._transition_locked(to)
             return True
 
-    def is_done(self) -> bool:
-        return self.done.is_set()
+    def _transition_locked(self, to: TaskState) -> None:
+        if not _is_legal_move(self.state, to):
+            raise OmniPrefixCacheUnmatchError(f"task {self.tid}: illegal transition {self.state.name} -> {to.name}")
+        self.state = to
+        if to is TaskState.HOST_READY:
+            self.host_ready.set()
+        elif to is TaskState.WRITTEN:
+            self.done.set()
+        elif to is TaskState.FAILED:
+            self.host_ready.set()
+            self.done.set()
 
-    def is_host_ready(self) -> bool:
-        return self.host_ready.is_set()
+    def claim_copy(self) -> bool:
+        """QUEUED -> COPYING. Only one thread may run the copy stage; True if this caller won."""
+        return self.try_transition(TaskState.COPYING)
 
-    def ready_to_scatter(self) -> bool:
-        return self.is_host_ready() and not self.is_done()
+    @property
+    def is_terminal(self) -> bool:
+        return self.state.is_terminal
 
-    def append_chunk(self, chunk: _WriteChunk, freeze_event: object | None = None) -> bool:
-        """Grow this write with one save's rows. False if copy already claimed.
+    def append_chunk(self, chunk: _WriteChunk, freeze_event: object | None = None) -> TaskState | None:
+        """Grow this write with one save's rows. Returns None when appended,
+        else the state that closed the task (COPYING or later).
 
         `freeze_event` is stored in the same snapshot: events on one compute
         stream are ordered, so the newest also covers every earlier clone.
         """
-        nbytes = sum(t.numel() * t.element_size() for t in chunk.tensors.values())
         with self.lock:
-            if self.d2h_claimed or self.is_done():
-                return False
+            if self.state not in _NOT_YET_COPYING:
+                return self.state
             self.chunks.append(chunk)
             self._slot_to_row = None
             if freeze_event is not None:
                 self.freeze_event = freeze_event
-            # Shared clones are charged on the snapshot holder, not per-view.
-            if chunk.snapshot_holder is None:
-                self.nbytes += nbytes
-            return True
+            return None
 
     def get_host_tensor(self, si: int, key: str) -> torch.Tensor | None:
         """`chunks[si]` host if written, else device freeze. One snapshot."""
@@ -225,29 +277,33 @@ class WriteTask:
             return src
 
     def set_host_tensor(self, rows: list[tuple[_WriteChunk, str, torch.Tensor]]) -> None:
-        """Write these host tensors, drop the device freeze, set `host_ready`."""
+        """COPYING -> HOST_READY: write these host tensors, drop the device freeze."""
         with self.lock:
             for chunk, key, tensor in rows:
                 chunk.host[key] = tensor
             self._clear_tensors()
-        self.host_ready.set()
+            self._transition_locked(TaskState.HOST_READY)
 
     def mark_host_ready(self) -> None:
-        """Host already written (staging views). Wait the step device→host, drop freeze."""
+        """COPYING -> HOST_READY for staging views: wait the step device→host, drop freeze."""
         if self.step_d2h_event is not None:
             self.step_d2h_event.synchronize()
-        self.clear_tensors()
-        self.host_ready.set()
+        with self.lock:
+            self._clear_tensors()
+            self._transition_locked(TaskState.HOST_READY)
 
-    def mark_failed(self) -> None:
-        """Unblock joiners. Host may be missing; manager raises on next entry."""
-        self.failed = True
-        self.clear_tensors()
-        self.host_ready.set()
-        self.done.set()
+    def mark_failed(self) -> bool:
+        """-> FAILED from any non-terminal state; unblocks joiners. False if already terminal."""
+        with self.lock:
+            if self.state.is_terminal:
+                return False
+            self._clear_tensors()
+            self._transition_locked(TaskState.FAILED)
+            return True
 
     def mark_done(self) -> None:
-        self.done.set()
+        """HOST_READY -> WRITTEN."""
+        self.transition(TaskState.WRITTEN)
 
     def scatter_rows(self) -> list[tuple[TensorName, torch.Tensor, torch.Tensor]]:
         """`(key, slots, host)` to write. Omits slots in `reassigned`."""
@@ -275,11 +331,13 @@ class WriteTask:
         for chunk in self.chunks:
             chunk.tensors = {}
 
-    def keys(self) -> set[TensorName]:
-        ks: set[TensorName] = set()
+    def budget_tickets(self) -> list[_BudgetTicket]:
+        """Distinct tickets across this task's chunks."""
+        out: list[_BudgetTicket] = []
         for chunk in self.chunks:
-            ks.update(chunk.tensors.keys())
-        return ks
+            if chunk.budget is not None and all(chunk.budget is not t for t in out):
+                out.append(chunk.budget)
+        return out
 
     def slot_to_row(self) -> dict[int, tuple[int, int]]:
         with self.lock:
@@ -484,16 +542,14 @@ class OmniPrefixCacheController:
         GPU clone until finish/abort or the GPU-byte budget forces a copy.
 
         Caller must reserve() the task bytes first (budget flush can
-        block; the manager does that outside the state lock).
+        block; the manager does that outside the state lock) and pin the
+        task on its budget ticket(s) before submit.
         """
-        # Immediate (no snapshot_holder): charge/release via task.nbytes.
-        # Deferred shared clone: charge the holder once at reserve().
-        task.nbytes = sum(
-            t.numel() * t.element_size() for s in task.chunks if s.snapshot_holder is None for t in s.tensors.values()
-        )
         task.enqueued_time = time.monotonic()
         with self._lock:
             self._tasks[task.tid] = task
+            if queued:
+                task.transition(TaskState.QUEUED)
         if self._eager:
             if queued:
                 self._run_eager(task)
@@ -503,13 +559,14 @@ class OmniPrefixCacheController:
                 (self._queue_hi if task.schedule is WriteSchedule.JOIN_NEXT_STEP else self._queue_lo).append(task.tid)
                 self._wake.notify_all()
 
-    def append_chunk(self, task: WriteTask, chunk: _WriteChunk, freeze_event: object | None = None) -> bool:
+    def append_chunk(self, task: WriteTask, chunk: _WriteChunk, freeze_event: object | None = None) -> TaskState | None:
+        """Append to a pending task. None when appended, else the closing state."""
         return task.append_chunk(chunk, freeze_event)
 
-    def pin_snapshot_holder(self, holder: _SnapshotHolder, tid: int) -> None:
-        """Record that ``tid`` holds a view of this step's deferred snapshot."""
+    def pin_budget(self, ticket: _BudgetTicket, tid: int) -> None:
+        """Record that ``tid`` holds a view of the clone ``ticket`` charges."""
         with self._lock:
-            holder.tids.add(tid)
+            ticket.tids.add(tid)
 
     def reserve(self, nbytes: int, exclude: set[int] | None = None) -> None:
         """Reserve GPU-clone bytes; blocking flush happens here, so callers
@@ -517,27 +574,12 @@ class OmniPrefixCacheController:
         self._reserve_bytes(nbytes, exclude=exclude)
 
     def _release_staged_bytes(self, task: WriteTask) -> None:
-        """Drop this task's GPU-byte-budget charge.
-
-        Shared deferred clones release only when the last holder tid drops.
-        Immediate tasks (no ``snapshot_holder``) still release ``task.nbytes``.
-        """
-        tickets: list[_SnapshotHolder] = []
-        seen: set[int] = set()
-        for chunk in task.chunks:
-            holder = chunk.snapshot_holder
-            if holder is not None and id(holder) not in seen:
-                seen.add(id(holder))
-                tickets.append(holder)
+        """Drop this task's hold on its budget ticket(s). Idempotent; a
+        ticket uncharges once, when its last holder leaves."""
+        tickets = task.budget_tickets()
         with self._wake:
-            if tickets:
-                for holder in tickets:
-                    if task.tid in holder.tids:
-                        holder.tids.discard(task.tid)
-                        if not holder.tids:
-                            self._staged_bytes -= holder.nbytes
-            else:
-                self._staged_bytes -= task.nbytes
+            for ticket in tickets:
+                self._staged_bytes -= ticket.release(task.tid)
 
     def _reserve_bytes(self, nbytes: int, exclude: set[int] | None = None) -> None:
         # GPU-byte budget: force-copy oldest pending tasks until under
@@ -545,7 +587,7 @@ class OmniPrefixCacheController:
         exclude = exclude or set()
         while True:
             with self._lock:
-                pending = [tid for tid, t in self._tasks.items() if not t.is_done() and tid not in exclude]
+                pending = [tid for tid, t in self._tasks.items() if not t.is_terminal and tid not in exclude]
                 if self._staged_bytes + nbytes <= self._config.gpu_staging_bytes or not pending:
                     # Under budget or no pending tasks; admit reservation.
                     self._staged_bytes += nbytes
@@ -558,27 +600,29 @@ class OmniPrefixCacheController:
     # ------------------------------------------------------------- lifecycle
 
     def escalate(self, tids: list[int]) -> None:
+        """Move pending tasks to the front of the high-priority queue.
+
+        PENDING -> QUEUED at the head; QUEUED on the low-priority queue
+        moves up; QUEUED already high-priority is a no-op. COPYING and later
+        belong to the worker and are untouched: the worker claims under
+        `_wake` too, so a task cannot be popped and re-queued behind its back.
+        """
         if self._eager:
             for tid in tids:
                 task = self._tasks.get(tid)
-                if task is not None and not task.is_done():
+                if task is not None and not task.is_terminal:
                     self._run_eager(task)
             return
         with self._wake:
             for tid in tids:
                 task = self._tasks.get(tid)
-                if task is None or task.escalated or task.is_done():
+                if task is None:
                     continue
-                task.escalated = True
-                try:
+                if task.try_transition(TaskState.QUEUED):
+                    self._queue_hi.appendleft(tid)
+                elif task.state is TaskState.QUEUED and tid in self._queue_lo:
                     self._queue_lo.remove(tid)
                     self._queue_hi.appendleft(tid)
-                except ValueError:
-                    # Not in the low-priority queue: either a deferred
-                    # task not queued yet (queue it now) or already on
-                    # the high-priority / copy-done lists.
-                    if tid not in self._queue_hi and tid not in self._blocked and not task.d2h_claimed:
-                        self._queue_hi.appendleft(tid)
             self._wake.notify_all()
 
     def join(self, tids: list[int]) -> None:
@@ -697,8 +741,11 @@ class OmniPrefixCacheController:
 
     @torch.inference_mode()
     def _run_eager(self, task: WriteTask) -> None:
-        if not task.try_claim_d2h():
-            if task.ready_to_scatter():
+        """Eager stand-in for queue + worker: walk the whole chain inline."""
+        task.try_transition(TaskState.QUEUED)  # no-op if submit already queued it
+        if not task.claim_copy():
+            # Copy stage already ran (a held stub, or a prior escalate); finish the write.
+            if task.state is TaskState.HOST_READY:
                 self._scatter(task)
             return
         if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
@@ -725,6 +772,7 @@ class OmniPrefixCacheController:
         while True:
             tid = None
             try:
+                task: WriteTask | None = None
                 with self._wake:
                     while not self._shutdown and not self._queue_hi and not self._queue_lo:
                         if self._blocked:
@@ -737,14 +785,17 @@ class OmniPrefixCacheController:
                         tid = self._queue_hi.popleft()
                     elif self._queue_lo:
                         tid = self._queue_lo.popleft()
-                if tid is not None:
-                    task = self._tasks.get(tid)
-                    if task is not None:
-                        self._copy_task(task)
-                        with self._wake:
-                            # escalate may re-queue a tid we just popped; skip if already written.
-                            if tid not in self._blocked and not task.is_done():
-                                self._blocked.append(tid)
+                    if tid is not None:
+                        task = self._tasks.get(tid)
+                        if task is not None:
+                            # Claim in the same critical section as the pop:
+                            # escalate holds `_wake` and sees COPYING.
+                            task.transition(TaskState.COPYING)
+                if task is not None:
+                    self._copy_task(task)
+                    with self._wake:
+                        assert task.tid not in self._blocked, f"task {task.tid} reached HOST_READY twice"
+                        self._blocked.append(task.tid)
                 self._scatter_host_ready()
             except BaseException:
                 logger.exception("omni prefix cache committer failed on task %s; releasing waiters", tid)
@@ -752,11 +803,9 @@ class OmniPrefixCacheController:
 
     @torch.inference_mode()
     def _copy_task(self, task: WriteTask) -> None:
-        """Reach `host_ready`. Staging: wait the save-time device→host event.
+        """COPYING -> HOST_READY. Staging: wait the save-time device→host event.
         Deferred: this is the device→host into owned `chunk.host` tensors.
         """
-        if not task.try_claim_d2h():
-            return
         if task.schedule is WriteSchedule.JOIN_NEXT_STEP:
             # `chunk.host` is already a staging view; device→host ran at save.
             # `mark_host_ready` waits `step_d2h_event` if one was recorded.
@@ -788,21 +837,18 @@ class OmniPrefixCacheController:
         self._release_staged_bytes(task)
 
     def _fail_task(self, tid: int | None) -> None:
-        """Release waiters for a task the committer could not complete.
+        """-> FAILED: release waiters for a task the committer could not complete.
 
-        Idempotent, and only releases bytes the copy stage has not already
-        released: a raise AFTER a successful _copy_task (host_ready set)
-        must not subtract this task's bytes a second time.
+        No-op once the task is terminal. Budget release is idempotent, so a
+        raise after a successful copy stage does not uncharge twice.
         """
         task = self._tasks.get(tid) if tid is not None else None
-        if task is None or task.is_done():
+        if task is None or not task.mark_failed():
             return
-        if not task.is_host_ready():
-            self._release_staged_bytes(task)
+        self._release_staged_bytes(task)
         with self._wake:
             if tid in self._blocked:
                 self._blocked.remove(tid)
-        task.mark_failed()
         self._release_task_slot(task)
         with self._lock:
             # Publish the failure: rows behind already-published block hashes
@@ -812,15 +858,13 @@ class OmniPrefixCacheController:
 
     @torch.inference_mode()
     def _scatter_host_ready(self) -> None:
-        """Write `_blocked` tasks whose `host_ready` is set into the CPU pool."""
+        """HOST_READY -> WRITTEN for every `_blocked` task that has reached HOST_READY."""
         with self._wake:
-            ready = [tid for tid in self._blocked if (t := self._tasks.get(tid)) and t.is_host_ready()]
+            ready = [tid for tid in self._blocked if (t := self._tasks.get(tid)) and t.state is TaskState.HOST_READY]
             for tid in ready:
                 self._blocked.remove(tid)
         for tid in ready:
-            task = self._tasks.get(tid)
-            if task is None or task.is_done():
-                continue
+            task = self._tasks[tid]
             try:
                 self._scatter(task)
             except BaseException:

@@ -523,14 +523,18 @@ def test_deferred_key_hit_reads_staged_rows_not_mirror():
     assert torch.equal(rows[4:], torch.full((2, 2), 9.0))
 
 
-def test_append_to_closed_deferred_entry_opens_new_one():
+def test_append_to_closed_deferred_entry_opens_new_one(caplog):
+    """Unreachable by the production call order; if it happens the manager
+    recovers with a new task and says which state closed the old one."""
     policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
     s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 1.0)})
     mgr.materialize(s1, ["a"])
     first = mgr._request_tasks.deferred["a"]
     mgr._controller.escalate([first.tid])
-    s2 = run_step(mgr, view, {"a": ([2], 1, 1)}, mm={"k": torch.full((1, 2), 2.0)})
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.core.prefix_cache.manager"):
+        s2 = run_step(mgr, view, {"a": ([2], 1, 1)}, mm={"k": torch.full((1, 2), 2.0)})
+    assert any(f"tid {first.tid}, write_n 1) was WRITTEN" in r.message for r in caplog.records)
     mgr.materialize(s2, ["a"])
     assert mgr._request_tasks.deferred["a"].tid != first.tid
     slots = view.slots_for("a", 0, 2)
@@ -914,10 +918,13 @@ def _hold_writes(mgr) -> None:
     """Non-eager stand-in: register the task with device→host done, but
     leave the pool write to the caller (`mgr._controller._scatter`)."""
 
+    from vllm_omni.core.prefix_cache.controller import TaskState
+
     def submit(task, queued=True):
         with mgr._controller._lock:
             mgr._controller._tasks[task.tid] = task
-        task.try_claim_d2h()
+        task.transition(TaskState.QUEUED)
+        assert task.claim_copy()
         task.mark_host_ready()
 
     mgr._controller.submit = submit
@@ -1168,34 +1175,138 @@ def test_fetch_host_waits_staging_step_d2h_event():
     assert torch.equal(rows, src)
 
 
-def test_scatter_host_ready_skips_already_done_task():
-    """A tid re-queued by escalate after its pool write finished must not be
-    written a second time or reported completed twice."""
+def _bare_controller(eager=True):
     from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
-    from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController, WriteTask, _WriteChunk
+    from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController
 
     cfg = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE)
     pool = PrefixBlockPool(cfg)
     pool.ensure_key(HIDDEN_KEY, DTYPE, HIDDEN)
-    ctrl = OmniPrefixCacheController(pool, cfg, eager=True)
+    ctrl = OmniPrefixCacheController(pool, cfg, eager=eager)
+    return ctrl, pool
+
+
+def _bare_task(tid=7, schedule=WriteSchedule.JOIN_NEXT_STEP, host=None, tensors=None, budget=None, queued=False):
+    from vllm_omni.core.prefix_cache.controller import TaskState, WriteTask, _WriteChunk
 
     slots = torch.tensor([0, 1], dtype=torch.int64)
-    first = torch.ones(2, HIDDEN)
-    chunk = _WriteChunk(slots_cpu=slots, tensors={})
-    chunk.host = {HIDDEN_KEY: first}
-    task = WriteTask(tid=7, req_id="r", write_n=1, schedule=WriteSchedule.JOIN_NEXT_STEP, chunks=[chunk])
-    ctrl._tasks[task.tid] = task
-    task.host_ready.set()
+    chunk = _WriteChunk(slots_cpu=slots, tensors=tensors or {}, budget=budget)
+    if host is not None:
+        chunk.host = {HIDDEN_KEY: host}
+    task = WriteTask(tid=tid, req_id="r", write_n=1, schedule=schedule, chunks=[chunk])
+    if queued:
+        task.transition(TaskState.QUEUED)
+    return task, slots
+
+
+def test_task_state_is_a_strict_chain():
+    """PENDING -> QUEUED -> COPYING -> HOST_READY -> WRITTEN, one step at a time."""
+    from vllm_omni.core.prefix_cache.controller import TaskState
+
+    task, _ = _bare_task()
+    assert task.state is TaskState.PENDING
+    assert not task.claim_copy()  # PENDING may not skip QUEUED
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="illegal transition PENDING -> HOST_READY"):
+        task.transition(TaskState.HOST_READY)
+    task.transition(TaskState.QUEUED)
+    assert task.claim_copy()
+    assert task.state is TaskState.COPYING and not task.host_ready.is_set()
+    assert not task.claim_copy()  # second claimant loses
+    task.mark_host_ready()
+    assert task.state is TaskState.HOST_READY and task.host_ready.is_set() and not task.done.is_set()
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="illegal transition HOST_READY -> COPYING"):
+        task.transition(TaskState.COPYING)  # no going back
     task.mark_done()
-    ctrl._completed.clear()
-    # Simulate the stale second pass: overwrite the pool rows out of band,
-    # then let the committer see the done task in `_blocked`.
-    pool.write(HIDDEN_KEY, slots, torch.full((2, HIDDEN), 5.0))
+    assert task.state is TaskState.WRITTEN and task.done.is_set()
+    assert not task.mark_failed()  # terminal stays terminal
+    assert task.state is TaskState.WRITTEN
+
+
+def test_task_failed_sets_both_events_and_closes_append():
+    from vllm_omni.core.prefix_cache.controller import TaskState, _WriteChunk
+
+    task, slots = _bare_task()
+    assert task.mark_failed()
+    assert task.state is TaskState.FAILED and task.host_ready.is_set() and task.done.is_set()
+    assert task.append_chunk(_WriteChunk(slots_cpu=slots, tensors={})) is TaskState.FAILED
+
+
+def test_escalate_leaves_claimed_task_alone():
+    """Once the worker owns the copy stage (COPYING), escalate must not
+    re-queue the tid — that re-queue was the double-write race."""
+    from vllm_omni.core.prefix_cache.controller import TaskState
+
+    ctrl, _ = _bare_controller(eager=True)
+    ctrl._eager = False  # exercise the queue path without a worker thread
+    later, _ = _bare_task(tid=1, schedule=WriteSchedule.JOIN_ON_FINISH)
+    ctrl.submit(later, queued=False)
+    assert later.state is TaskState.PENDING
+    ctrl.escalate([1])
+    assert later.state is TaskState.QUEUED and list(ctrl._queue_hi) == [1]
+    ctrl.escalate([1])  # already high-priority: no duplicate
+    assert list(ctrl._queue_hi) == [1]
+
+    ctrl._queue_hi.clear()
+    later.transition(TaskState.COPYING)
+    ctrl.escalate([1])
+    assert list(ctrl._queue_hi) == [] and list(ctrl._queue_lo) == []
+
+
+def test_scatter_host_ready_writes_only_staged_tasks():
+    from vllm_omni.core.prefix_cache.controller import TaskState
+
+    ctrl, pool = _bare_controller()
+    task, slots = _bare_task(host=torch.ones(2, HIDDEN), queued=True)
+    ctrl._tasks[task.tid] = task
+    assert task.claim_copy()
     ctrl._blocked.append(task.tid)
+    ctrl._scatter_host_ready()  # COPYING: not ready, stays blocked
+    assert ctrl._blocked == [task.tid] and list(ctrl._completed) == []
+    task.mark_host_ready()
     ctrl._scatter_host_ready()
-    assert ctrl._blocked == []
-    assert list(ctrl._completed) == []
-    assert torch.equal(pool.rows(HIDDEN_KEY, slots), torch.full((2, HIDDEN), 5.0))
+    assert ctrl._blocked == [] and list(ctrl._completed) == [task.tid]
+    assert task.state is TaskState.WRITTEN
+    assert torch.equal(pool.rows(HIDDEN_KEY, slots), torch.ones(2, HIDDEN))
+
+
+def test_budget_ticket_uncharges_once_per_clone():
+    from vllm_omni.core.prefix_cache.controller import _BudgetTicket
+
+    ctrl, _ = _bare_controller()
+    ticket = _BudgetTicket(nbytes=100)
+    ctrl.reserve(100)
+    a, _ = _bare_task(tid=1, budget=ticket)
+    b, _ = _bare_task(tid=2, budget=ticket)
+    ctrl.pin_budget(ticket, 1)
+    ctrl.pin_budget(ticket, 2)
+    ctrl._release_staged_bytes(a)
+    assert ctrl._staged_bytes == 100  # b still holds the clone
+    ctrl._release_staged_bytes(a)  # idempotent per tid
+    assert ctrl._staged_bytes == 100
+    ctrl._release_staged_bytes(b)
+    assert ctrl._staged_bytes == 0
+    ctrl._release_staged_bytes(b)  # freed once, never twice
+    assert ctrl._staged_bytes == 0
+
+
+def test_fail_task_after_copy_does_not_uncharge_twice():
+    from vllm_omni.core.prefix_cache.controller import TaskState, _BudgetTicket
+
+    ctrl, _ = _bare_controller()
+    ticket = _BudgetTicket(nbytes=64)
+    ctrl.reserve(64)
+    task, _ = _bare_task(tid=3, budget=ticket, queued=True)
+    ctrl._tasks[task.tid] = task
+    ctrl.pin_budget(ticket, 3)
+    assert task.claim_copy()
+    task.mark_host_ready()
+    ctrl._release_staged_bytes(task)  # what _copy_task does on HOST_READY
+    assert ctrl._staged_bytes == 0
+    ctrl._fail_task(3)
+    assert task.state is TaskState.FAILED and ctrl._staged_bytes == 0
+    assert list(ctrl._failed) == [3]
+    ctrl._fail_task(3)  # terminal: no second publish
+    assert list(ctrl._failed) == [3]
 
 
 def test_from_vllm_config_uses_batched_tokens():

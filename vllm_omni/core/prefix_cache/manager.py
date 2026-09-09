@@ -49,6 +49,7 @@ already in the next step. Warmup/dummy runs are never fed.
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections import deque
 from collections.abc import Iterable, Mapping
@@ -65,7 +66,7 @@ from vllm_omni.core.prefix_cache.controller import (
     StagingBufferHolder,
     StepD2HClaim,
     WriteTask,
-    _SnapshotHolder,
+    _BudgetTicket,
     _WriteChunk,
 )
 from vllm_omni.core.prefix_cache.interface import (
@@ -87,6 +88,8 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
     from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView
+
+logger = logging.getLogger(__name__)
 
 
 class _Occupancy(IntEnum):
@@ -160,11 +163,27 @@ class _StepOutputs:
     A deferred per-token key is in both ``deferred_chunks`` (later cache
     write) and ``leftover`` (this-step read) — two consumers, not a
     duplicate store.
+
+    ``immediate_budget`` charges the immediate clones once; every
+    JOIN_NEXT_STEP task of the step pins it. Deferred chunks carry their
+    own shared ticket.
     """
 
     immediate: dict[str, torch.Tensor]
     deferred_chunks: list[tuple[str, _WriteChunk]]
     leftover: dict[str, Any]
+    immediate_budget: _BudgetTicket | None = None
+
+    @property
+    def deferred_budget(self) -> _BudgetTicket | None:
+        return self.deferred_chunks[0][1].budget if self.deferred_chunks else None
+
+    def freeze_targets(self) -> list[torch.Tensor]:
+        """Device clones the freeze event must cover."""
+        return list(self.immediate.values()) + [t for _, c in self.deferred_chunks for t in c.tensors.values()]
+
+    def budget_bytes(self) -> int:
+        return sum(t.nbytes for t in (self.immediate_budget, self.deferred_budget) if t is not None)
 
 
 def _locked(fn):
@@ -541,29 +560,22 @@ class OmniPrefixCacheManager:
         )
 
         # 4. Freeze the device clones and reserve the GPU-byte budget (unlocked).
-        freezed_tensors = [t for t in step_outputs.immediate.values()] + [
-            t for _, chunk in step_outputs.deferred_chunks for t in chunk.tensors.values()
-        ]
+        freezed_tensors = step_outputs.freeze_targets()
         if freezed_tensors:
             if torch.cuda.is_available() and any(t.is_cuda for t in freezed_tensors):
                 freeze_event = torch.cuda.Event()
                 freeze_event.record()
-            # Charge unique allocations: immediate clones + one shared
-            # deferred clone (per-request slices are views, not copies).
-            immediate_bytes = sum(t.numel() * t.element_size() for t in step_outputs.immediate.values())
-            deferred_holder = (
-                step_outputs.deferred_chunks[0][1].snapshot_holder if step_outputs.deferred_chunks else None
-            )
-            deferred_bytes = deferred_holder.nbytes if deferred_holder is not None else 0
-            # GPU-byte-budget reserve may block on a flush: outside the lock.
-            # The flush must not close the deferred entries we are about to
-            # append to (main-thread-only reads, safe unlocked).
+            # One ticket per clone (immediate step clone, shared deferred
+            # clone); per-request slices are views and charge nothing.
+            # Reserve may block on a flush: outside the lock. The flush must
+            # not close the deferred entries we are about to append to
+            # (main-thread-only reads, safe unlocked).
             exclude = {
                 self._request_tasks.deferred[r].tid
                 for r, _ in step_outputs.deferred_chunks
                 if r in self._request_tasks.deferred
             }
-            self._controller.reserve(immediate_bytes + deferred_bytes, exclude=exclude)
+            self._controller.reserve(step_outputs.budget_bytes(), exclude=exclude)
 
         # 5. Claim a staging slot (unlocked), optional device→host into it,
         #    then submit + store the step snapshot (locked). Saves with only
@@ -580,11 +592,9 @@ class OmniPrefixCacheManager:
                 query_start=query_start,
                 num_sched=num_sched,
                 num_tokens_unpadded=num_tokens_unpadded,
-                device_snapshot=step_outputs.immediate,
+                step_outputs=step_outputs,
                 slots_cpu=slots_cpu,
-                leftover_mm=step_outputs.leftover,
                 mm_keys=set(mm_outputs.keys()),
-                deferred_chunks=step_outputs.deferred_chunks,
                 freeze_event=freeze_event,
                 d2h_claim=d2h_claim,
                 bound_tids=bound_tids,
@@ -796,11 +806,9 @@ class OmniPrefixCacheManager:
         query_start: dict[str, int],
         num_sched: dict[str, int],
         num_tokens_unpadded: int,
-        device_snapshot: dict[str, torch.Tensor],
+        step_outputs: _StepOutputs,
         slots_cpu: torch.Tensor | None,
-        leftover_mm: dict[str, Any],
         mm_keys: set[str],
-        deferred_chunks: list[tuple[str, _WriteChunk]],
         freeze_event: object | None,
         d2h_claim: StepD2HClaim | None,
         bound_tids: list[int],
@@ -810,12 +818,13 @@ class OmniPrefixCacheManager:
         clears them. Device→host and GPU-byte-budget flush stay outside.
         """
         self._commit_drained_writes()
-        if device_snapshot:
+        if step_outputs.immediate:
             self._submit_step_writes(
                 req_order,
                 query_start,
                 num_sched,
-                device_snapshot,
+                step_outputs.immediate,
+                step_outputs.immediate_budget,
                 slots_cpu,
                 d2h_claim.views,
                 freeze_event,
@@ -823,7 +832,7 @@ class OmniPrefixCacheManager:
                 d2h_claim.event,
                 bound_tids,
             )
-        self._stage_deferred(deferred_chunks, freeze_event)
+        self._stage_deferred(step_outputs.deferred_chunks, freeze_event)
         step_id = self._next_step_id
         self._next_step_id += 1
         self._step_ctxs[step_id] = _StepContext(
@@ -832,7 +841,7 @@ class OmniPrefixCacheManager:
             hits=dict(self._hit_spans),
             hit_prefetch=dict(self._hit_prefetch),
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
-            mm_cpu_snapshot=leftover_mm,
+            mm_cpu_snapshot=step_outputs.leftover,
             d2h=d2h_claim,
         )
         self._clear_hit_infos()
@@ -887,7 +896,12 @@ class OmniPrefixCacheManager:
         if deferred_tensors:
             assert slots_cpu is not None
             deferred_chunks = self._pack_deferred_chunks(deferred_tensors, slots_cpu, req_order, num_sched, query_start)
-        return _StepOutputs(immediate=immediate, deferred_chunks=deferred_chunks, leftover=leftover)
+        immediate_budget = (
+            _BudgetTicket(nbytes=sum(t.numel() * t.element_size() for t in immediate.values())) if immediate else None
+        )
+        return _StepOutputs(
+            immediate=immediate, deferred_chunks=deferred_chunks, leftover=leftover, immediate_budget=immediate_budget
+        )
 
     def _pack_deferred_chunks(
         self,
@@ -898,7 +912,7 @@ class OmniPrefixCacheManager:
         query_start: dict[str, int],
     ) -> list[tuple[str, _WriteChunk]]:
         """Per-req views of already-cloned deferred tensors. No further clone."""
-        holder = _SnapshotHolder(nbytes=sum(t.numel() * t.element_size() for t in deferred_tensors.values()))
+        ticket = _BudgetTicket(nbytes=sum(t.numel() * t.element_size() for t in deferred_tensors.values()))
         out: list[tuple[str, _WriteChunk]] = []
         for req_id in req_order:
             sched = num_sched[req_id]
@@ -912,7 +926,7 @@ class OmniPrefixCacheManager:
                     _WriteChunk(
                         slots_cpu=slots_cpu[start:end],
                         tensors={k: v[start:end] for k, v in deferred_tensors.items()},
-                        snapshot_holder=holder,
+                        budget=ticket,
                     ),
                 )
             )
@@ -924,6 +938,7 @@ class OmniPrefixCacheManager:
         query_start: dict[str, int],
         num_sched: dict[str, int],
         device_snapshot: dict[str, torch.Tensor],
+        budget: _BudgetTicket | None,
         slots_cpu: torch.Tensor,
         host_views: dict[str, torch.Tensor],
         freeze_event,
@@ -944,7 +959,7 @@ class OmniPrefixCacheManager:
                 continue
             tensors = {k: v[start:end] for k, v in device_snapshot.items()}
             tid = self._request_tasks.alloc_tid()
-            chunk = _WriteChunk(slots_cpu=slots_cpu[start:end], tensors=tensors)
+            chunk = _WriteChunk(slots_cpu=slots_cpu[start:end], tensors=tensors, budget=budget)
             # Host rows are views into the slot; the committer only waits
             # the shared step event. Device→host is already in flight.
             chunk.host = {k: v[start:end] for k, v in host_views.items()}
@@ -959,10 +974,13 @@ class OmniPrefixCacheManager:
                 step_d2h_event=step_d2h_event,
             )
             self._map_slots(slots_cpu[start:end], tid, tensors.keys())
-            # Bind before submit: the slot must never be holder-free
-            # while the task is live (released at its pool write).
+            # Bind and pin before submit: the slot must never be holder-free
+            # while the task is live (released at its pool write), and the
+            # committer may reach HOST_READY before this loop returns.
             self._controller.staging_bind(staging_slot, StagingBufferHolder.for_task(tid))
             bound_tids.append(tid)
+            if budget is not None:
+                self._controller.pin_budget(budget, tid)
             self._controller.submit(task)
             self._request_tasks.track(req_id, tid)
             self._join_next_step_tids.append(tid)
@@ -972,9 +990,22 @@ class OmniPrefixCacheManager:
         (bytes already reserved by save_outputs)."""
         for req_id, chunk in deferred_chunks:
             task = self._request_tasks.deferred.get(req_id)
-            if task is not None and not self._controller.append_chunk(task, chunk, freeze_event):
-                # Entry closed under us (budget flush / forced copy): start a new one.
-                task = None
+            if task is not None:
+                closed = self._controller.append_chunk(task, chunk, freeze_event)
+                if closed is not None:
+                    # Unreachable by construction: finish removes the entry
+                    # before the next save, and reserve() excludes this step's
+                    # entries from the budget flush. Recover with a new task,
+                    # but say so — it means one of those orderings broke.
+                    logger.warning(
+                        "omni prefix cache: deferred write for req %s (tid %d, write_n %d) was %s "
+                        "before this step's rows were appended; opening a new write",
+                        req_id,
+                        task.tid,
+                        task.write_n,
+                        closed.name,
+                    )
+                    task = None
             if task is None:
                 task = WriteTask(
                     tid=self._request_tasks.alloc_tid(),
@@ -987,8 +1018,10 @@ class OmniPrefixCacheManager:
                 self._request_tasks.deferred[req_id] = task
                 self._request_tasks.track(req_id, task.tid)
                 self._controller.submit(task, queued=False)
-            if chunk.snapshot_holder is not None:
-                self._controller.pin_snapshot_holder(chunk.snapshot_holder, task.tid)
+            if chunk.budget is not None:
+                # Safe after submit: queued=False keeps the task PENDING
+                # until escalate, which only this thread calls.
+                self._controller.pin_budget(chunk.budget, task.tid)
             # Block reuse across deferred tenants (preemption path) is
             # handled inside _map_slots: the old tenant's rows are skipped.
             self._map_slots(chunk.slots_cpu, task.tid, chunk.tensors.keys())
