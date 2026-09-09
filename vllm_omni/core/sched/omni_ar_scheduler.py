@@ -581,6 +581,10 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             confirmed_num_computed_tokens = None
             boundary_generation = None
+            # Cache this before _free_request pops it and rewrites additional_information.
+            omits_kv_transfer = (
+                self.chunk_transfer_adapter is not None and self._request_omits_kv_transfer_to_next_stage(request)
+            )
             if stopped:
                 if self.chunk_transfer_adapter is not None:
                     confirmed_num_computed_tokens = self.chunk_transfer_adapter._confirmed_num_computed_tokens(request)
@@ -681,7 +685,7 @@ class OmniARScheduler(OmniSchedulerMixin, VLLMScheduler):
 
             if (
                 self.chunk_transfer_adapter is not None
-                and not self._request_omits_kv_transfer_to_next_stage(request)
+                and not omits_kv_transfer
                 and (inter_stage_output is not None or is_segment_finished or finished)
             ):
                 save_kwargs = {
