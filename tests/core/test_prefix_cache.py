@@ -30,6 +30,11 @@ except ModuleNotFoundError:
             _m.__path__ = [str(_root / _pkg.replace(".", "/"))]
             sys.modules[_pkg] = _m
 
+from vllm_omni.core.prefix_cache.capture import (
+    OutputCapturer,
+    is_step_token_tensor,
+    snapshot_leftover_mm_cpu,
+)
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
 from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView, check_prefix_cache_kv_groups
 from vllm_omni.core.prefix_cache.interface import (
@@ -40,11 +45,7 @@ from vllm_omni.core.prefix_cache.interface import (
     PrefixCacheConfig,
     WriteSchedule,
 )
-from vllm_omni.core.prefix_cache.manager import (
-    OmniPrefixCacheManager,
-    _is_step_token_tensor,
-    _snapshot_leftover_mm_cpu,
-)
+from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -339,27 +340,24 @@ def test_unpadded_mm_registers_on_padded_step():
     assert torch.equal(merged[8:], torch.full((4, 2), 3.0))
 
 
-def test_split_step_outputs_routes_immediate_deferred_leftover():
-    """One split: immediate device→host, deferred write + leftover read, leftover only."""
+def test_capture_routes_immediate_deferred_leftover():
+    """One split: immediate device→host, deferred write + leftover read, leftover only.
+    Capture depends on the policy alone and reports (not opens) the pool keys."""
     policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"codes.audio"}))
-    mgr, view = make_manager(policy=policy)
-    view.order = ["a"]
-    view.req_blocks["a"] = [0]
-    view.computed["a"] = 0
     n = 4
-    mgr.new_step_starts(FakeSchedOut(new_reqs=[FakeNewReq("a")], num_scheduled={"a": n}))
+    slots = torch.arange(n, dtype=torch.int64)
     hidden = torch.ones(n, HIDDEN)
     mm = {
         "codes.audio": torch.full((n, 2), 5.0),
         "codes.ref": torch.zeros(15, 2),
         "tok": torch.full((n, 2), 7.0),
     }
-    step_outputs = mgr._split_step_outputs(
+    step_outputs = OutputCapturer(policy).capture(
         hidden,
         mm,
-        n,
-        n,
-        slots_cpu=view.step_slots_cpu(["a"], {"a": n}),
+        num_tokens_unpadded=n,
+        num_tokens_padded=n,
+        slots_cpu=slots,
         req_order=["a"],
         num_sched={"a": n},
         query_start={"a": 0},
@@ -371,6 +369,29 @@ def test_split_step_outputs_routes_immediate_deferred_leftover():
     assert len(step_outputs.deferred_chunks) == 1
     assert step_outputs.deferred_chunks[0][0] == "a"
     assert "codes.audio" in step_outputs.deferred_chunks[0][1].tensors
+    assert [k.key for k in step_outputs.keys_to_open] == [HIDDEN_KEY, "codes.audio", "tok"]
+    assert step_outputs.immediate_budget is not None
+    assert step_outputs.immediate_budget.nbytes == (n * HIDDEN + n * 2) * 4
+    assert step_outputs.deferred_budget is not None and step_outputs.deferred_budget.nbytes == n * 2 * 4
+    # Immediate rows are clones, not views of the live buffer.
+    hidden.fill_(0.0)
+    assert torch.equal(step_outputs.immediate[HIDDEN_KEY], torch.ones(n, HIDDEN))
+
+
+def test_capture_n0_has_only_leftover_and_opens_nothing():
+    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"codes.audio"}))
+    step_outputs = OutputCapturer(policy).capture(
+        None,
+        {"codes.ref": torch.zeros(3, 2)},
+        num_tokens_unpadded=0,
+        num_tokens_padded=0,
+        slots_cpu=None,
+        req_order=[],
+        num_sched={},
+        query_start={},
+    )
+    assert not step_outputs.immediate and not step_outputs.deferred_chunks and not step_outputs.keys_to_open
+    assert "codes.ref" in step_outputs.leftover and step_outputs.budget_bytes() == 0
 
 
 def test_leftover_snapshot_preserves_non_token_major_shapes():
@@ -387,7 +408,7 @@ def test_leftover_snapshot_preserves_non_token_major_shapes():
         "tokenish": torch.arange(n * 2, dtype=DTYPE).reshape(n, 2),
         "scalar": torch.tensor(3.0),
     }
-    out = _snapshot_leftover_mm_cpu(mm, set(), n)
+    out = snapshot_leftover_mm_cpu(mm, set(), n)
     _assert_leftover_shapes(mm, out, n)
     assert torch.equal(out["codes.ref"], mm["codes.ref"])
     assert out["codes.ref"].shape == (15, 2)
@@ -417,11 +438,11 @@ def test_codes_ref_matches_old_build_mm_cpu_path():
 
 def test_is_step_token_tensor():
     n, padded = 4, 8
-    assert _is_step_token_tensor(torch.zeros(n, 2), n, padded)
-    assert _is_step_token_tensor(torch.zeros(padded, 2), n, padded)
-    assert not _is_step_token_tensor([torch.zeros(1, 8)], n, padded)
-    assert not _is_step_token_tensor(torch.zeros(15, 2), n, padded)
-    assert not _is_step_token_tensor(torch.tensor([1, 2, 3]), n, padded)
+    assert is_step_token_tensor(torch.zeros(n, 2), n, padded)
+    assert is_step_token_tensor(torch.zeros(padded, 2), n, padded)
+    assert not is_step_token_tensor([torch.zeros(1, 8)], n, padded)
+    assert not is_step_token_tensor(torch.zeros(15, 2), n, padded)
+    assert not is_step_token_tensor(torch.tensor([1, 2, 3]), n, padded)
 
 
 def test_policy_from_model_shim():
