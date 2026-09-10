@@ -262,6 +262,32 @@ def test_partial_match_hits_shared_prefix_and_writes_divergent_block(a_finished_
         assert torch.equal(plan_fetch(mgr, b_tail, HIDDEN_KEY, req_id="b"), expected_rows(b_tail))
 
 
+def test_live_req_reentering_new_reqs_is_not_a_hit():
+    """async_chunk continuation: the same id re-enters scheduled_new_reqs with
+    num_computed_tokens equal to what it computed itself. No hit span is
+    opened and materialize returns only this step's rows (parity with the
+    pre-refactor cache; a delivered_upto span is Phase 2). Once the id has
+    finished, the same id is a new request again and its hit is merged."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    mgr.materialize(s1, ["a"])
+
+    # Next chunk arrives: `a` is scheduled again as a "new" request at 8.
+    s2 = run_step(mgr, view, {"a": ([0, 1, 2], 8, 4)}, new_hits={"a": 8})
+    assert not mgr._step_ctxs[s2].hits
+    outs = mgr.materialize(s2, ["a"])
+    assert torch.equal(outs.hidden_states["a"], expected_rows(view.slots_for("a", 8, 12)))
+
+    # `a` finishes; a later request reusing the id is new and does hit.
+    s3 = run_step(mgr, view, {"b": ([3], 0, 2)}, finished=["a"])
+    mgr.materialize(s3, ["b"])
+    s4 = run_step(mgr, view, {"a": ([0, 1, 4], 8, 4)}, new_hits={"a": 8}, finished=["b"])
+    assert mgr._step_ctxs[s4].hits == {"a": (8, [0, 1])}
+    outs = mgr.materialize(s4, ["a"])
+    assert outs.hidden_states["a"].shape == (12, HIDDEN)
+    assert torch.equal(outs.hidden_states["a"][:8], expected_rows(view.slots_for("a", 0, 8)))
+
+
 def test_join_next_step_hit_waits_done_then_reads_pool():
     """CPU stand-in for the non-eager path: submit registers but does not
     write the pool. A same-step hit must join(done), drain, then read the pool."""
