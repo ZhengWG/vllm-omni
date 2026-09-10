@@ -116,23 +116,36 @@ def _snapshot_leftover_mm_cpu(
     device_snapshot_keys: set[str],
     num_tokens_unpadded: int,
     num_tokens_padded: int | None = None,
-) -> dict[str, Any]:
+) -> tuple[dict[str, Any], object | None]:
     """CPU copy of mm that did not land on the staging page.
 
     Skip ``device_snapshot_keys`` (those already have a device→host page).
     Copy the rest — deferred mm, lists, ``codes.ref`` — so materialize can
     run after the next forward overwrites graph buffers. Slice ``[:n]``
     only when ``shape[0] == n``; ``>= n`` would clip ``codes.ref``.
+
+    CUDA tensors land in pinned memory through a non-blocking copy on the
+    current stream: stream order keeps it ahead of the next forward, and
+    the engine thread does not wait for this forward to finish. The
+    returned event (None when nothing was on CUDA) must be synchronized
+    before the snapshot is read.
     """
     n = num_tokens_unpadded
     padded = n if num_tokens_padded is None else int(num_tokens_padded)
+    on_cuda = False
 
     def _copy(val: Any) -> Any:
+        nonlocal on_cuda
         if isinstance(val, torch.Tensor):
             t = val[:n] if _is_step_token_tensor(val, n, padded) and int(val.shape[0]) == n else val
-            copied = t.detach()
-            # .cpu() copies device tensors; CPU/pinned views still share storage.
-            copied = copied.cpu() if copied.device.type != "cpu" else copied.clone()
+            t = t.detach()
+            if t.is_cuda:
+                host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+                host.copy_(t, non_blocking=True)
+                on_cuda = True
+                return host
+            # .cpu() copies other device tensors; CPU/pinned views still share storage.
+            copied = t.cpu() if t.device.type != "cpu" else t.clone()
             return copied.contiguous()
         if isinstance(val, Mapping):
             return {k: _copy(v) for k, v in val.items()}
@@ -142,9 +155,27 @@ def _snapshot_leftover_mm_cpu(
             return tuple(_copy(v) for v in val)
         return val
 
-    return {
+    leftover = {
         key: _copy(val) for key, val in mm_outputs.items() if key not in device_snapshot_keys and not is_hidden_key(key)
     }
+    event = None
+    if on_cuda:
+        event = torch.cuda.Event()
+        event.record()
+    return leftover, event
+
+
+def _unpin_leftover(val: Any) -> Any:
+    """Clone pinned tensors out so the payload does not hold pinned pages."""
+    if isinstance(val, torch.Tensor):
+        return val.clone() if val.is_pinned() else val
+    if isinstance(val, Mapping):
+        return {k: _unpin_leftover(v) for k, v in val.items()}
+    if isinstance(val, list):
+        return [_unpin_leftover(v) for v in val]
+    if isinstance(val, tuple):
+        return tuple(_unpin_leftover(v) for v in val)
+    return val
 
 
 @dataclass
@@ -172,6 +203,8 @@ class _StepOutputs:
     immediate: dict[str, torch.Tensor]
     deferred_chunks: list[tuple[str, _WriteChunk]]
     leftover: dict[str, Any]
+    # Completion of the leftover device→host copies; None when none ran on CUDA.
+    leftover_event: object | None = None
     immediate_budget: _BudgetTicket | None = None
 
     @property
@@ -248,6 +281,8 @@ class _StepContext:
     # Leftover mm copied to CPU at save (this-step deferred rows + mm
     # that is not written to the pool).
     mm_cpu_snapshot: dict[TensorName, Any] = field(default_factory=dict)
+    # Wait this before reading mm_cpu_snapshot (None when nothing was on CUDA).
+    mm_cpu_snapshot_event: object | None = None
 
     # Staging slot for this step id (empty views when only leftover mm).
     d2h: StepD2HClaim | None = None
@@ -663,6 +698,9 @@ class OmniPrefixCacheManager:
                         hit_sources[(req_id, key)] = self._slot_ref(slots, key, req_id)
 
             # ---- unlocked: data movement + merge ----
+            if ctx.mm_cpu_snapshot_event is not None:
+                ctx.mm_cpu_snapshot_event.synchronize()
+                ctx.mm_cpu_snapshot = _unpin_leftover(ctx.mm_cpu_snapshot)
             current: dict[str, torch.Tensor] = {}
             if ctx.d2h is not None:
                 # Whole-step device→host was launched at save. One event wait
@@ -839,6 +877,7 @@ class OmniPrefixCacheManager:
             hit_prefetch=dict(self._hit_prefetch),
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
             mm_cpu_snapshot=step_outputs.leftover,
+            mm_cpu_snapshot_event=step_outputs.leftover_event,
             d2h=d2h_claim,
         )
         self._clear_hit_infos()
@@ -888,7 +927,7 @@ class OmniPrefixCacheManager:
                     continue
                 self._ensure_cache_key(key, val.dtype, int(val.shape[-1]))
                 immediate[key] = val[:n].clone()
-        leftover = _snapshot_leftover_mm_cpu(mm_outputs, set(immediate), n, num_tokens_padded)
+        leftover, leftover_event = _snapshot_leftover_mm_cpu(mm_outputs, set(immediate), n, num_tokens_padded)
         deferred_chunks: list[tuple[str, _WriteChunk]] = []
         if deferred_tensors:
             assert slots_cpu is not None
@@ -897,7 +936,11 @@ class OmniPrefixCacheManager:
             _BudgetTicket(nbytes=sum(t.numel() * t.element_size() for t in immediate.values())) if immediate else None
         )
         return _StepOutputs(
-            immediate=immediate, deferred_chunks=deferred_chunks, leftover=leftover, immediate_budget=immediate_budget
+            immediate=immediate,
+            deferred_chunks=deferred_chunks,
+            leftover=leftover,
+            leftover_event=leftover_event,
+            immediate_budget=immediate_budget,
         )
 
     def _pack_deferred_chunks(

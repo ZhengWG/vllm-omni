@@ -456,10 +456,30 @@ def test_leftover_snapshot_preserves_non_token_major_shapes():
         "tokenish": torch.arange(n * 2, dtype=DTYPE).reshape(n, 2),
         "scalar": torch.tensor(3.0),
     }
-    out = _snapshot_leftover_mm_cpu(mm, set(), n)
+    out, event = _snapshot_leftover_mm_cpu(mm, set(), n)
+    assert event is None
     _assert_leftover_shapes(mm, out, n)
     assert torch.equal(out["codes.ref"], mm["codes.ref"])
     assert out["codes.ref"].shape == (15, 2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA leftover copy")
+def test_leftover_snapshot_cuda_is_pinned_and_event_ordered():
+    """CUDA leftover lands pinned via a non-blocking copy; values are exact once the event is waited."""
+    n = 4
+    mm = {
+        "codes.audio": torch.arange(n * 2, dtype=DTYPE, device="cuda").reshape(n, 2),
+        "codes.ref": torch.arange(30, dtype=DTYPE, device="cuda").reshape(15, 2),
+        "tags": [torch.ones(3, 5, device="cuda")],
+    }
+    out, event = _snapshot_leftover_mm_cpu(mm, set(), n)
+    assert event is not None
+    event.synchronize()
+    _assert_leftover_shapes(mm, out, n)
+    for t in (out["codes.audio"], out["codes.ref"], out["tags"][0]):
+        assert t.device.type == "cpu" and t.is_pinned()
+    assert torch.equal(out["codes.audio"], mm["codes.audio"].cpu())
+    assert torch.equal(out["codes.ref"], mm["codes.ref"].cpu())
 
 
 def test_codes_ref_matches_old_build_mm_cpu_path():
