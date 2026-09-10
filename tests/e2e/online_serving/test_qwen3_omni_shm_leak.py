@@ -7,15 +7,22 @@ The default L2 Qwen3-Omni job uses ``ci/qwen3_omni_moe.yaml`` with
 ``async_chunk: false`` plus ``--no-async-chunk``, so it never exercises the
 thinker→talker SharedMemoryConnector path.
 
-A text-only request is tagged ``omni_final_stage_id=0``. Nothing downstream
-``get()``s a finished-marker ``put()``, and adapter ``cleanup()`` does not
-unlink the POSIX segment. This module starts the production async-chunk
-deploy and asserts connector lockfiles do not grow after those requests.
+A text-only request is tagged ``omni_final_stage_id=0``, so nothing downstream
+ever ``get()``s what stage-0 ``put()``s for it. Before #7245 the scheduler still
+``put()`` a finished marker on finish and nothing unlinked it, so every such
+request left a ``SharedMemoryConnector`` segment plus lockfile in ``/dev/shm``.
+Stage-0-final finishes now skip the ``put()`` and the orchestrator reclaims any
+undrained segment on request cleanup.
+
+This module starts the production async-chunk deploy and asserts neither the
+connector lockfiles (``shm_<key>_lockfile.lock``) nor the POSIX segments
+(``<request_id>_<stage>_<chunk>``) grow after those requests.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 
@@ -68,9 +75,27 @@ def _system_prompt() -> dict:
     }
 
 
+# ``SharedMemoryConnector.put()`` writes two entries per ``put_key``
+# (``<external_req_id>_<stage_id>_<chunk_id>``, see chunk_transfer_adapter):
+# the flock file ``shm_<put_key>_lockfile.lock`` and the POSIX segment named
+# ``<put_key>`` itself. ``get()`` removes the lockfile and unlinks the segment on
+# separate paths, so count both: a regression that drops one but not the other
+# is still a leak. Online chat request ids are ``chatcmpl-...``; anchoring on
+# that keeps ``torch_<pid>_<n>`` and other IPC objects out of the count.
+_SEGMENT_RE = re.compile(r"chatcmpl-[^/]+_\d+_\d+")
+
+
 def _is_connector_lockfile(name: str) -> bool:
-    """SharedMemoryConnector lockfiles, not CUDA/NCCL IPC objects."""
     return name.startswith("shm_") and name.endswith("_lockfile.lock")
+
+
+def _is_connector_segment(name: str) -> bool:
+    return _SEGMENT_RE.fullmatch(name) is not None
+
+
+def _is_connector_entry(name: str) -> bool:
+    """SharedMemoryConnector artifacts, not CUDA/NCCL/torch IPC objects."""
+    return _is_connector_lockfile(name) or _is_connector_segment(name)
 
 
 def _shm_used_mib() -> str:
@@ -82,19 +107,19 @@ def _shm_used_mib() -> str:
         return "unknown"
 
 
-def _connector_lockfile_count() -> int:
+def _connector_entry_count() -> int:
     if not _SHM_DIR.is_dir():
         pytest.skip("/dev/shm is not available")
     with os.scandir(_SHM_DIR) as entries:
-        return sum(1 for entry in entries if _is_connector_lockfile(entry.name))
+        return sum(1 for entry in entries if _is_connector_entry(entry.name))
 
 
-def _connector_lockfiles_since(since_s: float, limit: int = 32) -> list[str]:
-    """Return a sample of connector lockfiles with mtime >= ``since_s``."""
+def _connector_entries_since(since_s: float, limit: int = 32) -> list[str]:
+    """Return a sample of connector lockfiles/segments with mtime >= ``since_s``."""
     found: list[str] = []
     with os.scandir(_SHM_DIR) as entries:
         for entry in entries:
-            if not _is_connector_lockfile(entry.name):
+            if not _is_connector_entry(entry.name):
                 continue
             try:
                 if entry.stat().st_mtime >= since_s:
@@ -106,12 +131,12 @@ def _connector_lockfiles_since(since_s: float, limit: int = 32) -> list[str]:
     return found
 
 
-def _wait_no_new_lockfiles(since_s: float, baseline: int, timeout_s: float = _SETTLE_S) -> tuple[int, list[str]]:
+def _wait_no_new_entries(since_s: float, baseline: int, timeout_s: float = _SETTLE_S) -> tuple[int, list[str]]:
     deadline = time.monotonic() + timeout_s
     time.sleep(1.0)
     while True:
-        count = _connector_lockfile_count()
-        extra = _connector_lockfiles_since(since_s)
+        count = _connector_entry_count()
+        extra = _connector_entries_since(since_s)
         if count <= baseline and not extra:
             return count, extra
         if time.monotonic() >= deadline:
@@ -129,9 +154,9 @@ def test_text_only_async_chunk_does_not_leak_shm(omni_server, online_client) -> 
     """Stage-0-final (text-only) requests must not leave connector SHM behind."""
     # Timestamp first so the scan below does not treat its own runtime as "new".
     since_s = time.time()
-    baseline = _connector_lockfile_count()
+    baseline = _connector_entry_count()
     print(
-        f"[shm-leak] before requests: lockfiles={baseline} /dev/shm_used={_shm_used_mib()}",
+        f"[shm-leak] before requests: connector_entries={baseline} /dev/shm_used={_shm_used_mib()}",
         flush=True,
     )
 
@@ -154,13 +179,13 @@ def test_text_only_async_chunk_does_not_leak_shm(omni_server, online_client) -> 
         f"leave /dev/shm unchanged and hide a leak."
     )
 
-    after, extra = _wait_no_new_lockfiles(since_s, baseline)
+    after, extra = _wait_no_new_entries(since_s, baseline)
     print(
         f"[shm-leak] after {_NUM_TEXT_REQUESTS} text-only requests: "
-        f"lockfiles={after} /dev/shm_used={_shm_used_mib()} new_sample={extra}",
+        f"connector_entries={after} /dev/shm_used={_shm_used_mib()} new_sample={extra}",
         flush=True,
     )
     assert after <= baseline and not extra, (
-        f"SharedMemoryConnector leaked lockfiles after {_NUM_TEXT_REQUESTS} "
+        f"SharedMemoryConnector leaked /dev/shm entries after {_NUM_TEXT_REQUESTS} "
         f"stage-0-final request(s): before={baseline} after={after} new_sample={extra}"
     )

@@ -154,6 +154,8 @@ steps:
       - label: "Omni · Qwen3-Omni Async-Chunk SHM Leak"
         source_file_dependencies:
           - tests/e2e/online_serving/test_qwen3_omni_shm_leak.py
+          - tests/helpers/runtime.py
+          - tests/helpers/stage_config.py
           - vllm_omni/core/sched/omni_ar_scheduler.py
           - vllm_omni/distributed/omni_connectors/connectors/shm_connector.py
           - vllm_omni/distributed/omni_connectors/transfer_adapter/chunk_transfer_adapter.py
