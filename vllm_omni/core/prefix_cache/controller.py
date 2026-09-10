@@ -306,20 +306,33 @@ class WriteTask:
         self.transition(TaskState.WRITTEN)
 
     def scatter_rows(self) -> list[tuple[TensorName, torch.Tensor, torch.Tensor]]:
-        """`(key, slots, host)` to write. Omits slots in `reassigned`."""
+        """`(key, slots, host)` to write, one entry per key. Omits slots in
+        `reassigned`. A slot written twice by this task (preempt + resume
+        onto the same block) keeps the later chunk's row.
+        """
         with self.lock:
             reassigned = {k: s.clone() for k, s in self.reassigned.items()}
-        out: list[tuple[TensorName, torch.Tensor, torch.Tensor]] = []
+        by_key: dict[TensorName, tuple[list[torch.Tensor], list[torch.Tensor]]] = {}
         for chunk in self.chunks:
             for k, host in chunk.host.items():
-                taken = reassigned.get(k)
-                if taken is not None and taken.numel():
-                    keep = ~torch.isin(chunk.slots_cpu, taken)
-                    if not bool(keep.any()):
-                        continue
-                    out.append((k, chunk.slots_cpu[keep], host[keep]))
-                else:
-                    out.append((k, chunk.slots_cpu, host))
+                s, h = by_key.setdefault(k, ([], []))
+                s.append(chunk.slots_cpu)
+                h.append(host)
+        out: list[tuple[TensorName, torch.Tensor, torch.Tensor]] = []
+        for k, (s, h) in by_key.items():
+            slots = s[0] if len(s) == 1 else torch.cat(s)
+            host = h[0] if len(h) == 1 else torch.cat(h, dim=0)
+            if len(s) > 1 and torch.unique(slots).numel() != slots.numel():
+                last_pos = {int(slot): i for i, slot in enumerate(slots.tolist())}
+                keep_idx = torch.tensor(sorted(last_pos.values()), dtype=torch.int64)
+                slots, host = slots[keep_idx], host[keep_idx]
+            taken = reassigned.get(k)
+            if taken is not None and taken.numel():
+                keep = ~torch.isin(slots, taken)
+                if not bool(keep.any()):
+                    continue
+                slots, host = slots[keep], host[keep]
+            out.append((k, slots, host))
         return out
 
     def clear_tensors(self) -> None:
@@ -332,12 +345,12 @@ class WriteTask:
             chunk.tensors = {}
 
     def budget_tickets(self) -> list[_BudgetTicket]:
-        """Distinct tickets across this task's chunks."""
-        out: list[_BudgetTicket] = []
+        """Distinct tickets across this task's chunks (by identity; one per save)."""
+        out: dict[int, _BudgetTicket] = {}
         for chunk in self.chunks:
-            if chunk.budget is not None and all(chunk.budget is not t for t in out):
-                out.append(chunk.budget)
-        return out
+            if chunk.budget is not None:
+                out.setdefault(id(chunk.budget), chunk.budget)
+        return list(out.values())
 
     def slot_to_row(self) -> dict[int, tuple[int, int]]:
         with self.lock:
@@ -813,27 +826,37 @@ class OmniPrefixCacheController:
             task.mark_host_ready()
             self._release_staged_bytes(task)
             return
+        # One device cat + one device→host per key, not one per chunk (a
+        # long request has one chunk per step).
         chunk_bytes = self._config.copy_chunk_bytes
-        pending_host: list[tuple[_WriteChunk, str, torch.Tensor]] = []
-        pending_cats: list[tuple[_WriteChunk, str, list[torch.Tensor]]] = []
+        by_key: dict[str, list[_WriteChunk]] = {}
+        for chunk in task.chunks:
+            for k in chunk.tensors:
+                by_key.setdefault(k, []).append(chunk)
+        pending: list[tuple[str, list[_WriteChunk], list[torch.Tensor]]] = []
         with torch.cuda.stream(self._copy_stream):
             if task.freeze_event is not None:
                 self._copy_stream.wait_event(task.freeze_event)
-            for chunk in task.chunks:
-                for k, src in chunk.tensors.items():
-                    if src.numel() * src.element_size() > chunk_bytes:
-                        rows_per_chunk = max(1, chunk_bytes // max(1, src.shape[-1] * src.element_size()))
-                        parts = [
-                            src[start : start + rows_per_chunk].to("cpu", non_blocking=True)
-                            for start in range(0, src.shape[0], rows_per_chunk)
-                        ]
-                        pending_cats.append((chunk, k, parts))
-                    else:
-                        pending_host.append((chunk, k, src.to("cpu", non_blocking=True)))
+            for k, chunks in by_key.items():
+                srcs = [c.tensors[k] for c in chunks]
+                src = srcs[0] if len(srcs) == 1 else torch.cat(srcs, dim=0)
+                rows = int(src.shape[0])
+                row_bytes = max(1, src[:1].numel() * src.element_size())
+                step = max(1, rows if rows * row_bytes <= chunk_bytes else chunk_bytes // row_bytes)
+                parts = [src[s : s + step].to("cpu", non_blocking=True) for s in range(0, max(rows, 1), step)]
+                pending.append((k, chunks, parts))
             ev = torch.cuda.Event()
             ev.record()
         ev.synchronize()
-        task.set_host_tensor([(chunk, k, torch.cat(parts, dim=0)) for chunk, k, parts in pending_cats] + pending_host)
+        rows_out: list[tuple[_WriteChunk, str, torch.Tensor]] = []
+        for k, chunks, parts in pending:
+            host = parts[0] if len(parts) == 1 else torch.cat(parts, dim=0)
+            if len(chunks) == 1:
+                rows_out.append((chunks[0], k, host))
+                continue
+            for chunk, view in zip(chunks, torch.split(host, [int(c.tensors[k].shape[0]) for c in chunks], dim=0)):
+                rows_out.append((chunk, k, view))
+        task.set_host_tensor(rows_out)
         self._release_staged_bytes(task)
 
     def _fail_task(self, tid: int | None) -> None:

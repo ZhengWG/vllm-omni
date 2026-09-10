@@ -773,6 +773,33 @@ def test_tenant_succession_mm_key():
     assert torch.equal(rows[4:], torch.full((2, 2), 3.0))
 
 
+def test_scatter_rows_coalesces_per_key_last_chunk_wins_and_skips_reassigned():
+    from vllm_omni.core.prefix_cache.controller import WriteSchedule, WriteTask, _BudgetTicket, _WriteChunk
+
+    t1, t2 = _BudgetTicket(nbytes=8), _BudgetTicket(nbytes=8)
+
+    def chunk(slots, base, ticket):
+        s = torch.tensor(slots, dtype=torch.int64)
+        host = {"k": torch.full((len(slots), 2), float(base)) + s[:, None]}
+        return _WriteChunk(slots_cpu=s, tensors={}, host=host, budget=ticket)
+
+    task = WriteTask(
+        tid=1,
+        req_id="a",
+        write_n=1,
+        schedule=WriteSchedule.JOIN_ON_FINISH,
+        chunks=[chunk([0, 1], 10, t1), chunk([2, 3], 20, t1), chunk([1, 4], 30, t2)],
+    )
+    assert task.budget_tickets() == [t1, t2]
+    task.add_reassigned("k", torch.tensor([3], dtype=torch.int64))
+    rows = task.scatter_rows()
+    assert len(rows) == 1
+    key, slots, host = rows[0]
+    assert key == "k" and slots.tolist() == [0, 2, 1, 4]
+    # slot 1: the third chunk's row (base 30) replaces the first chunk's; slot 3 is reassigned.
+    assert host[:, 0].tolist() == [10.0, 22.0, 31.0, 34.0]
+
+
 def test_slot_reuse_pushes_skip_to_old_task():
     """Reassignment = task swap. Keep the old write in progress so the
     new write records those rows as no longer owned by it."""
