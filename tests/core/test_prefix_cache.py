@@ -229,6 +229,39 @@ def test_hit_merge_from_mirror():
     assert torch.equal(merged[8:], expected_rows(view.slots_for("b", 8, 12)))
 
 
+@pytest.mark.parametrize("a_finished_before_b", [False, True])
+def test_partial_match_hits_shared_prefix_and_writes_divergent_block(a_finished_before_b):
+    """`a` occupies [0, 1, 2]; `b` shares the first two blocks and diverges on
+    the third ([0, 1, 3]). `b` must merge 8 hit rows from the shared blocks
+    plus its own 4 rows, land block 3 in the pool, and leave `a`'s block 2
+    untouched — whether `a` already finished or is still running."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0, 1, 2], 0, 12)})
+    mgr.materialize(s1, ["a"])
+    a_tail = view.slots_for("a", 8, 12)
+    assert torch.equal(plan_fetch(mgr, a_tail, HIDDEN_KEY, req_id="a"), expected_rows(a_tail))
+
+    finished = ["a"] if a_finished_before_b else ()
+    s2 = run_step(mgr, view, {"b": ([0, 1, 3], 8, 4)}, new_hits={"b": 8}, finished=finished)
+    outs = mgr.materialize(s2, ["b"])
+    merged = outs.hidden_states["b"]
+    assert merged.shape == (12, HIDDEN)
+    assert torch.equal(merged[:8], expected_rows(view.slots_for("b", 0, 8)))
+    assert torch.equal(merged[8:], expected_rows(view.slots_for("b", 8, 12)))
+    # Divergent third block landed; the shared prefix and a's own tail did not move.
+    b_tail = view.slots_for("b", 8, 12)
+    assert torch.equal(plan_fetch(mgr, b_tail, HIDDEN_KEY, req_id="b"), expected_rows(b_tail))
+    assert torch.equal(plan_fetch(mgr, a_tail, HIDDEN_KEY, req_id="a"), expected_rows(a_tail))
+    shared = view.slots_for("a", 0, 8)
+    assert torch.equal(plan_fetch(mgr, shared, HIDDEN_KEY, req_id="a"), expected_rows(shared))
+
+    if not a_finished_before_b:
+        # `a` finishes later; releasing its task must not disturb b's rows.
+        s3 = run_step(mgr, view, {"b": ([0, 1, 3, 4], 12, 1)}, finished=["a"])
+        mgr.materialize(s3, ["b"])
+        assert torch.equal(plan_fetch(mgr, b_tail, HIDDEN_KEY, req_id="b"), expected_rows(b_tail))
+
+
 def test_join_next_step_hit_waits_done_then_reads_pool():
     """CPU stand-in for the non-eager path: submit registers but does not
     write the pool. A same-step hit must join(done), drain, then read the pool."""
