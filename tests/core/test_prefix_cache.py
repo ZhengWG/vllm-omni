@@ -24,11 +24,19 @@ except ModuleNotFoundError:
     # Bypass vllm_omni/__init__ (which imports vllm): register namespace
     # parents so the pure-torch prefix_cache subpackage imports directly.
     _root = Path(__file__).resolve().parents[2]
-    for _pkg in ("vllm_omni", "vllm_omni.core"):
+    for _pkg in ("vllm_omni", "vllm_omni.core", "vllm_omni.utils"):
         if _pkg not in sys.modules:
             _m = __import__("types").ModuleType(_pkg)
             _m.__path__ = [str(_root / _pkg.replace(".", "/"))]
             sys.modules[_pkg] = _m
+    import logging
+
+    _vllm = __import__("types").ModuleType("vllm")
+    _vllm_logger = __import__("types").ModuleType("vllm.logger")
+    _vllm_logger.init_logger = logging.getLogger
+    _vllm.logger = _vllm_logger
+    sys.modules["vllm"] = _vllm
+    sys.modules["vllm.logger"] = _vllm_logger
 
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
 from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView, check_prefix_cache_kv_groups
@@ -550,11 +558,10 @@ def test_deferred_unpadded_registers_on_padded_step():
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)}, mm={"codes.audio": audio}, num_tokens_padded=16)
     assert mgr._pool.has_key("codes.audio")
     assert "codes.audio" in mgr._step_ctxs[s1].mm_cpu_snapshot
-    # Hidden opt-out + no hit: materialize returns empty; the freeze is
-    # the durable copy. Fetch it before consume.
     rows = plan_fetch(mgr, view.slots_for("a", 0, 8), "codes.audio", req_id="a")
     assert torch.equal(rows, audio)
-    mgr.materialize(s1, ["a"])
+    outs = mgr.materialize(s1, ["a"])
+    assert torch.equal(outs.mm_outputs["codes.audio"]["a"], audio)
 
 
 def test_check_kv_groups_rejects_empty_or_multi():
@@ -1041,17 +1048,25 @@ def test_leftover_mm_snapshot_survives_live_overwrite():
     mgr.discard_step(sid)
 
 
-def test_deferred_leftover_snapshot_survives_live_overwrite():
+@pytest.mark.parametrize("needs_full_hidden_states", [True, False])
+def test_deferred_leftover_snapshot_survives_live_overwrite(needs_full_hidden_states):
     """Deferred tails are leftover-copied at save for materialize; the GPU
-    freeze is a different product (pool write on finish)."""
-    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"codes.audio"}))
+    freeze is a different product (pool write on finish). ``False`` is the
+    hidden opt-out + miss path (Qwen3-TTS / Higgs talker)."""
+    policy = ModelCachePolicy(
+        needs_full_hidden_states=needs_full_hidden_states, deferred_keys=frozenset({"codes.audio"})
+    )
     mgr, view = make_manager(policy=policy)
     live = torch.full((2, 2), 1.0)
-    sid = run_step(mgr, view, {"a": ([0], 0, 2)}, mm={"codes.audio": live})
+    ref = [torch.arange(4, dtype=DTYPE)]
+    sid = run_step(mgr, view, {"a": ([0], 0, 2)}, mm={"codes.audio": live, "codes.ref": ref})
     assert "codes.audio" in mgr._step_ctxs[sid].mm_cpu_snapshot
     live.fill_(99.0)
+    ref[0].fill_(99.0)
     outs = mgr.materialize(sid, ["a"])
     assert torch.equal(outs.mm_outputs["codes.audio"]["a"], torch.full((2, 2), 1.0))
+    assert torch.equal(outs.mm_outputs["codes.ref"]["a"][0], torch.arange(4, dtype=DTYPE))
+    assert (outs.hidden_states is None) == (not needs_full_hidden_states)
 
 
 def test_frozen_mm_clone_survives_live_overwrite():
@@ -1064,14 +1079,16 @@ def test_frozen_mm_clone_survives_live_overwrite():
     assert torch.equal(outs.mm_outputs["codes.audio"]["a"], torch.full((2, 2), 1.0))
 
 
-def test_staging_slot_released_on_no_consumer_early_return():
+def test_hidden_opt_out_miss_returns_mm_and_releases_slot():
     policy = ModelCachePolicy(needs_full_hidden_states=False)
     mgr, view = make_manager(policy=policy)
     for i in range(6):
         sid = run_step(mgr, view, {"a": ([i % 8, (i % 8) + 8], i, 1)}, mm={"k": torch.full((1, 2), float(i))})
         ctx = mgr._step_ctxs[sid]
         assert ctx.d2h is not None, i
-        mgr.materialize(sid, ["a"])
+        outs = mgr.materialize(sid, ["a"])
+        assert outs.hidden_states is None
+        assert torch.equal(outs.mm_outputs["k"]["a"], torch.full((1, 2), float(i)))
         assert not mgr._controller._staging_pool._busy[ctx.d2h.staging_slot], i
 
 

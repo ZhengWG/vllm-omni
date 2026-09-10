@@ -640,13 +640,6 @@ class OmniPrefixCacheManager:
                     f"{sorted(set(req_ids) - set(ctx.spans))[:8]}"
                 )
 
-                if self._policy.hidden_key is None and not ctx.hits:
-                    # Merge would be an identity; empty mm_outputs tells the runner
-                    # to use its own mm copy. Still release the slot or it leaks.
-                    self._release_step_staging(ctx, step_id)
-                    step_released = True
-                    return StageCacheOutputs(hidden_states=None, mm_outputs={})
-
                 cached_keys = ctx.cached_keys
 
                 hit_sources: dict[tuple[str, str], _SlotRef | Future] = {}

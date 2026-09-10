@@ -723,7 +723,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states_cpu = staged_hidden_states_cpu
             return hidden_states_cpu, None, None
         outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
-        # mm_outputs is all-or-nothing: empty means "not merged, use the runner's own mm copy".
+        # mm_outputs is all-or-nothing; empty only when the step had no mm.
         return hidden_states_cpu, outs.hidden_states, (outs.mm_outputs or None)
 
     def _build_omni_pooler_payload(
