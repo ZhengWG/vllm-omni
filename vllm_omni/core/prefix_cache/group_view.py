@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError
+from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
 
 if TYPE_CHECKING:
     from vllm.v1.worker.gpu_input_batch import InputBatch
@@ -86,6 +86,49 @@ def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
             "omni prefix caching requires a single full-attention kv-cache group; "
             f"found {type(spec).__name__}. disable enable_prefix_caching for this model"
         )
+
+
+def check_prefix_cache_kv_transfer(kv_transfer_config: object) -> None:
+    """Reject kv_consumer / kv_both stages.
+
+    KV loaded from a producer also shows up as ``num_computed_tokens``; the
+    manager would read it as a local hit with no rows behind it.
+    """
+    if kv_transfer_config is not None and getattr(kv_transfer_config, "is_kv_consumer", False):
+        raise OmniPrefixCacheUnmatchError(
+            "omni prefix caching cannot tell locally cached tokens from KV received "
+            "through a KV connector; disable enable_prefix_caching on kv_consumer / "
+            "kv_both stages"
+        )
+
+
+def stage_prefix_cache_config(
+    *,
+    kv_cache_config: object,
+    cache_config: object,
+    kv_transfer_config: object,
+    scheduler_config: object,
+    model_config: object,
+    is_pooling_model: bool,
+) -> PrefixCacheConfig | None:
+    """Runner-side gate shared by the GPU and NPU model runners.
+
+    Returns None when the stage does not run an omni prefix cache
+    (``enable_prefix_caching`` off, or a pooling stage that never saves).
+    Otherwise refuses kv_consumer / kv_both and hybrid kv groups, then
+    sizes the config from the scheduler. One place so a platform runner
+    cannot silently skip a refusal the other one has.
+    """
+    if not getattr(cache_config, "enable_prefix_caching", False) or is_pooling_model:
+        return None
+    check_prefix_cache_kv_transfer(kv_transfer_config)
+    check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))
+    return PrefixCacheConfig.from_vllm_config(
+        num_blocks=kv_cache_config.num_blocks,  # type: ignore[attr-defined]
+        block_size=cache_config.block_size,  # type: ignore[attr-defined]
+        scheduler_config=scheduler_config,
+        model_config=model_config,
+    )
 
 
 def get_prefix_cache_group_view(

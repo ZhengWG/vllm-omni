@@ -37,9 +37,8 @@ from vllm_omni.core.prefix_cache import (
     ModelCachePolicy,
     OmniPrefixCacheManager,
     OmniPrefixCacheUnmatchError,
-    PrefixCacheConfig,
-    check_prefix_cache_kv_groups,
     get_prefix_cache_group_view,
+    stage_prefix_cache_config,
 )
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
@@ -182,24 +181,18 @@ class OmniGPUModelRunner(GPUModelRunner):
                             )
 
         # Stage the config; the manager is built on the first step once
-        # input_batch exists. Pooling stages never save, so no cache for them.
-        if self.cache_config.enable_prefix_caching and not self.is_pooling_model:
-            kv_cfg = getattr(self.vllm_config, "kv_transfer_config", None)
-            if kv_cfg is not None and getattr(kv_cfg, "is_kv_consumer", False):
-                # KV loaded from a producer also shows up as num_computed_tokens; the
-                # manager would read it as a local hit with no rows behind it.
-                raise OmniPrefixCacheUnmatchError(
-                    "omni prefix caching cannot tell locally cached tokens from KV received "
-                    "through a KV connector; disable enable_prefix_caching on kv_consumer / "
-                    "kv_both stages"
-                )
-            check_prefix_cache_kv_groups(getattr(kv_cache_config, "kv_cache_groups", None))
-            self._omni_prefix_cache_cfg = PrefixCacheConfig.from_vllm_config(
-                num_blocks=kv_cache_config.num_blocks,
-                block_size=self.cache_config.block_size,
-                scheduler_config=self.scheduler_config,
-                model_config=self.model_config,
-            )
+        # input_batch exists. The gate (pooling stage, kv_consumer, hybrid
+        # kv groups) is shared with the NPU runner.
+        cfg = stage_prefix_cache_config(
+            kv_cache_config=kv_cache_config,
+            cache_config=self.cache_config,
+            kv_transfer_config=getattr(self.vllm_config, "kv_transfer_config", None),
+            scheduler_config=self.scheduler_config,
+            model_config=self.model_config,
+            is_pooling_model=self.is_pooling_model,
+        )
+        if cfg is not None:
+            self._omni_prefix_cache_cfg = cfg
 
     def _snapshot_prefix_cache_model_flags(self, model) -> None:
         """Freeze the model's prefix-cache-relevant constants (set in the

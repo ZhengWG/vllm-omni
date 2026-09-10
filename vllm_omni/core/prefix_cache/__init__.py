@@ -24,7 +24,9 @@ from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
+    check_prefix_cache_kv_transfer,
     get_prefix_cache_group_view,
+    stage_prefix_cache_config,
 )
 from vllm_omni.core.prefix_cache.interface import (
     HIDDEN_KEY,
@@ -50,5 +52,7 @@ __all__ = [
     "PrefixCacheConfig",
     "WriteSchedule",
     "check_prefix_cache_kv_groups",
+    "check_prefix_cache_kv_transfer",
     "get_prefix_cache_group_view",
+    "stage_prefix_cache_config",
 ]

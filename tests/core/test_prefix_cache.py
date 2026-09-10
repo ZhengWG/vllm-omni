@@ -29,8 +29,6 @@ except ModuleNotFoundError:
             _m = __import__("types").ModuleType(_pkg)
             _m.__path__ = [str(_root / _pkg.replace(".", "/"))]
             sys.modules[_pkg] = _m
-    import logging
-
     _vllm = __import__("types").ModuleType("vllm")
     _vllm_logger = __import__("types").ModuleType("vllm.logger")
     _vllm_logger.init_logger = logging.getLogger
@@ -39,7 +37,11 @@ except ModuleNotFoundError:
     sys.modules["vllm.logger"] = _vllm_logger
 
 from vllm_omni.core.prefix_cache.controller import StagingBufferHolder
-from vllm_omni.core.prefix_cache.group_view import FullAttentionGroupView, check_prefix_cache_kv_groups
+from vllm_omni.core.prefix_cache.group_view import (
+    FullAttentionGroupView,
+    check_prefix_cache_kv_groups,
+    stage_prefix_cache_config,
+)
 from vllm_omni.core.prefix_cache.interface import (
     HIDDEN_KEY,
     ModelCachePolicy,
@@ -569,6 +571,41 @@ def test_check_kv_groups_rejects_empty_or_multi():
         check_prefix_cache_kv_groups([])
     with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
         check_prefix_cache_kv_groups([object(), object()])
+
+
+def _stage_cfg(*, enable=True, pooling=False, kv_transfer=None, groups=(object(),)):
+    return stage_prefix_cache_config(
+        kv_cache_config=SimpleNamespace(num_blocks=NUM_BLOCKS, kv_cache_groups=list(groups)),
+        cache_config=SimpleNamespace(enable_prefix_caching=enable, block_size=BLOCK_SIZE),
+        kv_transfer_config=kv_transfer,
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=64, max_model_len=128),
+        model_config=None,
+        is_pooling_model=pooling,
+    )
+
+
+def test_stage_prefix_cache_config_gate():
+    """The runner-side gate the GPU and NPU runners share: off / pooling
+    stages get no cache; kv_consumer and hybrid groups refuse loudly."""
+    assert _stage_cfg(enable=False) is None
+    assert _stage_cfg(pooling=True) is None
+    # kv_consumer / kv_both refuse before the group check, on both platforms.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="KV connector"):
+        _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), groups=())
+    assert _stage_cfg(kv_transfer=SimpleNamespace(is_kv_consumer=True), enable=False) is None
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="single full-attention"):
+        _stage_cfg(groups=(object(), object()))
+
+
+def test_npu_runner_uses_shared_prefix_cache_gate():
+    """npu_model_runner cannot be imported without vllm_ascend; pin at the
+    source level that it stages through the shared gate instead of a
+    hand-rolled subset of the GPU checks."""
+    path = Path(__file__).resolve().parents[2] / "vllm_omni/platforms/npu/worker/npu_model_runner.py"
+    tree = ast.parse(path.read_text())
+    calls = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
+    assert "stage_prefix_cache_config" in calls
+    assert "check_prefix_cache_kv_groups" not in calls
 
 
 def _table_slots(table, req_idx, token_start, token_end, block_size=BLOCK_SIZE):

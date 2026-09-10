@@ -183,7 +183,9 @@ writes: once a hash entered this step's batch it must land in the cache.
 `enable_prefix_caching` is refused on KV-consumer stages (`kv_role` of
 `kv_consumer` or `kv_both`). KV received from a producer is reported as
 `num_computed_tokens` too, and the manager cannot tell it from a local hit.
-Producer-only stages are unaffected.
+Producer-only stages are unaffected. Pooling stages never save, so they get
+no cache. This gate is one function, `stage_prefix_cache_config`, called by
+both the GPU and the NPU model runner at kv-cache init.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
