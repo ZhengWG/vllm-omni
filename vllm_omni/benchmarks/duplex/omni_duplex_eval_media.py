@@ -13,9 +13,25 @@ from typing import Any
 
 from vllm_omni.experimental.fullduplex.client import PCM16_BYTES_PER_SAMPLE, PCM16_SAMPLE_RATE
 
+# Some HEVC streams write the requested JPEG and then busy-loop in ffmpeg
+# (SIGTERM-immune). Bound the wait so one sample cannot stall the bench.
+FFMPEG_TIMEOUT_S = 30.0
 
-def _run_ffmpeg(args: list[str]) -> bytes:
-    result = subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", *args], capture_output=True, check=True)
+
+def _run_ffmpeg(args: list[str], *, timeout: float = FFMPEG_TIMEOUT_S) -> bytes:
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", *args],
+            capture_output=True,
+            check=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # ffmpeg.kill() is SIGKILL; recover a fully written frame if present.
+        stdout = exc.stdout or b""
+        if stdout:
+            return stdout
+        raise TimeoutError(f"ffmpeg timed out after {timeout:.1f}s without producing output") from exc
     return result.stdout
 
 
@@ -74,7 +90,7 @@ def iter_jpegs(
     while timestamp < end:
         try:
             frame = extract_jpeg(path, timestamp=timestamp, quality=quality)
-        except (OSError, subprocess.CalledProcessError):
+        except (OSError, subprocess.CalledProcessError, TimeoutError):
             break
         if frame:
             yield timestamp, frame
