@@ -263,6 +263,8 @@ mm that copy no device→host page. A slot is also held by each immediate
 write that views it, until the committer's pool write. A later save waits
 for `materialize`/`discard_step` or that pool write to free a slot;
 `staging_claim_timeout_s` then errors with the unused ids and the task count.
+`join`/`join_host_ready` use the same bound and raise with the stuck task's
+id and state instead of hanging the caller.
 `materialize` may run on the async output builder after the engine has
 entered the next step; leftover mm (not written to the pool) is copied
 to CPU at `save_outputs` so the builder never reads live CUDA-graph

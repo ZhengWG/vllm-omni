@@ -61,7 +61,8 @@ class PrefixCacheConfig:
     # Prefer from_vllm_config so staging_capacity_tokens tracks max_num_batched_tokens.
     staging_depth: int = 4
     staging_capacity_tokens: int = 1024
-    # How long save waits for a free staging slot (materialize/discard).
+    # How long save waits for a free staging slot, and join/join_host_ready
+    # for the committer; exceeding it raises.
     staging_claim_timeout_s: float = 30.0
     # Device→host chunk size for JOIN_ON_FINISH (copied a piece at a time).
     copy_chunk_bytes: int = 16 * 1024 * 1024

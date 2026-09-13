@@ -1412,6 +1412,25 @@ def test_escalate_leaves_claimed_task_alone():
     assert list(ctrl._queue_hi) == [] and list(ctrl._queue_lo) == []
 
 
+def test_join_on_stuck_committer_raises_instead_of_hanging():
+    from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
+    from vllm_omni.core.prefix_cache.controller import OmniPrefixCacheController, TaskState
+
+    cfg = PrefixCacheConfig(num_blocks=NUM_BLOCKS, block_size=BLOCK_SIZE, staging_claim_timeout_s=0.05)
+    ctrl = OmniPrefixCacheController(PrefixBlockPool(cfg), cfg, eager=True)
+    ctrl._eager = False  # queue path without a worker thread: nothing will finish the task
+    task, _ = _bare_task(tid=1, schedule=WriteSchedule.JOIN_ON_FINISH)
+    ctrl.submit(task, queued=True)
+    task.transition(TaskState.COPYING)
+
+    with pytest.raises(
+        OmniPrefixCacheUnmatchError, match=r"task 1 \(join_on_finish\) did not reach host_ready .*state=COPYING"
+    ):
+        ctrl.join_host_ready([1])
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="did not reach done"):
+        ctrl.join([1])
+
+
 def test_scatter_host_ready_writes_only_staged_tasks():
     from vllm_omni.core.prefix_cache.controller import TaskState
 

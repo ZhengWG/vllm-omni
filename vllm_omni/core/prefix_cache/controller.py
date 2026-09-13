@@ -640,10 +640,7 @@ class OmniPrefixCacheController:
 
     def join(self, tids: list[int]) -> None:
         """Block until each task has finished the CPU-pool write (or failed)."""
-        for tid in tids:
-            task = self._tasks.get(tid)
-            if task is not None:
-                task.done.wait()
+        self._wait_tasks(tids, "done")
 
     def join_host_ready(self, tids: list[int]) -> None:
         """Block until each task's device→host is complete (`host_ready`).
@@ -651,10 +648,20 @@ class OmniPrefixCacheController:
         Staging: committer has waited `step_d2h_event`. Deferred: committer
         has written `chunk.host`. Does not wait for the CPU-pool write.
         """
+        self._wait_tasks(tids, "host_ready")
+
+    def _wait_tasks(self, tids: list[int], event: Literal["done", "host_ready"]) -> None:
+        timeout = self._config.staging_claim_timeout_s
+        deadline = time.monotonic() + timeout
         for tid in tids:
             task = self._tasks.get(tid)
-            if task is not None:
-                task.host_ready.wait()
+            if task is None:
+                continue
+            if not getattr(task, event).wait(max(0.0, deadline - time.monotonic())):
+                raise OmniPrefixCacheUnmatchError(
+                    f"task {tid} ({task.schedule.value}) did not reach {event} within {timeout:g}s "
+                    f"(state={task.state.name}, in_flight_tasks={len(self._tasks)})"
+                )
 
     def drain_completed(self) -> list[int]:
         """Pop pool-written tasks from `_completed` and drop them from `_tasks`.
