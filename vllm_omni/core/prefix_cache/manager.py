@@ -672,12 +672,13 @@ class OmniPrefixCacheManager:
 
                 # The builder must pass (a subset of) the req list captured at
                 # save time — an id outside the snapshot means it is reading the
-                # live batch, which the contract forbids (debug assert, not a
-                # fallback that serves a miss).
-                assert set(req_ids) <= set(ctx.spans), (
-                    f"materialize(step {step_id}) got req ids outside the save snapshot: "
-                    f"{sorted(set(req_ids) - set(ctx.spans))[:8]}"
-                )
+                # live batch, which the contract forbids. Not a fallback that
+                # serves a miss.
+                unknown = set(req_ids) - set(ctx.spans)
+                if unknown:
+                    raise OmniPrefixCacheUnmatchError(
+                        f"materialize(step {step_id}) got req ids outside the save snapshot: {sorted(unknown)[:8]}"
+                    )
 
                 cached_keys = ctx.cached_keys
 

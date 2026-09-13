@@ -937,7 +937,7 @@ def test_materialize_rejects_out_of_snapshot_ids():
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
     mgr.materialize(s1, ["a"])
     s2 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8}, finished=["a"])
-    with pytest.raises(AssertionError, match="outside the save snapshot"):
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="outside the save snapshot"):
         mgr.materialize(s2, ["b", "late_joiner"])
 
 
