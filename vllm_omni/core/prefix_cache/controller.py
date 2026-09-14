@@ -581,10 +581,10 @@ class OmniPrefixCacheController:
         with self._lock:
             ticket.tids.add(tid)
 
-    def reserve(self, nbytes: int, exclude: set[int] | None = None) -> None:
+    def reserve(self, nbytes: int) -> None:
         """Reserve GPU-clone bytes; blocking flush happens here, so callers
         must not hold the manager's state lock."""
-        self._reserve_bytes(nbytes, exclude=exclude)
+        self._reserve_bytes(nbytes)
 
     def _release_staged_bytes(self, task: WriteTask) -> None:
         """Drop this task's hold on its budget ticket(s). Idempotent; a
@@ -594,13 +594,12 @@ class OmniPrefixCacheController:
             for ticket in tickets:
                 self._staged_bytes -= ticket.release(task.tid)
 
-    def _reserve_bytes(self, nbytes: int, exclude: set[int] | None = None) -> None:
+    def _reserve_bytes(self, nbytes: int) -> None:
         # GPU-byte budget: force-copy oldest pending tasks until under
         # budget. Bounded wait: their device→host has usually long completed.
-        exclude = exclude or set()
         while True:
             with self._lock:
-                pending = [tid for tid, t in self._tasks.items() if not t.is_terminal and tid not in exclude]
+                pending = [tid for tid, t in self._tasks.items() if not t.is_terminal]
                 if self._staged_bytes + nbytes <= self._config.gpu_staging_bytes or not pending:
                     # Under budget or no pending tasks; admit reservation.
                     self._staged_bytes += nbytes

@@ -577,13 +577,19 @@ def test_deferred_gpu_bytes_held_until_last_view_drops():
 
 
 def test_cap_forces_flush_of_deferred():
+    """One long request's deferred clone must not pin the whole budget:
+    the flush closes its open task and the next step opens a new one."""
     policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
-    mgr, view = make_manager(policy=policy, gpu_staging_bytes=48)
+    mgr, view = make_manager(policy=policy, gpu_staging_bytes=48)  # three (1, 4) fp32 chunks
     for pos in range(4):
-        sid = run_step(mgr, view, {"a": ([2, 3], pos, 1)}, mm={"k": torch.full((1, 4), float(pos))})
+        sid = run_step(mgr, view, {"a": ([2, 3], pos, 1)}, mm={"k": torch.full((1, 4), float(pos + 1))})
         mgr.materialize(sid, ["a"])
-    early = view.slots_for("a", 0, 1)
-    assert float(mgr._pool.rows("k", early)[0, 0]) == 0.0
+    # Fourth chunk flushed the first three; only it is still charged.
+    assert mgr._controller._staged_bytes == 16
+    rows = mgr._pool.rows("k", view.slots_for("a", 0, 4))[:, 0].tolist()
+    assert rows == [1.0, 2.0, 3.0, 0.0]
+    assert mgr._request_tasks.deferred["a"].write_n == 2
+    assert len(mgr._request_tasks.tasks["a"]) == 1  # the flushed write was drained
 
 
 def test_deferred_tenant_succession_no_stale_wins():
@@ -612,18 +618,17 @@ def test_deferred_key_hit_reads_staged_rows_not_mirror():
     assert torch.equal(rows[4:], torch.full((2, 2), 9.0))
 
 
-def test_append_to_closed_deferred_entry_opens_new_one(caplog):
-    """Unreachable by the production call order; if it happens the manager
-    recovers with a new task and says which state closed the old one."""
+def test_append_to_closed_deferred_entry_opens_new_one():
+    """A deferred task closed by the budget flush (or an early escalate)
+    cannot take more chunks; the next save opens a new write and a hit
+    reads both."""
     policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
     s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 1.0)})
     mgr.materialize(s1, ["a"])
     first = mgr._request_tasks.deferred["a"]
     mgr._controller.escalate([first.tid])
-    with caplog.at_level(logging.WARNING, logger="vllm_omni.core.prefix_cache.manager"):
-        s2 = run_step(mgr, view, {"a": ([2], 1, 1)}, mm={"k": torch.full((1, 2), 2.0)})
-    assert any(f"tid {first.tid}, write_n 1) was WRITTEN" in r.message for r in caplog.records)
+    s2 = run_step(mgr, view, {"a": ([2], 1, 1)}, mm={"k": torch.full((1, 2), 2.0)})
     mgr.materialize(s2, ["a"])
     assert mgr._request_tasks.deferred["a"].tid != first.tid
     slots = view.slots_for("a", 0, 2)

@@ -606,15 +606,11 @@ class OmniPrefixCacheManager:
                 freeze_event.record()
             # One ticket per clone (immediate step clone, shared deferred
             # clone); per-request slices are views and charge nothing.
-            # Reserve may block on a flush: outside the lock. The flush must
-            # not close the deferred entries we are about to append to
-            # (main-thread-only reads, safe unlocked).
-            exclude = {
-                self._request_tasks.deferred[r].tid
-                for r, _ in step_outputs.deferred_chunks
-                if r in self._request_tasks.deferred
-            }
-            self._controller.reserve(step_outputs.budget_bytes(), exclude=exclude)
+            # Reserve may block on a flush: outside the lock. The flush may
+            # close a deferred task this step appends to; _stage_deferred
+            # then opens a fresh one, so a long request cannot pin the
+            # whole budget.
+            self._controller.reserve(step_outputs.budget_bytes())
 
         # 5. Claim a staging slot (unlocked), optional device→host into it,
         #    then submit + store the step snapshot (locked). Saves with only
@@ -1028,25 +1024,16 @@ class OmniPrefixCacheManager:
 
     def _stage_deferred(self, deferred_chunks: list[tuple[str, _WriteChunk]], freeze_event) -> None:
         """Caller holds ``_state_lock``. Register pre-built deferred `_WriteChunk`s
-        (bytes already reserved by save_outputs)."""
+        (bytes already reserved by save_outputs).
+
+        A request's open deferred task may have been closed by the budget
+        flush in reserve(); this step's rows then start a new write
+        (``write_n`` + 1). Hits read both through ``staged_list``.
+        """
         for req_id, chunk in deferred_chunks:
             task = self._request_tasks.deferred.get(req_id)
-            if task is not None:
-                closed = self._controller.append_chunk(task, chunk, freeze_event)
-                if closed is not None:
-                    # Unreachable by construction: finish removes the entry
-                    # before the next save, and reserve() excludes this step's
-                    # entries from the budget flush. Recover with a new task,
-                    # but say so — it means one of those orderings broke.
-                    logger.warning(
-                        "omni prefix cache: deferred write for req %s (tid %d, write_n %d) was %s "
-                        "before this step's rows were appended; opening a new write",
-                        req_id,
-                        task.tid,
-                        task.write_n,
-                        closed.name,
-                    )
-                    task = None
+            if task is not None and self._controller.append_chunk(task, chunk, freeze_event) is not None:
+                task = None
             if task is None:
                 task = WriteTask(
                     tid=self._request_tasks.alloc_tid(),

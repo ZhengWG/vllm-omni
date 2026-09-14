@@ -227,8 +227,10 @@ Two write paths, split by `ModelCachePolicy.deferred_keys`:
   The next save waits `host_ready`.
 - Deferred (`JOIN_ON_FINISH`): mm whose first dim is this step's token count
   stays on a per-request GPU clone; `_WriteChunk`s append across steps;
-  finish/abort (or GPU-byte-budget pressure) forces the copy. One WriteTask
-  per request — lifetime follows the request, not the step.
+  finish/abort (or GPU-byte-budget pressure) forces the copy. One open
+  WriteTask per request; a budget flush may close it mid-request, in which
+  case the next save opens a new one (`write_n` + 1) and a hit reads both,
+  so one long request cannot pin the whole budget.
 
 A `WriteTask` moves through `TaskState` only via `transition()`, one step at
 a time along a strict chain:
