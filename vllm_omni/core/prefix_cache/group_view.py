@@ -30,6 +30,7 @@ class FullAttentionGroupView:
     def __init__(self, input_batch: InputBatch, block_size: int):
         self._input_batch = input_batch
         self.block_size = block_size
+        check_prefix_cache_block_layout(input_batch.block_table[0], block_size)
 
     def _block_table_cpu(self) -> torch.Tensor:
         return self._input_batch.block_table[0].block_table.cpu
@@ -64,6 +65,34 @@ class FullAttentionGroupView:
                     continue
             parts.append(block_table[req_idx, offs].to(torch.long) * bs + (pos % bs))
         return torch.cat(parts) if parts else torch.empty((0,), dtype=torch.long)
+
+
+def check_prefix_cache_block_layout(block_table: object, block_size: int) -> None:
+    """Reject block-table layouts ``step_slots_cpu`` cannot mirror.
+
+    The CPU slot math is ``table[req, pos // block_size] * block_size +
+    pos % block_size`` over allocator block ids. vLLM breaks that in two
+    cases: hybrid kernel blocks (the row holds ``blocks_per_kv_block``
+    kernel ids per allocator block, e.g. FlashInfer/FlashMLA with
+    ``--block-size 128``) and decode context parallel (tokens are striped
+    across ranks and hashed at ``block_size * dcp_world_size``).
+    """
+    if getattr(block_table, "use_hybrid_blocks", False) or int(getattr(block_table, "blocks_per_kv_block", 1)) != 1:
+        raise OmniPrefixCacheUnmatchError(
+            "omni prefix caching requires kernel_block_size == block_size; the attention backend "
+            f"splits each block into {getattr(block_table, 'blocks_per_kv_block', '?')} kernel blocks. "
+            "Pick a --block-size the backend supports natively or disable enable_prefix_caching"
+        )
+    if int(getattr(block_table, "dcp_world_size", 1)) != 1:
+        raise OmniPrefixCacheUnmatchError(
+            "omni prefix caching does not support decode context parallel "
+            f"(dcp_world_size={getattr(block_table, 'dcp_world_size', '?')}); disable enable_prefix_caching"
+        )
+    kv_bs = getattr(block_table, "kv_cache_block_size", block_size)
+    if int(kv_bs) != int(block_size):
+        raise OmniPrefixCacheUnmatchError(
+            f"omni prefix caching block_size {block_size} does not match the kv-cache block table ({kv_bs})"
+        )
 
 
 def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:

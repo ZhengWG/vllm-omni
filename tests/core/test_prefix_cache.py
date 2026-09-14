@@ -857,6 +857,33 @@ def test_step_slots_cpu_matches_block_table_math():
     assert torch.equal(view.step_slots_cpu(["r1", "r2"], {"r1": 3, "r2": 0}), _table_slots(table, 0, 4, 7))
 
 
+def _ib_with_layout(**layout):
+    """InputBatch fake whose group-0 block table carries vLLM's layout attrs."""
+    attrs = dict(kv_cache_block_size=BLOCK_SIZE, blocks_per_kv_block=1, use_hybrid_blocks=False, dcp_world_size=1)
+    attrs.update(layout)
+    group = SimpleNamespace(block_table=SimpleNamespace(cpu=torch.zeros((1, 2), dtype=torch.int32)), **attrs)
+
+    class BT:
+        block_tables = [group.block_table]
+
+        def __getitem__(self, idx):
+            return group
+
+    return SimpleNamespace(req_ids=[], req_id_to_index={}, num_computed_tokens_cpu=torch.zeros(1), block_table=BT())
+
+
+def test_group_view_refuses_hybrid_kernel_blocks_and_dcp():
+    """step_slots_cpu assumes one allocator block per table column and no
+    token striping; both are silent wrong-slot writes if not refused."""
+    FullAttentionGroupView(_ib_with_layout(), block_size=BLOCK_SIZE)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="kernel_block_size"):
+        FullAttentionGroupView(_ib_with_layout(use_hybrid_blocks=True, blocks_per_kv_block=2), block_size=BLOCK_SIZE)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="decode context parallel"):
+        FullAttentionGroupView(_ib_with_layout(dcp_world_size=2), block_size=BLOCK_SIZE)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="does not match"):
+        FullAttentionGroupView(_ib_with_layout(kv_cache_block_size=BLOCK_SIZE * 2), block_size=BLOCK_SIZE)
+
+
 def test_step_context_consumed_by_id_not_order():
     mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
