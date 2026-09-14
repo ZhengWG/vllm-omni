@@ -292,21 +292,18 @@ def test_join_next_step_hit_waits_done_then_reads_pool():
     """CPU stand-in for the non-eager path: dispatch holds the task instead of
     writing the pool. A same-step hit must join(done), drain, then read the pool."""
     mgr, view = make_manager()
-    held: list = []
     real_run = mgr._controller._run_eager
     real_join = mgr._controller.join
 
-    def hold_dispatch(tasks):
-        held.extend(tasks)
-
     def join_then_scatter(tids):
-        for task in list(held):
-            if task.tid in tids and not task.done.is_set():
+        # Stand-in committer: the write lands only when someone joins it.
+        for tid in tids:
+            task = mgr._controller.get_task(tid)
+            if task is not None and not task.done.is_set():
                 real_run(task)
-                held.remove(task)
         real_join(tids)
 
-    mgr._controller.dispatch = hold_dispatch
+    mgr._controller.dispatch = lambda tasks: None
     mgr._controller.join = join_then_scatter
 
     view.req_blocks["a"] = [0, 1]
@@ -1211,16 +1208,38 @@ def test_hit_prefetch_prebuilds_merged_buffer():
     assert torch.equal(merged[8:], expected_rows(view.slots_for("b", 8, 12)))
 
 
-def test_same_step_hit_skips_prefetch(caplog):
+def test_same_step_hit_prefetch_starts_at_save(caplog):
+    """b hits blocks a computes in the same step: nothing to plan at
+    new_step_starts (rows ABSENT), planned at publish once a's write is
+    registered, so the gather runs before the next step can reuse them."""
     mgr, view = make_manager()
     view.req_blocks["a"] = [0, 1]
     with caplog.at_level(logging.CRITICAL, logger="vllm_omni.core.prefix_cache.manager"):
         sid = run_step(mgr, view, {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8})
     assert not any("omni prefix cache unmatch" in r.message for r in caplog.records)
     ctx = mgr._step_ctxs[sid]
-    assert HIDDEN_KEY not in ctx.hit_prefetch.get("b", {})
+    fut = ctx.hit_prefetch["b"][HIDDEN_KEY]
+    assert torch.equal(fut.result()[:8], expected_rows(view.slots_for("b", 0, 8)))
     outs = mgr.materialize(sid, ["a", "b"])
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
+
+
+def test_reassigned_hit_of_finished_req_warns_instead_of_raising(caplog):
+    """Blocks are freed one step before finished_req_ids arrives; a late
+    materialize of a finished request may find them IN_TRANSIT to a new
+    tenant. Fatal for a live request, a warning for a finished one."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
+    mgr.materialize(s1, ["a"])
+    slots = view.slots_for("a", 0, 8)
+    mgr._controller.dispatch = lambda tasks: None  # new tenant's write stays IN_TRANSIT
+    s2 = run_step(mgr, view, {"c": ([0, 1], 0, 8)}, finished=["a"])
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="reassigned"):
+        mgr._ensure_not_reassigned(slots, HIDDEN_KEY, req_id="c")
+    with caplog.at_level(logging.WARNING, logger="vllm_omni.core.prefix_cache.manager"):
+        mgr._ensure_not_reassigned(slots, HIDDEN_KEY, req_id="a")
+    assert any("finished req a" in r.message for r in caplog.records)
+    mgr.discard_step(s2)
 
 
 def test_join_next_step_hit_survives_task_already_drained():

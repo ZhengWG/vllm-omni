@@ -206,7 +206,15 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
 
 - A new request with a (partial) prefix hit is the normal path: the hit
   blocks are read from the pool, the rest is this step's rows, and the
-  divergent tail is written under its own blocks.
+  divergent tail is written under its own blocks. The gather starts on the
+  prefetch thread at `new_step_starts`; a same-step hit (vLLM hashes blocks
+  at schedule time, so `b` can hit blocks `a` computes in the same forward)
+  cannot plan until `a`'s write is registered and starts at `save_outputs`
+  instead. Either way it runs before the next step can hand those blocks
+  to a new tenant. vLLM frees blocks one step before `finished_req_ids`
+  arrives, so a finished request whose last step materializes late may
+  still find a hit slot reassigned: that is logged (`rows may be stale`),
+  while the same condition on a live request raises.
 - `async_chunk` continuation: when the next upstream chunk arrives, the same
   request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
   to what it already computed itself. Ids already in `live_reqs` are skipped

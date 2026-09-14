@@ -767,17 +767,26 @@ class OmniPrefixCacheManager:
         self._hit_prefetch.clear()
 
     def _prefetch_hit_spans(self) -> None:
-        """Caller holds ``_state_lock``. Plan each hit span and gather it on
-        the prefetch thread, overlapping the forward. A span that fails to
-        plan — same-step hits resolve rows this step's save has not
-        registered yet — is left to materialize, which raises if unread.
+        """Caller holds ``_state_lock``. Plan each hit span not yet planned
+        and gather it on the prefetch thread.
+
+        Called twice per step: at new_step_starts (overlaps the forward)
+        and again at publish for spans that could not plan then — same-step
+        hits, whose rows this step's save has only now registered. Starting
+        the gather at publish, not at materialize, means it runs before the
+        next step can hand those blocks to a new tenant; a span that still
+        fails to plan is left to materialize, which raises if unread.
         """
         keys = self._policy.get_hit_keys(self._pool.keys())
         for req_id, (hit_upto, hit_blocks) in self._hit_spans.items():
+            futs = self._hit_prefetch.setdefault(req_id, {})
+            if all(key in futs for key in keys):
+                continue
             n_new = int(self._cur_num_scheduled.get(req_id, 0))
             slots = self._get_hit_slots(hit_upto, hit_blocks)
-            futs: dict[str, Future] = {}
             for key in keys:
+                if key in futs:
+                    continue
                 try:
                     src = self._slot_ref(slots, key, req_id)
                 except OmniPrefixCacheUnmatchError:
@@ -785,8 +794,8 @@ class OmniPrefixCacheManager:
                 fut = self._prefetch_pool.submit(self._prefetch_hit, src, n_new)
                 self._prefetch_queue.append((fut, src))
                 futs[key] = fut
-            if futs:
-                self._hit_prefetch[req_id] = futs
+            if not futs:
+                del self._hit_prefetch[req_id]
 
     @torch.inference_mode()
     def _prefetch_hit(self, src: _SlotRef, n_new: int) -> torch.Tensor:
@@ -876,6 +885,10 @@ class OmniPrefixCacheManager:
                 bound_tids,
             )
         self._stage_deferred(step_outputs.deferred_chunks, freeze_event)
+        if self._hit_spans:
+            # Same-step hits: their rows are registered now (IN_TRANSIT on
+            # this step's tasks); start the gather before the next step.
+            self._prefetch_hit_spans()
         step_id = self._next_step_id
         self._next_step_id += 1
         self._step_ctxs[step_id] = _StepContext(
@@ -1241,14 +1254,30 @@ class OmniPrefixCacheManager:
         pool read must raise. JOIN_ON_FINISH slots already in-transit at
         plan time are excluded; JOIN_NEXT_STEP slots must be COMMITTED
         after the wait-then-publish.
+
+        vLLM frees a request's blocks when it finishes or is aborted, one
+        step before ``finished_req_ids`` reaches us, and may reuse them at
+        once. A request that is no longer live can therefore legitimately
+        see its rows taken while the async builder still materializes its
+        last step: logged, not fatal.
         """
         with self._state_lock:
             status = self._slot_status.get_slot_status(key)
             violated = status.state[slots] == _Occupancy.IN_TRANSIT
             if in_transit_mask is not None:
                 violated &= ~in_transit_mask
-            if bool(violated.any()):
-                _raise_unreadable_hit(req_id, key, f"reassigned during materialize ({int(violated.sum())} slots)")
+            if not bool(violated.any()):
+                return
+            live = req_id in self._request_tasks.live_reqs
+        if live:
+            _raise_unreadable_hit(req_id, key, f"reassigned during materialize ({int(violated.sum())} slots)")
+        logger.warning(
+            "omni prefix cache: %d hit slots of finished req %s key=%s were reassigned before its last "
+            "step materialized; rows may be stale",
+            int(violated.sum()),
+            req_id,
+            key,
+        )
 
     # ---------------------------------------------------------- merge
 
