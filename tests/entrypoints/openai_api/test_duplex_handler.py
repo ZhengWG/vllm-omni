@@ -6208,6 +6208,11 @@ async def test_failed_native_append_prevents_queued_append_from_running():
 
     handler_task = asyncio.create_task(handler.handle_session(ws))
     await asyncio.wait_for(engine.first_started.wait(), timeout=1)
+    session_tasks = handler._session_tasks["sid-append-chain-failure"]
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while len(session_tasks.native_append_tasks) < 2 and asyncio.get_running_loop().time() < deadline:
+        await asyncio.sleep(0.001)
+    assert len(session_tasks.native_append_tasks) == 2
     engine.release_first.set()
     await asyncio.sleep(0.1)
     ws.put({"type": "session.close"})
