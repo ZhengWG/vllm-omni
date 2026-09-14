@@ -5,7 +5,7 @@
 
 from __future__ import annotations
 
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
@@ -22,6 +22,7 @@ from vllm_omni.core.sched.omni_ar_scheduler import OmniARAsyncScheduler, OmniARS
 from vllm_omni.distributed.omni_connectors.transfer_adapter.chunk_transfer_adapter import (
     OmniChunkTransferAdapter,
 )
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 
 # isort: on
 
@@ -103,12 +104,7 @@ def _make_talker_update(
 
 
 def _bind_omits_kv_transfer(sched) -> None:
-    """MagicMock is truthy; bind the real helper so save_async is not skipped."""
-    sched._omits_kv_transfer_cache = {}
-    sched._request_omits_kv_transfer_to_next_stage = MethodType(
-        OmniARScheduler._request_omits_kv_transfer_to_next_stage,
-        sched,
-    )
+    bind_omits_transfer_helpers(sched)
 
 
 def _run_resumable_segment_stop(

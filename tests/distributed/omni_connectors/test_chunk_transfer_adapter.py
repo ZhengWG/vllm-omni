@@ -14,6 +14,7 @@ from vllm.v1.core.sched.scheduler import Scheduler as VLLMScheduler
 from vllm.v1.metrics.stats import PrefillStats, PromptTokenStats
 from vllm.v1.request import Request, RequestStatus
 
+from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_generation_scheduler import OmniGenerationScheduler
 from vllm_omni.data_entry_keys import CodesStruct, MetaStruct, OmniPayload, OmniPayloadStruct
@@ -2419,16 +2420,9 @@ def test_ar_scheduler_defers_cleanup_and_queues_save_on_finished(mocker: MockerF
     adapter_mock.cleanup = lambda *a, **kw: cleanup_calls.append((a, kw))
     adapter_mock.save_async = lambda *a, **kw: save_calls.append((a, kw))
 
-    from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
-
     scheduler = mocker.MagicMock()
     scheduler.chunk_transfer_adapter = adapter_mock
-    # MagicMock is truthy; bind the real helper so save_async is not skipped.
-    scheduler._omits_kv_transfer_cache = {}
-    scheduler._request_omits_kv_transfer_to_next_stage = MethodType(
-        OmniARScheduler._request_omits_kv_transfer_to_next_stage,
-        scheduler,
-    )
+    bind_omits_transfer_helpers(scheduler)
     scheduler.connector = None
     scheduler.perf_metrics = None
     scheduler.log_stats = False

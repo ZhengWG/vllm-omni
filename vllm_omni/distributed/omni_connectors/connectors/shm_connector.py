@@ -158,11 +158,13 @@ class SharedMemoryConnector(OmniConnectorBase):
         ]
         for key in stale:
             self._pending_keys.discard(key)
+            unlinked = False
             try:
                 seg = shm_pkg.SharedMemory(name=key)
                 seg.close()
                 seg.unlink()
                 logger.debug("cleanup: unlinked unconsumed SHM segment %s", key)
+                unlinked = True
             except FileNotFoundError:
                 pass
             except Exception as e:
@@ -173,7 +175,8 @@ class SharedMemoryConnector(OmniConnectorBase):
                     os.remove(lock_file)
                 except OSError:
                     pass
-            reclaimed += 1
+            if unlinked:
+                reclaimed += 1
         return reclaimed
 
     def close(self) -> None:

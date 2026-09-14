@@ -14,15 +14,14 @@ request left a ``SharedMemoryConnector`` segment plus lockfile in ``/dev/shm``.
 Stage-0-final finishes now skip the ``put()`` and the orchestrator reclaims any
 undrained segment on request cleanup.
 
-This module starts the production async-chunk deploy and asserts neither the
-connector lockfiles (``shm_<key>_lockfile.lock``) nor the POSIX segments
-(``<request_id>_<stage>_<chunk>``) grow after those requests.
+This module starts the production async-chunk deploy and asserts the three
+text-only request ids leave no connector lockfile or POSIX segment in
+``/dev/shm``.
 """
 
 from __future__ import annotations
 
 import os
-import re
 import time
 from pathlib import Path
 
@@ -75,29 +74,6 @@ def _system_prompt() -> dict:
     }
 
 
-# ``SharedMemoryConnector.put()`` writes two entries per ``put_key``
-# (``<external_req_id>_<stage_id>_<chunk_id>``, see chunk_transfer_adapter):
-# the flock file ``shm_<put_key>_lockfile.lock`` and the POSIX segment named
-# ``<put_key>`` itself. ``get()`` removes the lockfile and unlinks the segment on
-# separate paths, so count both: a regression that drops one but not the other
-# is still a leak. Online chat request ids are ``chatcmpl-...``; anchoring on
-# that keeps ``torch_<pid>_<n>`` and other IPC objects out of the count.
-_SEGMENT_RE = re.compile(r"chatcmpl-[^/]+_\d+_\d+")
-
-
-def _is_connector_lockfile(name: str) -> bool:
-    return name.startswith("shm_") and name.endswith("_lockfile.lock")
-
-
-def _is_connector_segment(name: str) -> bool:
-    return _SEGMENT_RE.fullmatch(name) is not None
-
-
-def _is_connector_entry(name: str) -> bool:
-    """SharedMemoryConnector artifacts, not CUDA/NCCL/torch IPC objects."""
-    return _is_connector_lockfile(name) or _is_connector_segment(name)
-
-
 def _shm_used_mib() -> str:
     try:
         st = os.statvfs(_SHM_DIR)
@@ -107,41 +83,36 @@ def _shm_used_mib() -> str:
         return "unknown"
 
 
-def _connector_entry_count() -> int:
+def _is_entry_for_request(name: str, request_id: str) -> bool:
+    """Match a POSIX segment or ``shm_<put_key>_lockfile.lock`` for *request_id*."""
+    if name == request_id or name.startswith(f"{request_id}_"):
+        return True
+    shm_prefix = f"shm_{request_id}"
+    return name == shm_prefix or name.startswith(f"{shm_prefix}_")
+
+
+def _entries_for_request_ids(request_ids: list[str]) -> list[str]:
     if not _SHM_DIR.is_dir():
         pytest.skip("/dev/shm is not available")
-    with os.scandir(_SHM_DIR) as entries:
-        return sum(1 for entry in entries if _is_connector_entry(entry.name))
-
-
-def _connector_entries_since(since_s: float, limit: int = 32) -> list[str]:
-    """Return a sample of connector lockfiles/segments with mtime >= ``since_s``."""
     found: list[str] = []
     with os.scandir(_SHM_DIR) as entries:
         for entry in entries:
-            if not _is_connector_entry(entry.name):
-                continue
-            try:
-                if entry.stat().st_mtime >= since_s:
-                    found.append(entry.name)
-                    if len(found) >= limit:
-                        break
-            except FileNotFoundError:
-                continue
+            if any(_is_entry_for_request(entry.name, request_id) for request_id in request_ids):
+                found.append(entry.name)
     return found
 
 
-def _wait_no_new_entries(since_s: float, baseline: int, timeout_s: float = _SETTLE_S) -> tuple[int, list[str]]:
+def _wait_no_entries_for_request_ids(request_ids: list[str], timeout_s: float = _SETTLE_S) -> list[str]:
+    """Reclaim is fire-and-forget; poll until these ids are gone or *timeout_s*."""
     deadline = time.monotonic() + timeout_s
     time.sleep(1.0)
-    while True:
-        count = _connector_entry_count()
-        extra = _connector_entries_since(since_s)
-        if count <= baseline and not extra:
-            return count, extra
+    leftover: list[str] = _entries_for_request_ids(request_ids)
+    while leftover:
         if time.monotonic() >= deadline:
-            return count, extra
+            return leftover
         time.sleep(2.0)
+        leftover = _entries_for_request_ids(request_ids)
+    return leftover
 
 
 @pytest.mark.advanced_model
@@ -152,13 +123,7 @@ def _wait_no_new_entries(since_s: float, baseline: int, timeout_s: float = _SETT
 @pytest.mark.parametrize("omni_server", test_params, indirect=True)
 def test_text_only_async_chunk_does_not_leak_shm(omni_server, online_client) -> None:
     """Stage-0-final (text-only) requests must not leave connector SHM behind."""
-    # Timestamp first so the scan below does not treat its own runtime as "new".
-    since_s = time.time()
-    baseline = _connector_entry_count()
-    print(
-        f"[shm-leak] before requests: connector_entries={baseline} /dev/shm_used={_shm_used_mib()}",
-        flush=True,
-    )
+    print(f"[shm-leak] before requests: /dev/shm_used={_shm_used_mib()}", flush=True)
 
     messages = dummy_messages_from_mix_data(
         system_prompt=_system_prompt(),
@@ -178,14 +143,17 @@ def test_text_only_async_chunk_does_not_leak_shm(omni_server, online_client) -> 
         f"got {len(produced)} non-empty texts. A preprocess/engine miss would "
         f"leave /dev/shm unchanged and hide a leak."
     )
+    request_ids = [resp.request_id for resp in responses]
+    assert all(request_ids) and len(request_ids) == _NUM_TEXT_REQUESTS, (
+        f"Need chat completion ids to assert per-request SHM cleanup; got {request_ids}"
+    )
 
-    after, extra = _wait_no_new_entries(since_s, baseline)
+    leftover = _wait_no_entries_for_request_ids(request_ids)
     print(
         f"[shm-leak] after {_NUM_TEXT_REQUESTS} text-only requests: "
-        f"connector_entries={after} /dev/shm_used={_shm_used_mib()} new_sample={extra}",
+        f"/dev/shm_used={_shm_used_mib()} leftover={leftover} request_ids={request_ids}",
         flush=True,
     )
-    assert after <= baseline and not extra, (
-        f"SharedMemoryConnector leaked /dev/shm entries after {_NUM_TEXT_REQUESTS} "
-        f"stage-0-final request(s): before={baseline} after={after} new_sample={extra}"
+    assert not leftover, (
+        f"SharedMemoryConnector leaked /dev/shm entries for {leftover} after stage-0-final request(s) {request_ids}"
     )

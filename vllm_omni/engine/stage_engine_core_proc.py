@@ -86,6 +86,10 @@ class StageEngineCoreProc(EngineCoreProc):
     ``EngineCoreProc.run_engine_core()``.
     """
 
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._omni_reclaimed_total = 0
+
     def omni_release_request_resources(self, request_ids: list[str]) -> int:
         """Release this stage's inter-stage transfer resources for *request_ids*.
 
@@ -104,16 +108,11 @@ class StageEngineCoreProc(EngineCoreProc):
         if reclaimed:
             # Non-zero means a consumer stopped before draining the producer.
             # Common on audio requests, so warn only when the running total
-            # crosses another warn_internal_times boundary.
-            prev = getattr(self, "_omni_reclaimed_total", 0)
+            # crosses another warn_interval_times boundary.
+            prev = self._omni_reclaimed_total
             self._omni_reclaimed_total = prev + reclaimed
-            logger.debug(
-                "Reclaimed %d unconsumed inter-stage segment(s) for %d finished request(s)",
-                reclaimed,
-                len(request_ids or ()),
-            )
-            warn_internal_times = 1000
-            if prev // warn_internal_times != self._omni_reclaimed_total // warn_internal_times:
+            warn_interval_times = 1000
+            if prev // warn_interval_times != self._omni_reclaimed_total // warn_interval_times:
                 logger.warning(
                     "Reclaimed %d unconsumed inter-stage segments so far; "
                     "a downstream stage finished before draining its producer",

@@ -1039,14 +1039,17 @@ class Orchestrator:
                 try:
                     await pool.release_request_resources(request_ids)
                 except Exception as e:
-                    logger.debug("[Orchestrator] release transfer resources failed: %s", e)
+                    logger.warning("[Orchestrator] release transfer resources failed: %s", e)
 
         try:
             task = asyncio.get_running_loop().create_task(_run())
             self._transfer_release_tasks.add(task)
             task.add_done_callback(self._transfer_release_tasks.discard)
         except RuntimeError:
-            pass
+            logger.warning(
+                "[Orchestrator] no running event loop; skipped reclaim of transfer resources for %s",
+                request_ids,
+            )
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
