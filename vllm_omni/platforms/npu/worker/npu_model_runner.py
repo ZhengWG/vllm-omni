@@ -44,7 +44,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
             # self.kv_cache_config: vllm-ascend deepcopies the one it was
             # handed, so the stored value is the authoritative one.
             # Controller runs in eager mode on NPU (no CUDA streams:
-            # submit() completes the copy+scatter synchronously). Built once
+            # dispatch() completes the copy+scatter synchronously). Built once
             # on the first step via the inherited _ensure_omni_prefix_cache.
             cfg = stage_prefix_cache_config(
                 kv_cache_config=self.kv_cache_config,

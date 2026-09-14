@@ -289,16 +289,15 @@ def test_live_req_reentering_new_reqs_is_not_a_hit():
 
 
 def test_join_next_step_hit_waits_done_then_reads_pool():
-    """CPU stand-in for the non-eager path: submit registers but does not
-    write the pool. A same-step hit must join(done), drain, then read the pool."""
+    """CPU stand-in for the non-eager path: dispatch holds the task instead of
+    writing the pool. A same-step hit must join(done), drain, then read the pool."""
     mgr, view = make_manager()
     held: list = []
     real_run = mgr._controller._run_eager
     real_join = mgr._controller.join
 
-    def hold_submit(task):
-        mgr._controller._tasks[task.tid] = task
-        held.append(task)
+    def hold_dispatch(tasks):
+        held.extend(tasks)
 
     def join_then_scatter(tids):
         for task in list(held):
@@ -307,7 +306,7 @@ def test_join_next_step_hit_waits_done_then_reads_pool():
                 held.remove(task)
         real_join(tids)
 
-    mgr._controller.submit = hold_submit
+    mgr._controller.dispatch = hold_dispatch
     mgr._controller.join = join_then_scatter
 
     view.req_blocks["a"] = [0, 1]
@@ -819,12 +818,11 @@ def test_slot_reuse_pushes_skip_to_old_task():
     new write records those rows as no longer owned by it."""
     mgr, view = make_manager()
 
-    def register_only(task):
-        with mgr._controller._lock:
-            mgr._controller._tasks[task.tid] = task
-        task.host_ready.set()
+    def hold(tasks):
+        for task in tasks:
+            task.host_ready.set()
 
-    mgr._controller.submit = register_only
+    mgr._controller.dispatch = hold
     policy = ModelCachePolicy(needs_full_hidden_states=False)
     mgr.register_policy(policy)
     s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.ones(1, 2)})
@@ -1106,19 +1104,47 @@ def test_staging_slot_eager_save_leaves_only_step_holder():
 
 
 def _hold_writes(mgr) -> None:
-    """Non-eager stand-in: register the task with device→host done, but
-    leave the pool write to the caller (`mgr._controller._scatter`)."""
+    """Non-eager stand-in: dispatch takes the task to device→host done, but
+    leaves the pool write to the caller (`mgr._controller._scatter`)."""
 
-    from vllm_omni.core.prefix_cache.controller import TaskState
+    def dispatch(tasks):
+        for task in tasks:
+            assert task.claim_copy()
+            task.mark_host_ready()
 
-    def submit(task, queued=True):
-        with mgr._controller._lock:
-            mgr._controller._tasks[task.tid] = task
-        task.transition(TaskState.QUEUED)
-        assert task.claim_copy()
-        task.mark_host_ready()
+    mgr._controller.dispatch = dispatch
 
-    mgr._controller.submit = submit
+
+def test_eager_copy_runs_outside_state_lock_and_key_install_inside():
+    """Eager mode (NPU/CPU): the copy + pool write must not run under
+    _state_lock, or materialize on the builder thread waits a whole D2H;
+    publishing a new pool key must happen under it."""
+    policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"k"}))
+    mgr, view = make_manager(policy=policy)
+    seen: dict[str, bool] = {}
+
+    def probe(name):
+        free = mgr._state_lock.acquire(blocking=False)
+        if free:
+            mgr._state_lock.release()
+        seen[name] = free
+
+    real_run, real_install = mgr._controller._run_eager, mgr._pool.install_key
+
+    def run_eager(task):
+        probe("run_eager")
+        real_run(task)
+
+    def install_key(key, storage):
+        probe("install_key")
+        real_install(key, storage)
+
+    mgr._controller._run_eager = run_eager
+    mgr._pool.install_key = install_key
+    sid = run_step(mgr, view, {"a": ([0], 0, 2)}, mm={"k": torch.ones(2, 2)})
+    assert seen == {"run_eager": True, "install_key": False}
+    mgr.materialize(sid, ["a"])
+    assert mgr._pool.has_key("k") and "k" in mgr._slot_status.state
 
 
 def test_staging_task_slot_released_at_pool_write_not_drain():
@@ -1199,12 +1225,7 @@ def test_same_step_hit_skips_prefetch(caplog):
 
 def test_join_next_step_hit_survives_task_already_drained():
     mgr, view = make_manager()
-
-    def register_only(task):
-        with mgr._controller._lock:
-            mgr._controller._tasks[task.tid] = task
-
-    mgr._controller.submit = register_only
+    mgr._controller.dispatch = lambda tasks: None  # registered, never run
     view.req_blocks["a"] = [0, 1]
     sid = run_step(mgr, view, {"a": ([0, 1], 0, 8), "b": ([0, 1, 2], 8, 4)}, new_hits={"b": 8})
     with mgr._state_lock:

@@ -550,27 +550,43 @@ class OmniPrefixCacheController:
 
     # ------------------------------------------------------------------ submit
 
-    def submit(self, task: WriteTask, queued: bool = True) -> None:
-        """Register a task. queued=False (deferred tasks) stays on the
-        GPU clone until finish/abort or the GPU-byte budget forces a copy.
+    def register(self, task: WriteTask, queued: bool = True) -> None:
+        """Make a task visible (registry + QUEUED) without running anything;
+        safe under the manager's state lock. queued=False (deferred tasks)
+        stays PENDING on the GPU clone until finish/abort or the GPU-byte
+        budget forces a copy. Queued tasks must then go through
+        ``dispatch``.
 
         Caller must reserve() the task bytes first (budget flush can
         block; the manager does that outside the state lock) and pin the
-        task on its budget ticket(s) before submit.
+        task on its budget ticket(s) before register.
         """
         task.enqueued_time = time.monotonic()
         with self._lock:
             self._tasks[task.tid] = task
             if queued:
                 task.transition(TaskState.QUEUED)
+
+    def dispatch(self, tasks: list[WriteTask]) -> None:
+        """Hand registered, queued tasks to the copy path. Threaded: enqueue.
+        Eager: the copy + pool write run here, inline — never call this
+        under the manager's state lock."""
+        if not tasks:
+            return
         if self._eager:
-            if queued:
+            for task in tasks:
                 self._run_eager(task)
             return
-        if queued:
-            with self._wake:
+        with self._wake:
+            for task in tasks:
                 (self._queue_hi if task.schedule is WriteSchedule.JOIN_NEXT_STEP else self._queue_lo).append(task.tid)
-                self._wake.notify_all()
+            self._wake.notify_all()
+
+    def submit(self, task: WriteTask, queued: bool = True) -> None:
+        """register + dispatch in one call (callers not holding the state lock)."""
+        self.register(task, queued)
+        if queued:
+            self.dispatch([task])
 
     def append_chunk(self, task: WriteTask, chunk: _WriteChunk, freeze_event: object | None = None) -> TaskState | None:
         """Append to a pending task. None when appended, else the closing state."""

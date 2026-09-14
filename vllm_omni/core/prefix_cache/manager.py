@@ -206,6 +206,9 @@ class _StepOutputs:
     # Completion of the leftover device→host copies; None when none ran on CUDA.
     leftover_event: object | None = None
     immediate_budget: _BudgetTicket | None = None
+    # Pool storage allocated (unlocked) for keys first seen this step;
+    # published into the pool / occupancy tables under the state lock.
+    new_key_storage: dict[str, torch.Tensor] = field(default_factory=dict)
 
     @property
     def deferred_budget(self) -> _BudgetTicket | None:
@@ -613,8 +616,10 @@ class OmniPrefixCacheManager:
             self._controller.reserve(step_outputs.budget_bytes())
 
         # 5. Claim a staging slot (unlocked), optional device→host into it,
-        #    then submit + store the step snapshot (locked). Saves with only
-        #    leftover mm still claim. Full pool waits; timeout lists unused step ids.
+        #    register the writes + store the step snapshot (locked), then
+        #    dispatch the queued writes (unlocked: in eager mode dispatch
+        #    is the copy + pool write itself). Saves with only leftover mm
+        #    still claim. Full pool waits; timeout lists unused step ids.
         d2h_claim: StepD2HClaim | None = None
         step_holder = StagingBufferHolder.for_step(self._next_step_id)
         transferred = False
@@ -622,7 +627,7 @@ class OmniPrefixCacheManager:
         try:
             d2h_claim = self._stage_step_host(step_outputs.immediate, num_tokens_unpadded, freeze_event, step_holder)
 
-            step_id = self._publish_saved_step(
+            step_id, queued = self._publish_saved_step(
                 req_order=req_order,
                 query_start=query_start,
                 num_sched=num_sched,
@@ -634,6 +639,7 @@ class OmniPrefixCacheManager:
                 d2h_claim=d2h_claim,
                 bound_tids=bound_tids,
             )
+            self._controller.dispatch(queued)
             transferred = True
             return step_id
         finally:
@@ -844,14 +850,19 @@ class OmniPrefixCacheManager:
         freeze_event: object | None,
         d2h_claim: StepD2HClaim | None,
         bound_tids: list[int],
-    ) -> StepId:
-        """Takes ``_state_lock``. Submit this step's writes and store the
+    ) -> tuple[StepId, list[WriteTask]]:
+        """Takes ``_state_lock``. Register this step's writes and store the
         consume-once snapshot. Copies live hits into the snapshot, then
-        clears them. Device→host and GPU-byte-budget flush stay outside.
+        clears them. Returns the queued tasks for the caller to dispatch
+        unlocked; device→host, budget flush and the eager copy stay outside.
         """
         self._commit_drained_writes()
+        for key, storage in step_outputs.new_key_storage.items():
+            self._pool.install_key(key, storage)
+            self._slot_status.init_table(key)
+        queued: list[WriteTask] = []
         if step_outputs.immediate:
-            self._submit_step_writes(
+            queued = self._submit_step_writes(
                 req_order,
                 query_start,
                 num_sched,
@@ -878,7 +889,7 @@ class OmniPrefixCacheManager:
             d2h=d2h_claim,
         )
         self._clear_hit_infos()
-        return step_id
+        return step_id, queued
 
     def _split_step_outputs(
         self,
@@ -905,24 +916,31 @@ class OmniPrefixCacheManager:
         n = num_tokens_unpadded
         immediate: dict[str, torch.Tensor] = {}
         deferred_tensors: dict[str, torch.Tensor] = {}
+        new_key_storage: dict[str, torch.Tensor] = {}
+
+        def alloc_key(key: str, val: torch.Tensor) -> None:
+            # Pinned allocation, unlocked; installed under the lock at publish.
+            storage = self._pool.alloc_key(key, val.dtype, int(val.shape[-1]))
+            if storage is not None:
+                new_key_storage[key] = storage
+
         if n > 0:
             if hidden_states is not None and (hk := self._policy.hidden_key) is not None:
                 if hidden_states.ndim < 2 or hidden_states.shape[0] < n:
                     rows = 0 if hidden_states.ndim < 2 else int(hidden_states.shape[0])
                     raise OmniPrefixCacheUnmatchError(f"hidden_states has {rows} rows, need {n}")
-                self._ensure_cache_key(hk, hidden_states.dtype, int(hidden_states.shape[-1]))
+                alloc_key(hk, hidden_states)
                 immediate[hk] = hidden_states[:n].clone()
             for key, val in mm_outputs.items():
                 is_step_rows = _is_step_token_tensor(val, n, num_tokens_padded)
                 if key in self._policy.deferred_keys:
                     if is_step_rows:
-                        if not self._pool.has_key(key):
-                            self._ensure_cache_key(key, val.dtype, int(val.shape[-1]))
+                        alloc_key(key, val)
                         deferred_tensors[key] = val[:n].clone()
                     continue
                 if self._policy.skip_immediate_mm(key) or not is_step_rows:
                     continue
-                self._ensure_cache_key(key, val.dtype, int(val.shape[-1]))
+                alloc_key(key, val)
                 immediate[key] = val[:n].clone()
         leftover, leftover_event = _snapshot_leftover_mm_cpu(mm_outputs, set(immediate), n, num_tokens_padded)
         deferred_chunks: list[tuple[str, _WriteChunk]] = []
@@ -938,6 +956,7 @@ class OmniPrefixCacheManager:
             leftover=leftover,
             leftover_event=leftover_event,
             immediate_budget=immediate_budget,
+            new_key_storage=new_key_storage,
         )
 
     def _pack_deferred_chunks(
@@ -982,13 +1001,15 @@ class OmniPrefixCacheManager:
         staging_slot: int,
         step_d2h_event,
         bound_tids: list[int],
-    ) -> None:
-        """Caller holds ``_state_lock``. One queued WriteTask per request.
+    ) -> list[WriteTask]:
+        """Caller holds ``_state_lock``. Register one WriteTask per request;
+        returns them for the caller to dispatch once the lock is released.
 
         Per-req views of the shared device snapshot: one on-device clone, req-scoped
         finish/abort, reassigned rows, and completion. Appends bound tids to
         `bound_tids` as it goes so a mid-loop raise still unwinds holders.
         """
+        tasks: list[WriteTask] = []
         for req_id in req_order:
             start = query_start[req_id]
             end = start + num_sched[req_id]
@@ -1011,16 +1032,17 @@ class OmniPrefixCacheManager:
                 step_d2h_event=step_d2h_event,
             )
             self._map_slots(slots_cpu[start:end], tid, tensors.keys())
-            # Bind and pin before submit: the slot must never be holder-free
-            # while the task is live (released at its pool write), and the
-            # committer may reach HOST_READY before this loop returns.
+            # Bind and pin before register: the slot must never be holder-free
+            # while the task is live (released at its pool write).
             self._controller.staging_bind(staging_slot, StagingBufferHolder.for_task(tid))
             bound_tids.append(tid)
             if budget is not None:
                 self._controller.pin_budget(budget, tid)
-            self._controller.submit(task)
+            self._controller.register(task)
             self._request_tasks.track(req_id, tid)
             self._join_next_step_tids.append(tid)
+            tasks.append(task)
+        return tasks
 
     def _stage_deferred(self, deferred_chunks: list[tuple[str, _WriteChunk]], freeze_event) -> None:
         """Caller holds ``_state_lock``. Register pre-built deferred `_WriteChunk`s
@@ -1045,9 +1067,9 @@ class OmniPrefixCacheManager:
                 )
                 self._request_tasks.deferred[req_id] = task
                 self._request_tasks.track(req_id, task.tid)
-                self._controller.submit(task, queued=False)
+                self._controller.register(task, queued=False)
             if chunk.budget is not None:
-                # Safe after submit: queued=False keeps the task PENDING
+                # Safe after register: queued=False keeps the task PENDING
                 # until escalate, which only this thread calls.
                 self._controller.pin_budget(chunk.budget, task.tid)
             # Block reuse across deferred tenants (preemption path) is
@@ -1055,11 +1077,6 @@ class OmniPrefixCacheManager:
             self._map_slots(chunk.slots_cpu, task.tid, chunk.tensors.keys())
 
     # ----------------------------------------------------- occupancy
-
-    def _ensure_cache_key(self, key: TensorName, dtype: torch.dtype, feat: int) -> None:
-        """Open the pool storage and the occupancy row for ``key``."""
-        self._pool.ensure_key(key, dtype, feat)
-        self._slot_status.init_table(key)
 
     def _map_slots(self, slots: torch.Tensor, tid: int, keys: Iterable[str]) -> None:
         """Caller holds ``_state_lock``. Record `tid` on these (slot, key);

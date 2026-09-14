@@ -42,11 +42,24 @@ class PrefixBlockPool:
             pin_memory=torch.cuda.is_available(),
         )
 
-    def ensure_key(self, key: str, dtype: torch.dtype, feat: int) -> None:
+    def alloc_key(self, key: str, dtype: torch.dtype, feat: int) -> torch.Tensor | None:
+        """Allocate storage for a new ``key`` without publishing it (None if
+        already open). Pinned allocation is slow; run this unlocked and
+        hand the tensor to ``install_key`` under the manager's state lock."""
+        if key in self._caches:
+            return None
+        return self._alloc(dtype, feat)
+
+    def install_key(self, key: str, storage: torch.Tensor) -> None:
         if key in self._caches:
             return
-        self._caches[key] = self._alloc(dtype, feat)
-        logger.info("prefix_cache: initialized mirror %s for key %s", list(self._caches[key].shape), key)
+        self._caches[key] = storage
+        logger.info("prefix_cache: initialized mirror %s for key %s", list(storage.shape), key)
+
+    def ensure_key(self, key: str, dtype: torch.dtype, feat: int) -> None:
+        storage = self.alloc_key(key, dtype, feat)
+        if storage is not None:
+            self.install_key(key, storage)
 
     def has_key(self, key: str) -> bool:
         return key in self._caches
