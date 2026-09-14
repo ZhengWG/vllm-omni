@@ -8,7 +8,9 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import Any, Self, cast
+from typing import Any, cast
+
+from typing_extensions import Self
 
 import torch
 import torch.nn as nn
