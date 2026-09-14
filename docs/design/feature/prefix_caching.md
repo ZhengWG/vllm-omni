@@ -40,6 +40,8 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
+Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of **pinned** CPU memory (pinned so device→host can overlap compute), allocated on the first `save_outputs` that sees the key — the first real request pays the `cudaHostAlloc`. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
+
 ### Example
 
 !!! note "Note 3"
@@ -221,12 +223,18 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
   for hit marking: those rows were delivered in earlier steps and re-emitting
   them would duplicate output. A `delivered_upto` span for this case is
   Phase 2.
-- Preemption + reschedule: the resumed request arrives through
-  `scheduled_cached_reqs` (`resumed_req_ids`), never `scheduled_new_reqs`, so
-  a vLLM-side prefix hit on resume is not mirrored as an omni hit span; the
-  resumed request gets only the rows it recomputes. Stages that need full
-  prompt hidden states should be sized so preemption does not occur while
-  prefix caching is on. Same as before this refactor; tracked for Phase 2.
+- Preemption + reschedule: vLLM resets `num_computed_tokens` to 0 on
+  preemption and re-runs prefix matching on resume, so the resumed request
+  can come back with a fresh hit. With the V1 model runner it arrives
+  through `scheduled_cached_reqs` (id in `resumed_req_ids`, `new_block_ids`
+  replaces the table); with the V2 runner it re-enters `scheduled_new_reqs`
+  while still in `live_reqs`. Neither path marks an omni hit span: the
+  resumed request gets only the rows it recomputes, and its still-open
+  deferred write keeps appending (a slot written twice keeps the later
+  chunk). Cache integrity holds either way — the hit blocks already have
+  rows, from this request or the one it hit. Stages that need full prompt
+  hidden states should be sized so preemption does not occur while prefix
+  caching is on. Same as before this refactor; tracked for Phase 2.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 

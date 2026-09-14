@@ -496,12 +496,10 @@ class OmniPrefixCacheManager:
         for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
             req_id = new_req.req_id
             if req_id in self._request_tasks.live_reqs:
-                # Streaming continuation (async_chunk): the id is already
-                # live, so num_computed_tokens is its own earlier work, not
-                # a cache hit. No hit marking (parity with legacy); a
-                # delivered_upto span is Phase 2. Preempt+resume never
-                # comes through here (scheduled_cached_reqs), see the
-                # design doc.
+                # Already live: async_chunk continuation, or a V2-runner
+                # resume after preemption (V1 resumes via
+                # scheduled_cached_reqs). Either way num_computed_tokens is
+                # not mirrored as a hit span; see the design doc.
                 continue
             self._request_tasks.live_reqs.add(req_id)
             num_computed = int(getattr(new_req, "num_computed_tokens", 0) or 0)
