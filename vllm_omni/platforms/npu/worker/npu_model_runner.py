@@ -53,6 +53,7 @@ class OmniNPUModelRunner(OmniGPUModelRunner, NPUModelRunner):
                 scheduler_config=self.scheduler_config,
                 model_config=self.model_config,
                 is_pooling_model=self.is_pooling_model,
+                speculative_config=self.speculative_config,
             )
             if cfg is not None:
                 self._omni_prefix_cache_cfg = cfg
