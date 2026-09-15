@@ -1144,6 +1144,28 @@ def test_eager_copy_runs_outside_state_lock_and_key_install_inside():
     assert mgr._pool.has_key("k") and "k" in mgr._slot_status.state
 
 
+def test_eager_finish_escalate_runs_outside_state_lock():
+    """Finish/abort escalate must not _run_eager under _state_lock."""
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
+    mgr, view = make_manager(policy=policy)
+    s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.ones(1, 2)})
+    mgr.materialize(s1, ["a"])
+    seen: list[bool] = []
+    real_run = mgr._controller._run_eager
+
+    def run_eager(task):
+        free = mgr._state_lock.acquire(blocking=False)
+        if free:
+            mgr._state_lock.release()
+        seen.append(free)
+        real_run(task)
+
+    mgr._controller._run_eager = run_eager
+    s2 = run_step(mgr, view, {"z": ([9], 0, 1)}, finished=["a"])
+    assert seen == [True]
+    mgr.materialize(s2, ["z"])
+
+
 def test_staging_task_slot_released_at_pool_write_not_drain():
     mgr, view = make_manager()
     _hold_writes(mgr)

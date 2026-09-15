@@ -300,14 +300,14 @@ Threads, locks, and what each may block on:
 
 | Thread | Role | May block on | Must not hold while blocked |
 | --- | --- | --- | --- |
-| Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` GPU-byte flush; staging-slot claim; `dispatch()` (eager mode: the copy + pool write run inline) | `_state_lock` |
+| Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` GPU-byte flush; staging-slot claim; `dispatch()` / finish-abort `escalate()` (eager mode: the copy + pool write run inline) | `_state_lock` |
 | Async output builder | `materialize` (may overlap the next engine step) | this step's `step_d2h_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
 | Committer | `_worker_loop`: wait device→host / deferred copy / pool write | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
 | Prefetch pool | hit-span gather during forward | `join` (`done`); deferred `fetch_host` | `_state_lock` |
 
 | Lock | Covers | Does not cover |
 | --- | --- | --- |
-| manager `_state_lock` | occupancy tables, step contexts, hit spans, task registration, pool-key publish (`install_key`) | join, GPU-byte flush, copy, `step_d2h_event` wait, pool-key allocation, eager `dispatch()` |
+| manager `_state_lock` | occupancy tables, step contexts, hit spans, task registration, pool-key publish (`install_key`) | join, GPU-byte flush, copy, `step_d2h_event` wait, pool-key allocation, eager `dispatch()` / `escalate()` |
 | controller `_lock` / `_wake` | task registry, queues, GPU-clone byte budget | device→host / pool-write body (released before `synchronize`) |
 | `WriteTask.lock` | `state`, `reassigned`, `append_chunk` | waiting on `host_ready` / `done` (those are events) |
 

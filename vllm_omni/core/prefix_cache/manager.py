@@ -458,7 +458,6 @@ class OmniPrefixCacheManager:
         if (hk := policy.hidden_key) is not None:
             self._slot_status.init_table(hk)
 
-    @_locked
     @torch.inference_mode()
     def new_step_starts(self, scheduler_output: SchedulerOutput) -> None:
         """Handle one scheduler_output.
@@ -468,67 +467,71 @@ class OmniPrefixCacheManager:
         hits (copying their block tables) and forces finished/aborted
         requests' still-open writes onto the high-priority copy queue —
         a block hash that entered the batch must land in the cache,
-        abort included.
+        abort included. ``escalate`` (eager: the copy + pool write) runs
+        after ``_state_lock`` is released.
         """
-        # 1. Publish writes the committer has already written into the pool.
-        self._commit_drained_writes()
+        to_escalate: list[int] = []
+        with self._state_lock:
+            # 1. Publish writes the committer has already written into the pool.
+            self._commit_drained_writes()
 
-        # 2. Finished/aborted reqs: force their still-open deferred writes
-        #    onto the high-priority copy queue now. The next save waits
-        #    join_host_ready. (Not leftover_mm — those are this-step reads.)
-        finished = getattr(scheduler_output, "finished_req_ids", None) or ()
-        for req_id in finished:
-            tids, dtask = self._request_tasks.finish(req_id)
-            if dtask is not None:
-                tids.add(dtask.tid)
-            pending_tasks = [tid for tid in tids if self._controller.get_task(tid) is not None]
-            if pending_tasks:
-                # Abort too: those block hashes are already in vLLM.
-                # Dropping the write would leave future hits ABSENT.
-                self._controller.escalate(pending_tasks)
-                self._join_finished_tids.update(pending_tasks)
+            # 2. Finished/aborted reqs: collect still-open writes. Abort too:
+            #    those block hashes are already in vLLM; dropping the write
+            #    would leave future hits ABSENT. The next save waits
+            #    join_host_ready. (Not leftover_mm — those are this-step reads.)
+            finished = getattr(scheduler_output, "finished_req_ids", None) or ()
+            for req_id in finished:
+                tids, dtask = self._request_tasks.finish(req_id)
+                if dtask is not None:
+                    tids.add(dtask.tid)
+                pending_tasks = [tid for tid in tids if self._controller.get_task(tid) is not None]
+                if pending_tasks:
+                    to_escalate.extend(pending_tasks)
+                    self._join_finished_tids.update(pending_tasks)
 
-        # 3. Copy this arrival's prefix-hit block ids. scheduled_new_reqs
-        #    is the only place they appear; after _update_states they sit
-        #    on the live request and grow as decode allocates more blocks.
-        #    materialize (async builder) must not reread that live table.
-        self._clear_hit_infos()
-        for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
-            req_id = new_req.req_id
-            if req_id in self._request_tasks.live_reqs:
-                # Already live: async_chunk continuation, or a V2-runner
-                # resume after preemption (V1 resumes via
-                # scheduled_cached_reqs). Either way num_computed_tokens is
-                # not mirrored as a hit span; see the design doc.
-                continue
-            self._request_tasks.live_reqs.add(req_id)
-            num_computed = int(getattr(new_req, "num_computed_tokens", 0) or 0)
-            if num_computed > 0:
-                # block_ids is per-kv-group; group 0 only.
-                blocks = getattr(new_req, "block_ids", None)
-                if blocks is not None and len(blocks) > 0 and not isinstance(blocks[0], int):
-                    blocks = blocks[0]
-                if not blocks:
-                    # Fail at the cause: a hit we cannot snapshot now would
-                    # crash at materialize time with less context (materialize is
-                    # forbidden from reading the live batch).
-                    raise OmniPrefixCacheUnmatchError(
-                        f"prefix hit for req {req_id} ({num_computed} tokens) carries no block_ids"
-                    )
-                bs = self._config.block_size
-                if num_computed % bs != 0:
-                    raise OmniPrefixCacheUnmatchError(
-                        f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
-                    )
-                hit_blocks = list(blocks[: num_computed // bs])
-                self._hit_spans[req_id] = (num_computed, hit_blocks)
+            # 3. Copy this arrival's prefix-hit block ids. scheduled_new_reqs
+            #    is the only place they appear; after _update_states they sit
+            #    on the live request and grow as decode allocates more blocks.
+            #    materialize (async builder) must not reread that live table.
+            self._clear_hit_infos()
+            for new_req in getattr(scheduler_output, "scheduled_new_reqs", ()) or ():
+                req_id = new_req.req_id
+                if req_id in self._request_tasks.live_reqs:
+                    # Already live: async_chunk continuation, or a V2-runner
+                    # resume after preemption (V1 resumes via
+                    # scheduled_cached_reqs). Either way num_computed_tokens is
+                    # not mirrored as a hit span; see the design doc.
+                    continue
+                self._request_tasks.live_reqs.add(req_id)
+                num_computed = int(getattr(new_req, "num_computed_tokens", 0) or 0)
+                if num_computed > 0:
+                    # block_ids is per-kv-group; group 0 only.
+                    blocks = getattr(new_req, "block_ids", None)
+                    if blocks is not None and len(blocks) > 0 and not isinstance(blocks[0], int):
+                        blocks = blocks[0]
+                    if not blocks:
+                        # Fail at the cause: a hit we cannot snapshot now would
+                        # crash at materialize time with less context (materialize is
+                        # forbidden from reading the live batch).
+                        raise OmniPrefixCacheUnmatchError(
+                            f"prefix hit for req {req_id} ({num_computed} tokens) carries no block_ids"
+                        )
+                    bs = self._config.block_size
+                    if num_computed % bs != 0:
+                        raise OmniPrefixCacheUnmatchError(
+                            f"prefix hit not block aligned (req={req_id}, hit_upto={num_computed}, block_size={bs})"
+                        )
+                    hit_blocks = list(blocks[: num_computed // bs])
+                    self._hit_spans[req_id] = (num_computed, hit_blocks)
 
-        # 4. Gather those spans on the prefetch thread; overlaps this forward.
-        while self._prefetch_queue and self._prefetch_queue[0][0].done():
-            self._prefetch_queue.popleft()
-        self._cur_num_scheduled = dict(scheduler_output.num_scheduled_tokens)
-        if self._hit_spans:
-            self._prefetch_hit_spans()
+            # 4. Gather those spans on the prefetch thread; overlaps this forward.
+            while self._prefetch_queue and self._prefetch_queue[0][0].done():
+                self._prefetch_queue.popleft()
+            self._cur_num_scheduled = dict(scheduler_output.num_scheduled_tokens)
+            if self._hit_spans:
+                self._prefetch_hit_spans()
+        if to_escalate:
+            self._controller.escalate(to_escalate)
 
     @torch.inference_mode()
     def save_outputs(
