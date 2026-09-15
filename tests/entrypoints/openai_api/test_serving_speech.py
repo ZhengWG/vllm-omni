@@ -5176,6 +5176,23 @@ class TestTTSAsyncOffloading:
         qwen3_tts_server._generate_audio_bytes.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_word_timestamps_rejected_when_async_chunk_enabled(
+        self, qwen3_tts_server, mocker: MockerFixture
+    ) -> None:
+        qwen3_tts_server._check_model = mocker.AsyncMock(return_value=None)
+        qwen3_tts_server._generate_audio_bytes = mocker.AsyncMock(return_value=(b"RIFF", "audio/wav"))
+        qwen3_tts_server.forced_aligner_enabled = True
+        qwen3_tts_server.model_config.async_chunk = True
+
+        response = await qwen3_tts_server.create_speech(
+            OpenAICreateSpeechRequest(input="Hello", task_type="Base", word_timestamps=True)
+        )
+
+        assert response.status_code == 400
+        assert "async_chunk" in response.error.message
+        qwen3_tts_server._generate_audio_bytes.assert_not_awaited()
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("request_kwargs", [{"seed": 100423}, {"max_new_tokens": 192}])
     async def test_qwen3_tts_nonstream_does_not_retry_explicit_sampling_controls(
         self,

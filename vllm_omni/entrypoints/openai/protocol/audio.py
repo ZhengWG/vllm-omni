@@ -189,8 +189,9 @@ class OpenAICreateSpeechRequest(BaseModel):
             "X-Word-Timestamps header (JSON list of {word, start_ms, end_ms}, "
             "ASCII-escaped; replaced by X-Word-Timestamps-Omitted past 4 KB). "
             "Requires the server to be launched with --forced-aligner (400 otherwise). "
-            "Not supported with stream=true; for streaming use the WebSocket "
-            "/v1/audio/speech/stream path."
+            "Not supported with stream=true or when async_chunk is enabled "
+            "(the bundled Qwen3-TTS deploy config defaults to async_chunk: true). "
+            "For streaming use the WebSocket /v1/audio/speech/stream path."
         ),
     )
 
