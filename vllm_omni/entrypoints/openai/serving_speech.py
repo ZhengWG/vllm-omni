@@ -3641,6 +3641,13 @@ class OmniOpenAIServingSpeech(OpenAIServing, AudioMixin):
                 return self.create_error_response(
                     "word_timestamps=true requires the server to be launched with --forced-aligner."
                 )
+            if request.word_timestamps and getattr(self.model_config, "async_chunk", False) is True:
+                # Async-chunk Code2Wav never marks the source finished, so the
+                # aligner stage emits no timestamps and the collector waits forever.
+                return self.create_error_response(
+                    "word_timestamps=true is not supported when async_chunk is enabled. "
+                    "Restart with --no-async-chunk or set async_chunk: false in the deploy config."
+                )
 
             if request.is_raw_audio_stream():
                 response_format, error = self._validate_speech_streaming_request(
