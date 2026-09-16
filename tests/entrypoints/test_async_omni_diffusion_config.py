@@ -1,11 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
 
+from dataclasses import fields
 from types import SimpleNamespace
 
 import pytest
 
 from vllm_omni.diffusion.data import AttentionConfig
+from vllm_omni.engine.arg_utils import OmniEngineArgs
 from vllm_omni.engine.async_omni_engine import AsyncOmniEngine
 from vllm_omni.entrypoints.cli.serve import OmniServeCommand
 from vllm_omni.utils.tracking_parser import TrackingArgumentParser
@@ -349,6 +351,30 @@ def test_serve_cli_accepts_text_encoder_tp_size():
 
     assert args.text_encoder_tp_size == 4
     assert parallel_config.text_encoder_tp_size == 4
+
+
+def test_engine_args_from_cli_keeps_text_encoder_tp_size():
+    """from_cli_args copies only declared OmniEngineArgs fields.
+
+    The serve parser already accepts --text-encoder-tp-size, but library
+    callers that go through OmniEngineArgs.from_cli_args lose any knob that
+    is not declared on the dataclass. Default diffusion synthesis then
+    falls back to text_encoder_tp_size=1.
+    """
+    engine_fields = {f.name for f in fields(OmniEngineArgs)}
+    cli_ns = SimpleNamespace(
+        model="Qwen/Qwen-Image",
+        tensor_parallel_size=2,
+        text_encoder_tp_size=2,
+    )
+    engine_kwargs = {name: getattr(cli_ns, name) for name in vars(cli_ns) if name in engine_fields}
+
+    assert engine_kwargs["text_encoder_tp_size"] == 2
+
+    stage_cfg = AsyncOmniEngine._create_default_diffusion_stage_cfg(engine_kwargs)[0]
+    parallel_config = stage_cfg["engine_args"]["parallel_config"]
+    assert parallel_config.text_encoder_tp_size == 2
+    assert parallel_config.tensor_parallel_size == 2
 
 
 def test_serve_cli_forwards_model_defined_task_type_to_diffusion_stage():
