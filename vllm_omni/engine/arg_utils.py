@@ -216,6 +216,9 @@ class OmniEngineArgs(EngineArgs):
     # Diffusion request-mode batch admission (forwarded to OmniDiffusionConfig).
     request_batch_max_wait_ms: float = 0.0
     fa_deterministic: bool = False
+    # Must be declared so EngineArgs.from_cli_args / filter_dataclass_kwargs
+    # do not drop --text-encoder-tp-size before default diffusion synthesis.
+    text_encoder_tp_size: int | None = None
 
     @classmethod
     def _add_omni_specific_args(cls, parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -584,6 +587,7 @@ class OrchestratorArgs:
     cfg_parallel_size: int = 1
     vae_patch_parallel_size: int = 1
     vae_parallel_mode: str = "tile"
+    text_encoder_tp_size: int | None = None
     default_sampling_params: str | None = None
     max_generated_image_size: int | None = None
     tts_max_instructions_length: int | None = None
@@ -610,6 +614,7 @@ SHARED_FIELDS: frozenset[str] = frozenset(
         "log_stats",  # both want the flag
         "async_chunk",  # orch: read from CLI, redistribute; engine: per-stage flag
         "tokenizer",  # orch: detect model type; engine: tokenization
+        "text_encoder_tp_size",  # orch: CLI parse; engine: from_cli_args keep-alive
     }
 )
 

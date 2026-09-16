@@ -49,3 +49,11 @@ def test_internal_blacklist_keys_derived_from_orchestrator():
     """
     blacklist = internal_blacklist_keys()
     assert blacklist == orchestrator_field_names() - SHARED_FIELDS
+
+
+def test_text_encoder_tp_size_is_declared_on_cli_dataclasses():
+    """CLI-to-engine conversion keeps only fields declared on these classes."""
+    engine = {f.name for f in fields(OmniEngineArgs)}
+    assert "text_encoder_tp_size" in engine
+    assert "text_encoder_tp_size" in orchestrator_field_names()
+    assert "text_encoder_tp_size" in SHARED_FIELDS
