@@ -1277,7 +1277,11 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
     assert src.already_staged and not src.staged_list and not src.join_tids
     sb = run_step(mgr, view, {"b": ([0], 0, 4)}, finished=["a"])
     mgr.materialize(sb, ["b"])  # A freed, block 0 reused by B and COMMITTED
+    # run_step derives rows from slot ids, so A's and B's values coincide.
+    # Scribble the pool so only the preserved copy can produce A's rows.
+    assert set(src.preserved) == {int(s) for s in slots.tolist()}
     with torch.inference_mode():
+        mgr._pool.write(HIDDEN_KEY, slots, torch.full((4, HIDDEN), 99.0, dtype=DTYPE))
         got = mgr._fetch_source(src)
     assert torch.equal(got, expected_rows(slots))
     assert all(ref is not src for ref in mgr._pending_reads)
