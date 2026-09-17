@@ -649,7 +649,9 @@ class OmniStreamingVideoHandler:
                             dropped = frame_buffer.pop(0)
                             dropped_metadata = frame_metadata.pop(0)
                             dropped_frame_id = dropped_metadata.get("frame_id")
-                            if dropped not in pinned_frame_refs:
+                            # Duplicate frames share one cache entry keyed by
+                            # b64: keep it while any duplicate remains buffered.
+                            if dropped not in pinned_frame_refs and dropped not in frame_buffer:
                                 _drop_frame_cache(dropped)
                         frame_buffer.append(frame_data)
                         frame_metadata.append(
