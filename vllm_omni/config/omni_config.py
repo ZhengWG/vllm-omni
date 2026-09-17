@@ -47,8 +47,11 @@ from vllm_omni.config.stage_config import (
     _select_processor_funcs,
     build_stage_runtime_overrides,
     load_deploy_config,
+    merge_sampling_constraints,
     normalize_pipeline_cli_overrides,
     reconcile_diffusion_attention_overrides,
+    resolve_stage_async_chunk,
+    validate_stage_async_chunk_edges,
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 
@@ -63,6 +66,7 @@ _PIPELINE_DEPLOY_CLI_FIELDS = PIPELINE_WIDE_ENGINE_FIELDS
 _NON_STAGE_ENGINE_CLI_FIELDS = frozenset(
     {
         "async_chunk",
+        "disable_log_stats",
         "model",
         "omni",
         "output_modalities",
@@ -164,8 +168,22 @@ class _ModelEngineOverrides(TypedDict, total=False):
     max_cudagraph_capture_size: int
     enable_flashinfer_autotune: bool
     enable_multithread_weight_load: bool
+    enable_broadcast_weight_load: bool
     num_weight_load_threads: int
     disable_autocast: bool
+    # Upstream ModelConfig inputs that users pass as global CLI flags.
+    served_model_name: str | list[str]
+    allowed_local_media_path: str
+    allowed_media_domains: list[str]
+    max_logprobs: int
+    logprobs_mode: str
+    mm_processor_kwargs: dict[str, Any]
+    mm_processor_cache_type: str
+    hf_token: bool | str
+    hf_config_path: str
+    generation_config: str
+    override_generation_config: dict[str, Any]
+    enable_prompt_embeds: bool
 
 
 class _LoadEngineOverrides(TypedDict, total=False):
@@ -196,6 +214,7 @@ class _SchedulerEngineOverrides(TypedDict, total=False):
 
 
 class _RuntimeEngineOverrides(TypedDict, total=False):
+    additional_config: dict[str, Any]
     distributed_executor_backend: Any
     worker_cls: str
     devices: str
@@ -398,7 +417,7 @@ def _get_deploy_config(
 
 
 @config
-class OmniStageModelConfig:
+class OmniStageModelConfig(_TrackExplicitConfigFields):
     """Per-stage model behavior and resolved model-engine inputs."""
 
     model: str | None = None
@@ -433,6 +452,7 @@ class OmniStageModelConfig:
     max_cudagraph_capture_size: int | None = Field(default=None, ge=0)
     enable_flashinfer_autotune: bool | None = None
     enable_multithread_weight_load: bool = True
+    enable_broadcast_weight_load: bool = False
     num_weight_load_threads: int = Field(default=4, ge=1)
     disable_autocast: bool = False
     # Per-stage checkpoint/tokenizer subdirectories under the model root
@@ -441,6 +461,19 @@ class OmniStageModelConfig:
     model_subdir: str | None = None
     tokenizer_subdir: str | None = None
     requires_full_payload_input: bool = False
+    # Upstream ModelConfig inputs that users pass as global CLI flags.
+    served_model_name: str | list[str] | None = None
+    allowed_local_media_path: str | None = None
+    allowed_media_domains: list[str] | None = None
+    max_logprobs: int | None = None
+    logprobs_mode: str | None = None
+    mm_processor_kwargs: dict[str, Any] | None = None
+    mm_processor_cache_type: str | None = None
+    hf_token: bool | str | None = None
+    hf_config_path: str | None = None
+    generation_config: str | None = None
+    override_generation_config: dict[str, Any] | None = None
+    enable_prompt_embeds: bool | None = None
 
 
 @_enforce_keyword_only_init
@@ -524,6 +557,8 @@ class OmniStageConnectorConfig:
 class OmniStageRuntimeConfig:
     """Per-stage process placement and backend runtime behavior."""
 
+    # LLM backend extensions; diffusion owns these in its config projection.
+    additional_config: dict[str, Any] | None = None
     distributed_executor_backend: Any = None
     worker_cls: str | None = None
     devices: str | None = None
@@ -714,6 +749,7 @@ class _DiffusionConfigProjection:
     cache_strategy: str = "none"
     cache_backend: str = "none"
     cache_config: Any = field(default_factory=dict)
+    video_output_transport: object = field(default_factory=dict)
     enable_cache_dit_summary: bool = False
     diffusion_kv_mode: DiffusionKVCacheMode = DiffusionKVCacheMode.DENSE_LEGACY
     diffusion_kv_max_rows_per_request: int | None = Field(default=None, ge=1, strict=True)
@@ -770,6 +806,7 @@ class _DiffusionConfigProjection:
             "transformer": True,
             "vae": True,
             "text_encoder": True,
+            "vae_encoder": True,
         }
     )
     override_transformer_cls_name: str | None = None
@@ -780,6 +817,8 @@ class _DiffusionConfigProjection:
     enable_stage_verification: bool = True
     prompt_file_path: str | None = None
     quantization_config: _QuantizationConfigType = None
+    # Internal provenance, retained across config projection and worker transport.
+    quantization_config_is_auto_detected: bool = False
     extras: dict[str, Any] = field(default_factory=dict)
 
     @field_validator("kv_transfer_config", mode="before")
@@ -808,6 +847,7 @@ class _DiffusionConfigProjection:
             AttentionConfig,
             DiffusionCacheConfig,
             TransformerConfig,
+            VideoOutputTransportConfig,
             build_attention_config,
             parse_kv_cache_skip_selector,
             validate_dlo_host_registration_options,
@@ -849,6 +889,13 @@ class _DiffusionConfigProjection:
             self.cache_config = DiffusionCacheConfig.from_dict(dict(self.cache_config))
         elif not isinstance(self.cache_config, DiffusionCacheConfig):
             self.cache_config = DiffusionCacheConfig()
+
+        if self.video_output_transport is None:
+            self.video_output_transport = VideoOutputTransportConfig()
+        elif isinstance(self.video_output_transport, Mapping):
+            self.video_output_transport = VideoOutputTransportConfig(**dict(self.video_output_transport))
+        elif not isinstance(self.video_output_transport, VideoOutputTransportConfig):
+            raise TypeError("video_output_transport must be a VideoOutputTransportConfig or mapping")
 
         self._propagate_quantization_from_tf_config(self.tf_model_config)
         if self.quantization_config is not None:
@@ -919,6 +966,8 @@ class _DiffusionConfigProjection:
             or (is_checkpoint_nvfp4 and self._is_generic_nvfp4_quant_config(self.quantization_config))
         )
         if should_use_checkpoint_config:
+            if self.quantization_config is None:
+                self.quantization_config_is_auto_detected = True
             self.quantization_config = quant_config
             if quant_method is not None:
                 self.additional_config.setdefault("auto_detected_quant_method", quant_method)
@@ -1015,6 +1064,7 @@ _DIFFUSION_MOVED_SHARED_FIELDS = frozenset(
         "enable_sleep_mode",
         "enforce_eager",
         "enable_multithread_weight_load",
+        "enable_broadcast_weight_load",
         "num_weight_load_threads",
         "disable_autocast",
     }
@@ -1271,10 +1321,12 @@ def _stage_engine_values(
         load_engine_fields = _LLM_LOAD_ENGINE_FIELDS
         cache_engine_fields = _LLM_CACHE_ENGINE_FIELDS
         scheduler_engine_fields = _LLM_SCHEDULER_ENGINE_FIELDS
+        runtime_engine_fields = _RUNTIME_ENGINE_FIELDS
     else:
         load_engine_fields = _LOAD_ENGINE_FIELDS
         cache_engine_fields = _CACHE_ENGINE_FIELDS
         scheduler_engine_fields = _SCHEDULER_ENGINE_FIELDS
+        runtime_engine_fields = _RUNTIME_ENGINE_FIELDS - {"additional_config"}
     return _StageEngineValues(
         quantization=cast(
             _QuantizationEngineOverrides,
@@ -1291,7 +1343,7 @@ def _stage_engine_values(
             _ConnectorEngineOverrides,
             _select_engine_overrides(engine, _CONNECTOR_ENGINE_FIELDS),
         ),
-        runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, _RUNTIME_ENGINE_FIELDS)),
+        runtime=cast(_RuntimeEngineOverrides, _select_engine_overrides(engine, runtime_engine_fields)),
         parallel=cast(_ParallelEngineOverrides, _select_engine_overrides(engine, _PARALLEL_ENGINE_FIELDS)),
         diffusion=_DiffusionEngineOverrides.from_engine(engine),
         compilation_config=_copy_value(engine.get("compilation_config")),
@@ -1303,10 +1355,10 @@ def _stage_sampling_params(
     stage_deploy: StageDeployConfig | None,
     topology: StagePipelineConfig,
 ) -> dict[str, Any] | None:
-    sampling: dict[str, Any] = {}
-    if stage_deploy is not None and stage_deploy.default_sampling_params:
-        sampling.update(_copy_value(stage_deploy.default_sampling_params))
-    sampling.update(_copy_value(topology.sampling_constraints))
+    sampling = merge_sampling_constraints(
+        _copy_value(stage_deploy.default_sampling_params) if stage_deploy is not None else None,
+        _copy_value(topology.sampling_constraints),
+    )
     return sampling or None
 
 
@@ -1474,7 +1526,7 @@ def _build_common_stage_config_kwargs(
     *,
     model: str | None,
 ) -> tuple[dict[str, Any], str | None, str | None]:
-    input_proc, next_stage_proc = _select_processor_funcs(topology, bool(deploy.async_chunk))
+    input_proc, next_stage_proc = _select_processor_funcs(topology, resolve_stage_async_chunk(deploy, stage_deploy))
     quantization_config = _build_quantization_config(deploy, engine.quantization)
     parallel_config = _build_parallel_config(deploy, engine.parallel, parallel_config_cls)
 
@@ -1789,7 +1841,7 @@ def _build_connector_config(
     output_connectors = stage_deploy.output_connectors if stage_deploy is not None else None
     input_connectors = stage_deploy.input_connectors if stage_deploy is not None else None
     return cast(Any, OmniStageConnectorConfig)(
-        async_chunk=bool(deploy.async_chunk),
+        async_chunk=resolve_stage_async_chunk(deploy, stage_deploy),
         omni_kv_config=_copy_value(engine.get("omni_kv_config")),
         output_connectors=_copy_value(output_connectors) if output_connectors else None,
         input_connectors=_copy_value(input_connectors) if input_connectors else None,
@@ -1920,6 +1972,7 @@ class VllmOmniConfig:
         if len(pipeline_cfg.stages) <= 1:
             deploy.async_chunk = False
         _validate_async_chunk_support(pipeline_cfg, deploy)
+        validate_stage_async_chunk_edges(pipeline_cfg, deploy)
         deploy_by_id = {stage.stage_id: stage for stage in deploy.stages}
         model = cli_overrides.get("model")
 

@@ -18,19 +18,21 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from vllm_omni.entrypoints.openai.video_stream_base import (
     _DEFAULT_CONFIG_TIMEOUT,
     _DEFAULT_IDLE_TIMEOUT,
+    PrewarmedFrame,
     StreamingVideoSessionConfig,
     VideoStreamTurnTrigger,
 )
@@ -58,23 +60,16 @@ class QwenOmniStreamingVideoHandler(OmniStreamingVideoHandlerBase):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, Any],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        if self._incremental_prefill_active(config):
-            # Frames are sampled at arrival time only (EVS + max_frames), so
-            # the buffer already is the warmed sequence. Query-time
-            # subsampling would pick a subset, which is not a prefix.
-            frames = list(frame_buffer)
-        else:
-            n_buf = len(frame_buffer)
-            if n_buf <= config.num_frames:
-                frames = list(frame_buffer)
-            else:
-                stride = max(1, n_buf // config.num_frames)
-                idx = [i * stride for i in range(config.num_frames - 1)] + [n_buf - 1]
-                frames = [frame_buffer[i] for i in idx]
+        prewarmed = prewarmed_frames or {}
+        if frame_indices is None:
+            frame_indices = self._select_frame_indices(config, frame_buffer, prewarmed)
+        frames = [frame_buffer[index] for index in frame_indices]
 
-        user_content: list[dict] = self._build_frame_image_parts(frames, prewarmed_frames)
+        user_content: list[dict] = self._build_frame_image_parts(frames, prewarmed)
 
         if len(audio_buffer) > 0:
             wav_b64 = self._pcm_to_wav_b64(bytes(audio_buffer))

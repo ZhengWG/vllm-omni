@@ -21,8 +21,8 @@ Protocol:
         {"type": "response.start"}
         {"type": "response.text.delta", "delta": "..."}
         {"type": "response.text.done", "text": "..."}
-        {"type": "response.audio.delta", "data": "...", "format": "wav"}
-        {"type": "response.audio.done"}
+        {"type": "response.output_audio.delta", "data": "...", "format": "wav"}
+        {"type": "response.output_audio.done"}
         {"type": "session.done"}
         {"type": "error", "message": "..."}
 """
@@ -37,7 +37,8 @@ import uuid
 import wave
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol, runtime_checkable
+from enum import Enum
+from typing import Any, Final, Protocol, TypeAlias, runtime_checkable
 
 import torch
 from fastapi import WebSocket, WebSocketDisconnect
@@ -50,6 +51,7 @@ from vllm_omni.entrypoints.openai.video_frame_filter import FrameSimilarityFilte
 from vllm_omni.entrypoints.openai.video_stream_context import (
     text_only_message,
 )
+from vllm_omni.entrypoints.utils import coerce_param_message_types
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
@@ -61,7 +63,14 @@ _MAX_BUFFER_FRAMES = 64
 _MAX_AUDIO_BUFFER_BYTES = 4 * 1024 * 1024
 _MAX_MSG_QUEUE = 200
 _CODEC_FRAME_SAMPLES = 1920  # CausalConv leading-edge artifact length
-_BAD_FRAME = object()
+
+
+class _FrameStatus(Enum):
+    BAD = "bad"
+
+
+_BAD_FRAME: Final = _FrameStatus.BAD
+PrewarmedFrame: TypeAlias = tuple[Any, str] | _FrameStatus
 
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
@@ -94,9 +103,11 @@ class VideoStreamPipelineHooks(Protocol):
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, Any],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        """Build OpenAI-style messages and the current user message."""
+        """Build messages using the supplied frame selection, or sample if omitted."""
         ...
 
     def on_turn_complete(
@@ -113,7 +124,7 @@ class VideoStreamPipelineHooks(Protocol):
         config: "StreamingVideoSessionConfig",
         frame_buffer: list[str],
         message_history: list[dict[str, Any]],
-        prewarmed_frames: dict[str, Any],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
     ) -> list[dict[str, Any]] | None:
         """Prefix of the next :meth:`build_engine_prompt` through the last vision token.
 
@@ -197,7 +208,9 @@ class OmniStreamingVideoHandler:
         audio_buffer: bytearray,
         message_history: list[dict[str, Any]],
         query_text: str,
-        prewarmed_frames: dict[str, Any],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+        *,
+        frame_indices: list[int] | None = None,
     ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
         raise NotImplementedError
 
@@ -212,7 +225,7 @@ class OmniStreamingVideoHandler:
     @staticmethod
     def _build_frame_image_parts(
         frames: list[str],
-        prewarmed_frames: dict[str, Any] | None,
+        prewarmed_frames: Mapping[str, PrewarmedFrame] | None,
     ) -> list[dict[str, Any]]:
         """Decoded frame parts. Prefix and query both wait for PIL prewarm so
         every frame is ``image_pil`` plus the arrival-time uuid."""
@@ -256,7 +269,7 @@ class OmniStreamingVideoHandler:
         config: StreamingVideoSessionConfig,
         frame_buffer: list[str],
         message_history: list[dict[str, Any]],
-        prewarmed_frames: dict[str, Any],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
     ) -> list[dict[str, Any]] | None:
         """Prefix of the next :meth:`build_engine_prompt` through the last vision token.
 
@@ -315,7 +328,7 @@ class OmniStreamingVideoHandler:
             frame_buffer: list[str] = []  # base64-encoded JPEG frames
             frame_metadata: list[dict[str, Any]] = []
             # Per-frame PIL cache + uuid for mm_hash reuse. Aligned with frame_buffer by index.
-            frame_pil_cache: dict[str, tuple[Any, str] | object] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
+            frame_pil_cache: dict[str, PrewarmedFrame] = {}  # b64 -> (PIL.Image, uuid) or _BAD_FRAME
             frame_filter = (
                 FrameSimilarityFilter(threshold=config.frame_filter_threshold) if config.enable_frame_filter else None
             )
@@ -538,7 +551,6 @@ class OmniStreamingVideoHandler:
                         await self._engine_client.abort(prev_request_id)
                     except Exception:
                         pass
-                    await asyncio.sleep(0.1)
                 prev_was_interrupted = False
                 query_frames = list(frame_buffer)
                 query_frame_metadata = list(frame_metadata)
@@ -668,6 +680,8 @@ class OmniStreamingVideoHandler:
                                 cancelled = False
                                 try:
                                     pil = await asyncio.to_thread(_decode_frame_bytes, b)
+                                    # The frame may have been evicted (and unpinned)
+                                    # while decoding; frame_ready tracks liveness.
                                     if b64 in frame_ready:
                                         frame_pil_cache[b64] = (pil, u)
                                 except asyncio.CancelledError:
@@ -835,7 +849,7 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, Any],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Build prompt, run inference, stream text + audio response."""
@@ -874,20 +888,21 @@ class OmniStreamingVideoHandler:
         query_text: str,
         request_id: str,
         interrupt_event: asyncio.Event,
-        prewarmed_frames: dict[str, Any],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
         frame_metadata: list[dict[str, Any]] | None = None,
     ) -> None:
         """Direct engine_client.generate() path for async_chunk audio."""
+        engine_client = self._engine_client
+        assert engine_client is not None, "_process_query must validate the engine client"
+
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
         )
 
-        engine_client = self._engine_client
-        if engine_client is None:
-            await self._send_error(websocket, "Streaming video requires an engine client")
-            return
-
         reuse_active = self._incremental_prefill_active(config)
+        # Select once from this turn's snapshot so prompt images and the
+        # consumed event refer to exactly the same frames, including decode failures.
+        frame_indices = self._select_frame_indices(config, frame_buffer, prewarmed_frames)
         messages, user_message = self.build_engine_prompt(
             config,
             frame_buffer,
@@ -895,6 +910,7 @@ class OmniStreamingVideoHandler:
             message_history,
             query_text,
             prewarmed_frames,
+            frame_indices=frame_indices,
         )
 
         request_kwargs: dict[str, Any] = {
@@ -912,11 +928,13 @@ class OmniStreamingVideoHandler:
             request_kwargs["mm_processor_kwargs"] = {
                 "use_audio_in_video": True,
             }
-        if config.sampling_params_list:
-            request_kwargs["sampling_params_list"] = config.sampling_params_list
-
+        sampling_kwargs: dict[str, Any] = {}
         try:
             chat_request = ChatCompletionRequest(**request_kwargs)
+            if config.sampling_params_list:
+                params = self._chat_service._to_sampling_params_list(config.sampling_params_list)
+                # Explicit params must retain the engine's streaming output mode.
+                sampling_kwargs["sampling_params_list"] = coerce_param_message_types(params, is_streaming=True)
         except Exception as e:
             await self._send_error(websocket, f"Failed to build request: {e}")
             return
@@ -927,10 +945,7 @@ class OmniStreamingVideoHandler:
             await self._send_error(websocket, f"Preprocess failed: {e}")
             return
         decoded_ready_ts_ms = _time.monotonic() * 1000
-        if reuse_active:
-            selected_metadata = list(frame_metadata or [])
-        else:
-            selected_metadata = self._sample_frame_metadata(frame_metadata or [], config.num_frames)
+        selected_metadata = [frame_metadata[index] for index in frame_indices] if frame_metadata else []
         model_selected_ts_ms = _time.monotonic() * 1000
 
         await websocket.send_json({"type": "response.start"})
@@ -959,6 +974,7 @@ class OmniStreamingVideoHandler:
                 prompt=engine_prompt,
                 request_id=request_id,
                 output_modalities=config.modalities,
+                **sampling_kwargs,
             )
 
             async for output in result_gen:
@@ -1018,7 +1034,7 @@ class OmniStreamingVideoHandler:
                         if b64:
                             await websocket.send_json(
                                 {
-                                    "type": "response.audio.delta",
+                                    "type": "response.output_audio.delta",
                                     "data": b64,
                                     "format": "wav",
                                 }
@@ -1062,7 +1078,7 @@ class OmniStreamingVideoHandler:
                     if b64:
                         await websocket.send_json(
                             {
-                                "type": "response.audio.delta",
+                                "type": "response.output_audio.delta",
                                 "data": b64,
                                 "format": "wav",
                             }
@@ -1071,7 +1087,7 @@ class OmniStreamingVideoHandler:
                     logger.exception("Failed to coalesce off-path audio")
 
             if audio_chunk_count > 0:
-                await websocket.send_json({"type": "response.audio.done"})
+                await websocket.send_json({"type": "response.output_audio.done"})
 
             response_text = "".join(text_parts)
             self.on_turn_complete(message_history, user_message, response_text)
@@ -1258,8 +1274,9 @@ class OmniStreamingVideoHandler:
         )
         mixin = AudioMixin()
         resp = mixin.create_audio(audio_obj)
-        audio_b64 = resp.audio_data
-        return audio_b64.decode() if isinstance(audio_b64, bytes) else audio_b64
+        # base64_encode=True selects the string result of create_audio().
+        assert isinstance(resp.audio_data, str)
+        return resp.audio_data
 
     @staticmethod
     def _extract_text_delta(
@@ -1365,15 +1382,37 @@ class OmniStreamingVideoHandler:
             pass
 
     @staticmethod
-    def _sample_frame_metadata(
-        frame_metadata: list[dict[str, Any]],
+    def _sample_frame_indices(
+        frame_buffer: list[str],
         num_frames: int,
-    ) -> list[dict[str, Any]]:
-        if len(frame_metadata) <= num_frames:
-            return list(frame_metadata)
-        stride = max(1, len(frame_metadata) // num_frames)
-        indices = [index * stride for index in range(num_frames - 1)] + [len(frame_metadata) - 1]
-        return [frame_metadata[index] for index in indices]
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+    ) -> list[int]:
+        """Stride-sample with the last frame, then drop known bad frames without refilling."""
+        n_buf = len(frame_buffer)
+        if n_buf <= num_frames:
+            indices = list(range(n_buf))
+        else:
+            stride = max(1, n_buf // num_frames)
+            indices = [index * stride for index in range(num_frames - 1)] + [n_buf - 1]
+        return [index for index in indices if prewarmed_frames.get(frame_buffer[index]) is not _BAD_FRAME]
+
+    def _select_frame_indices(
+        self,
+        config: StreamingVideoSessionConfig,
+        frame_buffer: list[str],
+        prewarmed_frames: Mapping[str, PrewarmedFrame],
+    ) -> list[int]:
+        """This turn's frame selection, shared by the prompt and the consumed event."""
+        if self._incremental_prefill_active(config):
+            # Frames are sampled at arrival time only (EVS + max_frames), so
+            # the buffer already is the warmed sequence. Query-time
+            # subsampling would pick a subset, which is not a prefix.
+            return [
+                index
+                for index, frame_b64 in enumerate(frame_buffer)
+                if prewarmed_frames.get(frame_b64) is not _BAD_FRAME
+            ]
+        return self._sample_frame_indices(frame_buffer, config.num_frames, prewarmed_frames)
 
     @staticmethod
     async def _send_frame_ack(
