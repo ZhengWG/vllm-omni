@@ -23,8 +23,10 @@ from vllm_omni.core.prefix_cache.interface import (
     PrefixCacheConfig,
 )
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.data_entry_keys import flatten_payload
 
 if TYPE_CHECKING:
+    import torch
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
@@ -46,6 +48,7 @@ class PrefixCacheRunnerMixin:
     # Host-class fields (annotation only; the runner initializes them).
     input_batch: Any
     kv_cache_config: Any
+    is_pooling_model: bool
 
     omni_prefix_cache: OmniPrefixCacheManager | None = None
     _omni_prefix_cache_cfg: PrefixCacheConfig | None = None
@@ -103,3 +106,43 @@ class PrefixCacheRunnerMixin:
             self._ensure_omni_prefix_cache()
         if self.omni_prefix_cache is not None:
             self.omni_prefix_cache.new_step_starts(scheduler_output)
+
+    def _prefix_cache_save_step(
+        self,
+        hidden_states: torch.Tensor,
+        multimodal_outputs: dict | None,
+        *,
+        num_tokens_unpadded: int,
+        num_tokens_padded: int,
+    ) -> int | None:
+        """Write this step's outputs into the cache.
+
+        None when this stage/rank does not write (pooling, cache off, or not
+        the last PP rank). The returned step id must be consumed exactly once
+        — materialize or discard_step — by the output path.
+        """
+        from vllm.distributed.parallel_state import get_pp_group
+
+        if self.is_pooling_model or self.omni_prefix_cache is None or not get_pp_group().is_last_rank:
+            return None
+        return self.omni_prefix_cache.save_outputs(
+            hidden_states,
+            flatten_payload(multimodal_outputs) if multimodal_outputs else {},
+            num_tokens_unpadded=num_tokens_unpadded,
+            num_tokens_padded=num_tokens_padded,
+        )
+
+    def _prefix_cache_materialize(
+        self, step_id: int | None, req_ids: list[str]
+    ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
+        """Per-request merged outputs for a saved step.
+
+        ``req_ids`` must be the save-time snapshot, never the live
+        ``input_batch`` (under async output this runs a step late).
+        ``step_id`` None means save did not run — nothing to consume.
+        ``mm_outputs`` is all-or-nothing; empty only when the step had no mm.
+        """
+        if step_id is None or self.omni_prefix_cache is None:
+            return None, None
+        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
+        return outs.hidden_states, (outs.mm_outputs or None)

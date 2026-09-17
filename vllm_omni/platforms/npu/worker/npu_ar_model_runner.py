@@ -213,42 +213,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         finally:
             set_cudagraph_capturing_enabled(False)
 
-    def _maybe_update_prefix_cache(
-        self,
-        hidden_states: torch.Tensor,
-        multimodal_outputs: dict,
-        num_tokens_unpadded: int,
-        num_tokens_padded: int,
-    ) -> int | None:
-        """Write this step's outputs into the omni cache.
-
-        Returns the step id whose context must be consumed exactly once
-        (materialize or discard_step) in sample_tokens; None when this rank
-        does not write the cache.
-        """
-        if self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-            return self.omni_prefix_cache.save_outputs(
-                hidden_states,
-                flatten_payload(multimodal_outputs) if multimodal_outputs else {},
-                num_tokens_unpadded=num_tokens_unpadded,
-                num_tokens_padded=num_tokens_padded,
-            )
-        return None
-
-    def _maybe_get_combined_prefix_cache_tensors(
-        self,
-        *,
-        step_id: int | None = None,
-        req_ids: list[str] | None = None,
-    ) -> tuple[dict[str, torch.Tensor] | None, dict | None]:
-        if self.omni_prefix_cache is None or step_id is None:
-            return None, None
-        # The manager decides read-vs-nothing by policy/hits; the return
-        # is already assembled per request. req_ids must be (a subset of)
-        # the save-time snapshot (debug-asserted inside).
-        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids or ()))
-        return outs.hidden_states, (outs.mm_outputs or None)
-
     @staticmethod
     def _resolve_req_hidden_states(
         hidden_states_cpu: torch.Tensor,
@@ -735,9 +699,9 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 hidden_states, aux_hidden_states = hidden_states
 
             #  -------------------------------------- Omni-new -------------------------------------------------
-            prefix_cache_step_id = self._maybe_update_prefix_cache(
-                hidden_states=hidden_states,
-                multimodal_outputs=multimodal_outputs,
+            prefix_cache_step_id = self._prefix_cache_save_step(
+                hidden_states,
+                multimodal_outputs,
                 num_tokens_unpadded=num_tokens_unpadded,
                 num_tokens_padded=num_tokens_padded,
             )
@@ -1101,10 +1065,7 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 (
                     combined_hidden_states,
                     combined_multimodal_outputs,
-                ) = self._maybe_get_combined_prefix_cache_tensors(
-                    step_id=prefix_cache_step_id,
-                    req_ids=list(req_ids_output_copy),
-                )
+                ) = self._prefix_cache_materialize(prefix_cache_step_id, list(req_ids_output_copy))
             if not _omni_cache_on or combined_multimodal_outputs is None:
                 mm_cpu = build_mm_cpu(
                     flatten_payload(multimodal_outputs) if multimodal_outputs else multimodal_outputs

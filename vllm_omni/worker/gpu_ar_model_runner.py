@@ -748,9 +748,8 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if hidden_states_cpu is None and staged_hidden_states_cpu is not None:
                 hidden_states_cpu = staged_hidden_states_cpu
             return hidden_states_cpu, None, None
-        outs = self.omni_prefix_cache.materialize(step_id, list(req_ids))
-        # mm_outputs is all-or-nothing; empty only when the step had no mm.
-        return hidden_states_cpu, outs.hidden_states, (outs.mm_outputs or None)
+        combined_hidden, combined_mm = self._prefix_cache_materialize(step_id, list(req_ids))
+        return hidden_states_cpu, combined_hidden, combined_mm
 
     def _build_omni_pooler_payload(
         self,
@@ -1183,24 +1182,22 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             else:
                 hidden_states, multimodal_outputs = self.extract_multimodal_outputs(model_output)
             hidden_states_cpu = None
-            prefix_cache_step_id = None
-
-            if not self.is_pooling_model and self.omni_prefix_cache is not None and get_pp_group().is_last_rank:
-                # Prefix-cache write: freeze + submit; policy gating (full
-                # hidden, skip/deferred keys) happens inside the manager.
-                if (
-                    not self._model_needs_full_prefix_hidden_states()
-                    and self._model_omni_pooler_payload_include_hidden()
-                ):
-                    # Opt-out models keep the scheduled-slice CPU view for the
-                    # pooler payload (runner-side bypass, legacy parity).
-                    hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
-                prefix_cache_step_id = self.omni_prefix_cache.save_outputs(
-                    hidden_states,
-                    flatten_payload(multimodal_outputs) if multimodal_outputs else {},
-                    num_tokens_unpadded=num_tokens_unpadded,
-                    num_tokens_padded=num_tokens_padded,
-                )
+            # Prefix-cache write: freeze + submit; policy gating (full
+            # hidden, skip/deferred keys) happens inside the manager.
+            prefix_cache_step_id = self._prefix_cache_save_step(
+                hidden_states,
+                multimodal_outputs,
+                num_tokens_unpadded=num_tokens_unpadded,
+                num_tokens_padded=num_tokens_padded,
+            )
+            if (
+                prefix_cache_step_id is not None
+                and not self._model_needs_full_prefix_hidden_states()
+                and self._model_omni_pooler_payload_include_hidden()
+            ):
+                # Opt-out models keep the scheduled-slice CPU view for the
+                # pooler payload (runner-side bypass, legacy parity).
+                hidden_states_cpu = hidden_states[:num_tokens_unpadded].detach().to("cpu").contiguous()
 
             if not self.broadcast_pp_output:
                 # Common case.
