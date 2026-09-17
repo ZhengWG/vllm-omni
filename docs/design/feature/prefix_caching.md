@@ -215,8 +215,14 @@ Hit spans come from `scheduled_new_reqs` only, as in the pre-refactor cache:
   instead. Either way it runs before the next step can hand those blocks
   to a new tenant. vLLM frees blocks one step before `finished_req_ids`
   arrives, so a finished request whose last step materializes late may
-  still find a hit slot reassigned: that is logged (`rows may be stale`),
-  while the same condition on a live request raises.
+  still find a hit slot reassigned. Each `(slot, key)` carries a write
+  version, bumped whenever a new write claims it. A planned read captures
+  that version and is registered in `_pending_reads`; a later write that
+  reclaims those slots copy-on-writes the still-`COMMITTED` rows into the
+  ref before it overwrites the pool, so a delayed fetch serves the original
+  tenant. A version mismatch with no preserved copy raises for live and
+  finished alike (the pool rows are a newer tenant's). Production defaults
+  stay opt-in until preempt/resume hit spans are reconstructed.
 - `async_chunk` continuation: when the next upstream chunk arrives, the same
   request id re-enters `scheduled_new_reqs` with `num_computed_tokens` equal
   to what it already computed itself. Ids already in `live_reqs` are skipped

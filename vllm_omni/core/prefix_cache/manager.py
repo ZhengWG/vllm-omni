@@ -257,6 +257,10 @@ class _SlotRef:
     already_staged: bool  # this key is already in the CPU pool
     staged_list: list[tuple[WriteTask, torch.Tensor]]  # JOIN_ON_FINISH only
     join_tids: list[Tid] = field(default_factory=list)  # JOIN_NEXT_STEP in-transit
+    # Slot version snapshot at plan time, checked on fetch.
+    reserved_version: torch.Tensor | None = None
+    # Copy-on-write rescue: slot's committed rows for pending reads.
+    preserved: dict[int, torch.Tensor] = field(default_factory=dict)
 
 
 @dataclass(kw_only=True)
@@ -296,6 +300,7 @@ class _SlotStatus(NamedTuple):
 
     state: torch.Tensor  # int8[num_slots]
     tids: torch.Tensor  # Tid per kv slot; 0 = none
+    slot_version: torch.Tensor  # int64[num_slots]; bumped each time a new write claims the slot
 
 
 class _SlotStatusTable:
@@ -312,6 +317,7 @@ class _SlotStatusTable:
         self.num_slots = num_slots
         self.state: dict[TensorName, torch.Tensor] = {}  # int8[num_slots]
         self.tids: dict[TensorName, torch.Tensor] = {}  # Tid per kv slot; 0 = none
+        self.slot_versions: dict[TensorName, torch.Tensor] = {}  # int64[num_slots]; bumped on each new write claim
         self.task_slots: dict[Tid, torch.Tensor] = {}  # kv slots
         self.task_keys: dict[Tid, tuple[TensorName, ...]] = {}
 
@@ -321,10 +327,11 @@ class _SlotStatusTable:
             return
         self.state[key] = torch.zeros(self.num_slots, dtype=torch.int8)
         self.tids[key] = torch.zeros(self.num_slots, dtype=torch.int64)
+        self.slot_versions[key] = torch.zeros(self.num_slots, dtype=torch.int64)
 
     def get_slot_status(self, key: TensorName) -> _SlotStatus:
         """Occupancy tensors for ``key``. ``init_table`` must have run."""
-        return _SlotStatus(state=self.state[key], tids=self.tids[key])
+        return _SlotStatus(state=self.state[key], tids=self.tids[key], slot_version=self.slot_versions[key])
 
     def map_slots(
         self, slots: torch.Tensor, tid: Tid, keys: Iterable[TensorName]
@@ -342,6 +349,9 @@ class _SlotStatusTable:
                     stolen.append((old, key, slots[stale & (cur == old)]))
             status.state[slots] = _Occupancy.IN_TRANSIT
             status.tids[slots] = tid
+            # Bump the version so a reader that captured an older one detects
+            # this claim even after it later commits (COMMITTED, not IN_TRANSIT).
+            status.slot_version[slots] += 1
         prev = self.task_slots.get(tid)
         if prev is None:
             self.task_slots[tid] = slots
@@ -441,6 +451,11 @@ class OmniPrefixCacheManager:
         self._cur_num_scheduled: dict[ReqId, int] = {}
         self._hit_spans: dict[ReqId, tuple[int, list[int]]] = {}  # (upto, blocks)
         self._hit_prefetch: dict[ReqId, dict[TensorName, Future]] = {}
+
+        # Planned-but-unread slot refs. A write reusing their slots copies the
+        # old rows into ``_SlotRef.preserved`` before overwriting (COW). Guarded
+        # by ``_state_lock``; each ref is dropped when its fetch completes.
+        self._pending_reads: list[_SlotRef] = []
 
         # Prefix gather during forward (CPU work releases the GIL).
         # One worker: complete in submit order; pop finished work from the head.
@@ -1095,10 +1110,39 @@ class OmniPrefixCacheManager:
     def _map_slots(self, slots: torch.Tensor, tid: int, keys: Iterable[str]) -> None:
         """Caller holds ``_state_lock``. Record `tid` on these (slot, key);
         if another write still owns them, mark those rows skipped on it."""
+        keys = tuple(keys)
+        # Copy committed rows aside before this claim overwrites them.
+        if self._pending_reads:
+            self._preserve_for_pending_reads(slots, keys)
         for old, key, stolen in self._slot_status.map_slots(slots, tid, keys):
             old_task = self._controller.get_task(old)
             if old_task is not None:
                 old_task.add_reassigned(key, stolen)
+
+    def _preserve_for_pending_reads(self, new_slots: torch.Tensor, keys: tuple[str, ...]) -> None:
+        """Caller holds ``_state_lock``. Copy still-valid committed rows
+        into each pending ref before ``new_slots`` are claimed."""
+        new_set = {int(s) for s in new_slots.tolist()}
+        for ref in self._pending_reads:
+            if ref.key not in keys or ref.reserved_version is None or not self._pool.has_key(ref.key):
+                continue
+            status = self._slot_status.get_slot_status(ref.key)
+            take: list[tuple[int, int]] = []  # (row index in ref, slot)
+            for i, s in enumerate(ref.slots.tolist()):
+                s = int(s)
+                if s not in new_set or s in ref.preserved:
+                    continue
+                # Only rows the pool holds definitively (COMMITTED) and still
+                # at the version this ref reserved are ours to rescue.
+                committed = status.state[s] == _Occupancy.COMMITTED
+                same_ver = int(status.slot_version[s]) == int(ref.reserved_version[i])
+                if committed and same_ver:
+                    take.append((i, s))
+            if not take:
+                continue
+            rows = self._pool.rows(ref.key, torch.tensor([s for _, s in take], dtype=torch.long))
+            for j, (_, s) in enumerate(take):
+                ref.preserved[s] = rows[j].clone()
 
     @torch.inference_mode()
     def _commit_drained_writes(self) -> None:
@@ -1169,10 +1213,17 @@ class OmniPrefixCacheManager:
 
         Hidden rejects any empty hole (prefetch skips; materialize
         raises). Other keys only need a source — holes fall to the pool.
+
+        The ref is registered in ``_pending_reads`` so a write that later
+        reuses one of these slots copies the old row aside first (COW). Reads
+        are planned synchronously under the lock at hit time (prefetch runs at
+        ``new_step_starts`` / publish), before the block can be reused, so this
+        registration always precedes the reuse. ``_fetch_source`` unregisters.
         """
         status = self._slot_status.get_slot_status(key)
         states = status.state[slots]
         tids = status.tids[slots]
+        reserved_version = status.slot_version[slots].clone()
         staged_mask = states == _Occupancy.IN_TRANSIT
 
         staged: list[tuple[WriteTask, torch.Tensor]] = []
@@ -1192,14 +1243,33 @@ class OmniPrefixCacheManager:
             n_abs = int((states == _Occupancy.ABSENT).sum())
             if n_abs or not has_source:
                 _raise_unreadable_hit(req_id, key, f"{n_abs} absent slots")
-        return _SlotRef(
+        ref = _SlotRef(
             slots=slots,
             key=key,
             req_id=req_id,
             already_staged=already_staged,
             staged_list=staged,
             join_tids=join_tids,
+            reserved_version=reserved_version,
         )
+        self._pending_reads.append(ref)
+        return ref
+
+    def _apply_preserved_rows(self, src: _SlotRef, out: torch.Tensor) -> torch.Tensor:
+        """Write ``src.preserved`` rows over the matching slots in ``out``."""
+        if not src.preserved:
+            return out
+        for i, s in enumerate(src.slots.tolist()):
+            row = src.preserved.get(int(s))
+            if row is not None:
+                out[i] = row
+        return out
+
+    def _unregister_pending_read(self, src: _SlotRef) -> None:
+        """Drop ``src`` from ``_pending_reads``. Identity, not dataclass eq
+        (tensors in the ref make ``==`` unusable). Safe if already removed."""
+        with self._state_lock:
+            self._pending_reads = [ref for ref in self._pending_reads if ref is not src]
 
     def _fetch_source(self, src: _SlotRef) -> torch.Tensor:
         """Fetch a planned row source (execute phase, no lock).
@@ -1208,17 +1278,31 @@ class OmniPrefixCacheManager:
         ``staged_list`` (JOIN_ON_FINISH) do not coexist. Immediate: wait
         ``done``, drain, read the pool. Deferred: pool rows already
         written, overlay ``fetch_host`` on the still-in-progress mask.
+        Slots a later write reused are served from ``src.preserved``
+        (copied under the lock before that write claimed them).
         """
+        try:
+            return self._fetch_source_inner(src)
+        finally:
+            self._unregister_pending_read(src)
+
+    def _fetch_source_inner(self, src: _SlotRef) -> torch.Tensor:
         # For JOIN_NEXT_STEP, wait `done`, drain, read the pool
         if src.join_tids:
             self._controller.join(src.join_tids)
             with self._state_lock:
                 self._commit_drained_writes()
-            out = self._pool.rows(src.key, src.slots)
-            self._ensure_not_reassigned(src.slots, src.key, req_id=src.req_id)
-            return out
+            joined = self._apply_preserved_rows(src, self._pool.rows(src.key, src.slots))
+            self._ensure_not_reassigned(
+                src.slots,
+                src.key,
+                req_id=src.req_id,
+                planned_version=src.reserved_version,
+                preserved_slots=src.preserved,
+            )
+            return joined
 
-        # For JOIN_ON_FINISH, pool rows already written, overlay `fetch_host` on the still-in-progress mask
+        # For JOIN_ON_FINISH, pool rows already written, overlay `fetch_host`
         n = int(src.slots.numel())
         out: torch.Tensor | None = None
         if src.already_staged:
@@ -1237,7 +1321,16 @@ class OmniPrefixCacheManager:
                 out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
             out[mask] = rows
             in_transit = mask if in_transit is None else in_transit | mask
-        self._ensure_not_reassigned(src.slots, src.key, in_transit_mask=in_transit, req_id=src.req_id)
+        if out is not None:
+            out = self._apply_preserved_rows(src, out)
+        self._ensure_not_reassigned(
+            src.slots,
+            src.key,
+            in_transit_mask=in_transit,
+            req_id=src.req_id,
+            planned_version=src.reserved_version,
+            preserved_slots=src.preserved,
+        )
         if out is None:
             _raise_unreadable_hit(src.req_id, src.key, "no source")
         return out
@@ -1249,35 +1342,45 @@ class OmniPrefixCacheManager:
         *,
         in_transit_mask: torch.Tensor | None = None,
         req_id: str = "?",
+        planned_version: torch.Tensor | None = None,
+        preserved_slots: dict[int, torch.Tensor] | None = None,
     ) -> None:
-        """Takes ``_state_lock``. Post-fetch check: pool rows read unlocked
-        may have been given to a newer write mid-read (block reuse). A torn
-        pool read must raise. JOIN_ON_FINISH slots already in-transit at
-        plan time are excluded; JOIN_NEXT_STEP slots must be COMMITTED
-        after the wait-then-publish.
+        """Takes ``_state_lock``. Post-fetch check: rows read unlocked may
+        have been given to a newer write between plan and read (block reuse).
 
         vLLM frees a request's blocks when it finishes or is aborted, one
         step before ``finished_req_ids`` reaches us, and may reuse them at
-        once. A request that is no longer live can therefore legitimately
-        see its rows taken while the async builder still materializes its
-        last step: logged, not fatal.
+        once. A planned ``_SlotRef`` is registered in ``_pending_reads``;
+        the reusing write copy-on-writes those COMMITTED rows into
+        ``preserved`` before it claims the slots. Those slots are safe.
+        A version mismatch with no preserved copy means the pool rows are
+        a newer tenant's — raise for live and finished alike, never serve
+        them.
+
+        ``planned_version`` is the per-slot version captured at plan time.
+        ``in_transit_mask`` excludes JOIN_ON_FINISH slots this task itself
+        still serves through ``fetch_host``.
         """
         with self._state_lock:
             status = self._slot_status.get_slot_status(key)
-            violated = status.state[slots] == _Occupancy.IN_TRANSIT
+            if planned_version is not None:
+                violated = status.slot_version[slots] != planned_version
+            else:
+                violated = status.state[slots] == _Occupancy.IN_TRANSIT
             if in_transit_mask is not None:
                 violated &= ~in_transit_mask
+            if preserved_slots:
+                for i, s in enumerate(slots.tolist()):
+                    if int(s) in preserved_slots:
+                        violated[i] = False
             if not bool(violated.any()):
                 return
             live = req_id in self._request_tasks.live_reqs
-        if live:
-            _raise_unreadable_hit(req_id, key, f"reassigned during materialize ({int(violated.sum())} slots)")
-        logger.warning(
-            "omni prefix cache: %d hit slots of finished req %s key=%s were reassigned before its last "
-            "step materialized; rows may be stale",
-            int(violated.sum()),
+        _raise_unreadable_hit(
             req_id,
             key,
+            f"{int(violated.sum())} hit slots reassigned before this delayed read "
+            f"({'live' if live else 'finished'} req, block reuse)",
         )
 
     # ---------------------------------------------------------- merge

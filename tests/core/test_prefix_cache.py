@@ -1246,22 +1246,41 @@ def test_same_step_hit_prefetch_starts_at_save(caplog):
     assert torch.equal(outs.hidden_states["b"][:8], expected_rows(view.slots_for("b", 0, 8)))
 
 
-def test_reassigned_hit_of_finished_req_warns_instead_of_raising(caplog):
-    """Blocks are freed one step before finished_req_ids arrives; a late
-    materialize of a finished request may find them IN_TRANSIT to a new
-    tenant. Fatal for a live request, a warning for a finished one."""
+def test_delayed_read_of_reassigned_hit_raises():
+    """A version check with no COW copy still raises for live and finished.
+    The production path registers the ref first so remap preserves the rows
+    (see test_delayed_read_after_committed_reuse_serves_preserved)."""
     mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0, 1], 0, 8)})
     mgr.materialize(s1, ["a"])
     slots = view.slots_for("a", 0, 8)
+    with mgr._state_lock:
+        planned = mgr._slot_status.get_slot_status(HIDDEN_KEY).slot_version[slots].clone()
     mgr._controller.dispatch = lambda tasks: None  # new tenant's write stays IN_TRANSIT
     s2 = run_step(mgr, view, {"c": ([0, 1], 0, 8)}, finished=["a"])
-    with pytest.raises(OmniPrefixCacheUnmatchError, match="reassigned"):
-        mgr._ensure_not_reassigned(slots, HIDDEN_KEY, req_id="c")
-    with caplog.at_level(logging.WARNING, logger="vllm_omni.core.prefix_cache.manager"):
-        mgr._ensure_not_reassigned(slots, HIDDEN_KEY, req_id="a")
-    assert any("finished req a" in r.message for r in caplog.records)
+    for req in ("c", "a"):  # live then finished — both fatal without a preserved copy
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="reassigned"):
+            mgr._ensure_not_reassigned(slots, HIDDEN_KEY, req_id=req, planned_version=planned)
     mgr.discard_step(s2)
+
+
+def test_delayed_read_after_committed_reuse_serves_preserved():
+    """Amy's block-0 reuse: plan A's read, then B commits over the same
+    slots. The reusing write copy-on-writes A's committed rows into the
+    planned ref; the delayed fetch must return those, not B's."""
+    mgr, view = make_manager()
+    sa = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(sa, ["a"])  # A committed into block 0
+    slots = view.slots_for("a", 0, 4)
+    with mgr._state_lock:
+        src = mgr._slot_ref(slots, HIDDEN_KEY, "a")  # plan A's read
+    assert src.already_staged and not src.staged_list and not src.join_tids
+    sb = run_step(mgr, view, {"b": ([0], 0, 4)}, finished=["a"])
+    mgr.materialize(sb, ["b"])  # A freed, block 0 reused by B and COMMITTED
+    with torch.inference_mode():
+        got = mgr._fetch_source(src)
+    assert torch.equal(got, expected_rows(slots))
+    assert all(ref is not src for ref in mgr._pending_reads)
 
 
 def test_join_next_step_hit_survives_task_already_drained():
