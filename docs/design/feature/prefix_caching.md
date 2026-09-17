@@ -246,7 +246,9 @@ Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
 - Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into
   a staging slot; the committer waits that event and writes the CPU pool.
-  The next save waits `host_ready`.
+  The next save waits `done` (the pool write): a reused slot must never
+  leave a pending pool write behind, or a delayed hit read of the old rows
+  would find nothing recoverable.
 - Deferred (`JOIN_ON_FINISH`): mm whose first dim is this step's token count
   stays on a per-request GPU clone; `_WriteChunk`s append across steps;
   finish/abort (or GPU-byte-budget pressure) forces the copy. One open
@@ -306,7 +308,7 @@ Threads, locks, and what each may block on:
 
 | Thread | Role | May block on | Must not hold while blocked |
 | --- | --- | --- | --- |
-| Engine | `new_step_starts`, `save_outputs` | previous-step `join_host_ready`; `reserve()` GPU-byte flush; staging-slot claim; `dispatch()` / finish-abort `escalate()` (eager mode: the copy + pool write run inline) | `_state_lock` |
+| Engine | `new_step_starts`, `save_outputs` | previous-step `join` (`done`) / finished-write `join_host_ready`; `reserve()` GPU-byte flush; staging-slot claim; `dispatch()` / finish-abort `escalate()` (eager mode: the copy + pool write run inline) | `_state_lock` |
 | Async output builder | `materialize` (may overlap the next engine step) | this step's `step_d2h_event`; `join` (`done`); deferred `fetch_host` | `_state_lock` |
 | Committer | `_worker_loop`: wait device→host / deferred copy / pool write | `_wake.wait`; `step_d2h_event` or copy-stream sync | never takes `_state_lock` |
 | Prefetch pool | hit-span gather during forward | `join` (`done`); deferred `fetch_host` | `_state_lock` |

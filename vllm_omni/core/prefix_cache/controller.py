@@ -120,7 +120,7 @@ class TaskState(Enum):
     HOST_READY  host rows ready (`host_ready` set); device clone dropped
     WRITTEN     in the CPU pool (`done` set)
     FAILED      committer could not finish (`host_ready` + `done` set;
-                manager raises on next entry)
+                manager raises from every later entry)
 
     Moves only through `WriteTask.transition`; skipping a step is illegal.
     """
@@ -216,6 +216,18 @@ class WriteTask:
             prev = self.reassigned.get(key)
             self.reassigned[key] = slots.clone() if prev is None else torch.cat([prev, slots])
 
+    def reassigned_intersects(self, chunk: _WriteChunk) -> bool:
+        """True if this write already lost ownership of any (key, slot) the
+        chunk would add; the caller opens a fresh WriteTask instead."""
+        with self.lock:
+            if not self.reassigned:
+                return False
+            for key in chunk.tensors:
+                taken = self.reassigned.get(key)
+                if taken is not None and taken.numel() and bool(torch.isin(chunk.slots_cpu, taken).any()):
+                    return True
+            return False
+
     # ------------------------------------------------------------ lifecycle
 
     def transition(self, to: TaskState) -> None:
@@ -231,10 +243,12 @@ class WriteTask:
             self._transition_locked(to)
             return True
 
-    def _transition_locked(self, to: TaskState) -> None:
+    def _transition_locked(self, to: TaskState, wake: bool = True) -> None:
         if not _is_legal_move(self.state, to):
             raise OmniPrefixCacheUnmatchError(f"task {self.tid}: illegal transition {self.state.name} -> {to.name}")
         self.state = to
+        if not wake:
+            return
         if to is TaskState.HOST_READY:
             self.host_ready.set()
         elif to is TaskState.WRITTEN:
@@ -292,14 +306,22 @@ class WriteTask:
             self._clear_tensors()
             self._transition_locked(TaskState.HOST_READY)
 
-    def mark_failed(self) -> bool:
-        """-> FAILED from any non-terminal state; unblocks joiners. False if already terminal."""
+    def mark_failed(self, *, defer_wake: bool = False) -> bool:
+        """-> FAILED from any non-terminal state; unblocks joiners. False if
+        already terminal. ``defer_wake``: the caller publishes the failure
+        record first, then calls ``wake_failed_waiters``."""
         with self.lock:
             if self.state.is_terminal:
                 return False
             self._clear_tensors()
-            self._transition_locked(TaskState.FAILED)
+            self._transition_locked(TaskState.FAILED, wake=not defer_wake)
             return True
+
+    def wake_failed_waiters(self) -> None:
+        """Set the events after the failure record is published (see
+        ``mark_failed(defer_wake=True)``): a woken joiner must find it."""
+        self.host_ready.set()
+        self.done.set()
 
     def mark_done(self) -> None:
         """HOST_READY -> WRITTEN."""
@@ -456,7 +478,7 @@ class OmniPrefixCacheController:
         self._eager = (not torch.cuda.is_available()) if eager is None else eager
         self._tasks: dict[Tid, WriteTask] = {}
         self._completed: deque[Tid] = deque()  # pool write done, awaiting manager drain
-        self._failed: deque[Tid] = deque()  # write failed; manager raises on next entry
+        self._failed: deque[Tid] = deque()  # write failed; manager raises from every later entry (sticky)
         self._staged_bytes = 0
         self._lock = threading.Lock()
         self._wake = threading.Condition(self._lock)
@@ -677,6 +699,11 @@ class OmniPrefixCacheController:
                     f"task {tid} ({task.schedule.value}) did not reach {event} within {timeout:g}s "
                     f"(state={task.state.name}, in_flight_tasks={len(self._tasks)})"
                 )
+            if task.state is TaskState.FAILED:
+                # FAILED sets both events; success here would read rows the
+                # write never produced. The one-shot failure record may have
+                # been drained by another thread — do not rely on it.
+                raise OmniPrefixCacheUnmatchError(f"task {tid} ({task.schedule.value}) write failed before {event}")
 
     def drain_completed(self) -> list[int]:
         """Pop pool-written tasks from `_completed` and drop them from `_tasks`.
@@ -888,7 +915,7 @@ class OmniPrefixCacheController:
         raise after a successful copy stage does not uncharge twice.
         """
         task = self._tasks.get(tid) if tid is not None else None
-        if task is None or not task.mark_failed():
+        if task is None or not task.mark_failed(defer_wake=True):
             return
         self._release_staged_bytes(task)
         with self._wake:
@@ -900,6 +927,9 @@ class OmniPrefixCacheController:
             # never landed, which the manager must raise on (hiding it would
             # crash on every future hit that touches these slots).
             self._failed.append(task.tid)
+        # Events last: a joiner woken by them must find the record on drain,
+        # not read never-written pool rows in a done-but-unpublished window.
+        task.wake_failed_waiters()
 
     @torch.inference_mode()
     def _scatter_host_ready(self) -> None:
@@ -924,9 +954,11 @@ class OmniPrefixCacheController:
     def _scatter(self, task: WriteTask) -> None:
         for key, slots, host in task.scatter_rows():
             self._pool.write(key, slots, host)
-        task.mark_done()
-        # This write was the staging page's last reader. Release before
-        # publishing so a join() that sees `done` never sees a busy slot.
+        # `done` is set LAST: a join(done) waiter (the save barrier) must find
+        # the completion record on its next drain and the staging slot free —
+        # a done-but-undrained window would leave occupancy IN_TRANSIT and
+        # make the COW preserve skip the reused rows.
         self._release_task_slot(task)
         with self._lock:
             self._completed.append(task.tid)
+        task.mark_done()

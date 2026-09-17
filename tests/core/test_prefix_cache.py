@@ -603,6 +603,26 @@ def test_deferred_tenant_succession_no_stale_wins():
     assert torch.equal(mgr._pool.rows("k", slots), torch.full((2, 2), 2.0))
 
 
+def test_reacquired_slot_deferred_rewrite_wins_over_interim_tenant():
+    """Preempt + resume onto the same block: the rewrite must open a new
+    write, or the old task's reassigned tombstone drops the fresh rows and
+    the interim tenant's stale value is served as a's."""
+    policy = ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"}))
+    mgr, view = make_manager(policy=policy)
+    s1 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 11.0)})
+    mgr.materialize(s1, ["a"])
+    slots = view.slots_for("a", 0, 1)
+    s2 = run_step(mgr, view, {"b": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 22.0)})
+    mgr.materialize(s2, ["b"])
+    s3 = run_step(mgr, view, {"z": ([9], 0, 1)}, finished=["b"])  # 22 committed
+    mgr.materialize(s3, ["z"])
+    s4 = run_step(mgr, view, {"a": ([2], 0, 1)}, mm={"k": torch.full((1, 2), 33.0)})  # a re-claims
+    mgr.materialize(s4, ["a"])
+    s5 = run_step(mgr, view, {"z2": ([9], 1, 1)}, finished=["a"])  # flush a's write
+    mgr.materialize(s5, ["z2"])
+    assert torch.equal(mgr._pool.rows("k", slots), torch.full((1, 2), 33.0))
+
+
 def test_deferred_key_hit_reads_staged_rows_not_mirror():
     policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
@@ -818,6 +838,7 @@ def test_slot_reuse_pushes_skip_to_old_task():
     def hold(tasks):
         for task in tasks:
             task.host_ready.set()
+            task.done.set()  # satisfy the next save's done barrier; state stays QUEUED
 
     mgr._controller.dispatch = hold
     policy = ModelCachePolicy(needs_full_hidden_states=False)
@@ -1015,7 +1036,7 @@ def test_mm_in_transit_unresolvable_fails_fast():
 
 
 def test_lock_never_covers_fetch_or_join():
-    """State lock must not be held across join_host_ready or fetch_host."""
+    """State lock must not be held across join / join_host_ready / fetch_host."""
     policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
     calls = []
@@ -1025,9 +1046,11 @@ def test_lock_never_covers_fetch_or_join():
         calls.append((kind, on_facade and mgr._state_lock.locked()))
 
     real_fetch = mgr._controller.fetch_host
-    real_join = mgr._controller.join_host_ready
+    real_join_hr = mgr._controller.join_host_ready
+    real_join = mgr._controller.join
     mgr._controller.fetch_host = lambda *a, **kw: (probe("fetch"), real_fetch(*a, **kw))[1]
-    mgr._controller.join_host_ready = lambda ids: (probe("join"), real_join(ids))[1]
+    mgr._controller.join_host_ready = lambda ids: (probe("join"), real_join_hr(ids))[1]
+    mgr._controller.join = lambda ids: (probe("join"), real_join(ids))[1]
 
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 1.0)})
     mgr.materialize(s1, ["a"])
@@ -1055,6 +1078,23 @@ def test_failed_write_fails_fast_at_next_facade_entry():
     mgr._controller._fail_task(999)
     with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
         run_step(mgr, view, {"a": ([0, 1], 4, 1)})
+    # Sticky: the record is one-shot and the first raise may land in a
+    # swallowed path (prefetch Future dropped by discard_step); a later
+    # entry must keep raising, never serve zeros for the lost rows.
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
+        run_step(mgr, view, {"c": ([0, 1], 0, 4)})
+
+
+def test_join_raises_on_failed_task():
+    """A joiner woken by FAILED must not treat the wake as a completed
+    write; the one-shot failure record may already be drained elsewhere."""
+    mgr, view = make_manager()
+    _hold_writes(mgr)
+    run_step(mgr, view, {"a": ([0], 0, 4)})
+    tid = next(iter(mgr._request_tasks.tasks["a"]))
+    mgr._controller._fail_task(tid)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="failed before done"):
+        mgr._controller.join([tid])
 
 
 def test_per_request_staging_writes():
@@ -1285,6 +1325,60 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
         got = mgr._fetch_source(src)
     assert torch.equal(got, expected_rows(slots))
     assert all(ref is not src for ref in mgr._pending_reads)
+
+
+def test_done_fires_only_after_completion_record_published():
+    """A join(done) waiter (the save barrier) must find the completion record
+    on its next drain — done-before-append leaves occupancy IN_TRANSIT and the
+    COW preserve skips the reused rows."""
+    mgr, view = make_manager()
+    checks = []
+    orig_scatter = mgr._controller._scatter
+
+    def scatter(task):
+        orig_set = task.done.set
+
+        def checked_set():
+            checks.append(task.tid in mgr._controller._completed)
+            orig_set()
+
+        task.done.set = checked_set
+        orig_scatter(task)
+
+    mgr._controller._scatter = scatter
+    sid = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(sid, ["a"])
+    assert checks and all(checks)
+
+
+def test_failed_wakes_only_after_failure_record_published():
+    """Same window as the done/_completed one, failure side: a joiner woken
+    by FAILED must find the record on drain, not read never-written rows."""
+    mgr, view = make_manager()
+    _hold_writes(mgr)  # keep the write non-terminal
+    run_step(mgr, view, {"a": ([0], 0, 4)})
+    tid = next(iter(mgr._request_tasks.tasks["a"]))
+    task = mgr._controller.get_task(tid)
+    checks = []
+    orig_set = task.done.set
+
+    def checked_set():
+        checks.append(tid in mgr._controller._failed)
+        orig_set()
+
+    task.done.set = checked_set
+    mgr._controller._fail_task(tid)
+    assert checks and all(checks)
+
+
+def test_save_waits_pool_write_of_previous_step():
+    """A save must not reuse slots whose JOIN_NEXT_STEP write has not reached
+    the pool — no delayed read could recover such a row."""
+    mgr, view = make_manager(staging_claim_timeout_s=0.2)
+    _hold_writes(mgr)  # host_ready only; the pool write never happens
+    run_step(mgr, view, {"a": ([0], 0, 4)})
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="did not reach done"):
+        run_step(mgr, view, {"b": ([1], 0, 4)})
 
 
 def test_join_next_step_hit_survives_task_already_drained():

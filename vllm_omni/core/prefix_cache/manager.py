@@ -28,7 +28,8 @@ Two write paths (which keys, not how many tokens):
     JOIN_NEXT_STEP      immediately-cached keys. Device→host is already
                         in flight at submit; the committer waits
                         `step_d2h_event` then copies host→pool. The next
-                        save waits `host_ready` only.
+                        save waits `done`: reused slots must not leave a
+                        pending pool write behind.
     JOIN_ON_FINISH      deferred mm. Stays on the device clone; the
                         committer does that device→host, then writes the
                         pool. Forced onto the high-priority queue on
@@ -456,6 +457,9 @@ class OmniPrefixCacheManager:
         # old rows into ``_SlotRef.preserved`` before overwriting (COW). Guarded
         # by ``_state_lock``; each ref is dropped when its fetch completes.
         self._pending_reads: list[_SlotRef] = []
+        # Sticky fatal set on the first drained write failure; every later
+        # facade entry re-raises it (see _commit_drained_writes).
+        self._fatal_write_failure: str | None = None
 
         # Prefix gather during forward (CPU work releases the GIL).
         # One worker: complete in submit order; pop finished work from the head.
@@ -849,17 +853,23 @@ class OmniPrefixCacheManager:
             ) from e
 
     def _wait_for_host_ready(self) -> None:
-        """Pop last step's join worklists, then wait ``host_ready`` unlocked.
+        """Pop last step's join worklists and wait them out, unlocked.
 
-        Lock covers only the pop. ``join_host_ready`` may block on device→host.
+        JOIN_NEXT_STEP waits ``done``, not ``host_ready``: this save may reuse
+        those slots, and a pool write still pending behind a reused slot is
+        unreadable for a delayed hit read (scatter skips reassigned rows).
+        Escalated deferred writes keep ``host_ready`` — their readers hold the
+        task in ``staged_list``. Lock covers only the pop.
         """
         with self._state_lock:
-            join_ids = list(self._join_finished_tids)
-            join_ids.extend(self._join_next_step_tids)
+            finished_ids = list(self._join_finished_tids)
+            next_step_ids = list(self._join_next_step_tids)
             self._join_finished_tids.clear()
             self._join_next_step_tids.clear()
-        if join_ids:
-            self._controller.join_host_ready(join_ids)
+        if finished_ids:
+            self._controller.join_host_ready(finished_ids)
+        if next_step_ids:
+            self._controller.join(next_step_ids)
 
     @_locked
     def _publish_saved_step(
@@ -1077,13 +1087,17 @@ class OmniPrefixCacheManager:
         """Caller holds ``_state_lock``. Register pre-built deferred `_WriteChunk`s
         (bytes already reserved by save_outputs).
 
-        A request's open deferred task may have been closed by the budget
-        flush in reserve(); this step's rows then start a new write
-        (``write_n`` + 1). Hits read both through ``staged_list``.
+        A new write (``write_n`` + 1) starts when the open task was closed by
+        the budget flush, or when a chunk re-acquires a (key, slot) the task
+        already lost — appending there would let its own reassigned tombstone
+        drop the fresh rows at scatter. Hits read both through ``staged_list``.
         """
         for req_id, chunk in deferred_chunks:
             task = self._request_tasks.deferred.get(req_id)
-            if task is not None and self._controller.append_chunk(task, chunk, freeze_event) is not None:
+            if task is not None and (
+                task.reassigned_intersects(chunk)
+                or self._controller.append_chunk(task, chunk, freeze_event) is not None
+            ):
                 task = None
             if task is None:
                 task = WriteTask(
@@ -1120,8 +1134,14 @@ class OmniPrefixCacheManager:
                 old_task.add_reassigned(key, stolen)
 
     def _preserve_for_pending_reads(self, new_slots: torch.Tensor, keys: tuple[str, ...]) -> None:
-        """Caller holds ``_state_lock``. Copy still-valid committed rows
-        into each pending ref before ``new_slots`` are claimed."""
+        """Caller holds ``_state_lock``. Copy still-valid committed rows into
+        each pending ref before ``new_slots`` are claimed.
+
+        Only COMMITTED rows at the reserved version need rescuing: the save
+        barrier joins JOIN_NEXT_STEP writes to ``done`` and publish drains
+        before claiming, and JOIN_ON_FINISH in-transit rows are read through
+        ``staged_list`` task refs directly.
+        """
         new_set = {int(s) for s in new_slots.tolist()}
         for ref in self._pending_reads:
             if ref.key not in keys or ref.reserved_version is None or not self._pool.has_key(ref.key):
@@ -1132,11 +1152,8 @@ class OmniPrefixCacheManager:
                 s = int(s)
                 if s not in new_set or s in ref.preserved:
                     continue
-                # Only rows the pool holds definitively (COMMITTED) and still
-                # at the version this ref reserved are ours to rescue.
-                committed = status.state[s] == _Occupancy.COMMITTED
-                same_ver = int(status.slot_version[s]) == int(ref.reserved_version[i])
-                if committed and same_ver:
+                committed = int(status.state[s]) == _Occupancy.COMMITTED
+                if committed and int(status.slot_version[s]) == int(ref.reserved_version[i]):
                     take.append((i, s))
             if not take:
                 continue
@@ -1146,16 +1163,22 @@ class OmniPrefixCacheManager:
 
     @torch.inference_mode()
     def _commit_drained_writes(self) -> None:
-        """Fold completed/failed writes into occupancy. Caller holds ``_state_lock``."""
+        """Fold completed/failed writes into occupancy. Caller holds ``_state_lock``.
+
+        A failed write leaves rows absent behind hashes vLLM already
+        published — unservable and unrecoverable, so fatal. The fatality is
+        sticky: the drained record is one-shot and the first raise can land
+        in a swallowed path (a prefetch Future dropped by discard_step), so
+        every later entry must keep raising rather than serve zeros.
+        """
+        if self._fatal_write_failure is not None:
+            raise OmniPrefixCacheUnmatchError(self._fatal_write_failure)
         failed = self._controller.drain_failed()
         if failed:
-            # A failed write leaves rows absent behind hashes vLLM already
-            # published — unservable and unrecoverable, so fatal. Raise here,
-            # once, at the earliest public entry instead of leaving every
-            # future hit that touches these slots unreadable.
-            raise OmniPrefixCacheUnmatchError(
+            self._fatal_write_failure = (
                 f"prefix cache write failed for task(s) {failed}; cached rows lost behind published hashes"
             )
+            raise OmniPrefixCacheUnmatchError(self._fatal_write_failure)
         drained = self._controller.drain_completed()
         if drained:
             self._slot_status.commit(drained)

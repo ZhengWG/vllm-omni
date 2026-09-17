@@ -41,7 +41,7 @@ class WriteSchedule(Enum):
 
     # Immediately-cached keys: device→host launched at save into the
     # staging pool; committer waits that event and writes the CPU pool.
-    # The next save waits host_ready.
+    # The next save waits done (a reused slot must be pool-complete).
     JOIN_NEXT_STEP = "join_next_step"
     # Deferred mm: stays on the GPU clone until finish/abort (GPU-byte
     # budget may force a copy earlier). One WriteTask per request.
