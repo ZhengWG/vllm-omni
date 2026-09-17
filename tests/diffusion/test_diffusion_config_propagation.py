@@ -17,11 +17,18 @@ from vllm_omni.diffusion.data import (
 )
 from vllm_omni.diffusion.diffusion_kv.config import DiffusionKVCacheMode
 from vllm_omni.diffusion.model_metadata import (
+    FLUX2_KLEIN_MAX_INPUT_IMAGES,
     HUNYUAN_IMAGE3_MAX_INPUT_IMAGES,
     QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES,
 )
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+
+@pytest.fixture(autouse=True)
+def _local_model_paths(monkeypatch):
+    # These tests exercise config transport, not model repository resolution.
+    monkeypatch.setattr("vllm_omni.diffusion.data.get_model_path", lambda model, revision: model)
 
 
 def _roundtrip_diffusion_config(**kwargs) -> OmniDiffusionConfig:
@@ -194,6 +201,18 @@ def test_qwen_image_edit_plus_sets_generic_multimodal_limit():
 
     assert od_config.supports_multimodal_inputs is True
     assert od_config.max_multimodal_image_inputs == QWEN_IMAGE_EDIT_PLUS_MAX_INPUT_IMAGES
+
+
+def test_flux2_klein_sets_generic_multimodal_limit():
+    od_config = OmniDiffusionConfig(
+        model="black-forest-labs/FLUX.2-klein-9B",
+        model_class_name="Flux2KleinPipeline",
+    )
+
+    od_config.update_multimodal_support()
+
+    assert od_config.supports_multimodal_inputs is True
+    assert od_config.max_multimodal_image_inputs == FLUX2_KLEIN_MAX_INPUT_IMAGES
 
 
 def test_task_type_roundtrip():
