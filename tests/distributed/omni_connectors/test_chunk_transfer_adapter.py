@@ -2054,6 +2054,36 @@ def test_finish_requests_does_not_wait_for_inflight_send(build_adapter):
     assert first.external_req_id not in adapter.put_req_chunk
 
 
+def test_inflight_abort_reclaims_shm_after_put_returns(build_adapter):
+    adapter, connector = build_adapter(stage_id=1)
+    request = _req("req-abort-shm", RequestStatus.WAITING, external_req_id="ext-abort-shm")
+    adapter.custom_process_next_stage_input_func = lambda **kwargs: OmniPayloadStruct()
+    put_started = threading.Event()
+    release_put = threading.Event()
+
+    def blocking_put(**kwargs):
+        put_started.set()
+        release_put.wait(timeout=2)
+        return True, 1, {}
+
+    connector.put.side_effect = blocking_put
+    adapter.save_async(multimodal_output=None, request=request)
+    task = adapter._pending_save_reqs.popleft()
+    sender = threading.Thread(target=adapter._send_single_request, args=(task,))
+    sender.start()
+    assert put_started.wait(timeout=1)
+    adapter.finish_requests(
+        [request.request_id],
+        RequestStatus.FINISHED_ABORTED,
+        {request.request_id: request},
+    )
+    assert connector.cleanup.call_count == 0
+    release_put.set()
+    sender.join(timeout=1)
+    assert not sender.is_alive()
+    connector.cleanup.assert_called_with("ext-abort-shm")
+
+
 def test_cleanup_only_affects_target_request(build_adapter):
     """Cleanup for one request must not affect another request's state."""
     adapter, _ = build_adapter(stage_id=1)

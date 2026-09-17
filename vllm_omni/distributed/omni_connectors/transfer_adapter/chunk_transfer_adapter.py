@@ -636,12 +636,19 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         try:
             self._send_single_request_for_generation(task, sender_token)
         finally:
+            cancelled_after_send = False
             with self._sender_state_lock:
                 if self._sender_tokens.get(external_req_id) is sender_token:
                     sender_token.in_flight = False
                     if sender_token.cancelled:
+                        cancelled_after_send = True
                         self._sender_tokens.pop(external_req_id, None)
                         self._clear_sender_state_locked(external_req_id)
+            if cancelled_after_send:
+                # Abort / finish_requests returned without waiting for put().
+                # Orchestrator reclaim may already have run, so unlink whatever
+                # this send just wrote.
+                self._reclaim_sender_shm(external_req_id)
 
     def _sender_generation_is_active(
         self,
@@ -852,8 +859,9 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
 
         Called after a terminal chunk is sent or when the scheduler aborts the
         request before a terminal chunk can be produced. In-flight sends are
-        cancelled here and reclaim their own state in ``finally``; cleanup
-        never waits for connector I/O on the scheduler thread.
+        cancelled here and reclaim adapter state plus leftover SHM in
+        ``finally`` after ``put()`` returns; cleanup never waits for connector
+        I/O on the scheduler thread.
 
         Idempotent: calling with an already-cleaned or unknown id is safe.
         """
@@ -885,6 +893,17 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         cached_ic = getattr(self, "_cached_ic", None)
         if cached_ic is not None:
             cached_ic.pop(external_req_id, None)
+
+    def _reclaim_sender_shm(self, external_req_id: str) -> None:
+        """Unlink SHM written by a cancelled in-flight ``put()``."""
+        connector = getattr(self, "connector", None)
+        cleanup = getattr(connector, "cleanup", None)
+        if cleanup is None:
+            return
+        try:
+            cleanup(external_req_id)
+        except Exception as e:
+            logger.warning("Cancelled in-flight send left SHM for %s unreclaimed: %s", external_req_id, e)
 
     def release_shm_resources(self, request_id: str) -> int:
         """Unlink inter-stage segments this request left unconsumed.
