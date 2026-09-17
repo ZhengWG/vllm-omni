@@ -1470,7 +1470,7 @@ stages:
         assert thinker.yaml_engine_args["enforce_eager"] is True
         assert thinker.yaml_engine_args["async_scheduling"] is False
         assert thinker.yaml_engine_args["distributed_executor_backend"] == "mp"
-        assert thinker.yaml_engine_args["enable_prefix_caching"] is True
+        assert thinker.yaml_engine_args["enable_prefix_caching"] is False
         assert thinker.yaml_engine_args["async_chunk"] is False
         assert thinker.yaml_extras["default_sampling_params"]["detokenize"] is True
 
