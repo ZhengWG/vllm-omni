@@ -423,6 +423,7 @@ class Orchestrator:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
+    _transfer_release_tasks: set[asyncio.Task] = set()
     duplex_control_plane: DuplexControlPlanePort | None = None
 
     def __init__(
