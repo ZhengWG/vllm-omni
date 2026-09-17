@@ -213,10 +213,6 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         finally:
             set_cudagraph_capturing_enabled(False)
 
-    def _model_needs_full_prefix_hidden_states(self) -> bool:
-        """See gpu_ar_model_runner._model_needs_full_prefix_hidden_states."""
-        return self._needs_full_prefix_hidden_states_flag
-
     def _maybe_update_prefix_cache(
         self,
         hidden_states: torch.Tensor,
@@ -412,13 +408,8 @@ class NPUARModelRunner(OmniNPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
                 if flush_ids:
                     self.flush_full_payload_outputs(flush_ids)
 
-        # Prefix-cache lifecycle: must run before _update_states removes
-        # finished requests (finished/abort escalation happens inside
-        # new_step_starts).
-        if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
-            self._ensure_omni_prefix_cache()
-        if self.omni_prefix_cache is not None:
-            self.omni_prefix_cache.new_step_starts(scheduler_output)
+        # Exactly once per real scheduler_output, before _update_states.
+        self._prefix_cache_step_begin(scheduler_output)
 
         #  -------------------------------------- Omni-new -------------------------------------------------
         if self.speculative_config is not None and self.speculative_config.use_ngram_gpu():

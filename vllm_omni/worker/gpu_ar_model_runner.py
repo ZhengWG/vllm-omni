@@ -635,17 +635,6 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         finally:
             set_cudagraph_capturing_enabled(False)
 
-    def _model_needs_full_prefix_hidden_states(self) -> bool:
-        """Opt-out hook for models whose postprocess only consumes the tail.
-
-        When False, we skip both the per-step hidden-state write into the
-        omni prefix cache and the merged-tensor reconstruction on hits;
-        postprocess receives the normal scheduled-token slice instead. Models
-        that need the full cached_prefix + new_tail span (default) are not
-        affected.
-        """
-        return self._needs_full_prefix_hidden_states_flag
-
     def _get_runner_assisted_full_attention_metadata_request(
         self,
         *,
@@ -868,13 +857,9 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             if hasattr(self.model, "_clear_warmup_state"):
                 self.model._clear_warmup_state()
 
-        # Prefix-cache lifecycle entry. Contract: must run before
-        # _update_states removes finished requests, exactly once per real
-        # scheduler_output (dummy/warmup runs never reach execute_model).
-        if self.omni_prefix_cache is None and self._omni_prefix_cache_cfg is not None:
-            self._ensure_omni_prefix_cache()
-        if self.omni_prefix_cache is not None:
-            self.omni_prefix_cache.new_step_starts(scheduler_output)
+        # Exactly once per real scheduler_output, before _update_states
+        # (dummy/warmup runs never reach execute_model).
+        self._prefix_cache_step_begin(scheduler_output)
 
         # [Omni] Handle KV transfer BEFORE updating states (which removes finished requests)
         finished_reqs = getattr(scheduler_output, "finished_requests_needing_kv_transfer", {})

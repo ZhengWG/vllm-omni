@@ -33,13 +33,8 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner, PerLayerAttnMetadata
 from vllm.v1.worker.ubatch_utils import maybe_create_ubatch_slices
 
-from vllm_omni.core.prefix_cache import (
-    ModelCachePolicy,
-    OmniPrefixCacheManager,
-    OmniPrefixCacheUnmatchError,
-    get_prefix_cache_group_view,
-    stage_prefix_cache_config,
-)
+from vllm_omni.core.prefix_cache import stage_prefix_cache_config
+from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 from vllm_omni.data_entry_keys import OmniPayload
 from vllm_omni.engine.serialization import deserialize_additional_information
 from vllm_omni.model_executor.layers.rotary_embedding.mrope import OmniMRotaryEmbedding as MRotaryEmbedding
@@ -85,7 +80,7 @@ def _filter_mrope_kwargs_for_model(model: object, kwargs: dict[str, Any]) -> dic
     return {key: value for key, value in kwargs.items() if key in accepted}
 
 
-class OmniGPUModelRunner(GPUModelRunner):
+class OmniGPUModelRunner(PrefixCacheRunnerMixin, GPUModelRunner):
     intermediate_tensors: IntermediateTensors | None
 
     def __init__(self, *args, **kwargs):
@@ -100,9 +95,8 @@ class OmniGPUModelRunner(GPUModelRunner):
         self._omni_prefix_cache_cfg = None
         self._sampled_token_ids_cpu_override = None
         self._omni_query_start_loc_model_kwarg = False
-        # Model constants snapshotted once in load_model; the hot path must
-        # not re-probe model attributes every step.
-        self._needs_full_prefix_hidden_states_flag = True
+        # Output-payload constant snapshotted once in load_model; the cache
+        # policy counterpart lives on PrefixCacheRunnerMixin.
         self._pooler_payload_include_hidden_flag = True
 
     def _to_list(self, sampled_token_ids: torch.Tensor) -> list[list[int]]:
@@ -200,37 +194,11 @@ class OmniGPUModelRunner(GPUModelRunner):
             self._omni_prefix_cache_cfg = cfg
 
     def _snapshot_prefix_cache_model_flags(self, model) -> None:
-        """Freeze the model's prefix-cache-relevant constants (set in the
-        model's __init__) so per-step code reads plain attributes."""
-        self._needs_full_prefix_hidden_states_flag = bool(
-            getattr(model, "requires_full_prefix_cached_hidden_states", True)
-        )
+        """Freeze the model's load-time constants: the cache policy (on the
+        mixin) and the output-payload hidden flag (a runner concern that
+        also has consumers with the cache disabled)."""
+        self._snapshot_prefix_cache_model_policy(model)
         self._pooler_payload_include_hidden_flag = bool(getattr(model, "omni_pooler_payload_include_hidden", True))
-
-    def _ensure_omni_prefix_cache(self) -> None:
-        """One-shot construction (caller gates on the staged config).
-
-        Only the last PP rank writes and materializes the cache. Other ranks
-        would register hits they can never serve (save_outputs is last-rank
-        only), so skip construction there.
-        """
-        cfg = self._omni_prefix_cache_cfg
-        self._omni_prefix_cache_cfg = None
-        if not get_pp_group().is_last_rank:
-            return
-        view = get_prefix_cache_group_view(
-            self.input_batch,
-            cfg.block_size,
-            kv_cache_groups=getattr(self.kv_cache_config, "kv_cache_groups", None),
-        )
-        if view is None:
-            raise OmniPrefixCacheUnmatchError(
-                "omni prefix caching requires a block table on the input batch; "
-                "disable enable_prefix_caching for this model"
-            )
-        manager = OmniPrefixCacheManager(cfg, view)
-        manager.register_policy(ModelCachePolicy.from_model(getattr(self, "model", None)))
-        self.omni_prefix_cache = manager
 
     @instrument(span_name="Loading (GPU)")
     def load_model(self, *args, **kwargs) -> None:
