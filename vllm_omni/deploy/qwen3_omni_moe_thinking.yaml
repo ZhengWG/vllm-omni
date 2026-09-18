@@ -4,7 +4,7 @@
 # Verified on 2x H100-80G GPUs.
 pipeline: qwen3_omni_moe_thinker_only
 distributed_executor_backend: mp
-enable_prefix_caching: false
+enable_prefix_caching: true
 
 stages:
   - stage_id: 0
