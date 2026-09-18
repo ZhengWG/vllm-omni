@@ -73,7 +73,9 @@ def _baseline_path() -> Path:
     return path
 
 
-_OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "hunyuan_image3" / "end2end.py"
+# Shared T2I example. The Hunyuan-specific end2end.py script was removed when
+# HunyuanImage-3.0 moved onto this path.
+_OFFLINE_SCRIPT = _REPO_ROOT / "examples" / "offline_inference" / "text_to_image" / "text_to_image.py"
 
 # DiT-only deploy config with trust_remote_code (based on hunyuan_image3_dit.yaml).
 _DEPLOY_CONFIG: dict[str, Any] = {
@@ -228,20 +230,22 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
     import subprocess
     import sys
 
-    output_dir = str(output_path.parent)
+    if not _OFFLINE_SCRIPT.is_file():
+        raise FileNotFoundError(f"Offline HunyuanImage3 example is missing: {_OFFLINE_SCRIPT}")
+
     subprocess.run(
         [
             sys.executable,
             str(_OFFLINE_SCRIPT),
-            "--modality",
-            "text2img",
+            "--model",
+            model,
             "--deploy-config",
             deploy_config,
-            "--prompts",
+            "--prompt",
             PROMPT,
             "--output",
-            output_dir,
-            "--steps",
+            str(output_path),
+            "--num-inference-steps",
             str(NUM_INFERENCE_STEPS),
             "--guidance-scale",
             str(GUIDANCE_SCALE),
@@ -251,21 +255,17 @@ def _run_vllm_omni_hunyuan_image3_offline(*, model: str, deploy_config: str, out
             str(HEIGHT),
             "--width",
             str(WIDTH),
-            "--bot-task",
-            "none",
-            "--sys-type",
+            "--extra-body",
+            '{"bot_task": "none"}',
+            "--use-system-prompt",
             "en_unified",
-            "--model",
-            model,
+            "--trust-remote-code",
             "--enforce-eager",
         ],
         check=True,
     )
-    images = sorted(Path(output_dir).glob("output_*.png"))
-    assert images, f"No output image found in {output_dir}"
-    image = Image.open(images[0]).convert("RGB")
+    image = Image.open(output_path).convert("RGB")
     image.load()
-    image.save(output_path)
     return image
 
 
@@ -311,6 +311,23 @@ def test_hunyuan_image3_pixel_accuracy_online(accuracy_artifact_root: Path) -> N
             model=model, deploy_config=str(deploy_config_path), output_path=output_dir / "vllm_omni_online.png"
         )
     _assert_against_baseline(image, "online")
+
+
+@pytest.mark.core_model
+@pytest.mark.cpu
+def test_hunyuan_image3_offline_example_script_is_present() -> None:
+    """Guard the shared T2I example so nightly offline accuracy cannot call a removed path."""
+    assert _OFFLINE_SCRIPT.is_file(), f"missing {_OFFLINE_SCRIPT}"
+    source = _OFFLINE_SCRIPT.read_text(encoding="utf-8")
+    for flag in (
+        "--prompt",
+        "--output",
+        "--num-inference-steps",
+        "--extra-body",
+        "--use-system-prompt",
+        "--trust-remote-code",
+    ):
+        assert flag in source, f"{_OFFLINE_SCRIPT} is missing {flag}"
 
 
 @pytest.mark.full_model

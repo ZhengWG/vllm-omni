@@ -49,9 +49,12 @@ def _first_request_images(outputs) -> list:
 
 @pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": ["L4", "B200"]})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 def test_qwen_image_autoround_w4a16_load():
     """Load the W4A16 quantized Qwen-Image model and run a minimal generation.
+
+    L4 (22 GiB) OOMs while constructing INC W4A16 weights, so this stays on
+    H100/B200.
 
     Verifies that quant_config is propagated to all transformer blocks
     and produces a valid, non-blank image.
@@ -71,7 +74,7 @@ def test_qwen_image_autoround_w4a16_load():
 
 @pytest.mark.full_model
 @pytest.mark.diffusion
-@hardware_test(res={"cuda": ["L4", "B200"]})
+@hardware_test(res={"cuda": ["H100", "B200"]})
 def test_qwen_image_autoround_w4a16_generate():
     """Full generation: 512×512, 20 steps, CFG=5.0.
 

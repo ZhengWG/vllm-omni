@@ -244,11 +244,11 @@ steps:
             -m "full_model and diffusion and H100 and B200 and cards_2"
             --run-level "full_model"
 
-      - label: ":full_moon: Diffusion X2I(&A&T) · Function Test with L4 · Single-GPU"
+      - label: ":full_moon: Diffusion X2I(&A&T) · Qwen-Image AutoRound · Single-GPU"
         source_file_dependencies: diffusion_qwen_image_function
         timeout_in_minutes: 120
         commands:
-          - pytest -sv tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py -m "full_model and diffusion and L4 and B200 and cards_1" --run-level "full_model"
+          - pytest -sv tests/e2e/offline_inference/test_qwen_image_autoround_w4a16_expansion.py -m "full_model and diffusion and H100 and B200 and cards_1" --run-level "full_model"
 
 
       - label: ":full_moon: Diffusion X2I(&A&T) · Doc Test"

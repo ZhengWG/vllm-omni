@@ -38,10 +38,14 @@ COPY . .
 
 ENV VLLM_OMNI_TARGET_DEVICE=xpu
 # Keep the upstream oneCCL packages paired with the XPU torch runtime.
+# USTC is an optional accelerator. Fall back to PyPI when the mirror
+# rate-limits large wheels (HTTP 429 while unzipping e.g. ray).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --no-build-isolation \
-    --extra-index-url https://mirrors.ustc.edu.cn/pypi/simple/ \
-    ".[dev]" && \
+    UV_HTTP_RETRIES=5 uv pip install --no-build-isolation \
+        --extra-index-url https://mirrors.ustc.edu.cn/pypi/simple/ \
+        ".[dev]" \
+    || UV_HTTP_RETRIES=5 uv pip install --no-build-isolation ".[dev]"
+RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip uninstall triton && \
     uv pip install triton-xpu==3.7.2 --reinstall
 
