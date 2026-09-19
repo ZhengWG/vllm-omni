@@ -260,6 +260,8 @@ class _SlotRef:
     join_tids: list[Tid] = field(default_factory=list)  # JOIN_NEXT_STEP in-transit
     # Slot version snapshot at plan time, checked on fetch.
     reserved_version: torch.Tensor | None = None
+    # Sparse mm holes are logical zeros, independent of later pool writes.
+    absent_mask: torch.Tensor | None = None
     # Copy-on-write rescue: slot's committed rows for pending reads.
     preserved: dict[int, torch.Tensor] = field(default_factory=dict)
 
@@ -335,24 +337,29 @@ class _SlotStatusTable:
         return _SlotStatus(state=self.state[key], tids=self.tids[key], slot_version=self.slot_versions[key])
 
     def map_slots(
-        self, slots: torch.Tensor, tid: Tid, keys: Iterable[TensorName]
+        self, slots: torch.Tensor, tid: Tid | None, keys: Iterable[TensorName]
     ) -> list[tuple[Tid, TensorName, torch.Tensor]]:
-        """Record ``tid`` on these (slot, key). Return in-transit rows
-        another write still owned (caller marks them skipped on it)."""
+        """Assign these (slot, key) to ``tid``, or mark ABSENT when None.
+
+        Return displaced in-transit rows for the caller to retire on old writes.
+        """
         keys = tuple(keys)
+        owner = tid if tid is not None else 0
         stolen: list[tuple[Tid, TensorName, torch.Tensor]] = []
         for key in keys:
             status = self.get_slot_status(key)
             cur = status.tids[slots]
-            stale = (status.state[slots] == _Occupancy.IN_TRANSIT) & (cur != tid) & (cur != 0)
+            stale = (status.state[slots] == _Occupancy.IN_TRANSIT) & (cur != owner) & (cur != 0)
             if bool(stale.any()):
                 for old in {int(o) for o in cur[stale].tolist()}:
                     stolen.append((old, key, slots[stale & (cur == old)]))
-            status.state[slots] = _Occupancy.IN_TRANSIT
-            status.tids[slots] = tid
+            status.state[slots] = _Occupancy.ABSENT if tid is None else _Occupancy.IN_TRANSIT
+            status.tids[slots] = owner
             # Bump the version so a reader that captured an older one detects
             # this claim even after it later commits (COMMITTED, not IN_TRANSIT).
             status.slot_version[slots] += 1
+        if tid is None:
+            return stolen
         prev = self.task_slots.get(tid)
         if prev is None:
             self.task_slots[tid] = slots
@@ -911,6 +918,13 @@ class OmniPrefixCacheManager:
         for key, storage in step_outputs.new_key_storage.items():
             self._pool.install_key(key, storage)
             self._slot_status.init_table(key)
+        if slots_cpu is not None:
+            written_keys = set(step_outputs.immediate)
+            for _, chunk in step_outputs.deferred_chunks:
+                written_keys.update(chunk.tensors)
+            missing_keys = without_hidden(self._pool.keys()) - written_keys
+            if missing_keys:
+                self._map_slots(slots_cpu, None, missing_keys)
         queued: list[WriteTask] = []
         if step_outputs.immediate:
             queued = self._submit_step_writes(
@@ -1138,9 +1152,9 @@ class OmniPrefixCacheManager:
 
     # ----------------------------------------------------- occupancy
 
-    def _map_slots(self, slots: torch.Tensor, tid: int, keys: Iterable[str]) -> None:
-        """Caller holds ``_state_lock``. Record `tid` on these (slot, key);
-        if another write still owns them, mark those rows skipped on it."""
+    def _map_slots(self, slots: torch.Tensor, tid: int | None, keys: Iterable[str]) -> None:
+        """Caller holds ``_state_lock``. Assign or invalidate (tid=None) rows,
+        preserving pending reads and retiring displaced writes."""
         keys = tuple(keys)
         # Copy committed rows aside before this claim overwrites them.
         if self._pending_reads:
@@ -1251,8 +1265,8 @@ class OmniPrefixCacheManager:
         JOIN_NEXT_STEP tasks go in ``join_tids`` (wait-then-pool at
         fetch). JOIN_ON_FINISH tasks stay as refs for fetch_host.
 
-        Hidden rejects any empty hole (prefetch skips; materialize
-        raises). Other keys only need a source — holes fall to the pool.
+        Hidden rejects any empty hole (prefetch skips; materialize raises).
+        Sparse mm holes are snapshotted as zeros, regardless of pool contents.
 
         The ref is registered in ``_pending_reads`` so a write that later
         reuses one of these slots copies the old row aside first (COW). Reads
@@ -1283,6 +1297,7 @@ class OmniPrefixCacheManager:
             n_abs = int((states == _Occupancy.ABSENT).sum())
             if n_abs or not has_source:
                 _raise_unreadable_hit(req_id, key, f"{n_abs} absent slots")
+        absent_mask = states == _Occupancy.ABSENT
         ref = _SlotRef(
             slots=slots,
             key=key,
@@ -1291,6 +1306,7 @@ class OmniPrefixCacheManager:
             staged_list=staged,
             join_tids=join_tids,
             reserved_version=reserved_version,
+            absent_mask=absent_mask if bool(absent_mask.any()) else None,
         )
         self._pending_reads.append(ref)
         return ref
@@ -1332,22 +1348,13 @@ class OmniPrefixCacheManager:
             self._controller.join(src.join_tids)
             with self._state_lock:
                 self._commit_drained_writes()
-            joined = self._apply_preserved_rows(src, self._pool.rows(src.key, src.slots))
-            self._ensure_not_reassigned(
-                src.slots,
-                src.key,
-                req_id=src.req_id,
-                planned_version=src.reserved_version,
-                preserved_slots=src.preserved,
-            )
-            return joined
 
-        # For JOIN_ON_FINISH, pool rows already written, overlay `fetch_host`
+        # Deferred rows overlay the pool; both schedules share snapshot validation.
         n = int(src.slots.numel())
         out: torch.Tensor | None = None
-        if src.already_staged:
+        if src.already_staged or src.join_tids:
             out = self._pool.rows(src.key, src.slots)
-        in_transit = None
+        protected = src.absent_mask
         for task, mask in src.staged_list:
             try:
                 rows = self._controller.fetch_host(task, src.slots[mask], src.key)
@@ -1360,13 +1367,15 @@ class OmniPrefixCacheManager:
             if out is None:
                 out = torch.zeros((n, rows.shape[-1]), dtype=rows.dtype)
             out[mask] = rows
-            in_transit = mask if in_transit is None else in_transit | mask
+            protected = mask if protected is None else protected | mask
         if out is not None:
+            if src.absent_mask is not None:
+                out[src.absent_mask] = 0
             out = self._apply_preserved_rows(src, out)
         self._ensure_not_reassigned(
             src.slots,
             src.key,
-            in_transit_mask=in_transit,
+            protected_mask=protected,
             req_id=src.req_id,
             planned_version=src.reserved_version,
             preserved_slots=src.preserved,
@@ -1380,7 +1389,7 @@ class OmniPrefixCacheManager:
         slots: torch.Tensor,
         key: str,
         *,
-        in_transit_mask: torch.Tensor | None = None,
+        protected_mask: torch.Tensor | None = None,
         req_id: str = "?",
         planned_version: torch.Tensor | None = None,
         preserved_slots: dict[int, torch.Tensor] | None = None,
@@ -1398,8 +1407,7 @@ class OmniPrefixCacheManager:
         them.
 
         ``planned_version`` is the per-slot version captured at plan time.
-        ``in_transit_mask`` excludes JOIN_ON_FINISH slots this task itself
-        still serves through ``fetch_host``.
+        ``protected_mask`` excludes rows served from task refs or frozen sparse holes.
         """
         with self._state_lock:
             status = self._slot_status.get_slot_status(key)
@@ -1407,8 +1415,8 @@ class OmniPrefixCacheManager:
                 violated = status.slot_version[slots] != planned_version
             else:
                 violated = status.state[slots] == _Occupancy.IN_TRANSIT
-            if in_transit_mask is not None:
-                violated &= ~in_transit_mask
+            if protected_mask is not None:
+                violated &= ~protected_mask
             if preserved_slots:
                 for i, s in enumerate(slots.tolist()):
                     if int(s) in preserved_slots:

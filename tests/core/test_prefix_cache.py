@@ -1022,6 +1022,78 @@ def test_mm_hit_span_never_registered_serves_mirror_baseline():
     assert torch.equal(rows[8:], torch.full((2, 2), 9.0))
 
 
+@pytest.mark.parametrize("deferred_mm", [False, True], ids=["immediate", "deferred"])
+def test_sparse_mm_block_reuse_invalidates_missing_key(deferred_mm):
+    policy = ModelCachePolicy(
+        needs_full_hidden_states=False,
+        deferred_keys=frozenset({"k"}) if deferred_mm else frozenset(),
+    )
+    mgr, view = make_manager(policy=policy)
+    try:
+        sid = run_step(mgr, view, {"old": ([1], 0, 4)}, mm={"k": torch.full((4, 2), 11.0)})
+        mgr.materialize(sid, ["old"])
+        # Reuse before the old request finishes also exercises a pending deferred write.
+        sid = run_step(mgr, view, {"new": ([1], 0, 4)})
+        mgr.materialize(sid, ["new"])
+        sid = run_step(
+            mgr,
+            view,
+            {"hit": ([1, 2], 4, 1)},
+            new_hits={"hit": 4},
+            finished=["old", "new"],
+            mm={"k": torch.full((1, 2), 33.0)},
+        )
+        rows = mgr.materialize(sid, ["hit"]).mm_outputs["k"]["hit"]
+        assert torch.equal(rows, torch.tensor([[0.0, 0.0]] * 4 + [[33.0, 33.0]]))
+        if deferred_mm:
+            # The retired write must not land when its request eventually finishes.
+            assert torch.equal(mgr._pool.rows("k", view.slots_for("new", 0, 4)), torch.zeros(4, 2))
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("reuse_with_mm", [False, True], ids=["invalidate", "overwrite"])
+def test_sparse_mm_delayed_prefetch_preserves_present_and_absent_rows(reuse_with_mm):
+    mgr, view = make_manager(policy=ModelCachePolicy(needs_full_hidden_states=False))
+    unblock = threading.Event()
+    try:
+        sid = run_step(mgr, view, {"present": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 11.0)})
+        mgr.materialize(sid, ["present"])
+        sid = run_step(mgr, view, {"absent": ([1], 0, 4)}, finished=["present"])
+        mgr.materialize(sid, ["absent"])
+
+        # The single-worker executor queues hit reads behind this barrier.
+        blocker = mgr._prefetch_pool.submit(unblock.wait, 5)
+        sid = run_step(
+            mgr,
+            view,
+            {"hit": ([0, 1, 2], 8, 1)},
+            new_hits={"hit": 8},
+            finished=["absent"],
+            mm={"k": torch.full((1, 2), 33.0)},
+        )
+        assert not mgr._step_ctxs[sid].hit_prefetch["hit"]["k"].done()
+        later = run_step(
+            mgr,
+            view,
+            {"reuse": ([0, 1], 0, 8)},
+            finished=["hit"],
+            mm={"k": torch.full((8, 2), 44.0)} if reuse_with_mm else {},
+        )
+        mgr.materialize(later, ["reuse"])
+        unblock.set()
+        assert blocker.result(timeout=5)
+
+        rows = mgr.materialize(sid, ["hit"]).mm_outputs["k"]["hit"]
+        assert torch.equal(rows[:4], torch.full((4, 2), 11.0))
+        assert torch.equal(rows[4:8], torch.zeros(4, 2))
+        assert torch.equal(rows[8:], torch.full((1, 2), 33.0))
+    finally:
+        unblock.set()
+        mgr._prefetch_pool.shutdown(wait=True)
+        mgr.shutdown()
+
+
 def test_mm_in_transit_unresolvable_fails_fast():
     """Rows registered in-transit whose entry cannot serve them must raise."""
     policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"k"}))
