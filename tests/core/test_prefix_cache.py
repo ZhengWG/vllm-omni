@@ -1097,6 +1097,83 @@ def test_join_raises_on_failed_task():
         mgr._controller.join([tid])
 
 
+@pytest.mark.parametrize("fail_at", ["copy", "scatter"])
+def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, fail_at):
+    from vllm_omni.core.prefix_cache.controller import TaskState, WriteTask
+
+    mgr, view = make_manager(staging_claim_timeout_s=0)
+    ctrl = mgr._controller
+    preserved_sid = run_step(mgr, view, {"previous": ([3], 0, 4)})
+    if fail_at == "copy":
+        original = WriteTask.mark_host_ready
+
+        def fail_copy(task):
+            if task.req_id == "b":
+                raise RuntimeError("injected copy failure")
+            return original(task)
+
+        monkeypatch.setattr(WriteTask, "mark_host_ready", fail_copy)
+    else:
+        original = ctrl._scatter
+
+        def fail_scatter(task):
+            if task.req_id == "b":
+                raise RuntimeError("injected scatter failure")
+            return original(task)
+
+        monkeypatch.setattr(ctrl, "_scatter", fail_scatter)
+
+    try:
+        with pytest.raises(RuntimeError, match=f"injected {fail_at} failure"):
+            run_step(mgr, view, {"a": ([0], 0, 4), "b": ([1], 0, 4), "c": ([2], 0, 4)})
+        assert set(mgr._step_ctxs) == {preserved_sid}
+        assert ctrl._staged_bytes == 0
+        tasks = [task for task in ctrl._tasks.values() if task.req_id in {"a", "b", "c"}]
+        assert len(tasks) == 3
+        for task in tasks:
+            expected = TaskState.WRITTEN if task.req_id == "a" else TaskState.FAILED
+            assert task.state is expected
+            assert task.done.is_set() and task.host_ready.is_set()
+        assert all(
+            holder == StagingBufferHolder.for_step(preserved_sid)
+            for holders in ctrl._staging_pool._busy
+            for holder in holders
+        )
+        mgr.discard_step(preserved_sid)
+        assert all(not holders for holders in ctrl._staging_pool._busy)
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
+            mgr.new_step_starts(FakeSchedOut())
+    finally:
+        mgr.shutdown()
+
+
+def test_eager_escalation_failure_releases_deferred_tasks(monkeypatch):
+    from vllm_omni.core.prefix_cache.controller import TaskState
+
+    mgr, view = make_manager(policy=ModelCachePolicy(needs_full_hidden_states=False, deferred_keys=frozenset({"k"})))
+    ctrl = mgr._controller
+    sid = run_step(mgr, view, {"a": ([0], 0, 4), "b": ([1], 0, 4)}, mm={"k": torch.ones(8, 2)})
+    mgr.discard_step(sid)
+    assert ctrl._staged_bytes > 0
+    tasks = list(ctrl._tasks.values())
+
+    def fail_scatter(task):
+        raise RuntimeError("injected deferred scatter failure")
+
+    monkeypatch.setattr(ctrl, "_scatter", fail_scatter)
+    try:
+        with pytest.raises(RuntimeError, match="injected deferred scatter failure"):
+            ctrl.escalate([task.tid for task in tasks])
+        assert ctrl._staged_bytes == 0
+        assert all(task.state is TaskState.FAILED for task in tasks)
+        assert all(task.done.is_set() and task.host_ready.is_set() for task in tasks)
+        assert all(not holders for holders in ctrl._staging_pool._busy)
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="write failed"):
+            mgr.new_step_starts(FakeSchedOut())
+    finally:
+        mgr.shutdown()
+
+
 def test_per_request_staging_writes():
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})

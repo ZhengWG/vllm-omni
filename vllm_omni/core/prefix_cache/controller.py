@@ -191,7 +191,7 @@ class WriteTask:
     # On-device clone finished on the compute stream. Copy/read streams
     # must wait this before touching `chunks[].tensors`, or they can read
     # the next CUDA-graph static-buffer overwrite.
-    freeze_event: object | None = None
+    freeze_event: torch.cuda.Event | None = None
     state: TaskState = TaskState.PENDING
     # Slots this write no longer owns (a newer write took them over).
     reassigned: dict[TensorName, torch.Tensor] = field(default_factory=dict)
@@ -206,7 +206,7 @@ class WriteTask:
     # Immediate path: this write's view into the shared step staging page.
     staging_slot: int | None = None
     # Immediate path: this step's CUDA device→host event (shared). None if deferred.
-    step_d2h_event: object | None = None
+    step_d2h_event: torch.cuda.Event | None = None
     # slot -> (which chunk, row in that tensor). Built on demand
     # when a write has more than one `_WriteChunk`; pool write uses slot, the tensor uses row.
     _slot_to_row: dict[int, tuple[int, int]] | None = None
@@ -265,7 +265,7 @@ class WriteTask:
     def is_terminal(self) -> bool:
         return self.state.is_terminal
 
-    def append_chunk(self, chunk: _WriteChunk, freeze_event: object | None = None) -> TaskState | None:
+    def append_chunk(self, chunk: _WriteChunk, freeze_event: torch.cuda.Event | None = None) -> TaskState | None:
         """Grow this write with one save's rows. Returns None when appended,
         else the state that closed the task (COPYING or later).
 
@@ -463,7 +463,7 @@ class StepD2HClaim:
 
     staging_slot: int  # StagingBufferPool index
     views: dict[TensorName, torch.Tensor]  # host rows [0:n)
-    event: object | None = None  # torch.cuda.Event; None on eager/CPU
+    event: torch.cuda.Event | None = None  # torch.cuda.Event; None on eager/CPU
 
 
 class OmniPrefixCacheController:
@@ -501,7 +501,7 @@ class OmniPrefixCacheController:
     def _d2h_on_stream(
         self,
         stream: torch.cuda.Stream,
-        freeze_event: object | None,
+        freeze_event: torch.cuda.Event | None,
         copy: Callable[[], None],
     ) -> torch.cuda.Event:
         """Issue device→host on `stream` after freeze; return the done event."""
@@ -514,7 +514,11 @@ class OmniPrefixCacheController:
         return ev
 
     def stage_step_host(
-        self, tensors: dict[str, torch.Tensor], n: int, freeze_event: object | None, step_holder: StagingBufferHolder
+        self,
+        tensors: dict[str, torch.Tensor],
+        n: int,
+        freeze_event: torch.cuda.Event | None,
+        step_holder: StagingBufferHolder,
     ) -> StepD2HClaim:
         """Claim a staging slot and, when `tensors` is non-empty, launch
         ONE whole-step device→host into it.
@@ -535,7 +539,7 @@ class OmniPrefixCacheController:
         try:
             pin = not self._eager
             views: dict[str, torch.Tensor] = {}
-            event: object | None = None
+            event: torch.cuda.Event | None = None
             if self._eager or all(t.device.type == "cpu" for t in tensors.values()):
                 for key, src in tensors.items():
                     v = self._staging_pool.views(slot, key, n, int(src.shape[-1]), src.dtype, pin)
@@ -596,8 +600,15 @@ class OmniPrefixCacheController:
         if not tasks:
             return
         if self._eager:
-            for task in tasks:
-                self._run_eager(task)
+            try:
+                for task in tasks:
+                    self._run_eager(task)
+            except Exception:
+                # Later tasks were registered but will never be dispatched.
+                # Fail them too so shared budget owners and waiters release.
+                for task in tasks:
+                    self._fail_task(task.tid)
+                raise
             return
         with self._wake:
             for task in tasks:
@@ -610,7 +621,9 @@ class OmniPrefixCacheController:
         if queued:
             self.dispatch([task])
 
-    def append_chunk(self, task: WriteTask, chunk: _WriteChunk, freeze_event: object | None = None) -> TaskState | None:
+    def append_chunk(
+        self, task: WriteTask, chunk: _WriteChunk, freeze_event: torch.cuda.Event | None = None
+    ) -> TaskState | None:
         """Append to a pending task. None when appended, else the closing state."""
         return task.append_chunk(chunk, freeze_event)
 
@@ -658,10 +671,7 @@ class OmniPrefixCacheController:
         `_wake` too, so a task cannot be popped and re-queued behind its back.
         """
         if self._eager:
-            for tid in tids:
-                task = self._tasks.get(tid)
-                if task is not None and not task.is_terminal:
-                    self._run_eager(task)
+            self.dispatch([task for tid in tids if (task := self._tasks.get(tid)) is not None and not task.is_terminal])
             return
         with self._wake:
             for tid in tids:
@@ -883,6 +893,8 @@ class OmniPrefixCacheController:
             for k in chunk.tensors:
                 by_key.setdefault(k, []).append(chunk)
         pending: list[tuple[str, list[_WriteChunk], list[torch.Tensor]]] = []
+        if self._copy_stream is None:
+            raise OmniPrefixCacheUnmatchError("deferred prefix cache copy requires a CUDA copy stream")
         with torch.cuda.stream(self._copy_stream):
             if task.freeze_event is not None:
                 self._copy_stream.wait_event(task.freeze_event)

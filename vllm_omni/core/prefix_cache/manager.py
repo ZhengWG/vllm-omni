@@ -117,7 +117,7 @@ def _snapshot_leftover_mm_cpu(
     device_snapshot_keys: set[str],
     num_tokens_unpadded: int,
     num_tokens_padded: int | None = None,
-) -> tuple[dict[str, Any], object | None]:
+) -> tuple[dict[str, Any], torch.cuda.Event | None]:
     """CPU copy of mm that did not land on the staging page.
 
     Skip ``device_snapshot_keys`` (those already have a device→host page).
@@ -205,7 +205,7 @@ class _StepOutputs:
     deferred_chunks: list[tuple[str, _WriteChunk]]
     leftover: dict[str, Any]
     # Completion of the leftover device→host copies; None when none ran on CUDA.
-    leftover_event: object | None = None
+    leftover_event: torch.cuda.Event | None = None
     immediate_budget: _BudgetTicket | None = None
     # Pool storage allocated (unlocked) for keys first seen this step;
     # published into the pool / occupancy tables under the state lock.
@@ -281,7 +281,7 @@ class _StepContext:
 
     # Hits snapshotted at new_step_starts. Prefetch fills [hit | empty tail]
     # during forward; materialize writes the tail.
-    hits: dict[ReqId, tuple[int, list[int] | None]]  # (hit_upto, blocks)
+    hits: dict[ReqId, tuple[int, list[int]]]  # (hit_upto, blocks)
     hit_prefetch: dict[ReqId, dict[TensorName, Future]] = field(default_factory=dict)
 
     # Key split frozen at save: recompute at materialize races ensure_key.
@@ -290,7 +290,7 @@ class _StepContext:
     # that is not written to the pool).
     mm_cpu_snapshot: dict[TensorName, Any] = field(default_factory=dict)
     # Wait this before reading mm_cpu_snapshot (None when nothing was on CUDA).
-    mm_cpu_snapshot_event: object | None = None
+    mm_cpu_snapshot_event: torch.cuda.Event | None = None
 
     # Staging slot for this step id (empty views when only leftover mm).
     d2h: StepD2HClaim | None = None
@@ -666,6 +666,9 @@ class OmniPrefixCacheManager:
             # Slot claim is outside the lock; a later raise must release
             # the step and any task that already bound this slot.
             if not transferred and d2h_claim is not None:
+                # A dispatch failure has no caller that can consume this step.
+                with self._state_lock:
+                    self._step_ctxs.pop(step_holder.owner_id, None)
                 self._release_staging_on_failed_save(d2h_claim.staging_slot, step_holder, bound_tids)
 
     @torch.inference_mode()
@@ -834,7 +837,7 @@ class OmniPrefixCacheManager:
         self,
         device_snapshot: dict[str, torch.Tensor],
         num_tokens_unpadded: int,
-        freeze_event: object | None,
+        freeze_event: torch.cuda.Event | None,
         step_holder: StagingBufferHolder,
     ) -> StepD2HClaim:
         """Claim a staging slot (wait + timeout) and copy device→host if this step has rows.
@@ -882,8 +885,8 @@ class OmniPrefixCacheManager:
         step_outputs: _StepOutputs,
         slots_cpu: torch.Tensor | None,
         mm_keys: set[str],
-        freeze_event: object | None,
-        d2h_claim: StepD2HClaim | None,
+        freeze_event: torch.cuda.Event | None,
+        d2h_claim: StepD2HClaim,
         bound_tids: list[int],
     ) -> tuple[StepId, list[WriteTask]]:
         """Takes ``_state_lock``. Register this step's writes and store the
