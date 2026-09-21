@@ -38,7 +38,7 @@ import wave
 from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Final, Protocol, TypeAlias, runtime_checkable
+from typing import Any, Final, Protocol, TypeAlias, TypeGuard, runtime_checkable
 
 import torch
 from fastapi import WebSocket, WebSocketDisconnect
@@ -75,6 +75,10 @@ PrewarmedFrame: TypeAlias = tuple[Any, str] | _FrameStatus
 
 def _decode_frame_bytes(raw_bytes: bytes) -> Any:
     return Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+
+
+def _usable_prewarmed_frame(cached: PrewarmedFrame | None) -> TypeGuard[tuple[Any, str]]:
+    return cached is not None and cached is not _BAD_FRAME
 
 
 def _stage0_prefix_caching_enabled(engine_client: Any) -> bool:
@@ -233,7 +237,7 @@ class OmniStreamingVideoHandler:
         parts: list[dict[str, Any]] = []
         for frame_b64 in frames:
             cached = prewarmed.get(frame_b64)
-            if cached is _BAD_FRAME or cached is None:
+            if not _usable_prewarmed_frame(cached):
                 continue
             pil, mm_uuid = cached
             parts.append(
@@ -455,7 +459,7 @@ class OmniStreamingVideoHandler:
 
             def _context_signature() -> tuple[Any, ...]:
                 history_len = len(message_history) if isinstance(message_history, list) else None
-                return (history_len, len(frame_buffer), frame_buffer[-1] if frame_buffer else None)
+                return (history_len, tuple(frame_buffer))
 
             def _maybe_start_warmup() -> None:
                 nonlocal warmup_task, warmup_request_id
@@ -612,7 +616,7 @@ class OmniStreamingVideoHandler:
                             ]
                             frame_buffer[:] = [frame_buffer[index] for index in retained_indices]
                             frame_metadata[:] = [frame_metadata[index] for index in retained_indices]
-                        if frame_pil_cache.get(frame_data) is _BAD_FRAME:
+                        if frame_pil_cache.get(frame_data) is _BAD_FRAME and frame_data not in pinned_frame_refs:
                             _drop_frame_cache(frame_data)
                         if removed:
                             await self._send_error(websocket, "Frame decode failed")
@@ -1396,7 +1400,7 @@ class OmniStreamingVideoHandler:
         else:
             stride = max(1, n_buf // num_frames)
             indices = [index * stride for index in range(num_frames - 1)] + [n_buf - 1]
-        return [index for index in indices if prewarmed_frames.get(frame_buffer[index]) is not _BAD_FRAME]
+        return [index for index in indices if _usable_prewarmed_frame(prewarmed_frames.get(frame_buffer[index]))]
 
     def _select_frame_indices(
         self,
@@ -1412,7 +1416,7 @@ class OmniStreamingVideoHandler:
             return [
                 index
                 for index, frame_b64 in enumerate(frame_buffer)
-                if prewarmed_frames.get(frame_b64) is not _BAD_FRAME
+                if _usable_prewarmed_frame(prewarmed_frames.get(frame_b64))
             ]
         return self._sample_frame_indices(frame_buffer, config.num_frames, prewarmed_frames)
 
