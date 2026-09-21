@@ -119,7 +119,7 @@ class VoicePresetRegistry:
             )
 
         prompt_wav_lat, prompt_wav_emb = self._build_wav_embeddings(
-            voice_name, torch.cat(speech_chunks, dim=-1), device=device
+            voice_name, torch.cat(speech_chunks, dim=-1), device=device, dtype=dtype
         )
 
         if voice_name in self.registered:
@@ -242,6 +242,7 @@ class VoicePresetRegistry:
         speech: torch.Tensor,
         *,
         device: torch.device,
+        dtype: torch.dtype,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         if self._audio_vae is None:
             return None, None
@@ -254,7 +255,7 @@ class VoicePresetRegistry:
             speech = pad_speech
 
         prompt_wav_lat, _ = self._audio_vae.encode_latent(
-            speech.to(dtype=torch.bfloat16, device=device),
+            speech.to(dtype=dtype, device=device),
             torch.tensor([speech.size(1)], dtype=torch.long, device=device),
         )
         assert prompt_wav_lat.shape[1] % self._patch_size == 0, (
