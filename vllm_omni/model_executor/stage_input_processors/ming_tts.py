@@ -27,6 +27,7 @@ from vllm_omni.model_executor.models.ming_tts.patch_emission import (
 
 logger = init_logger(__name__)
 
+_MING_ASYNC_STATE_KEY = "_ming_async_state"
 MING_EMIT_PATCH_COUNT_KEY = "ming_emit_patch_count"
 MING_LATENT_SHAPE_KEY = "ming_latent_shape"
 MING_ESTIMATED_BYTES_KEY = "ming_estimated_bytes"
@@ -190,16 +191,16 @@ def llm2audio_vae_async_chunk(
     final_decode_step = _extract_last_value(pooling_output, "ming_decode_step")
     stop_reason = _decode_stop_reason(_extract_last_value(pooling_output, MING_STOP_REASON_KEY))
     request_payload = transfer_manager.request_payload
-    request_state = request_payload.get(request_id)
-    if not isinstance(request_state, dict) or "_ming_async_state" not in request_state:
-        request_state = {
-            "_ming_async_state": {
-                "seen_patch_len": 0,
-                "terminal_sent": False,
-            }
-        }
-        request_payload[request_id] = request_state
-    state = request_state["_ming_async_state"]
+    # The connector owns this container and stores its own keys alongside ours,
+    # so nest under _MING_ASYNC_STATE_KEY rather than replacing the container.
+    container = request_payload.get(request_id)
+    if not isinstance(container, dict):
+        container = {}
+        request_payload[request_id] = container
+    state = container.get(_MING_ASYNC_STATE_KEY)
+    if not isinstance(state, dict):
+        state = {"seen_patch_len": 0, "terminal_sent": False}
+        container[_MING_ASYNC_STATE_KEY] = state
     if bool(state.get("terminal_sent", False)):
         return None
 
