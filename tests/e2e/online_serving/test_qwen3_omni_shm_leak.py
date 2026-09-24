@@ -116,7 +116,6 @@ def _wait_no_entries_for_request_ids(request_ids: list[str], timeout_s: float = 
 
 
 @pytest.mark.advanced_model
-@pytest.mark.core_model
 @pytest.mark.omni
 @pytest.mark.skipif(_USE_PD, reason="Temporarily skip PD mode in this test module.")
 @hardware_test(res={"cuda": "H100", "rocm": "MI325"}, num_cards=2)

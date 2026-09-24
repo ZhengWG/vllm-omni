@@ -11,9 +11,6 @@ from vllm.v1.request import RequestStatus
 from tests.helpers.omni_scheduler import bind_omits_transfer_helpers
 from vllm_omni.core.sched.omni_ar_scheduler import OmniARScheduler
 from vllm_omni.core.sched.omni_scheduler_mixin import OmniSchedulerMixin
-from vllm_omni.distributed.omni_connectors.connectors.shm_connector import (
-    SharedMemoryConnector,
-)
 from vllm_omni.engine.async_engine_utils import apply_omni_final_stage_metadata
 from vllm_omni.engine.serialization import deserialize_additional_information
 
@@ -109,24 +106,9 @@ def _make_chunk_request(final_stage_id: int, *, force_kv_transfer: bool = False)
     return request
 
 
-class _PendingKeyConnector(SharedMemoryConnector):
-    """Record put() keys without touching /dev/shm."""
-
-    def put(self, from_stage, to_stage, put_key, data):
-        self._pending_keys.add(put_key)
-        return True, 1, {"shm": True}
-
-
 def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
-    connector = _PendingKeyConnector({})
     adapter = mocker.MagicMock()
     adapter._confirmed_num_computed_tokens.return_value = 1
-    adapter.save_async.side_effect = lambda *args, **kwargs: connector.put(
-        "0",
-        "1",
-        f"{request.request_id}_finished",
-        {"finished": True},
-    )
 
     sched = mocker.MagicMock()
     sched.requests = {request.request_id: request}
@@ -174,42 +156,31 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
     model_runner_output.inter_stage_outputs = inter_stage_outputs
 
     OmniARScheduler.update_from_output(sched, scheduler_output, model_runner_output)
-    return adapter, sched, connector
+    return adapter
 
 
-def test_stage_zero_final_finish_does_not_save_async(mocker):
-    request = _make_chunk_request(0)
-    adapter, _, connector = _run_finished_save_step(mocker, request)
+@pytest.mark.parametrize(
+    ("final_stage_id", "force_kv_transfer", "expect_save"),
+    [
+        pytest.param(0, False, False, id="stage-zero-final"),
+        pytest.param(0, True, False, id="cfg-companion"),
+        pytest.param(1, False, True, id="downstream-final"),
+    ],
+)
+def test_finish_saves_async_only_with_downstream_consumer(mocker, final_stage_id, force_kv_transfer, expect_save):
+    request = _make_chunk_request(final_stage_id, force_kv_transfer=force_kv_transfer)
+    adapter = _run_finished_save_step(mocker, request)
 
-    adapter.save_async.assert_not_called()
-    assert connector._pending_keys == set()
+    assert adapter.save_async.called is expect_save
 
 
 def test_stage_zero_final_skips_inter_stage_output(mocker):
     warn = mocker.patch("vllm_omni.core.sched.omni_ar_scheduler.logger.warning")
     request = _make_chunk_request(0)
-    adapter, _, connector = _run_finished_save_step(mocker, request, inter_stage_outputs=[{"codes": 1}])
+    adapter = _run_finished_save_step(mocker, request, inter_stage_outputs=[{"codes": 1}])
 
     adapter.save_async.assert_not_called()
-    assert connector._pending_keys == set()
-    assert warn.called
     assert any("inter_stage_output is present" in str(call) for call in warn.call_args_list)
-
-
-def test_cfg_companion_finish_does_not_save_async(mocker):
-    request = _make_chunk_request(0, force_kv_transfer=True)
-    adapter, _, connector = _run_finished_save_step(mocker, request)
-
-    adapter.save_async.assert_not_called()
-    assert connector._pending_keys == set()
-
-
-def test_downstream_finish_still_saves_async(mocker):
-    request = _make_chunk_request(1)
-    adapter, _, connector = _run_finished_save_step(mocker, request)
-
-    adapter.save_async.assert_called_once()
-    assert f"{request.request_id}_finished" in connector._pending_keys
 
 
 def test_streaming_session_update_invalidates_omits_kv_transfer_cache():

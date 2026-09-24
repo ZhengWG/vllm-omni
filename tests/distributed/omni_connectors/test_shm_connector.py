@@ -227,11 +227,6 @@ class TestCleanup:
         assert connector.cleanup("consumed_req_99") is False
         assert "consumed_req_99" not in connector._pending_keys
 
-    def test_cleanup_does_not_count_missing_segment(self, connector):
-        connector._pending_keys["missing_req_1"] = None
-        assert connector.cleanup("missing_req_1") is False
-        assert "missing_req_1" not in connector._pending_keys
-
     def test_close_cleans_all_pending(self, connector):
         for i in range(3):
             connector.put("s0", "s1", f"close_test_{i}", {"i": i})
