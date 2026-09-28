@@ -1042,6 +1042,70 @@ async def test_query_waits_for_frame_prewarm(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_legacy_query_does_not_wait_for_unselected_frame(monkeypatch):
+    """APC off and num_frames=1: a blocked older frame must not delay the query."""
+    frame_a = _make_jpeg(1, 0, 0)
+    frame_b = _make_jpeg(0, 1, 0)
+    decode_a_started = threading.Event()
+    release_a = threading.Event()
+    decode_b_done = threading.Event()
+    query_started = asyncio.Event()
+
+    def gated_decode(raw_bytes: bytes):
+        if raw_bytes == frame_a:
+            decode_a_started.set()
+            release_a.wait(timeout=5.0)
+        image = Image.open(io.BytesIO(raw_bytes)).convert("RGB")
+        if raw_bytes == frame_b:
+            decode_b_done.set()
+        return image
+
+    class RecordingHandler(QwenOmniStreamingVideoHandler):
+        async def _process_query(self, *args, **kwargs):
+            query_started.set()
+
+    monkeypatch.setattr(video_stream_base, "_decode_frame_bytes", gated_decode)
+    ws = TimedWebSocket()
+    handler = RecordingHandler(chat_service=object(), engine_client=object(), idle_timeout=5.0)
+    task = asyncio.create_task(handler.handle_session(ws))
+    try:
+        ws.put(
+            {
+                "type": "session.config",
+                "model": "test",
+                "modalities": ["text"],
+                "num_frames": 1,
+                "enable_frame_filter": False,
+            }
+        )
+        await asyncio.sleep(0)
+        ws.put({"type": "video.frame", "data": _b64(frame_a), "frame_id": "A"})
+        for _ in range(100):
+            if decode_a_started.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert decode_a_started.is_set()
+        ws.put({"type": "video.frame", "data": _b64(frame_b), "frame_id": "B"})
+        for _ in range(200):
+            if decode_b_done.is_set():
+                break
+            await asyncio.sleep(0.01)
+        assert decode_b_done.is_set()
+
+        ws.put({"type": "video.query", "text": "describe"})
+        await asyncio.wait_for(query_started.wait(), timeout=2.0)
+        assert not release_a.is_set()
+        release_a.set()
+        ws.put({"type": "video.done"})
+        await asyncio.wait_for(task, timeout=2.0)
+    finally:
+        release_a.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("max_frames", [1, 2], ids=["evicted", "retained"])
 async def test_frame_prewarm_only_keeps_retained_images(monkeypatch, max_frames):
     frame_a = _make_jpeg(255, 0, 0)
