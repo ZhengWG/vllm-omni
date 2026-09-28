@@ -560,12 +560,19 @@ class OmniStreamingVideoHandler:
                 query_frame_metadata = list(frame_metadata)
                 query_audio_buffer = bytearray(audio_buffer)
                 audio_buffer.clear()
-                _pin_frames(query_frames)
+                # Legacy stride positions ignore decode status. Waiting on the
+                # whole buffer would stall the query on a frame it will not use.
+                if self._incremental_prefill_active(config):
+                    wait_indices = list(range(len(query_frames)))
+                else:
+                    wait_indices = self._candidate_frame_indices(query_frames, config.num_frames)
+                wait_frames = [query_frames[index] for index in wait_indices]
+                _pin_frames(wait_frames)
 
                 async def _run_query() -> None:
                     nonlocal active_request_id, prev_request_id
                     try:
-                        await _await_frames_ready(query_frames)
+                        await _await_frames_ready(wait_frames)
                         query_prewarmed_frames = _snapshot_prewarmed(query_frames)
                         process_kwargs: dict[str, Any] = {}
                         if any(metadata.get("frame_id") for metadata in query_frame_metadata):
@@ -583,7 +590,7 @@ class OmniStreamingVideoHandler:
                             **process_kwargs,
                         )
                     finally:
-                        _unpin_frames(query_frames)
+                        _unpin_frames(wait_frames)
                         if active_request_id == request_id:
                             prev_request_id = request_id
                             active_request_id = None
@@ -1353,18 +1360,25 @@ class OmniStreamingVideoHandler:
             pass
 
     @staticmethod
+    def _candidate_frame_indices(frame_buffer: list[str], num_frames: int) -> list[int]:
+        """Stride positions for a legacy query, including the last frame.
+
+        Ignores decode status so a frame still decoding is waited on, not skipped.
+        """
+        n_buf = len(frame_buffer)
+        if n_buf <= num_frames:
+            return list(range(n_buf))
+        stride = max(1, n_buf // num_frames)
+        return [index * stride for index in range(num_frames - 1)] + [n_buf - 1]
+
+    @staticmethod
     def _sample_frame_indices(
         frame_buffer: list[str],
         num_frames: int,
         prewarmed_frames: Mapping[str, PrewarmedFrame],
     ) -> list[int]:
         """Stride-sample with the last frame, then drop known bad frames without refilling."""
-        n_buf = len(frame_buffer)
-        if n_buf <= num_frames:
-            indices = list(range(n_buf))
-        else:
-            stride = max(1, n_buf // num_frames)
-            indices = [index * stride for index in range(num_frames - 1)] + [n_buf - 1]
+        indices = OmniStreamingVideoHandler._candidate_frame_indices(frame_buffer, num_frames)
         return [index for index in indices if _usable_prewarmed_frame(prewarmed_frames.get(frame_buffer[index]))]
 
     def _select_frame_indices(

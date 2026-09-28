@@ -58,7 +58,7 @@ WebSocket /v1/video/chat/stream
 
 When buffered frames include client-supplied `frame_id` values, the server emits `video.frames.consumed` after the first engine output. Its `frame_ids`, `frames`, and `latest_pts_ms` describe the images included in that query's prompt.
 
-Queries stride-sample the buffered frames, keeping the last frame, then exclude frames already known to have failed decoding. With incremental prefill active, every buffered frame is included instead of stride-sampling, with the same decode-failure exclusion. Excluded frames are not replaced with other buffered frames. Queries wait for background frame decoding to finish before building the prompt.
+Queries stride-sample the buffered frames, keeping the last frame, then exclude frames already known to have failed decoding. With incremental prefill active, every buffered frame is included instead of stride-sampling, with the same decode-failure exclusion. Excluded frames are not replaced with other buffered frames. The incremental path waits for the whole window to finish decoding. The legacy path waits only for its sampled positions, so an unselected frame still decoding does not delay the query.
 
 **Bugfix compatibility note:** `video.frames.consumed` now excludes known decode failures that were already excluded from the prompt. Older versions could report those frames and their timestamps as consumed. The event name and fields are unchanged; an empty selection reports empty lists and `latest_pts_ms: null`.
 
@@ -129,7 +129,8 @@ new prefix.
 ### Legacy path (incremental prefill inactive)
 
 Stage-0 prefix caching is off, or `modalities` includes `"audio"`: no warmup,
-frames are re-sampled up to `num_frames` each query. Prompt shape is the same
+frames are re-sampled up to `num_frames` each query, and the query waits only
+for those sampled frames to decode. Prompt shape is the same
 (`image_pil` frames, optional trailing `input_audio`, text). Both paths keep the
 frame buffer across queries (`max_frames`) and compress history the same way.
 
