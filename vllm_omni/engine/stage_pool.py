@@ -99,7 +99,7 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
-    # A replica that dies mid-release never answers; this also bounds how long a reused id waits for admission.
+    # A replica that dies mid-release never answers; without a bound its background release never finishes.
     RELEASE_RPC_TIMEOUT_S: float = 5.0
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.

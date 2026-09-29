@@ -84,11 +84,8 @@ def _shm_used_mib() -> str:
 
 
 def _is_entry_for_request(name: str, request_id: str) -> bool:
-    """Match a POSIX segment or ``shm_<put_key>_lockfile.lock`` for *request_id*."""
-    if name == request_id or name.startswith(f"{request_id}_"):
-        return True
-    shm_prefix = f"shm_{request_id}"
-    return name == shm_prefix or name.startswith(f"{shm_prefix}_")
+    """Match a segment or ``shm_`` lockfile keyed by the ``{request_id}-{suffix}`` orchestrator id."""
+    return name.removeprefix("shm_").startswith((f"{request_id}-", f"{request_id}_"))
 
 
 def _entries_for_request_ids(request_ids: list[str]) -> list[str]:

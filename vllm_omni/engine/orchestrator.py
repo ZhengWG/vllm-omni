@@ -300,7 +300,7 @@ class OrchestratorBase:
     _transfer_emitter: Any = None
     _prom_metrics: Any = None
     _stat_logger: OmniPrometheusStatLogger | None = None
-    _transfer_release_tasks: dict[str, asyncio.Task] = {}
+    _transfer_release_tasks: set[asyncio.Task] = set()
 
     def __init__(
         self,
@@ -348,8 +348,8 @@ class OrchestratorBase:
             self._pd_bootstrap_addr = pd_config.get("bootstrap_addr")
             self._pd_prefill_engine_id = pd_config.get("prefill_engine_id")
         self.request_states: dict[str, OrchestratorRequestState] = {}
-        # Latest release per id: a reused id waits on it, and it pins the task the loop only weak-refs.
-        self._transfer_release_tasks: dict[str, asyncio.Task] = {}
+        # Strong refs for in-flight releases; the loop only weak-refs tasks, so dropping these risks mid-flight GC.
+        self._transfer_release_tasks: set[asyncio.Task] = set()
         self._init_metrics_state(
             stage_pools,
             running_counter,
@@ -712,27 +712,15 @@ class OrchestratorBase:
                 if isinstance(result, Exception):
                     logger.warning("[Orchestrator] release transfer resources failed: %s", result)
 
-        def _untrack_stage_transfer_release(task: asyncio.Task) -> None:
-            for request_id in request_ids:
-                if self._transfer_release_tasks.get(request_id) is task:
-                    del self._transfer_release_tasks[request_id]
-
         try:
             task = asyncio.get_running_loop().create_task(_run())
-            for request_id in request_ids:
-                self._transfer_release_tasks[request_id] = task
-            task.add_done_callback(_untrack_stage_transfer_release)
+            self._transfer_release_tasks.add(task)
+            task.add_done_callback(self._transfer_release_tasks.discard)
         except RuntimeError:
             logger.warning(
                 "[Orchestrator] no running event loop; skipped reclaim of transfer resources for %s",
                 request_ids,
             )
-
-    async def _wait_transfer_release(self, request_id: str) -> None:
-        """Hold a reused id until its previous prefix unlink is queued, so it cannot hit the new chunks."""
-        task = self._transfer_release_tasks.get(request_id)
-        if task is not None:
-            await asyncio.wait({task})
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""
@@ -2957,7 +2945,6 @@ class Orchestrator(OrchestratorBase):
         """Handle an add_request message from the main thread."""
         stage_id = 0
         request_id = msg.request_id
-        await self._wait_transfer_release(request_id)
         prompt = msg.prompt
         original_prompt = msg.original_prompt
         sampling_params_list = msg.sampling_params_list
@@ -3070,7 +3057,6 @@ class Orchestrator(OrchestratorBase):
         role = msg.role
         companion_prompt = msg.prompt
         sampling_params_list = msg.sampling_params_list
-        await self._wait_transfer_release(companion_id)
 
         parent_state = self.request_states.get(parent_id)
         if parent_state is None:

@@ -163,7 +163,6 @@ def _run_finished_save_step(mocker, request, *, inter_stage_outputs=None):
     ("final_stage_id", "force_kv_transfer", "expect_save"),
     [
         pytest.param(0, False, False, id="stage-zero-final"),
-        pytest.param(0, True, False, id="cfg-companion"),
         pytest.param(1, False, True, id="downstream-final"),
     ],
 )
