@@ -140,10 +140,10 @@ frame buffer across queries (`max_frames`) and compress history the same way.
   on `WS /v1/video/chat/stream`. It does not accelerate `/v1/realtime` camera input, which
   uses duplex conversation items rather than `video.frame` / `video.query`. Audio-output
   sessions on this endpoint rebuild the prompt each query.
-- Isolating audio-output requests from an enabled stage-0 prefix cache (so a cache hit
-  cannot stall the talker, which needs thinker hidden states for the whole prompt) is
-  tracked separately. Until then, do not enable stage-0 prefix caching on an instance that
-  also serves audio-output requests, including a `/v1/realtime` voice-call deployment.
+- Stage-0 prefix caching is safe for audio-output requests: on a hit, the omni prefix cache
+  restores the thinker hidden states the talker needs. A preempted request that resumes on a
+  hit does not get them back, so size the deployment to avoid preemption; see
+  [Prefix Caching](../design/feature/prefix_caching.md).
 - Back-to-back short replies can still expose an engine-layer scheduler race. The PR notes an observed workaround of at least 200 ms idle between turns when clients repeatedly see idle timeouts.
 - If the audio buffer exceeds the server limit, the server emits `Audio buffer overflow` and clears the currently buffered audio for the session.
 - The API is intended for Qwen3-Omni streaming video understanding; other models may not support the same multimodal processor arguments.
