@@ -2097,3 +2097,44 @@ async def test_duplex_session_request_error_finish_is_delivered_as_request_error
         plain_state,
     )
     assert output_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_reused_request_id_waits_bounded_for_transfer_release(mocker) -> None:
+    async def hung_release(request_ids):
+        await asyncio.Event().wait()
+
+    mocker.patch("vllm_omni.engine.orchestrator._TRANSFER_RELEASE_WAIT_S", 0.2)
+    pool = StagePool(0, FakeStageClient(final_output=True))
+    mocker.patch.object(pool, "release_request_resources", side_effect=hung_release)
+    submit = mocker.patch.object(pool, "submit_initial", return_value=0)
+    orchestrator = Orchestrator(
+        request_async_queue=asyncio.Queue(),
+        output_async_queue=asyncio.Queue(),
+        rpc_async_queue=asyncio.Queue(),
+        stage_pools=[pool],
+    )
+    await orchestrator._cleanup_request_ids(["req-1"])
+    hung = orchestrator._transfer_release_tasks["req-1"]
+    admit = asyncio.create_task(
+        orchestrator._handle_add_request(
+            StageSubmissionMessage(
+                type="add_request",
+                request_id="req-1",
+                prompt=SimpleNamespace(),
+                original_prompt={},
+                output_prompt_text=None,
+                sampling_params_list=[SamplingParams()],
+                final_stage_id=0,
+                preprocess_ms=0,
+                request_timestamp=0,
+                enqueue_ts=0,
+            )
+        )
+    )
+    await asyncio.sleep(0.05)
+    submit.assert_not_awaited()
+
+    await admit
+    submit.assert_awaited_once()
+    hung.cancel()
