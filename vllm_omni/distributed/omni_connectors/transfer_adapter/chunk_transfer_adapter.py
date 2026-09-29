@@ -1060,8 +1060,8 @@ class OmniChunkTransferAdapter(OmniTransferAdapterBase):
         orchestrator -- the only party that knows all stages are done -- drives
         this (see ``Orchestrator._cleanup_request_ids``).
 
-        Like abort cleanup, the unlink runs on the save thread: the scheduler
-        never performs SHM I/O, and it is ordered before any reuse of the id.
+        Like abort cleanup, the unlink runs on the save thread, so the
+        scheduler never performs SHM I/O.
         """
         if not isinstance(self.connector, SharedMemoryConnector):
             return
