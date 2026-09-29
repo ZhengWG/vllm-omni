@@ -1408,12 +1408,12 @@ class TestDeployConfigLoading:
     @pytest.mark.parametrize(
         ("filename", "max_sessions"),
         [
-            ("minicpmo_4_5.yaml", 4),
+            ("minicpmo_4_5.yaml", 16),
             ("minicpmo_4_5_2gpu.yaml", 4),
             ("minicpmo_4_5_3gpu.yaml", 4),
             ("minicpmo_4_5_8x4090.yaml", 1),
-            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 4),
-            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 4),
+            ("minicpmo_4_5_3gpu_stage1_replicas.yaml", 16),
+            ("minicpmo_4_5_4gpu_stage1_replicas.yaml", 16),
             ("minicpmo_4_5_8x4090_stage1_replicas.yaml", 1),
         ],
     )
@@ -2857,6 +2857,28 @@ class TestPlatformOverrides:
             config = deploy.stages[0].compilation_config or {}
             assert "+rotary_embedding" not in config.get("custom_ops", [])
 
+    def test_qwen3_omni_talker_sampling_is_seeded(self):
+        """The only stochastic Qwen3-Omni stage must stay reproducible.
+
+        Dropping this seed (as #4986 did) leaves the talker sampling codec
+        tokens unseeded at temperature 0.9, which reopened the audio-vs-text
+        nightly failures in #6090. Pin it so a cleanup cannot remove it again
+        without failing here.
+        """
+        deploy_path = Path(get_deploy_config_path("qwen3_omni_moe.yaml"))
+        pipeline = resolve_pipeline_config(
+            "qwen3_omni_moe",
+            Q3_OMNI_ALL_STAGES_HF_CONFIG,
+        )
+        assert isinstance(pipeline, PipelineConfig)
+
+        for platform in ("cpu", "cuda", "musa", "npu", "rocm", "xpu"):
+            deploy = _apply_platform_overrides(load_deploy_config(deploy_path), platform=platform)
+            stages = merge_pipeline_deploy(pipeline, deploy)
+            talker_sampling = stages[1].yaml_extras["default_sampling_params"]
+            assert talker_sampling["temperature"] > 0.0, "talker is expected to sample, not decode greedily"
+            assert talker_sampling.get("seed") == 42, f"talker sampling lost its seed on {platform}"
+
     def test_minicpmo_4_5_cuda_caps_talker_kv_cache(self):
         pipeline = resolve_pipeline_config("minicpmo_4_5")
         assert isinstance(pipeline, PipelineConfig)
@@ -2864,7 +2886,7 @@ class TestPlatformOverrides:
 
         cuda = _apply_platform_overrides(load_deploy_config(deploy_path), platform="cuda")
         cuda_stages = merge_pipeline_deploy(pipeline, cuda)
-        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 2 * 1024**3
+        assert cuda_stages[1].yaml_engine_args["kv_cache_memory_bytes"] == 4 * 1024**3
 
         # The CUDA memory budget must not leak into the existing NPU profile.
         npu = _apply_platform_overrides(load_deploy_config(deploy_path), platform="npu")
@@ -2881,7 +2903,7 @@ class TestPlatformOverrides:
                 load_deploy_config(Path(get_deploy_config_path(filename))), platform="cuda"
             )
             replica_stages = merge_pipeline_deploy(pipeline, replica)
-            # Explicit null clears the inherited single-GPU 2 GiB CUDA cap.
+            # Explicit null clears the inherited single-GPU 4 GiB CUDA cap.
             assert replica_stages[1].yaml_engine_args.get("kv_cache_memory_bytes") is None
 
     def test_fish_speech_npu_uses_ascend_kv_block_size(self):
