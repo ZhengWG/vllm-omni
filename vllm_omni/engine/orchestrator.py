@@ -90,9 +90,6 @@ _EVENT_DRIVEN_ORCH_ENV = "VLLM_OMNI_EVENT_DRIVEN_ORCH"
 # `available_replica_ids()` (elastic membership, replica eviction) while idle.
 _ORCH_READER_RECONCILE_INTERVAL_S = 0.5
 
-# A replica that dies mid-release never answers, so a reused id waits at most this long.
-_TRANSFER_RELEASE_WAIT_S = 5.0
-
 
 def _event_driven_orch_enabled(*, default: bool = False) -> bool:
     value = os.environ.get(_EVENT_DRIVEN_ORCH_ENV)
@@ -707,11 +704,13 @@ class OrchestratorBase:
             return
 
         async def _run() -> None:
-            for pool in self.stage_pools:
-                try:
-                    await pool.release_request_resources(request_ids)
-                except Exception as e:
-                    logger.warning("[Orchestrator] release transfer resources failed: %s", e)
+            results = await asyncio.gather(
+                *(pool.release_request_resources(request_ids) for pool in self.stage_pools),
+                return_exceptions=True,
+            )
+            for result in results:
+                if isinstance(result, Exception):
+                    logger.warning("[Orchestrator] release transfer resources failed: %s", result)
 
         def _untrack_stage_transfer_release(task: asyncio.Task) -> None:
             for request_id in request_ids:
@@ -732,15 +731,8 @@ class OrchestratorBase:
     async def _wait_transfer_release(self, request_id: str) -> None:
         """Hold a reused id until its previous prefix unlink is queued, so it cannot hit the new chunks."""
         task = self._transfer_release_tasks.get(request_id)
-        if task is None:
-            return
-        done, _ = await asyncio.wait({task}, timeout=_TRANSFER_RELEASE_WAIT_S)
-        if not done:
-            logger.warning(
-                "[Orchestrator] transfer release for reused req=%s still pending after %.0fs; admitting anyway",
-                request_id,
-                _TRANSFER_RELEASE_WAIT_S,
-            )
+        if task is not None:
+            await asyncio.wait({task})
 
     def _release_request_bindings(self, request_ids: list[str]) -> None:
         """Release all stage-local route bindings for the given request ids."""

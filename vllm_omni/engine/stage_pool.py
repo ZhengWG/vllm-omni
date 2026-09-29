@@ -99,6 +99,8 @@ class StagePool:
 
     DISPATCH_WAIT_TIMEOUT_S: float = 10.0
     DISPATCH_RETRY_INTERVAL_S: float = 0.1
+    # A replica that dies mid-release never answers; this also bounds how long a reused id waits for admission.
+    RELEASE_RPC_TIMEOUT_S: float = 5.0
     # Only these EngineCore helpers may skip collective_rpc_async. A generic
     # ``{method}_async`` on AsyncMPClient must not silently drop timeout.
     _CACHE_RESET_METHODS = frozenset({"reset_prefix_cache", "reset_encoder_cache", "reset_mm_cache"})
@@ -1318,16 +1320,18 @@ class StagePool:
         """
         if not request_ids or not self._has_chunk_transfer_adapter:
             return
-        for client in self.clients:
-            if client is None:
-                continue
-            call = getattr(client, "call_utility_async", None)
-            if call is None:
-                continue
+        ids = list(request_ids)
+
+        async def release(replica_id: int, call: Any) -> None:
             try:
-                await call("omni_release_request_resources", list(request_ids))
+                await asyncio.wait_for(call("omni_release_request_resources", ids), timeout=self.RELEASE_RPC_TIMEOUT_S)
             except Exception as e:
-                logger.debug("[StagePool-%s] release_request_resources failed: %s", self.stage_id, e)
+                logger.warning(
+                    "[StagePool-%s] release_request_resources on replica %s failed: %r", self.stage_id, replica_id, e
+                )
+
+        calls = [(i, getattr(self.clients[i], "call_utility_async", None)) for i in self.live_replica_ids()]
+        await asyncio.gather(*(release(i, call) for i, call in calls if call is not None))
 
     async def collective_rpc(
         self,
