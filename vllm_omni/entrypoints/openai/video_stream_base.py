@@ -441,15 +441,16 @@ class OmniStreamingVideoHandler:
                     interrupt_event.set()
                     prev_was_interrupted = True
                     logger.info("Interrupt signaled for %s", active_request_id)
+                    if query_task is not None and not query_task.done():
+                        query_task.cancel()
+                        await asyncio.gather(query_task, return_exceptions=True)
+                    query_task = None
+                    # Abort after the task reaches Stage0 so a cancel during preprocess still submits.
                     if abort_now and self._engine_client:
                         try:
                             await self._engine_client.abort(active_request_id)
                         except Exception:
                             logger.debug("Abort failed for %s", active_request_id, exc_info=True)
-                    if query_task is not None and not query_task.done():
-                        query_task.cancel()
-                        await asyncio.gather(query_task, return_exceptions=True)
-                    query_task = None
 
             # --- Incremental prefill: keep the prefix cache warmed to the latest
             # buffered frame so a query only pays for its own text suffix. ---
@@ -657,13 +658,24 @@ class OmniStreamingVideoHandler:
                         max_buf = config.max_frames
                         dropped_frame_id: str | None = None
                         if len(frame_buffer) >= max_buf:
-                            dropped = frame_buffer.pop(0)
-                            dropped_metadata = frame_metadata.pop(0)
-                            dropped_frame_id = dropped_metadata.get("frame_id")
-                            # Duplicate frames share one cache entry keyed by
-                            # b64: keep it while any duplicate remains buffered.
-                            if dropped not in pinned_frame_refs and dropped not in frame_buffer:
-                                _drop_frame_cache(dropped)
+                            # Legacy drops one frame. Incremental drops the oldest half so later frames append.
+                            drop_count = max(1, max_buf // 2) if self._incremental_prefill_active(config) else 1
+                            for _ in range(drop_count):
+                                dropped = frame_buffer.pop(0)
+                                dropped_metadata = frame_metadata.pop(0)
+                                if dropped_frame_id is None:
+                                    dropped_frame_id = dropped_metadata.get("frame_id")
+                                # Duplicate frames share one cache entry keyed by
+                                # b64: keep it while any duplicate remains buffered.
+                                if dropped not in pinned_frame_refs and dropped not in frame_buffer:
+                                    _drop_frame_cache(dropped)
+                            if drop_count > 1:
+                                logger.warning(
+                                    "incremental prefill dropped %d oldest frames at max_frames=%d; "
+                                    "buffered_frames is the remaining suffix",
+                                    drop_count,
+                                    max_buf,
+                                )
                         frame_buffer.append(frame_data)
                         frame_metadata.append(
                             {
@@ -952,97 +964,142 @@ class OmniStreamingVideoHandler:
             await self._send_error(websocket, f"Failed to build request: {e}")
             return
 
-        try:
-            engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
-        except Exception as e:
-            await self._send_error(websocket, f"Preprocess failed: {e}")
-            return
-        decoded_ready_ts_ms = _time.monotonic() * 1000
-        selected_metadata = [frame_metadata[index] for index in frame_indices] if frame_metadata else []
-        model_selected_ts_ms = _time.monotonic() * 1000
+        submitted = asyncio.get_running_loop().create_future()
 
-        await websocket.send_json({"type": "response.start"})
-        text_parts: list[str] = []
-        text_done_sent = False
-        audio_chunk_count = 0
-        # Count emitted tensors only to identify the first audio emission.
-        # Default and explicit sampling parameters use DELTA audio outputs.
-        audio_chunks_drained = 0
-        previous_text = ""
-        interrupted = False
-        frames_consumed_sent = False
-        t_start = _time.monotonic()
-        t_first_text = None
-        t_first_audio = None
+        async def _drive_query() -> None:
+            decoded_ready_ts_ms = _time.monotonic() * 1000
+            selected_metadata = [frame_metadata[index] for index in frame_indices] if frame_metadata else []
+            model_selected_ts_ms = _time.monotonic() * 1000
 
-        # Wire-level async-chunk switch. "off" means
-        # buffer all deltas server-side and flush once at the end; the engine
-        # pipeline still overlaps internally.
-        async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
-        streaming = async_chunk_mode == "on"
-        audio_tail_tensors: list[Any] = []
+            if not interrupt_event.is_set():
+                await websocket.send_json({"type": "response.start"})
+            text_parts: list[str] = []
+            text_done_sent = False
+            audio_chunk_count = 0
+            # Count emitted tensors only to identify the first audio emission.
+            # Default and explicit sampling parameters use DELTA audio outputs.
+            audio_chunks_drained = 0
+            previous_text = ""
+            interrupted = False
+            frames_consumed_sent = False
+            t_start = _time.monotonic()
+            t_first_text = None
+            t_first_audio = None
 
-        try:
-            result_gen = engine_client.generate(
-                prompt=engine_prompt,
-                request_id=request_id,
-                output_modalities=config.modalities,
-                **sampling_kwargs,
-            )
+            # Wire-level async-chunk switch. "off" means
+            # buffer all deltas server-side and flush once at the end; the engine
+            # pipeline still overlaps internally.
+            async_chunk_mode = video_stream_envs.VLLM_VIDEO_ASYNC_CHUNK
+            streaming = async_chunk_mode == "on"
+            audio_tail_tensors: list[Any] = []
 
-            async for output in result_gen:
-                # Soft interrupt: drain without sending
-                if interrupt_event.is_set():
-                    if not interrupted:
-                        logger.info("Generation interrupted — draining")
-                        interrupted = True
-                    continue
+            try:
+                assert engine_client is not None
+                result_gen = engine_client.generate(
+                    prompt=engine_prompt,
+                    request_id=request_id,
+                    output_modalities=config.modalities,
+                    submitted=submitted,
+                    **sampling_kwargs,
+                )
 
-                if not isinstance(output, OmniRequestOutput):
-                    continue
+                async for output in result_gen:
+                    # Soft interrupt: drain without sending
+                    if interrupt_event.is_set():
+                        if not interrupted:
+                            logger.info("Generation interrupted — draining")
+                            interrupted = True
+                        continue
 
-                if not frames_consumed_sent and frame_metadata:
-                    await websocket.send_json(
-                        {
-                            "type": "video.frames.consumed",
-                            "request_id": request_id,
-                            "model_selected_ts_ms": model_selected_ts_ms,
-                            "frame_ids": [
-                                metadata["frame_id"]
-                                for metadata in selected_metadata
-                                if isinstance(metadata.get("frame_id"), str)
-                            ],
-                            "frames": [
-                                {
-                                    "frame_id": metadata.get("frame_id"),
-                                    "pts_ms": metadata.get("pts_ms"),
-                                    "source_pts_ms": metadata.get("source_pts_ms"),
-                                    "quality_profile": metadata.get("quality_profile"),
-                                    "receiver_received_ts_ms": metadata.get("receiver_received_ts_ms"),
-                                    "decoded_ready_ts_ms": decoded_ready_ts_ms,
-                                }
-                                for metadata in selected_metadata
-                            ],
-                            "latest_pts_ms": selected_metadata[-1].get("pts_ms") if selected_metadata else None,
-                        }
-                    )
-                    frames_consumed_sent = True
+                    if not isinstance(output, OmniRequestOutput):
+                        continue
 
-                out_type = getattr(output, "final_output_type", "text")
+                    if not frames_consumed_sent and frame_metadata:
+                        await websocket.send_json(
+                            {
+                                "type": "video.frames.consumed",
+                                "request_id": request_id,
+                                "model_selected_ts_ms": model_selected_ts_ms,
+                                "frame_ids": [
+                                    metadata["frame_id"]
+                                    for metadata in selected_metadata
+                                    if isinstance(metadata.get("frame_id"), str)
+                                ],
+                                "frames": [
+                                    {
+                                        "frame_id": metadata.get("frame_id"),
+                                        "pts_ms": metadata.get("pts_ms"),
+                                        "source_pts_ms": metadata.get("source_pts_ms"),
+                                        "quality_profile": metadata.get("quality_profile"),
+                                        "receiver_received_ts_ms": metadata.get("receiver_received_ts_ms"),
+                                        "decoded_ready_ts_ms": decoded_ready_ts_ms,
+                                    }
+                                    for metadata in selected_metadata
+                                ],
+                                "latest_pts_ms": selected_metadata[-1].get("pts_ms") if selected_metadata else None,
+                            }
+                        )
+                        frames_consumed_sent = True
 
-                if out_type == "audio":
-                    if streaming and not text_done_sent:
-                        full_text = "".join(text_parts)
-                        await websocket.send_json({"type": "response.text.done", "text": full_text})
-                        text_done_sent = True
+                    out_type = getattr(output, "final_output_type", "text")
 
-                    if t_first_audio is None:
-                        t_first_audio = _time.monotonic()
-                    audio_chunk_count += 1
-                    if streaming:
-                        b64, audio_chunks_drained = self._extract_audio_delta_b64(
+                    if out_type == "audio":
+                        if streaming and not text_done_sent:
+                            full_text = "".join(text_parts)
+                            await websocket.send_json({"type": "response.text.done", "text": full_text})
+                            text_done_sent = True
+
+                        if t_first_audio is None:
+                            t_first_audio = _time.monotonic()
+                        audio_chunk_count += 1
+                        if streaming:
+                            b64, audio_chunks_drained = self._extract_audio_delta_b64(
+                                output,
+                                audio_chunks_drained,
+                            )
+                            if b64:
+                                await websocket.send_json(
+                                    {
+                                        "type": "response.output_audio.delta",
+                                        "data": b64,
+                                        "format": "wav",
+                                    }
+                                )
+                        else:
+                            audio_data = self._get_audio_data(output)
+                            if audio_data is not None:
+                                if isinstance(audio_data, list):
+                                    audio_tail_tensors.extend(audio_data)
+                                else:
+                                    audio_tail_tensors.append(audio_data)
+                    else:
+                        delta_text, previous_text = self._extract_text_delta(
                             output,
-                            audio_chunks_drained,
+                            previous_text,
+                        )
+                        if delta_text:
+                            if t_first_text is None:
+                                t_first_text = _time.monotonic()
+                            text_parts.append(delta_text)
+                            if streaming:
+                                await websocket.send_json({"type": "response.text.delta", "delta": delta_text})
+
+                if not text_done_sent:
+                    full_text = "".join(text_parts)
+                    await websocket.send_json({"type": "response.text.done", "text": full_text})
+                    text_done_sent = True
+
+                if not streaming and audio_tail_tensors:
+                    try:
+                        coalesced = audio_tail_tensors[0]
+                        if len(audio_tail_tensors) != 1:
+                            coalesced = torch.cat(audio_tail_tensors, dim=-1)
+                        tail_np = self._tensor_to_1d_np(coalesced)
+                        b64, _ = self._encode_tail(
+                            tail_np,
+                            0,
+                            new_drained=len(audio_tail_tensors),
+                            is_first=True,
                         )
                         if b64:
                             await websocket.send_json(
@@ -1052,76 +1109,45 @@ class OmniStreamingVideoHandler:
                                     "format": "wav",
                                 }
                             )
-                    else:
-                        audio_data = self._get_audio_data(output)
-                        if audio_data is not None:
-                            if isinstance(audio_data, list):
-                                audio_tail_tensors.extend(audio_data)
-                            else:
-                                audio_tail_tensors.append(audio_data)
-                else:
-                    delta_text, previous_text = self._extract_text_delta(
-                        output,
-                        previous_text,
-                    )
-                    if delta_text:
-                        if t_first_text is None:
-                            t_first_text = _time.monotonic()
-                        text_parts.append(delta_text)
-                        if streaming:
-                            await websocket.send_json({"type": "response.text.delta", "delta": delta_text})
+                    except Exception:
+                        logger.exception("Failed to coalesce off-path audio")
 
-            if not text_done_sent:
+                if audio_chunk_count > 0:
+                    await websocket.send_json({"type": "response.output_audio.done"})
+
+                response_text = "".join(text_parts)
+                self.on_turn_complete(message_history, user_message, response_text)
+
+                t_end = _time.monotonic()
+                logger.info(
+                    "[TIMING] mode=%s total=%.2fs first_text=%.2fs first_audio=%.2fs audio_chunks=%d",
+                    async_chunk_mode,
+                    t_end - t_start,
+                    (t_first_text - t_start) if t_first_text else -1,
+                    (t_first_audio - t_start) if t_first_audio else -1,
+                    audio_chunk_count,
+                )
+
+            except Exception:
+                logger.exception("Engine query failed")
+                await self._send_error(websocket, "Query processing failed")
+
+            if not text_done_sent and not interrupt_event.is_set():
                 full_text = "".join(text_parts)
                 await websocket.send_json({"type": "response.text.done", "text": full_text})
-                text_done_sent = True
 
-            if not streaming and audio_tail_tensors:
-                try:
-                    coalesced = (
-                        audio_tail_tensors[0] if len(audio_tail_tensors) == 1 else torch.cat(audio_tail_tensors, dim=-1)
-                    )
-                    tail_np = self._tensor_to_1d_np(coalesced)
-                    b64, _ = self._encode_tail(
-                        tail_np,
-                        0,
-                        new_drained=len(audio_tail_tensors),
-                        is_first=True,
-                    )
-                    if b64:
-                        await websocket.send_json(
-                            {
-                                "type": "response.output_audio.delta",
-                                "data": b64,
-                                "format": "wav",
-                            }
-                        )
-                except Exception:
-                    logger.exception("Failed to coalesce off-path audio")
-
-            if audio_chunk_count > 0:
-                await websocket.send_json({"type": "response.output_audio.done"})
-
-            response_text = "".join(text_parts)
-            self.on_turn_complete(message_history, user_message, response_text)
-
-            t_end = _time.monotonic()
-            logger.info(
-                "[TIMING] mode=%s total=%.2fs first_text=%.2fs first_audio=%.2fs audio_chunks=%d",
-                async_chunk_mode,
-                t_end - t_start,
-                (t_first_text - t_start) if t_first_text else -1,
-                (t_first_audio - t_start) if t_first_audio else -1,
-                audio_chunk_count,
-            )
-
-        except Exception:
-            logger.exception("Engine query failed")
-            await self._send_error(websocket, "Query processing failed")
-
-        if not text_done_sent:
-            full_text = "".join(text_parts)
-            await websocket.send_json({"type": "response.text.done", "text": full_text})
+        prompt_task = asyncio.ensure_future(self._preprocess_to_engine_prompt(chat_request))
+        try:
+            engine_prompt = await asyncio.shield(prompt_task)
+        except asyncio.CancelledError:
+            # Sender cache is updated in preprocess; submit before the caller aborts.
+            engine_prompt = await asyncio.shield(prompt_task)
+            await self._stop_after_submit(asyncio.ensure_future(_drive_query()), submitted)
+            raise
+        except Exception as e:
+            await self._send_error(websocket, f"Preprocess failed: {e}")
+            return
+        await self._await_until_submitted(asyncio.ensure_future(_drive_query()), submitted)
 
     # ------------------------------------------------------------------
     # Audio helpers
@@ -1285,6 +1311,60 @@ class OmniStreamingVideoHandler:
     # Incremental prefill (context warmup)
     # ------------------------------------------------------------------
 
+    async def _stop_after_submit(self, drive: asyncio.Future[Any], submitted: asyncio.Future[None]) -> None:
+        """Stage0 must observe the request before the caller aborts it."""
+        if not submitted.done():
+            submit_wait = asyncio.ensure_future(asyncio.shield(submitted))
+            await asyncio.wait({submit_wait, drive}, return_when=asyncio.FIRST_COMPLETED)
+            if not submitted.done():
+                submit_wait.cancel()
+                exc = drive.exception() if drive.done() else None
+                if exc is not None:
+                    raise exc
+        if not drive.done():
+            drive.cancel()
+            await asyncio.gather(drive, return_exceptions=True)
+
+    async def _await_until_submitted(self, drive: asyncio.Future[Any], submitted: asyncio.Future[None]) -> None:
+        """On cancel, wait until Stage0 has accepted the request before aborting."""
+        try:
+            # Shield so cancelling this task does not cancel generate before Stage0 submit.
+            await asyncio.shield(drive)
+        except asyncio.CancelledError:
+            await self._stop_after_submit(drive, submitted)
+            raise
+
+    async def _drive_warmup_generate(
+        self,
+        engine_client: Any,
+        engine_prompt: Any,
+        request_id: str,
+        modalities: list[str],
+        *,
+        stop_after_submit: bool = False,
+    ) -> None:
+        """max_tokens=1 generate; cancellation still submits before abort."""
+        from vllm import SamplingParams
+
+        submitted = asyncio.get_running_loop().create_future()
+        result_gen = engine_client.generate(
+            prompt=engine_prompt,
+            request_id=request_id,
+            sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
+            output_modalities=modalities,
+            submitted=submitted,
+        )
+
+        async def _drive() -> None:
+            async for _ in result_gen:
+                pass
+
+        drive = asyncio.ensure_future(_drive())
+        if stop_after_submit:
+            await self._stop_after_submit(drive, submitted)
+            return
+        await self._await_until_submitted(drive, submitted)
+
     async def _prefill_context(
         self,
         config: StreamingVideoSessionConfig,
@@ -1292,7 +1372,6 @@ class OmniStreamingVideoHandler:
         request_id: str,
     ) -> None:
         """max_tokens=1 generate so arriving frames land in the prefix cache."""
-        from vllm import SamplingParams
         from vllm.entrypoints.openai.chat_completion.protocol import (
             ChatCompletionRequest,
         )
@@ -1315,15 +1394,17 @@ class OmniStreamingVideoHandler:
                 "use_audio_in_video": True,
             }
         chat_request = ChatCompletionRequest(**request_kwargs)
-        engine_prompt = await self._preprocess_to_engine_prompt(chat_request)
-        result_gen = engine_client.generate(
-            prompt=engine_prompt,
-            request_id=request_id,
-            sampling_params=SamplingParams(max_tokens=1, temperature=0.0),
-            output_modalities=config.modalities,
-        )
-        async for _ in result_gen:
-            pass
+        prompt_task = asyncio.ensure_future(self._preprocess_to_engine_prompt(chat_request))
+        try:
+            engine_prompt = await asyncio.shield(prompt_task)
+        except asyncio.CancelledError:
+            # Sender cache is updated in preprocess; submit before the caller aborts.
+            engine_prompt = await asyncio.shield(prompt_task)
+            await self._drive_warmup_generate(
+                engine_client, engine_prompt, request_id, config.modalities, stop_after_submit=True
+            )
+            raise
+        await self._drive_warmup_generate(engine_client, engine_prompt, request_id, config.modalities)
 
     # ------------------------------------------------------------------
     # Preprocessing

@@ -69,7 +69,7 @@ Queries stride-sample the buffered frames, keeping the last frame, then exclude 
 | `model` | string or null | null | Optional model name. Usually omitted because the server hosts one model. |
 | `modalities` | list[string] | `["text", "audio"]` | Output modalities. Use `["text"]`, `["audio"]`, or both. |
 | `num_frames` | integer, 1-128 | `4` | Number of buffered frames sampled for each query. Legacy path only: with incremental prefill active, every buffered frame is submitted and frame density is the client's responsibility (clients push discrete frames at their own rate). |
-| `max_frames` | integer, 1-256 | `50` | Maximum retained frame buffer size. Oldest frames are evicted first. |
+| `max_frames` | integer, 1-256 | `50` | Maximum retained frame buffer size. Below the cap both paths keep every frame. Legacy evicts the oldest frame once full. Incremental prefill drops the oldest half at once, then appends until full again. |
 | `system_prompt` | string or null | null | Optional custom system prompt. |
 | `use_audio_in_video` | bool | `true` | Incremental prefill: forwarded on warmup and every query when this is true, so multimodal hashes stay aligned. Legacy: forwarded only when this query has input audio. |
 | `sampling_params_list` | list or null | null | Optional per-stage parameter dictionaries. Each provided entry replaces that stage's deployment sampling settings. |
@@ -122,7 +122,9 @@ prefills `history + frames` as they arrive (`max_tokens=1`). When
 `video.query` is the same prompt plus optional input audio and the question text,
 so the warmed vision prefix cache is reused and the query pays for the audio/text
 suffix. All buffered frames are
-submitted in arrival order (`num_frames` subsample is legacy-only). After a turn,
+submitted in arrival order (`num_frames` subsample is legacy-only). Once the buffer
+hits `max_frames`, the oldest half is dropped in one step and a warning is logged;
+until then the buffer matches the legacy path. After a turn,
 history compresses to the last two text messages and the next warmup follows the
 new prefix.
 
@@ -136,6 +138,7 @@ frame buffer across queries (`max_frames`) and compress history the same way.
 
 ## Known Limitations
 
+- Past `max_frames`, incremental prefill keeps a suffix of the newest frames, not a resample of the whole stream. Rebuilding that longer window is left to a follow-up.
 - Incremental prefill applies only to text-only sessions with stage-0 prefix caching enabled
   on `WS /v1/video/chat/stream`. It does not accelerate `/v1/realtime` camera input, which
   uses duplex conversation items rather than `video.frame` / `video.query`. Audio-output

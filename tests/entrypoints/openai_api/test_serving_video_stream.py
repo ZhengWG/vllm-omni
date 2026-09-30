@@ -905,6 +905,9 @@ async def test_interrupted_queries_wait_for_abort_without_fixed_delay(monkeypatc
 
     class BlockingEngine:
         async def generate(self, *, request_id, **kwargs):
+            submitted = kwargs.get("submitted")
+            if submitted is not None and not submitted.done():
+                submitted.set_result(None)
             if request_ids:
                 assert aborted[-1] == request_ids[-1]
             request_ids.append(request_id)
@@ -1361,6 +1364,9 @@ class RecordingReuseEngine:
 
     def generate(self, **kwargs):
         self.requests.append(kwargs)
+        submitted = kwargs.get("submitted")
+        if submitted is not None and not submitted.done():
+            submitted.set_result(None)
         is_warmup = kwargs["request_id"].startswith("video-warmup-")
         delay = self._warmup_delay if is_warmup else self._query_delay
 
@@ -1446,6 +1452,98 @@ async def test_warmup_fires_on_frame_and_query_cancels_it():
     assert await _poll(lambda: "response.text.done" in ws.sent_types())
     # the committed turn changed the context -> a fresh warmup fires
     assert await _poll(lambda: len(engine.warmup_ids()) == 2)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_warmup_reaches_stage0_before_abort():
+    """Cancel during submit must not abort a warmup the engine never received."""
+
+    class _HoldSubmitEngine(RecordingReuseEngine):
+        def __init__(self):
+            super().__init__()
+            self.started = asyncio.Event()
+            self.release_submit = asyncio.Event()
+
+        def generate(self, **kwargs):
+            submitted = kwargs.get("submitted")
+
+            async def _gen():
+                self.started.set()
+                await self.release_submit.wait()
+                self.requests.append(kwargs)
+                if submitted is not None and not submitted.done():
+                    submitted.set_result(None)
+                yield _text_result("ok")
+
+            return _gen()
+
+    engine = _HoldSubmitEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "modalities": ["text"], "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    assert await _poll(engine.started.is_set)
+    ws.put({"type": "video.query", "text": "describe"})
+    await asyncio.sleep(0.05)
+    assert engine.requests == []
+    assert engine.aborted == []
+    engine.release_submit.set()
+    assert await _poll(lambda: engine.aborted)
+    assert engine.warmup_ids()
+    assert engine.aborted[0] == engine.warmup_ids()[0]
+    assert await _poll(lambda: engine.query_ids())
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_query_reaches_stage0_before_abort():
+    """Cancel during query submit must not abort a request the engine never received."""
+
+    class _HoldQueryEngine(RecordingReuseEngine):
+        def __init__(self):
+            super().__init__()
+            self.query_started = asyncio.Event()
+            self.release_submit = asyncio.Event()
+
+        def generate(self, **kwargs):
+            if str(kwargs.get("request_id", "")).startswith("video-warmup-"):
+                return super().generate(**kwargs)
+            submitted = kwargs.get("submitted")
+
+            async def _gen():
+                self.query_started.set()
+                await self.release_submit.wait()
+                self.requests.append(kwargs)
+                if submitted is not None and not submitted.done():
+                    submitted.set_result(None)
+                yield _text_result("ok")
+
+            return _gen()
+
+    engine = _HoldQueryEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put({"type": "session.config", "model": "test", "modalities": ["text"], "enable_frame_filter": False})
+    await asyncio.sleep(0)
+    ws.put({"type": "video.frame", "data": _b64(_make_jpeg())})
+    assert await _poll(lambda: engine.warmup_ids())
+    ws.put({"type": "video.query", "text": "first"})
+    assert await _poll(engine.query_started.is_set)
+    ws.put({"type": "video.query", "text": "second"})
+    await asyncio.sleep(0.05)
+    assert engine.query_ids() == []
+    assert engine.aborted == []
+    engine.release_submit.set()
+    assert await _poll(lambda: engine.query_ids())
+    first_query = engine.query_ids()[0]
+    assert await _poll(lambda: first_query in engine.aborted)
+    assert await _poll(lambda: len(engine.query_ids()) == 2)
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
 
@@ -1588,6 +1686,52 @@ async def test_query_keeps_frames_evicted_while_pinned(monkeypatch):
     assert uuids == expected
     ws.put({"type": "video.done"})
     await asyncio.wait_for(task, timeout=2.0)
+
+
+async def _query_image_uuids(modalities: list[str], frames: list[str], *, max_frames: int) -> list[str]:
+    engine = RecordingReuseEngine()
+    handler = PromptRecordingHandler(chat_service=object(), engine_client=engine, idle_timeout=5.0)
+    ws = TimedWebSocket()
+    task = asyncio.create_task(handler.handle_session(ws))
+    ws.put(
+        {
+            "type": "session.config",
+            "model": "test",
+            "modalities": modalities,
+            "max_frames": max_frames,
+            "num_frames": max_frames,
+            "enable_frame_filter": False,
+        }
+    )
+    await asyncio.sleep(0)
+    for frame in frames:
+        ws.put({"type": "video.frame", "data": frame})
+    ws.put({"type": "video.query", "text": "describe"})
+    assert await _poll(lambda: handler.query_contents)
+    ws.put({"type": "video.done"})
+    await asyncio.wait_for(task, timeout=2.0)
+    return [part["uuid"] for part in handler.query_contents[0] if part.get("type") == "image_pil"]
+
+
+def _frame_uuid(frame_b64: str) -> str:
+    return hashlib.md5(base64.b64decode(frame_b64), usedforsecurity=False).hexdigest()
+
+
+@pytest.mark.asyncio
+async def test_below_max_frames_incremental_matches_legacy_window():
+    frames = [_b64(_make_jpeg(i, 0, 0)) for i in range(3)]
+    expected = [_frame_uuid(frame) for frame in frames]
+    assert await _query_image_uuids(["text"], frames, max_frames=4) == expected
+    assert await _query_image_uuids(["text", "audio"], frames, max_frames=4) == expected
+
+
+@pytest.mark.asyncio
+async def test_incremental_full_window_drops_oldest_half():
+    frames = [_b64(_make_jpeg(i, 1, 0)) for i in range(5)]
+    kept = await _query_image_uuids(["text"], frames, max_frames=4)
+    legacy = await _query_image_uuids(["text", "audio"], frames, max_frames=4)
+    assert kept == [_frame_uuid(frame) for frame in frames[2:]]
+    assert legacy == [_frame_uuid(frame) for frame in frames[1:]]
 
 
 async def _run_frame_audio_query(modalities: list[str], frame: str, pcm: bytes) -> PromptRecordingHandler:
