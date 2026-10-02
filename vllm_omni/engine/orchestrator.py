@@ -931,7 +931,7 @@ class OrchestratorBase:
                     req_state is None
                     or req_state.upstream_first_audio
                     or req_state.pending_upstream_first_audio is not None
-                    or stage_id + 1 > req_state.final_stage_id
+                    or (stage_id if final_output else stage_id + 1) > req_state.final_stage_id
                 ):
                     continue
                 audio = mm.get("model_outputs")
@@ -968,7 +968,7 @@ class OrchestratorBase:
         if pending is None or self.request_states.get(req_state.request_id) is not req_state:
             return
         source_stage, first_output = pending
-        codec_stage = source_stage + 1
+        codec_stage = source_stage if self.stage_pools[source_stage].final_output else source_stage + 1
         pool = self.stage_pools[codec_stage]
         replica_id = pool.get_bound_replica_id(req_state.request_id)
         if replica_id is None or req_state.request_id not in pool.output_processor.request_states:

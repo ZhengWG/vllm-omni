@@ -4,13 +4,17 @@
 graph/eager paths with per-request seed independence, async snapshot ownership."""
 
 from contextlib import nullcontext
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
 import torch
+from vllm.v1.worker.gpu.input_batch import InputBatch, InputBuffers
+from vllm.v1.worker.gpu.mm.encoder_runner import EncoderRunner
 from vllm.v1.worker.gpu.model_states.default import DefaultModelState
+from vllm.v1.worker.gpu.states import RequestState
 
 from vllm_omni.model_executor.models.output_templates import OmniOutput, OwnedBatchTensor
 from vllm_omni.worker_v2.model_states.omni_model_state import OmniModelState, _make_safe_get_rope
@@ -36,6 +40,7 @@ class _DummyInputBatch:
 def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, have_multimodal_outputs=False):
     state = object.__new__(OmniModelState)
     model = MagicMock()
+    model.stream_decoder = None
     model.has_preprocess = has_preprocess
     model.has_postprocess = has_postprocess
     model.have_multimodal_outputs = have_multimodal_outputs
@@ -62,6 +67,10 @@ def _make_state(max_num_reqs=4, has_preprocess=False, has_postprocess=False, hav
 
     state.intermediate_buffer = OmniIntermediateBuffer(max_num_reqs)
     state._static_inputs_embeds = None
+    from vllm_omni.worker_v2.model_states.eager_mtp import EagerMTPState
+
+    state._eager_state = EagerMTPState(state)
+    state._stream_pos = {}
     state._mtp_generators = {}
     state._mtp_runner = None
     for name in ("_mtp_input_ids", "_mtp_input_embeds", "_mtp_hidden", "_mtp_text_step", "_mtp_offsets"):
@@ -264,6 +273,7 @@ def test_seed_independence_resolve_once_and_sampling_kwargs():
     # vLLM sampling seed must not produce a talker generator.
     cpu = torch.device("cpu")
     assert state._get_mtp_generator("r1", SimpleNamespace(extra_args={}, seed=42), cpu) is None
+    state._mtp_generators.clear()  # The following rows are new requests.
     # Same model-local seed reproduces identical uniforms regardless of batch makeup.
     state._mtp_sample_uniforms = torch.empty((2, 2, 4))
     assert torch.equal(
@@ -620,6 +630,12 @@ def test_publish_sampled_embeddings_for_rows_whose_sample_is_kept(monkeypatch) -
     assert [tuple(row.shape) for row in sampled] == [(1, 3), (1, 3), (0,), (1, 3)]
     assert [row.tolist() for row in sampled if row.numel()] == [[[v] * 3] for v in (11.0, 12.0, 14.0)]
 
+    batch.is_prefilling_np[:] = True
+    batch.num_computed_prefill_tokens_np[:] = 0
+    batch.num_scheduled_tokens = [1] * 4
+    extra, _done = state.publish_sampled_embeddings(batch, torch.tensor([[11], [12], [13], [14]]))
+    assert all(row.numel() == 0 for row in extra["embed"]["sampled"])
+
     # Speculative steps sample several tokens per row: not published.
     assert state.publish_sampled_embeddings(batch, torch.tensor([[11, 1], [12, 1], [13, 1], [14, 1]])) is None
 
@@ -649,3 +665,32 @@ def test_identity_preprocess_skips_only_decode_rows(prefilling):
     state.run_preprocess(batch, {"input_ids": torch.tensor([1]), "inputs_embeds": embeds})
     assert seen == (["r1"] if prefilling else [])
     assert torch.equal(embeds, torch.ones(1, 4))
+
+
+def test_mm_embeddings_exclude_zero_length_graph_padding_rows():
+    state = object.__new__(OmniModelState)
+    state.supports_mm_inputs = True
+    state.mm_pruner = None
+    state.prompt_embeds_state = None
+    state.encoder_runner = MagicMock(spec=EncoderRunner, inputs_embeds=torch.zeros(8, 2))
+    state.execute_mm_encoder = lambda _: None
+    state.gather_mm_embeddings = lambda _: ([torch.ones(1, 2)], torch.ones(5, dtype=torch.bool))
+
+    def embed(input_ids, *, query_start_loc, multimodal_embeddings, is_multimodal):
+        assert query_start_loc == [0, 2, 5]
+        return input_ids[:, None].expand(-1, 2).float()
+
+    state.model = MagicMock(supports_embed_input_ids_query_start_loc=True, embed_input_ids=embed)
+    buffers = InputBuffers(4, 8, torch.device("cpu"))
+    batch = replace(
+        InputBatch.make_dummy(2, 5, buffers),
+        num_reqs=2,
+        num_reqs_after_padding=4,
+        num_tokens=5,
+        num_tokens_after_padding=8,
+        input_ids=torch.arange(8),
+        query_start_loc_np=np.array([0, 2, 5, 5, 5], dtype=np.int32),
+    )
+    result = state.prepare_inputs_embeds({}, batch, MagicMock(spec=RequestState))
+    torch.testing.assert_close(result[:5], torch.arange(5).float()[:, None].expand(-1, 2))
+    assert result.shape == (8, 2)

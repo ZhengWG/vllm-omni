@@ -222,6 +222,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
         # num_in_flight_tokens already includes any undrained stale share.
         # Assign instead of accumulating so callers that fenced the same
         # rollover before entering this helper do not count it twice.
+        session.drop_stale_output = True
         session.num_stale_output_tokens = int(getattr(session, "num_in_flight_tokens", 0) or 0)
         session.num_output_placeholders = 0
         session.spec_token_ids = []
@@ -319,6 +320,7 @@ class OmniSchedulerMixin(_SchedulerMixinBase):
             # The streaming update may already have fenced this same in-flight
             # frame. Seed idempotently so the replacement does not count it twice.
             request.num_stale_output_tokens = int(getattr(request, "num_in_flight_tokens", 0) or 0)
+            request.drop_stale_output = True
             request.num_output_placeholders = 0
             request.spec_token_ids = []
             self._release_replaced_streaming_prompt_cache(request)

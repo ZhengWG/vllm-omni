@@ -27,7 +27,12 @@ from vllm.logger import init_logger
 from vllm_omni.diffusion.compile import regionally_compile
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.models.auk.auk_transformer import AuKTransformer, dit_state_dict, sample_latents
+from vllm_omni.diffusion.models.auk.auk_transformer import (
+    AuKTransformer,
+    build_time_grid,
+    dit_state_dict,
+    sample_latents,
+)
 from vllm_omni.diffusion.models.auk.auk_vae import AuKVAE
 from vllm_omni.diffusion.models.auk.cudagraph_wrapper import AuKCUDAGraphWrapper
 from vllm_omni.diffusion.models.auk.vae_cudagraph import AuKVAEDecodeGraph
@@ -267,6 +272,12 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
         text = torch.zeros(1, _WARMUP_TEXT_TOKENS, self.text_hidden_dim, device=self.device, dtype=self.dtype)
         c_mask = torch.ones(text.shape[:2], dtype=torch.bool, device=self.device)
         timestep = torch.zeros((), device=self.device, dtype=torch.float32)
+        # The graphs are keyed by the number of steps, so warm the variant's default grid.
+        if self.is_flash:
+            grid = torch.tensor(self.flash_t_grid, device=self.device, dtype=torch.float32)
+        else:
+            sway = None if self.default_sway is None else float(self.default_sway)
+            grid = build_time_grid(nfe=self.default_nfe, sway_sampling_coef=sway, t_grid=None, device=self.device)
         start = time.perf_counter()
         with torch.inference_mode(), self._dit_autocast():
             for ref_frames in _WARMUP_REF_FRAMES:
@@ -283,6 +294,8 @@ class AuKPipeline(nn.Module, SupportAudioInput, SupportAudioOutput, SupportsComp
                         timestep=timestep,
                         cfg_strength=cfg,
                         new_request=True,
+                        timesteps=grid[:-1],
+                        step_index=0,
                     )
         if self.device.type != "cpu":
             torch.accelerator.synchronize(self.device)
