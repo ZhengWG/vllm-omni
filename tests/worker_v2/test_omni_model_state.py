@@ -620,6 +620,12 @@ def test_publish_sampled_embeddings_for_rows_whose_sample_is_kept(monkeypatch) -
     assert [tuple(row.shape) for row in sampled] == [(1, 3), (1, 3), (0,), (1, 3)]
     assert [row.tolist() for row in sampled if row.numel()] == [[[v] * 3] for v in (11.0, 12.0, 14.0)]
 
+    batch.is_prefilling_np[:] = True
+    batch.num_computed_prefill_tokens_np[:] = 0
+    batch.num_scheduled_tokens = [1] * 4
+    extra, _done = state.publish_sampled_embeddings(batch, torch.tensor([[11], [12], [13], [14]]))
+    assert all(row.numel() == 0 for row in extra["embed"]["sampled"])
+
     # Speculative steps sample several tokens per row: not published.
     assert state.publish_sampled_embeddings(batch, torch.tensor([[11, 1], [12, 1], [13, 1], [14, 1]])) is None
 

@@ -890,15 +890,15 @@ class OmniModelState(DefaultModelState):
         finishing = computed + scheduled >= input_batch.prefill_len_np[:num_reqs]
         kept = ~input_batch.is_prefilling_np[:num_reqs] | finishing
         rows = np.flatnonzero(kept).tolist()
-        if not rows:
-            return None
         device = sampled_token_ids.device
-        first = sampled_token_ids.reshape(num_reqs, -1)[:, 0].index_select(0, index_to_device(rows, device))
-        embeds = self.model.embed_input_ids(first.long())
-        empty = torch.empty(0, dtype=embeds.dtype)
-        sampled: list[torch.Tensor] = [empty] * num_reqs
-        for k, row in enumerate(rows):
-            sampled[row] = embeds[k : k + 1]
+        # Preserve the empty per-row prefill marker even when every request
+        # is prefilling; absence would look like a broken decode handoff.
+        sampled: list[torch.Tensor] = [torch.empty(0)] * num_reqs
+        if rows:
+            first = sampled_token_ids.reshape(num_reqs, -1)[:, 0].index_select(0, index_to_device(rows, device))
+            embeds = self.model.embed_input_ids(first.long())
+            for k, row in enumerate(rows):
+                sampled[row] = embeds[k : k + 1]
         done = torch.cuda.Event()
         done.record()
         extra: dict[str, Any] = {"embed": {"sampled": sampled}}
