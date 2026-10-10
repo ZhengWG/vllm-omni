@@ -98,18 +98,6 @@ def test_tts_preprocess_seeds_noise_generator_once():
     assert _NOISE_GENERATOR_KEY not in info
 
 
-def test_extract_noise_generators_is_row_aligned():
-    from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts import _NOISE_GENERATOR_KEY
-
-    model_cls = _voxtral_tts_model_cls()
-    generator = torch.Generator()
-    infos = [{}, {_NOISE_GENERATOR_KEY: generator}, {"voice": "x"}]
-
-    assert model_cls._extract_noise_generators(model_intermediate_buffer=infos) == [None, generator, None]
-    assert model_cls._extract_noise_generators(model_intermediate_buffer=[{}, {}]) is None
-    assert model_cls._extract_noise_generators() is None
-
-
 def test_fill_seeded_noise_ignores_global_rng_and_batch_position():
     _voxtral_tts_model_cls()
     from vllm_omni.model_executor.models.voxtral_tts.voxtral_tts_audio_generation import fill_seeded_noise

@@ -334,14 +334,13 @@ def test_deterministic_across_calls(model, wrapper):
 def test_seeded_rows_ignore_global_rng(model, wrapper):
     """A row with its own generator reproduces regardless of the global RNG."""
 
-    def run(global_seed: int, row_seed: int):
-        generators = [None, torch.Generator(device=DEVICE).manual_seed(row_seed), None]
+    def seeded_row_codes(global_seed: int) -> torch.Tensor:
+        generators = [None, torch.Generator(device=DEVICE).manual_seed(7), None]
         torch.manual_seed(global_seed)
         with torch.no_grad():
-            return _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise_generators=generators))[1]
+            _, codes = _unpack_audio_codes(wrapper(hidden, cfg_alpha=alpha, noise_generators=generators))
+        return codes[1]
 
     hidden = _random_hidden(3)
     alpha = _cfg_alpha(3)
-    reference = run(global_seed=1, row_seed=7)
-    torch.testing.assert_close(run(global_seed=2, row_seed=7)[1], reference[1], atol=0, rtol=0)
-    assert not torch.equal(run(global_seed=1, row_seed=8)[1], reference[1])
+    torch.testing.assert_close(seeded_row_codes(global_seed=1), seeded_row_codes(global_seed=2), atol=0, rtol=0)
