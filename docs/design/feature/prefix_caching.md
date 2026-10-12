@@ -238,21 +238,21 @@ The state lock covers those tables only.
 
 The manager passes packed, frozen tensors to `controller.prepare_step()`
 outside its state lock. This reserves the clone budget and launches the
-whole-step device→host copy, returning a `PreparedWrites` context:
+whole-step device→host copy, returning a `StepWriteContext`:
 
 1. Under the state lock, the manager registers request slices or appends to
    an existing deferred write, then publishes their slot ownership. The
    context constructs tasks and binds their budget and staging owners;
    registration itself does not run a write or wait for a copy.
-2. Outside the lock, `activate()` dispatches immediate writes. Deferred
+2. Outside the lock, `start_writes()` dispatches immediate writes. Deferred
    writes remain pending until finish/abort or budget pressure. A refused
    append tells the manager to open a new write without exposing task states.
-3. Exiting without activation fails touched writes and releases the step
-   snapshot and unused reservations. Failures remain visible through the
+3. Exiting without a successful start fails touched writes and releases the
+   step snapshot and unused reservations. Failures remain visible through the
    controller's failure drain so published slot metadata cannot silently
    serve missing rows.
 
-The manager holds read-only `WriteHandle`s, not mutable execution tasks.
+The manager holds read-only `WriteTaskHandle`s, not mutable execution tasks.
 A handle keeps deferred rows readable even after completion drain removes
 the task from the controller registry. Slot reassignment is communicated
 through `mark_reassigned()`. A `StepSnapshot` owns the step's staging hold;

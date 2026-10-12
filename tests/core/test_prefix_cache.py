@@ -36,7 +36,7 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
-from vllm_omni.core.prefix_cache.controller import StagingBufferHolder, WriteHandle
+from vllm_omni.core.prefix_cache.controller import StagingBufferHolder, WriteTaskHandle
 from vllm_omni.core.prefix_cache.group_view import (
     FullAttentionGroupView,
     check_prefix_cache_kv_groups,
@@ -1614,7 +1614,7 @@ def test_fetch_host_maps_slots_across_layouts():
         chunks=[_WriteChunk(slots_cpu=slots, tensors={HIDDEN_KEY: rows})],
     )
     for want in (slots, slots[:3], slots[[0, 1, 3, 4]]):
-        assert torch.equal(ctrl.fetch_host(WriteHandle(one), want, HIDDEN_KEY), _expect(want))
+        assert torch.equal(ctrl.fetch_host(WriteTaskHandle(one), want, HIDDEN_KEY), _expect(want))
 
     two = WriteTask(
         tid=2,
@@ -1627,7 +1627,7 @@ def test_fetch_host_maps_slots_across_layouts():
         ],
     )
     want = slots[[0, 3, 1, 4]]
-    assert torch.equal(ctrl.fetch_host(WriteHandle(two), want, HIDDEN_KEY), _expect(want))
+    assert torch.equal(ctrl.fetch_host(WriteTaskHandle(two), want, HIDDEN_KEY), _expect(want))
 
 
 def test_fetch_host_waits_staging_step_d2h_event():
@@ -1664,7 +1664,7 @@ def test_fetch_host_waits_staging_step_d2h_event():
         staging_slot=0,
         step_d2h_event=event,
     )
-    rows = ctrl.fetch_host(WriteHandle(task), slots, HIDDEN_KEY)
+    rows = ctrl.fetch_host(WriteTaskHandle(task), slots, HIDDEN_KEY)
     assert event.n == 1
     assert torch.equal(rows, src)
 
@@ -1681,7 +1681,7 @@ def _bare_controller(eager=True):
 
 
 @pytest.mark.parametrize("registered_count", [0, 1, 3, 4])
-def test_prepared_writes_rollback_partial_registration(registered_count):
+def test_step_write_context_rollback_partial_registration(registered_count):
     """A failed publish releases both unused reservations and bound owners."""
     ctrl, pool = _bare_controller()
     rows = torch.ones(4, HIDDEN)
@@ -1741,7 +1741,7 @@ def test_manager_partial_publish_failure_releases_resources(monkeypatch, failure
 
 
 @pytest.mark.parametrize("registered", [False, True])
-def test_prepared_writes_registration_error_releases_bound_resources(monkeypatch, registered):
+def test_step_write_context_registration_error_releases_bound_resources(monkeypatch, registered):
     ctrl, _ = _bare_controller()
     register = ctrl._register
 
@@ -1782,7 +1782,7 @@ def test_prepare_step_timeout_returns_unused_budget():
         mgr.shutdown()
 
 
-def test_write_handle_keeps_deferred_rows_after_completion_drain():
+def test_write_task_handle_keeps_deferred_rows_after_completion_drain():
     ctrl, _ = _bare_controller()
     rows = torch.arange(2 * HIDDEN, dtype=DTYPE).reshape(2, HIDDEN)
     slots = torch.tensor([0, 1])
@@ -1798,7 +1798,7 @@ def test_write_handle_keeps_deferred_rows_after_completion_drain():
             handle = writes.register(
                 tid=1, req_id="a", write_n=1, schedule=WriteSchedule.JOIN_ON_FINISH, start=0, end=2
             )
-            writes.activate()
+            writes.start_writes()
         writes.snapshot.release()
         ctrl.escalate([handle.tid])
         ctrl.join([handle.tid])

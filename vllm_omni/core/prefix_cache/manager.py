@@ -64,9 +64,9 @@ import torch
 from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
 from vllm_omni.core.prefix_cache.controller import (
     OmniPrefixCacheController,
-    PreparedWrites,
     StepSnapshot,
-    WriteHandle,
+    StepWriteContext,
+    WriteTaskHandle,
 )
 from vllm_omni.core.prefix_cache.interface import (
     ModelCachePolicy,
@@ -244,7 +244,7 @@ class _SlotRef:
     key: TensorName
     req_id: ReqId
     already_staged: bool  # this key is already in the CPU pool
-    staged_list: list[tuple[WriteHandle, torch.Tensor]]  # JOIN_ON_FINISH only
+    staged_list: list[tuple[WriteTaskHandle, torch.Tensor]]  # JOIN_ON_FINISH only
     join_tids: list[Tid] = field(default_factory=list)  # JOIN_NEXT_STEP in-transit
     # Slot version snapshot at plan time, checked on fetch.
     reserved_version: torch.Tensor | None = None
@@ -377,7 +377,7 @@ class _RequestTaskTable:
         self._next_tid: Tid = 1
         self.write_n: dict[ReqId, int] = {}  # last write_n issued
         self.tasks: dict[ReqId, set[Tid]] = {}
-        self.deferred: dict[ReqId, WriteHandle] = {}
+        self.deferred: dict[ReqId, WriteTaskHandle] = {}
         self.live_reqs: set[ReqId] = set()
 
     def alloc_tid(self) -> Tid:
@@ -393,7 +393,7 @@ class _RequestTaskTable:
     def track(self, req_id: ReqId, tid: Tid) -> None:
         self.tasks.setdefault(req_id, set()).add(tid)
 
-    def finish(self, req_id: ReqId) -> tuple[set[Tid], WriteHandle | None]:
+    def finish(self, req_id: ReqId) -> tuple[set[Tid], WriteTaskHandle | None]:
         """Drop this request's rows. Returns owned tids + deferred task."""
         self.live_reqs.discard(req_id)
         self.write_n.pop(req_id, None)
@@ -626,7 +626,7 @@ class OmniPrefixCacheManager:
                     writes=writes,
                 )
                 # Eager execution and queue dispatch must remain outside the lock.
-                writes.activate()
+                writes.start_writes()
                 return step_id
         except BaseException:
             with self._state_lock:
@@ -812,7 +812,7 @@ class OmniPrefixCacheManager:
         slots: torch.Tensor | None,
         num_tokens: int,
         freeze_event: torch.cuda.Event | None,
-    ) -> PreparedWrites:
+    ) -> StepWriteContext:
         """Prepare unlocked; annotate backpressure with manager-owned diagnostics."""
         try:
             return self._controller.prepare_step(
@@ -861,11 +861,11 @@ class OmniPrefixCacheManager:
         step_outputs: _StepOutputs,
         slots_cpu: torch.Tensor | None,
         mm_keys: set[str],
-        writes: PreparedWrites,
+        writes: StepWriteContext,
     ) -> None:
         """Takes ``_state_lock``. Register this step's writes and store the
         consume-once snapshot. Copies live hits into the snapshot, then
-        clears them. The caller activates writes after releasing the lock;
+        clears them. The caller starts writes after releasing the lock;
         device→host, budget flush and eager execution stay outside.
         """
         self._commit_drained_writes()
@@ -951,7 +951,7 @@ class OmniPrefixCacheManager:
 
     def _register_step_writes(
         self,
-        writes: PreparedWrites,
+        writes: StepWriteContext,
         outputs: _StepOutputs,
         slots: torch.Tensor,
         req_order: list[str],
@@ -1099,7 +1099,7 @@ class OmniPrefixCacheManager:
         reserved_version = status.slot_version[slots].clone()
         staged_mask = states == _Occupancy.IN_TRANSIT
 
-        staged: list[tuple[WriteHandle, torch.Tensor]] = []
+        staged: list[tuple[WriteTaskHandle, torch.Tensor]] = []
         join_tids: list[int] = []
         for tid in {int(t) for t in tids[staged_mask].tolist()}:
             task = self._controller.lookup(tid) if tid != 0 else None

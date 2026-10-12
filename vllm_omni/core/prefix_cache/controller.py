@@ -17,7 +17,7 @@ the committer:
                      tensors, then writes the pool.
 
 Async: high-priority then low-priority queues, then pool write.
-Eager: PreparedWrites.activate() waits and writes inline (CPU tests / no CUDA).
+Eager: StepWriteContext.start_writes() waits and writes inline (CPU tests / no CUDA).
 """
 
 from __future__ import annotations
@@ -467,8 +467,8 @@ class StepD2HClaim:
 
 
 @dataclass(frozen=True, eq=False)
-class WriteHandle:
-    """Read-only identity that keeps deferred rows alive after completion drain."""
+class WriteTaskHandle:
+    """Read-only reference to a write task, retaining its deferred rows after drain."""
 
     _task: WriteTask = field(repr=False)
 
@@ -506,10 +506,12 @@ class StepSnapshot:
         self._pool.release(self._claim.staging_slot, self._holder)
 
 
-class PreparedWrites:
-    """One save's resource transaction: prepare, register under the manager
-    lock, then activate outside it. Exiting without activation fails all
-    touched writes and releases reservations and the step snapshot.
+class StepWriteContext:
+    """Own a step's write registrations and shared resource reservations.
+
+    Registers new tasks and appends to deferred tasks that may span steps.
+    Exiting without a successful start fails affected tasks and releases
+    reservations and the step snapshot.
     """
 
     def __init__(
@@ -529,10 +531,10 @@ class PreparedWrites:
         self._freeze_event = freeze_event
         self._touched: dict[Tid, WriteTask] = {}
         self._queued: list[WriteTask] = []
-        self._activated = False
+        self._started = False
         self._closed = False
 
-    def __enter__(self) -> PreparedWrites:
+    def __enter__(self) -> StepWriteContext:
         return self
 
     def __exit__(
@@ -540,7 +542,7 @@ class PreparedWrites:
     ) -> None:
         self._closed = True
         try:
-            if not self._activated:
+            if not self._started:
                 # Do not recycle a page while its device copy is in flight.
                 try:
                     if self.snapshot._claim.event is not None:
@@ -557,8 +559,8 @@ class PreparedWrites:
             self._controller._release_unused_tickets(self._tickets.values())
 
     def _check_open(self) -> None:
-        if self._activated or self._closed:
-            raise OmniPrefixCacheUnmatchError("prepared writes already activated or closed")
+        if self._started or self._closed:
+            raise OmniPrefixCacheUnmatchError("step write context already started or closed")
 
     def _chunk(self, schedule: WriteSchedule, start: int, end: int) -> _WriteChunk:
         assert self._slots is not None
@@ -570,7 +572,7 @@ class PreparedWrites:
 
     def register(
         self, *, tid: Tid, req_id: ReqId, write_n: int, schedule: WriteSchedule, start: int, end: int
-    ) -> WriteHandle:
+    ) -> WriteTaskHandle:
         """Bind resources and publish a write without running or waiting."""
         self._check_open()
         chunk = self._chunk(schedule, start, end)
@@ -594,10 +596,10 @@ class PreparedWrites:
         self._controller._register(task, queued=immediate)
         if immediate:
             self._queued.append(task)
-        return WriteHandle(task)
+        return WriteTaskHandle(task)
 
-    def append(self, handle: WriteHandle, *, start: int, end: int) -> bool:
-        """Append deferred rows, or ask the caller to open a new write."""
+    def append(self, handle: WriteTaskHandle, *, start: int, end: int) -> bool:
+        """Append deferred rows; return False if a new task is required."""
         self._check_open()
         task = handle._task
         chunk = self._chunk(WriteSchedule.JOIN_ON_FINISH, start, end)
@@ -610,11 +612,14 @@ class PreparedWrites:
             self._touched[task.tid] = task
         return True
 
-    def activate(self) -> None:
-        """Run immediate writes outside the manager lock; retain deferred ones."""
+    def start_writes(self) -> None:
+        """Close registration and dispatch immediate writes; leave deferred tasks pending.
+
+        May execute writes inline, so call without holding the state lock.
+        """
         self._check_open()
         self._controller._dispatch(self._queued)
-        self._activated = True
+        self._started = True
 
 
 class OmniPrefixCacheController:
@@ -658,7 +663,7 @@ class OmniPrefixCacheController:
         slots: torch.Tensor | None,
         num_tokens: int,
         freeze_event: torch.cuda.Event | None,
-    ) -> PreparedWrites:
+    ) -> StepWriteContext:
         """Reserve clones and launch staging outside the manager lock.
 
         Inputs are frozen device snapshots. Each packed clone is charged
@@ -679,7 +684,7 @@ class OmniPrefixCacheController:
             self._release_unused_tickets(tickets.values())
             raise
         snapshot = StepSnapshot(self._staging_pool, claim, holder)
-        return PreparedWrites(self, snapshot, tensors, tickets, slots, freeze_event)
+        return StepWriteContext(self, snapshot, tensors, tickets, slots, freeze_event)
 
     def _release_unused_tickets(self, tickets: Iterable[_BudgetTicket]) -> None:
         with self._lock:
@@ -716,7 +721,7 @@ class OmniPrefixCacheController:
         (empty views) so every step id shares this bound. A full pool
         waits for materialize/discard; timeout then errors. A step
         larger than the page overflows the next slot — that is a config
-        break. PreparedWrites binds task holders; StepSnapshot owns the
+        break. StepWriteContext binds task holders; StepSnapshot owns the
         step holder until materialize/discard.
         """
         if tensors and n > self._staging_pool.capacity:
@@ -764,7 +769,7 @@ class OmniPrefixCacheController:
         safe under the manager's state lock. queued=False (deferred tasks)
         stays PENDING on the GPU clone until finish/abort or the GPU-byte
         budget forces a copy. Queued tasks must then go through
-        ``_dispatch``. PreparedWrites binds staging and budget owners
+        ``_dispatch``. StepWriteContext binds staging and budget owners
         before registering either schedule.
         """
         task.enqueued_time = time.monotonic()
@@ -899,9 +904,9 @@ class OmniPrefixCacheController:
                 out.append(self._failed.popleft())
         return out
 
-    def lookup(self, tid: Tid) -> WriteHandle | None:
+    def lookup(self, tid: Tid) -> WriteTaskHandle | None:
         task = self._tasks.get(tid)
-        return WriteHandle(task) if task is not None else None
+        return WriteTaskHandle(task) if task is not None else None
 
     def mark_reassigned(self, tid: Tid, key: str, slots: torch.Tensor) -> None:
         task = self._tasks.get(tid)
@@ -919,7 +924,7 @@ class OmniPrefixCacheController:
     # ------------------------------------------------------------ fetch_host
 
     @torch.inference_mode()
-    def fetch_host(self, handle: WriteHandle, slots: torch.Tensor, key: str) -> torch.Tensor:
+    def fetch_host(self, handle: WriteTaskHandle, slots: torch.Tensor, key: str) -> torch.Tensor:
         """Rows for `slots` of one not-yet-done JOIN_ON_FINISH task.
 
         `_slot_ref` puts JOIN_NEXT_STEP tids in `join_tids` (wait then
