@@ -160,6 +160,16 @@ class OmniServeCommand(CLISubcommand):
             uvloop.run(omni_run_server(args))
 
     def validate(self, args: argparse.Namespace) -> None:
+        # Only the head owns stage-metric collection; API statistics default on.
+        if (
+            not bool(getattr(args, "headless", False))
+            and not bool(getattr(args, "disable_log_stats", False))
+            and not bool(getattr(args, "collect_stage_metrics", True))
+        ):
+            raise ValueError(
+                "--no-collect-stage-metrics requires --disable-log-stats when statistics logging is enabled"
+            )
+
         if args.stage_id is not None and (args.omni_master_address is None or args.omni_master_port is None):
             raise ValueError("--stage-id requires both --omni-master-address and --omni-master-port to be set")
 
@@ -454,6 +464,16 @@ class OmniServeCommand(CLISubcommand):
             help="Enable logging the stats.",
         )
         omni_config_group.add_argument(
+            "--collect-stage-metrics",
+            action=argparse.BooleanOptionalAction,
+            default=True,
+            help=(
+                "Collect per-request stage diagnostics. Enabled by default; "
+                "use --no-collect-stage-metrics with --disable-log-stats to skip diagnostics "
+                "while preserving completion and usage metadata."
+            ),
+        )
+        omni_config_group.add_argument(
             "--log-file",
             type=str,
             default=None,
@@ -561,6 +581,15 @@ class OmniServeCommand(CLISubcommand):
             ),
         )
         omni_config_group.add_argument(
+            "--hsdp-weight-load-strategy",
+            choices=["full", "pre_sharded"],
+            default=None,
+            help=(
+                "HSDP checkpoint loading strategy: 'full' loads then shards; "
+                "'pre_sharded' shards meta parameters first and reads rank-local HF safetensors slices."
+            ),
+        )
+        omni_config_group.add_argument(
             "--lora-path",
             type=str,
             nargs="+",
@@ -603,6 +632,16 @@ class OmniServeCommand(CLISubcommand):
             help=(
                 "Use dynamic shapes for the selected generic diffusion compile scope. "
                 "Disable for fixed-shape workloads with --no-diffusion-compile-dynamic."
+            ),
+        )
+        omni_config_group.add_argument(
+            "--enable-cuda-graph-decode",
+            action=argparse.BooleanOptionalAction,
+            default=None,
+            help=(
+                "Capture fixed-shape KV-cache decode steps into CUDA graphs on models that implement them "
+                "(currently Qwen-Image-2.1). Independent of compilation_config.cudagraph_mode; "
+                "disable with --no-enable-cuda-graph-decode. --enforce-eager also disables it."
             ),
         )
         omni_config_group.add_argument(
@@ -791,7 +830,10 @@ class OmniServeCommand(CLISubcommand):
             type=_json_object,
             default=None,
             help=(
-                "JSON object configuring video output preparation, for example '{\"enable_device_postprocess\": true}'."
+                "JSON object configuring video output transport: enable_device_postprocess enables GPU preparation; "
+                "enable_registered_shm enables experimental CUDA-registered SHM for supported video outputs. "
+                "enable_borrowed_frames enables borrowed RGB frames in MP4 response encoding. "
+                "All default to false."
             ),
         )
         omni_config_group.add_argument(
@@ -833,6 +875,18 @@ class OmniServeCommand(CLISubcommand):
                 "'channels_last' additionally switches decoder convolutions to channels-last memory "
                 "format and fuses RMSNorm+SiLU (faster, not bit-exact); 'off' keeps the reference "
                 "diffusers implementation."
+            ),
+        )
+
+        omni_config_group.add_argument(
+            "--vae-encode-fast-path",
+            choices=("off", "lossless", "channels_last"),
+            default="lossless",
+            help=(
+                "Cosmos3/Wan2.2 residual VAE encoder fast path, independent of --vae-fast-path. "
+                "'lossless' (default) preserves reference values; 'channels_last' also switches "
+                "encoder convolution layouts and fuses reductions (not bit-exact); 'off' uses "
+                "the reference encoder."
             ),
         )
 
@@ -991,8 +1045,8 @@ class OmniServeCommand(CLISubcommand):
             "--vae-patch-parallel-size",
             type=int,
             default=1,
-            help="VAE Patch Parallelism degree for diffusion models. "
-            "Distributes VAE decode workload across multiple ranks by splitting the latent spatially. "
+            help="VAE parallelism degree for diffusion models. "
+            "Distributes VAE decode across ranks using --vae-parallel-mode. "
             "Equivalent to setting DiffusionParallelConfig.vae_patch_parallel_size.",
         )
         omni_config_group.add_argument(
@@ -1007,9 +1061,10 @@ class OmniServeCommand(CLISubcommand):
             "--vae-parallel-mode",
             type=str,
             default="tile",
-            choices=["tile", "spatial_shard_height", "spatial_shard_width"],
+            choices=["tile", "batch", "spatial_shard_height", "spatial_shard_width"],
             help="VAE parallel decode strategy for diffusion models. "
             "'tile' (default) uses patch/tile parallel decode; "
+            "'batch' distributes complete images for AutoencoderKL/Flux2 with DP/PP/CFG sizes of 1; "
             "'spatial_shard_height'/'spatial_shard_width' use spatially-sharded decode that splits "
             "decoder feature maps along height/width and exchanges halo regions. The "
             "'spatial_shard_*' modes require vae_patch_parallel_size to match the DiT group size. "
