@@ -336,11 +336,11 @@ def test_absent_hit_fails_fast():
     mgr, view = make_manager()
     view.req_blocks["c"] = [5, 6]
     sid = run_step(mgr, view, {"c": ([5, 6, 7], 8, 4)}, new_hits={"c": 8})
-    d2h = mgr._step_ctxs[sid].d2h
+    d2h_snapshot = mgr._step_ctxs[sid].d2h_snapshot
     with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.materialize(sid, ["c"])
-    if d2h is not None:
-        assert not mgr._controller._staging_pool._busy[d2h._claim.staging_slot]
+    if d2h_snapshot is not None:
+        assert not mgr._controller._staging_pool._busy[d2h_snapshot._claim.staging_slot]
 
 
 def test_hit_not_block_aligned_fails_at_register():
@@ -972,8 +972,8 @@ def test_leftover_only_save_claims_staging_slot():
     leftover = {"codes.ref": torch.zeros(3, 2)}
     s0 = run_step(mgr, view, {"a": ([0], 0, 1)}, mm=leftover)
     s1 = run_step(mgr, view, {"a": ([0], 1, 1)}, mm=leftover)
-    assert mgr._step_ctxs[s0].d2h is not None and mgr._step_ctxs[s0].d2h._claim.views == {}
-    assert mgr._step_ctxs[s1].d2h is not None and mgr._step_ctxs[s1].d2h._claim.views == {}
+    assert mgr._step_ctxs[s0].d2h_snapshot is not None and mgr._step_ctxs[s0].d2h_snapshot._claim.views == {}
+    assert mgr._step_ctxs[s1].d2h_snapshot is not None and mgr._step_ctxs[s1].d2h_snapshot._claim.views == {}
     with pytest.raises(OmniPrefixCacheStagingTimeoutError, match="unconsumed step contexts"):
         run_step(mgr, view, {"a": ([0], 2, 1)}, mm=leftover)
 
@@ -1192,7 +1192,7 @@ def test_staging_step_prefills_task_host_and_recycles():
     for i in range(6):
         sid = run_step(mgr, view, {"a": ([i % 8, (i % 8) + 8], i, 1)})
         ctx = mgr._step_ctxs[sid]
-        assert ctx.d2h is not None
+        assert ctx.d2h_snapshot is not None
         expect = expected_rows(view.slots_for("a", i, i + 1))
         outs = mgr.materialize(sid, ["a"])
         assert torch.equal(outs.hidden_states["a"], expect), i
@@ -1210,8 +1210,8 @@ def test_staging_slot_eager_save_leaves_only_step_holder():
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
     ctx = mgr._step_ctxs[sid]
-    assert ctx.d2h is not None
-    busy = mgr._controller._staging_pool._busy[ctx.d2h._claim.staging_slot]
+    assert ctx.d2h_snapshot is not None
+    busy = mgr._controller._staging_pool._busy[ctx.d2h_snapshot._claim.staging_slot]
     assert busy == {StagingBufferHolder.for_step(sid)}
     mgr.materialize(sid, ["p"])
     assert not busy
@@ -1289,7 +1289,7 @@ def test_staging_task_slot_released_at_pool_write_not_drain():
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
     ctx = mgr._step_ctxs[sid]
     tid = next(iter(mgr._request_tasks.tasks["p"]))
-    busy = mgr._controller._staging_pool._busy[ctx.d2h._claim.staging_slot]
+    busy = mgr._controller._staging_pool._busy[ctx.d2h_snapshot._claim.staging_slot]
     assert StagingBufferHolder.for_task(tid) in busy and StagingBufferHolder.for_step(sid) in busy
     task = mgr._controller._tasks.get(tid)
     mgr._controller._scatter(task)
@@ -1562,11 +1562,11 @@ def test_hidden_opt_out_miss_returns_mm_and_releases_slot():
     for i in range(6):
         sid = run_step(mgr, view, {"a": ([i % 8, (i % 8) + 8], i, 1)}, mm={"k": torch.full((1, 2), float(i))})
         ctx = mgr._step_ctxs[sid]
-        assert ctx.d2h is not None, i
+        assert ctx.d2h_snapshot is not None, i
         outs = mgr.materialize(sid, ["a"])
         assert outs.hidden_states is None
         assert torch.equal(outs.mm_outputs["k"]["a"], torch.full((1, 2), float(i)))
-        assert not mgr._controller._staging_pool._busy[ctx.d2h._claim.staging_slot], i
+        assert not mgr._controller._staging_pool._busy[ctx.d2h_snapshot._claim.staging_slot], i
 
 
 def test_save_releases_staging_if_commit_drained_writes_fails():
@@ -1586,7 +1586,7 @@ def test_save_releases_staging_if_commit_drained_writes_fails():
     assert all(not busy for busy in mgr._controller._staging_pool._busy)
     mgr._commit_drained_writes = real
     sid = run_step(mgr, view, {"a": ([0], 0, 4)})
-    assert mgr._step_ctxs[sid].d2h is not None
+    assert mgr._step_ctxs[sid].d2h_snapshot is not None
     mgr.materialize(sid, ["a"])
 
 
@@ -1694,9 +1694,9 @@ def test_step_write_context_rollback_partial_registration(registered_count):
             slots=slots,
             num_tokens=4,
             freeze_event=None,
-        ) as writes:
+        ) as write_ctx:
             for i in range(registered_count):
-                writes.register(
+                write_ctx.register(
                     tid=i + 1,
                     req_id=str(i % 2),
                     write_n=1,
@@ -1760,8 +1760,8 @@ def test_step_write_context_registration_error_releases_bound_resources(monkeypa
                 slots=torch.arange(2),
                 num_tokens=2,
                 freeze_event=None,
-            ) as writes:
-                writes.register(tid=1, req_id="a", write_n=1, schedule=WriteSchedule.JOIN_NEXT_STEP, start=0, end=2)
+            ) as write_ctx:
+                write_ctx.register(tid=1, req_id="a", write_n=1, schedule=WriteSchedule.JOIN_NEXT_STEP, start=0, end=2)
         assert ctrl._staged_bytes == 0
         assert all(not holders for holders in ctrl._staging_pool._busy)
     finally:
@@ -1794,12 +1794,12 @@ def test_write_task_handle_keeps_deferred_rows_after_completion_drain():
             slots=slots,
             num_tokens=2,
             freeze_event=None,
-        ) as writes:
-            handle = writes.register(
+        ) as write_ctx:
+            handle = write_ctx.register(
                 tid=1, req_id="a", write_n=1, schedule=WriteSchedule.JOIN_ON_FINISH, start=0, end=2
             )
-            writes.start_writes()
-        writes.snapshot.release()
+            write_ctx.start_writes()
+        write_ctx.snapshot.release()
         ctrl.escalate([handle.tid])
         ctrl.join([handle.tid])
         assert ctrl.drain_completed() == [handle.tid]

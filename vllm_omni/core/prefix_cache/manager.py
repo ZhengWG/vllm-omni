@@ -257,7 +257,7 @@ class _StepContext:
     """Save-time snapshot of one step; consumed exactly once.
 
     Built on the engine thread in save_outputs so materialize (possibly on
-    the async builder) never reads the live batch. Host rows live on `d2h`
+    the async builder) never reads the live batch. Host rows live on `d2h_snapshot`
     (empty views when this save only had leftover mm). materialize or
     discard_step pops it and frees the staging slot. A later save waits
     if all slots are still held.
@@ -281,7 +281,7 @@ class _StepContext:
     mm_cpu_snapshot_event: torch.cuda.Event | None = None
 
     # Staging slot for this step id (empty views when only leftover mm).
-    d2h: StepSnapshot | None = None
+    d2h_snapshot: StepSnapshot | None = None
 
 
 class _SlotStatus(NamedTuple):
@@ -614,7 +614,7 @@ class OmniPrefixCacheManager:
 
         step_id = self._next_step_id
         try:
-            with self._prepare_step(step_outputs, slots_cpu, num_tokens_unpadded, freeze_event) as writes:
+            with self._prepare_step(step_outputs, slots_cpu, num_tokens_unpadded, freeze_event) as write_ctx:
                 self._publish_saved_step(
                     req_order=req_order,
                     query_start=query_start,
@@ -623,10 +623,10 @@ class OmniPrefixCacheManager:
                     step_outputs=step_outputs,
                     slots_cpu=slots_cpu,
                     mm_keys=set(mm_outputs.keys()),
-                    writes=writes,
+                    write_ctx=write_ctx,
                 )
                 # Eager execution and queue dispatch must remain outside the lock.
-                writes.start_writes()
+                write_ctx.start_writes()
                 return step_id
         except BaseException:
             with self._state_lock:
@@ -690,11 +690,11 @@ class OmniPrefixCacheManager:
                 ctx.mm_cpu_snapshot_event.synchronize()
                 ctx.mm_cpu_snapshot = _unpin_leftover(ctx.mm_cpu_snapshot)
             current: dict[str, torch.Tensor] = {}
-            if ctx.d2h is not None:
+            if ctx.d2h_snapshot is not None:
                 # Whole-step device→host was launched at save. One event wait
                 # (usually already complete), then a contiguous copy-out per
                 # key so consumers no longer depend on the reusable slot.
-                current = ctx.d2h.copy_to_cpu()
+                current = ctx.d2h_snapshot.copy_to_cpu()
                 self._release_step_staging(ctx)
                 step_released = True
 
@@ -861,7 +861,7 @@ class OmniPrefixCacheManager:
         step_outputs: _StepOutputs,
         slots_cpu: torch.Tensor | None,
         mm_keys: set[str],
-        writes: StepWriteContext,
+        write_ctx: StepWriteContext,
     ) -> None:
         """Takes ``_state_lock``. Register this step's writes and store the
         consume-once snapshot. Copies live hits into the snapshot, then
@@ -874,7 +874,7 @@ class OmniPrefixCacheManager:
             self._slot_status.init_table(key)
         if step_outputs.immediate or step_outputs.deferred:
             assert slots_cpu is not None
-            self._register_step_writes(writes, step_outputs, slots_cpu, req_order, query_start, num_sched)
+            self._register_step_writes(write_ctx, step_outputs, slots_cpu, req_order, query_start, num_sched)
         if self._hit_spans:
             # Same-step hits: their rows are registered now (IN_TRANSIT on
             # this step's tasks); start the gather before the next step.
@@ -890,7 +890,7 @@ class OmniPrefixCacheManager:
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
             mm_cpu_snapshot=step_outputs.leftover,
             mm_cpu_snapshot_event=step_outputs.leftover_event,
-            d2h=writes.snapshot,
+            d2h_snapshot=write_ctx.snapshot,
         )
         self._clear_hit_infos()
 
@@ -951,7 +951,7 @@ class OmniPrefixCacheManager:
 
     def _register_step_writes(
         self,
-        writes: StepWriteContext,
+        write_ctx: StepWriteContext,
         outputs: _StepOutputs,
         slots: torch.Tensor,
         req_order: list[str],
@@ -972,8 +972,8 @@ class OmniPrefixCacheManager:
                     continue
                 deferred = schedule is WriteSchedule.JOIN_ON_FINISH
                 handle = self._request_tasks.deferred.get(req_id) if deferred else None
-                if handle is None or not writes.append(handle, start=start, end=end):
-                    handle = writes.register(
+                if handle is None or not write_ctx.append(handle, start=start, end=end):
+                    handle = write_ctx.register(
                         tid=self._request_tasks.alloc_tid(),
                         req_id=req_id,
                         write_n=self._request_tasks.increment_write_n(req_id),
@@ -1063,8 +1063,8 @@ class OmniPrefixCacheManager:
         return ctx
 
     def _release_step_staging(self, ctx: _StepContext) -> None:
-        if ctx.d2h is not None:
-            ctx.d2h.release()
+        if ctx.d2h_snapshot is not None:
+            ctx.d2h_snapshot.release()
 
     # -------------------------------------------------- slot ref / fetch
 
