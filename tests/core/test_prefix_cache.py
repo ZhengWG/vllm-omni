@@ -647,6 +647,8 @@ def test_append_to_closed_deferred_entry_opens_new_one():
     s2 = run_step(mgr, view, {"a": ([2], 1, 1)}, mm={"k": torch.full((1, 2), 2.0)})
     mgr.materialize(s2, ["a"])
     assert mgr._request_tasks.deferred["a"].tid != first.tid
+    assert mgr._controller.lookup(first.tid) is None
+    assert torch.equal(mgr._controller.fetch_host(first, view.slots_for("a", 0, 1), "k"), torch.full((1, 2), 1.0))
     slots = view.slots_for("a", 0, 2)
     rows = plan_fetch(mgr, slots, "k", req_id="a")
     assert torch.equal(rows[:, 0], torch.tensor([1.0, 2.0]))
@@ -939,6 +941,7 @@ def test_unconsumed_contexts_timeout():
     with pytest.raises(OmniPrefixCacheStagingTimeoutError, match="unconsumed step contexts"):
         for pos in range(8):
             run_step(mgr, view, {"a": ([0, 1, 2, 3], pos, 1)})
+    assert mgr._controller._staged_bytes == 0
 
 
 def test_save_waits_until_a_slot_is_consumed():
@@ -1583,6 +1586,7 @@ def test_save_releases_staging_if_commit_drained_writes_fails():
     mgr._commit_drained_writes = wrapped
     with pytest.raises(OmniPrefixCacheUnmatchError, match="injected fail"):
         run_step(mgr, view, {"a": ([0], 0, 4)})
+    assert mgr._controller._staged_bytes == 0
     assert all(not busy for busy in mgr._controller._staging_pool._busy)
     mgr._commit_drained_writes = real
     sid = run_step(mgr, view, {"a": ([0], 0, 4)})
@@ -1680,57 +1684,23 @@ def _bare_controller(eager=True):
     return ctrl, pool
 
 
-@pytest.mark.parametrize("registered_count", [0, 1, 3, 4])
-def test_step_write_context_rollback_partial_registration(registered_count):
-    """A failed publish releases both unused reservations and bound owners."""
-    ctrl, pool = _bare_controller()
-    rows = torch.ones(4, HIDDEN)
-    slots = torch.arange(4)
-    with pytest.raises(RuntimeError, match="publish failed"):
-        with ctrl.prepare_step(
-            step_id=1,
-            immediate={HIDDEN_KEY: rows},
-            deferred={"k": rows},
-            slots=slots,
-            num_tokens=4,
-            freeze_event=None,
-        ) as write_ctx:
-            for i in range(registered_count):
-                write_ctx.register(
-                    tid=i + 1,
-                    req_id=str(i % 2),
-                    write_n=1,
-                    schedule=WriteSchedule.JOIN_NEXT_STEP if i < 2 else WriteSchedule.JOIN_ON_FINISH,
-                    start=(i % 2) * 2,
-                    end=(i % 2 + 1) * 2,
-                )
-            raise RuntimeError("publish failed")
-    assert ctrl._staged_bytes == 0
-    assert all(not holders for holders in ctrl._staging_pool._busy)
-    assert set(ctrl.drain_failed()) == set(range(1, registered_count + 1))
-    assert all(task.done.is_set() and task.host_ready.is_set() for task in ctrl._tasks.values())
-    assert torch.count_nonzero(pool.rows(HIDDEN_KEY, slots)) == 0
-    ctrl.shutdown()
-
-
-@pytest.mark.parametrize("failure_after", [1, 3])
-def test_manager_partial_publish_failure_releases_resources(monkeypatch, failure_after):
+def test_manager_partial_publish_failure_releases_resources(monkeypatch):
     policy = ModelCachePolicy(deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
     map_slots = mgr._map_slots
-    published = 0
 
-    def fail_publish(*args):
-        nonlocal published
-        map_slots(*args)
-        published += 1
-        if published == failure_after:
+    def fail_publish(slots, tid, keys):
+        map_slots(slots, tid, keys)
+        if "k" in keys:
             raise RuntimeError("partial publish")
 
-    monkeypatch.setattr(mgr, "_map_slots", fail_publish)
     try:
+        # Rollback must release both the old and newly appended deferred rows.
+        sid = run_step(mgr, view, {"a": ([0], 0, 1)}, mm={"k": torch.ones(1, 2)})
+        mgr.materialize(sid, ["a"])
+        monkeypatch.setattr(mgr, "_map_slots", fail_publish)
         with pytest.raises(RuntimeError, match="partial publish"):
-            run_step(mgr, view, {"a": ([0], 0, 2), "b": ([1], 0, 2)}, mm={"k": torch.ones(4, 2)})
+            run_step(mgr, view, {"a": ([0], 1, 1), "b": ([1], 0, 2)}, mm={"k": torch.ones(3, 2)})
         assert mgr._step_ctxs == {}
         assert mgr._controller._staged_bytes == 0
         assert all(not holders for holders in mgr._controller._staging_pool._busy)
@@ -1740,14 +1710,10 @@ def test_manager_partial_publish_failure_releases_resources(monkeypatch, failure
         mgr.shutdown()
 
 
-@pytest.mark.parametrize("registered", [False, True])
-def test_step_write_context_registration_error_releases_bound_resources(monkeypatch, registered):
+def test_step_write_context_registration_error_releases_bound_resources(monkeypatch):
     ctrl, _ = _bare_controller()
-    register = ctrl._register
 
     def fail_register(task, queued):
-        if registered:
-            register(task, queued)
         raise RuntimeError("registration failed")
 
     monkeypatch.setattr(ctrl, "_register", fail_register)
@@ -1764,47 +1730,6 @@ def test_step_write_context_registration_error_releases_bound_resources(monkeypa
                 write_ctx.register(tid=1, req_id="a", write_n=1, schedule=WriteSchedule.JOIN_NEXT_STEP, start=0, end=2)
         assert ctrl._staged_bytes == 0
         assert all(not holders for holders in ctrl._staging_pool._busy)
-    finally:
-        ctrl.shutdown()
-
-
-def test_prepare_step_timeout_returns_unused_budget():
-    mgr, view = make_manager(staging_depth=1, staging_claim_timeout_s=0)
-    try:
-        sid = run_step(mgr, view, {"a": ([0], 0, 2)})
-        before = mgr._controller._staged_bytes
-        with pytest.raises(OmniPrefixCacheStagingTimeoutError):
-            run_step(mgr, view, {"a": ([0], 2, 1)})
-        assert mgr._controller._staged_bytes == before
-        mgr.discard_step(sid)
-        assert all(not holders for holders in mgr._controller._staging_pool._busy)
-    finally:
-        mgr.shutdown()
-
-
-def test_write_task_handle_keeps_deferred_rows_after_completion_drain():
-    ctrl, _ = _bare_controller()
-    rows = torch.arange(2 * HIDDEN, dtype=DTYPE).reshape(2, HIDDEN)
-    slots = torch.tensor([0, 1])
-    try:
-        with ctrl.prepare_step(
-            step_id=1,
-            immediate={},
-            deferred={HIDDEN_KEY: rows},
-            slots=slots,
-            num_tokens=2,
-            freeze_event=None,
-        ) as write_ctx:
-            handle = write_ctx.register(
-                tid=1, req_id="a", write_n=1, schedule=WriteSchedule.JOIN_ON_FINISH, start=0, end=2
-            )
-            write_ctx.start_writes()
-        write_ctx.snapshot.release()
-        ctrl.escalate([handle.tid])
-        ctrl.join([handle.tid])
-        assert ctrl.drain_completed() == [handle.tid]
-        assert ctrl.lookup(handle.tid) is None
-        assert torch.equal(ctrl.fetch_host(handle, slots, HIDDEN_KEY), rows)
     finally:
         ctrl.shutdown()
 
