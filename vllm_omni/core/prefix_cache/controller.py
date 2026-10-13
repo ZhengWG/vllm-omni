@@ -509,7 +509,9 @@ class OmniPrefixCacheController:
             if freeze_event is not None:
                 stream.wait_event(freeze_event)
             copy()
-            ev = torch.cuda.Event()
+            # Host threads wait on this event; a non-blocking event spin-waits
+            # and keeps a core busy for most of every step.
+            ev = torch.cuda.Event(blocking=True)
             ev.record()
         return ev
 
@@ -906,7 +908,7 @@ class OmniPrefixCacheController:
                 step = max(1, rows if rows * row_bytes <= chunk_bytes else chunk_bytes // row_bytes)
                 parts = [src[s : s + step].to("cpu", non_blocking=True) for s in range(0, max(rows, 1), step)]
                 pending.append((k, chunks, parts))
-            ev = torch.cuda.Event()
+            ev = torch.cuda.Event(blocking=True)
             ev.record()
         ev.synchronize()
         rows_out: list[tuple[_WriteChunk, str, torch.Tensor]] = []

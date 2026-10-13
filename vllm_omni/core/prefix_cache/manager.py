@@ -161,7 +161,8 @@ def _snapshot_leftover_mm_cpu(
     }
     event = None
     if on_cuda:
-        event = torch.cuda.Event()
+        # Waited on by materialize from a host thread; blocking avoids a spin-wait.
+        event = torch.cuda.Event(blocking=True)
         event.record()
     return leftover, event
 
