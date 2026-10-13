@@ -614,8 +614,9 @@ class OmniPrefixCacheManager:
 
         step_id = self._next_step_id
         try:
-            with self._prepare_step(step_outputs, slots_cpu, num_tokens_unpadded, freeze_event) as write_ctx:
+            with self._prepare_step(step_id, step_outputs, slots_cpu, num_tokens_unpadded, freeze_event) as write_ctx:
                 self._publish_saved_step(
+                    step_id=step_id,
                     req_order=req_order,
                     query_start=query_start,
                     num_sched=num_sched,
@@ -808,6 +809,7 @@ class OmniPrefixCacheManager:
 
     def _prepare_step(
         self,
+        step_id: StepId,
         outputs: _StepOutputs,
         slots: torch.Tensor | None,
         num_tokens: int,
@@ -816,7 +818,7 @@ class OmniPrefixCacheManager:
         """Prepare unlocked; annotate backpressure with manager-owned diagnostics."""
         try:
             return self._controller.prepare_step(
-                step_id=self._next_step_id,
+                step_id=step_id,
                 immediate=outputs.immediate,
                 deferred=outputs.deferred,
                 slots=slots,
@@ -854,6 +856,7 @@ class OmniPrefixCacheManager:
     def _publish_saved_step(
         self,
         *,
+        step_id: StepId,
         req_order: list[str],
         query_start: dict[str, int],
         num_sched: dict[str, int],
@@ -880,8 +883,7 @@ class OmniPrefixCacheManager:
             # this step's tasks); start the gather before the next step.
             self._invalidate_overwritten_prefetches()
             self._prefetch_hit_spans()
-        step_id = self._next_step_id
-        self._next_step_id += 1
+        self._next_step_id = step_id + 1
         self._step_ctxs[step_id] = _StepContext(
             spans={r: (query_start[r], query_start[r] + num_sched[r]) for r in req_order},
             num_tokens_unpadded=num_tokens_unpadded,

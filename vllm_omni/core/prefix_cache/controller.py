@@ -497,9 +497,25 @@ class StepSnapshot:
     _claim: StepD2HClaim
     _holder: StagingBufferHolder
 
-    def copy_to_cpu(self) -> dict[str, torch.Tensor]:
+    @property
+    def staging_slot(self) -> int:
+        return self._claim.staging_slot
+
+    @property
+    def event(self) -> torch.cuda.Event | None:
+        return self._claim.event
+
+    def host_rows(self, start: int, end: int) -> dict[str, torch.Tensor]:
+        """Views of staged rows [start, end) per key; no copy."""
+        return {k: v[start:end] for k, v in self._claim.views.items()}
+
+    def wait(self) -> None:
+        """Block until this step's device→host copy has landed."""
         if self._claim.event is not None:
             self._claim.event.synchronize()
+
+    def copy_to_cpu(self) -> dict[str, torch.Tensor]:
+        self.wait()
         return {k: v.clone() for k, v in self._claim.views.items()}
 
     def release(self) -> None:
@@ -545,8 +561,7 @@ class StepWriteContext:
             if not self._started:
                 # Do not recycle a page while its device copy is in flight.
                 try:
-                    if self.snapshot._claim.event is not None:
-                        self.snapshot._claim.event.synchronize()
+                    self.snapshot.wait()
                 finally:
                     for task in self._touched.values():
                         if self._controller._tasks.get(task.tid) is task:
@@ -587,11 +602,11 @@ class StepWriteContext:
         self._touched[tid] = task
         immediate = schedule is WriteSchedule.JOIN_NEXT_STEP
         if immediate:
-            claim = self.snapshot._claim
-            chunk.host = {k: v[start:end] for k, v in claim.views.items()}
-            task.staging_slot = claim.staging_slot
-            task.step_d2h_event = claim.event
-            self._controller._staging_pool.bind(claim.staging_slot, StagingBufferHolder.for_task(tid))
+            snapshot = self.snapshot
+            chunk.host = snapshot.host_rows(start, end)
+            task.staging_slot = snapshot.staging_slot
+            task.step_d2h_event = snapshot.event
+            self._controller._staging_pool.bind(snapshot.staging_slot, StagingBufferHolder.for_task(tid))
         self._controller._pin_budget(self._tickets[schedule], tid)
         self._controller._register(task, queued=immediate)
         if immediate:
@@ -603,10 +618,14 @@ class StepWriteContext:
         self._check_open()
         task = handle._task
         chunk = self._chunk(WriteSchedule.JOIN_ON_FINISH, start, end)
+        # `reassigned` only changes on this thread under the manager state
+        # lock, so the check needs no controller lock.
+        if task.reassigned_intersects(chunk):
+            return False
         # The worker claims copies under this same lock. Publish the new
         # budget owner before it can copy and release the appended chunk.
         with self._controller._lock:
-            if task.reassigned_intersects(chunk) or task.append_chunk(chunk, self._freeze_event) is not None:
+            if task.append_chunk(chunk, self._freeze_event) is not None:
                 return False
             self._tickets[WriteSchedule.JOIN_ON_FINISH].tids.add(task.tid)
             self._touched[task.tid] = task

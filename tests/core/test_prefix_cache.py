@@ -340,7 +340,7 @@ def test_absent_hit_fails_fast():
     with pytest.raises(OmniPrefixCacheUnmatchError):
         mgr.materialize(sid, ["c"])
     if d2h_snapshot is not None:
-        assert not mgr._controller._staging_pool._busy[d2h_snapshot._claim.staging_slot]
+        assert not mgr._controller._staging_pool._busy[d2h_snapshot.staging_slot]
 
 
 def test_hit_not_block_aligned_fails_at_register():
@@ -975,8 +975,8 @@ def test_leftover_only_save_claims_staging_slot():
     leftover = {"codes.ref": torch.zeros(3, 2)}
     s0 = run_step(mgr, view, {"a": ([0], 0, 1)}, mm=leftover)
     s1 = run_step(mgr, view, {"a": ([0], 1, 1)}, mm=leftover)
-    assert mgr._step_ctxs[s0].d2h_snapshot is not None and mgr._step_ctxs[s0].d2h_snapshot._claim.views == {}
-    assert mgr._step_ctxs[s1].d2h_snapshot is not None and mgr._step_ctxs[s1].d2h_snapshot._claim.views == {}
+    assert mgr._step_ctxs[s0].d2h_snapshot is not None and mgr._step_ctxs[s0].d2h_snapshot.copy_to_cpu() == {}
+    assert mgr._step_ctxs[s1].d2h_snapshot is not None and mgr._step_ctxs[s1].d2h_snapshot.copy_to_cpu() == {}
     with pytest.raises(OmniPrefixCacheStagingTimeoutError, match="unconsumed step contexts"):
         run_step(mgr, view, {"a": ([0], 2, 1)}, mm=leftover)
 
@@ -1214,7 +1214,7 @@ def test_staging_slot_eager_save_leaves_only_step_holder():
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
     ctx = mgr._step_ctxs[sid]
     assert ctx.d2h_snapshot is not None
-    busy = mgr._controller._staging_pool._busy[ctx.d2h_snapshot._claim.staging_slot]
+    busy = mgr._controller._staging_pool._busy[ctx.d2h_snapshot.staging_slot]
     assert busy == {StagingBufferHolder.for_step(sid)}
     mgr.materialize(sid, ["p"])
     assert not busy
@@ -1292,7 +1292,7 @@ def test_staging_task_slot_released_at_pool_write_not_drain():
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8)})
     ctx = mgr._step_ctxs[sid]
     tid = next(iter(mgr._request_tasks.tasks["p"]))
-    busy = mgr._controller._staging_pool._busy[ctx.d2h_snapshot._claim.staging_slot]
+    busy = mgr._controller._staging_pool._busy[ctx.d2h_snapshot.staging_slot]
     assert StagingBufferHolder.for_task(tid) in busy and StagingBufferHolder.for_step(sid) in busy
     task = mgr._controller._tasks.get(tid)
     mgr._controller._scatter(task)
@@ -1569,7 +1569,7 @@ def test_hidden_opt_out_miss_returns_mm_and_releases_slot():
         outs = mgr.materialize(sid, ["a"])
         assert outs.hidden_states is None
         assert torch.equal(outs.mm_outputs["k"]["a"], torch.full((1, 2), float(i)))
-        assert not mgr._controller._staging_pool._busy[ctx.d2h_snapshot._claim.staging_slot], i
+        assert not mgr._controller._staging_pool._busy[ctx.d2h_snapshot.staging_slot], i
 
 
 def test_save_releases_staging_if_commit_drained_writes_fails():
