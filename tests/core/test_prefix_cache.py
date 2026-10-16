@@ -714,8 +714,9 @@ def test_cap_forces_flush_of_deferred():
         mgr.materialize(sid, ["a"])
     # Fourth chunk flushed the first three; only it is still charged.
     assert mgr._controller._staged_bytes == 16
-    rows = mgr._pool.rows("k", view.slots_for("a", 0, 4))[:, 0].tolist()
-    assert rows == [1.0, 2.0, 3.0, 0.0]
+    slots = view.slots_for("a", 0, 4)
+    assert mgr._pool.rows("k", slots[:3])[:, 0].tolist() == [1.0, 2.0, 3.0]
+    assert mgr._slot_status.get_slot_status("k").state[slots].tolist() == [2, 2, 2, 1]  # 4th still in transit
     assert mgr._request_tasks.deferred["a"].write_n == 2
     assert len(mgr._request_tasks.tasks["a"]) == 1  # the flushed write was drained
 
@@ -1154,6 +1155,24 @@ def test_mm_hit_span_never_registered_serves_mirror_baseline():
     legitimate absence — served from the mirror baseline, not a crash."""
     policy = ModelCachePolicy(needs_full_hidden_states=True, deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 5.0)})
+    mgr.materialize(s1, ["a"])
+    s2 = run_step(mgr, view, {"c": ([1], 0, 4)})
+    mgr.materialize(s2, ["c"])
+    s3 = run_step(mgr, view, {"b": ([0, 1, 2], 8, 2)}, new_hits={"b": 8}, mm={"k": torch.full((2, 2), 9.0)})
+    rows = mgr.materialize(s3, ["b"]).mm_outputs["k"]["b"]
+    assert torch.equal(rows[:4], torch.full((4, 2), 5.0))
+    assert torch.equal(rows[4:8], torch.zeros(4, 2))
+    assert torch.equal(rows[8:], torch.full((2, 2), 9.0))
+
+
+def test_mm_hole_reads_zeros_over_unset_pool_storage(monkeypatch):
+    """Pool storage is not zero-filled; a never-written slot still reads as zeros."""
+    from vllm_omni.core.prefix_cache.block_pool import PrefixBlockPool
+
+    alloc = PrefixBlockPool._alloc
+    monkeypatch.setattr(PrefixBlockPool, "_alloc", lambda self, dtype, feat: alloc(self, dtype, feat).fill_(7.0))
+    mgr, view = make_manager()
     s1 = run_step(mgr, view, {"a": ([0], 0, 4)}, mm={"k": torch.full((4, 2), 5.0)})
     mgr.materialize(s1, ["a"])
     s2 = run_step(mgr, view, {"c": ([1], 0, 4)})

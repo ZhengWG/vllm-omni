@@ -26,6 +26,13 @@ class PrefixBlockPool:
     fixed tensor sized to the same ``num_blocks`` as the upstream KV
     pool. Rows *are* those kv slots: when vLLM recycles a block, the
     next pool write overwrites that row. Slot reuse is the eviction.
+
+    Storage is plain pageable memory, neither pinned nor zero-filled:
+    pinning or zeroing a mirror of every KV slot takes seconds on the first
+    save, and the pool is only touched by CPU copies (writes from the
+    pinned staging buffers, reads through ``index_select``). Rows never
+    written hold arbitrary bytes; readers zero the slots that were absent
+    when the read was planned.
     """
 
     def __init__(self, config: PrefixCacheConfig):
@@ -33,19 +40,12 @@ class PrefixBlockPool:
         self._caches: dict[TensorName, torch.Tensor] = {}
 
     def _alloc(self, dtype: torch.dtype, feat: int) -> torch.Tensor:
-        return torch.zeros(
-            (self._config.num_blocks, self._config.block_size, feat),
-            dtype=dtype,
-            device="cpu",
-            # Pinning lets device→host overlap compute; unsupported on
-            # CPU-only builds where that overlap is off anyway.
-            pin_memory=torch.cuda.is_available(),
-        )
+        return torch.empty((self._config.num_blocks, self._config.block_size, feat), dtype=dtype, device="cpu")
 
     def alloc_key(self, key: str, dtype: torch.dtype, feat: int) -> torch.Tensor | None:
         """Allocate storage for a new ``key`` without publishing it (None if
-        already open). Pinned allocation is slow; run this unlocked and
-        hand the tensor to ``install_key`` under the manager's state lock."""
+        already open). Run this unlocked and hand the tensor to
+        ``install_key`` under the manager's state lock."""
         if key in self._caches:
             return None
         return self._alloc(dtype, feat)

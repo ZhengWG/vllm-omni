@@ -250,6 +250,8 @@ class _SlotRef:
     reserved_version: torch.Tensor | None = None
     # Copy-on-write rescue: slot's committed rows for pending reads.
     preserved: dict[int, torch.Tensor] = field(default_factory=dict)
+    # Slots never written at plan time; their pool rows are unset storage.
+    absent: torch.Tensor | None = None
 
 
 @dataclass(kw_only=True)
@@ -945,7 +947,7 @@ class OmniPrefixCacheManager:
         new_key_storage: dict[str, torch.Tensor] = {}
 
         def alloc_key(key: str, val: torch.Tensor) -> None:
-            # Pinned allocation, unlocked; installed under the lock at publish.
+            # Allocated unlocked; installed under the lock at publish.
             storage = self._pool.alloc_key(key, val.dtype, int(val.shape[-1]))
             if storage is not None:
                 new_key_storage[key] = storage
@@ -1144,6 +1146,7 @@ class OmniPrefixCacheManager:
             n_abs = int((states == _Occupancy.ABSENT).sum())
             if n_abs or not has_source:
                 _raise_unreadable_hit(req_id, key, f"{n_abs} absent slots")
+        absent = states == _Occupancy.ABSENT
         ref = _SlotRef(
             slots=slots,
             key=key,
@@ -1152,6 +1155,7 @@ class OmniPrefixCacheManager:
             staged_list=staged,
             join_tids=join_tids,
             reserved_version=reserved_version,
+            absent=absent if bool(absent.any()) else None,
         )
         self._pending_reads.append(ref)
         return ref
@@ -1187,13 +1191,20 @@ class OmniPrefixCacheManager:
         finally:
             self._unregister_pending_read(src)
 
+    def _pool_rows(self, src: _SlotRef) -> torch.Tensor:
+        """Pool rows for ``src``; slots absent at plan time read as zeros."""
+        rows = self._pool.rows(src.key, src.slots)
+        if src.absent is not None:
+            rows[src.absent] = 0
+        return rows
+
     def _fetch_source_inner(self, src: _SlotRef) -> torch.Tensor:
         # For JOIN_NEXT_STEP, wait `done`, drain, read the pool
         if src.join_tids:
             self._controller.join(src.join_tids)
             with self._state_lock:
                 self._commit_drained_writes()
-            joined = self._apply_preserved_rows(src, self._pool.rows(src.key, src.slots))
+            joined = self._apply_preserved_rows(src, self._pool_rows(src))
             self._ensure_not_reassigned(
                 src.slots,
                 src.key,
@@ -1207,7 +1218,7 @@ class OmniPrefixCacheManager:
         n = int(src.slots.numel())
         out: torch.Tensor | None = None
         if src.already_staged:
-            out = self._pool.rows(src.key, src.slots)
+            out = self._pool_rows(src)
         in_transit = None
         for task, mask in src.staged_list:
             try:
