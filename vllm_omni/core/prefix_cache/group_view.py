@@ -10,8 +10,10 @@ returns None when the input batch has no block table.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError, PrefixCacheConfig
@@ -66,6 +68,21 @@ class FullAttentionGroupView:
             parts.append(block_table[req_idx, offs].to(torch.long) * bs + (pos % bs))
         return torch.cat(parts) if parts else torch.empty((0,), dtype=torch.long)
 
+    def decode_slots_cpu(self, req_ids: list[str]) -> np.ndarray | None:
+        """KV slot of each request's single scheduled position, vectorized.
+
+        For a pure decode step only (one token per request). None when a
+        position lies past the table width, which ``step_slots_cpu`` clamps.
+        """
+        index_of = self._input_batch.req_id_to_index
+        idx = np.fromiter((index_of[req_id] for req_id in req_ids), dtype=np.int64, count=len(req_ids))
+        pos = np.asarray(self._input_batch.num_computed_tokens_cpu)[idx].astype(np.int64)
+        table = self._block_table_cpu().numpy()
+        blocks = pos // self.block_size
+        if blocks.size and int(blocks.max()) >= table.shape[1]:
+            return None
+        return table[idx, blocks].astype(np.int64) * self.block_size + pos % self.block_size
+
 
 def check_prefix_cache_block_layout(block_table: object, block_size: int) -> None:
     """Reject block-table layouts ``step_slots_cpu`` cannot mirror.
@@ -95,7 +112,7 @@ def check_prefix_cache_block_layout(block_table: object, block_size: int) -> Non
         )
 
 
-def check_prefix_cache_kv_groups(kv_cache_groups: object) -> None:
+def check_prefix_cache_kv_groups(kv_cache_groups: Iterable[Any] | None) -> None:
     """Reject hybrid / multi-group models at kv-cache init, not first step.
 
     Only needs ``kv_cache_config.kv_cache_groups``. ``FullAttentionSpec``
@@ -192,7 +209,7 @@ def stage_prefix_cache_config(
 def get_prefix_cache_group_view(
     input_batch: InputBatch,
     block_size: int,
-    kv_cache_groups: object = None,
+    kv_cache_groups: Iterable[Any] | None = None,
 ) -> FullAttentionGroupView | None:
     """Build the group view; None only if the batch has no block table.
 

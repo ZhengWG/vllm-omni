@@ -367,6 +367,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
 
     execute_model_state: ExecuteModelState | None
     kv_extracted_req_ids: list[str] | None
+    _prefix_cache_coalesce_decode = True
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1928,10 +1929,13 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
+        # A step the cache did not save (a parked decode step) serves its live
+        # rows, like a stage without the cache.
+        cache_step = self.omni_prefix_cache is not None and prefix_cache_step_id is not None
         needs_scheduled_hidden_payload = (
             include_hidden_payload
             and needs_pooler_payload
-            and (self.omni_prefix_cache is None or not self._model_needs_full_prefix_hidden_states())
+            and (not cache_step or not self._model_needs_full_prefix_hidden_states())
         )
         if prefix_cache_step_id is not None and (
             not needs_pooler_payload or self._model_mm_outputs_written_in_sample()
@@ -1943,7 +1947,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             assert self.omni_prefix_cache is not None
             self.omni_prefix_cache.discard_step(prefix_cache_step_id)
             prefix_cache_step_id = None
-        if self.omni_prefix_cache is None and needs_scheduled_hidden_payload and not audio_sparse_output:
+        if not cache_step and needs_scheduled_hidden_payload and not audio_sparse_output:
             num_valid_tokens = min(
                 int(scheduler_output.total_num_scheduled_tokens),
                 int(hidden_states.shape[0]),
@@ -1981,7 +1985,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
             hidden_seq_len = int(hidden_states.shape[0])
             scheduled_seq_len = int(scheduler_output.total_num_scheduled_tokens)
             mm_cpu = None
-            if self.omni_prefix_cache is not None:
+            if cache_step:
                 (
                     hidden_states_cpu,
                     combined_hidden_states,
