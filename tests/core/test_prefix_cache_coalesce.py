@@ -32,9 +32,9 @@ def _park(co: DecodeRowCoalescer, req_id: str, block: int, pos: int) -> bool:
 
 
 def test_coalescer_keeps_partial_blocks_and_takes_full_ones():
-    co = DecodeRowCoalescer(BS, max_full_blocks=2)
+    co = DecodeRowCoalescer(BS)
     flushes = [_park(co, "a", 1 if p < 8 else 2, p) for p in range(5, 10)]  # 5..7 close block 1, 8..9 open block 2
-    assert flushes == [False] * 5
+    assert flushes == [False, False, True, True, True]  # one full block for one parked request
     full = co.take(full_only=True)
     assert full is not None and full.req_ids == ("a",) and full.counts == (3,)
     assert full.slots_cpu.tolist() == [5, 6, 7]
@@ -44,13 +44,16 @@ def test_coalescer_keeps_partial_blocks_and_takes_full_ones():
     assert rest is not None and rest.slots_cpu.tolist() == [8, 9] and not co.has_parked()
 
 
-def test_coalescer_flags_a_flush_and_selects_blocks_by_base():
-    co = DecodeRowCoalescer(BS, max_full_blocks=2)
-    flags = [_park(co, "a", 3 + p // BS, p) for p in range(8)]  # blocks 3 and 4, both full
-    assert flags[-1] and not any(flags[:-1])
+def test_coalescer_flushes_once_full_blocks_match_parked_requests():
+    co = DecodeRowCoalescer(BS)
+    _park(co, "b", 9, 36)  # b holds an open block
+    flags = [_park(co, "a", 3 + p // BS, p) for p in range(8)]  # a fills blocks 3 and 4
+    assert flags == [False, False, False, False, False, False, False, True]
     picked = co.take(bases={4 * BS})
     assert picked is not None and picked.slots_cpu.tolist() == [16, 17, 18, 19]
-    assert co.take(full_only=True).slots_cpu.tolist() == [12, 13, 14, 15]
+    full = co.take(full_only=True)
+    assert full is not None and full.slots_cpu.tolist() == [12, 13, 14, 15]
+    assert co.open_bases() == {"b": 36}
 
 
 def test_coalescer_rejects_a_gap_and_drops():
@@ -96,11 +99,11 @@ class _View:
 
 
 class _Runner(PrefixCacheRunnerMixin):
-    def __init__(self, coalesce: bool, max_full_blocks: int = 2):
+    def __init__(self, coalesce: bool):
         self.omni_prefix_cache = OmniPrefixCacheManager(PrefixCacheConfig(num_blocks=16, block_size=BS), eager=True)
         self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
         self._prefix_cache_group_view = _View()
-        self._prefix_cache_coalescer = DecodeRowCoalescer(BS, max_full_blocks) if coalesce else None
+        self._prefix_cache_coalescer = DecodeRowCoalescer(BS) if coalesce else None
         self._omni_prefix_cache_cfg = None
         self.is_pooling_model = False
         self.saves = 0
@@ -151,34 +154,55 @@ def _expect(req_id: str, positions, tail: tuple[str, int]) -> torch.Tensor:
     return torch.stack([_row(req_id, p) for p in positions] + [_row(*tail)])
 
 
-@pytest.mark.parametrize(("coalesce", "max_full_blocks"), [(False, 2), (True, 2), (True, 8)])
-def test_hit_on_decode_written_blocks_reads_the_produced_rows(monkeypatch, coalesce, max_full_blocks):
+Z_BLOCKS = [8, 9, 10, 11]
+
+
+def _decode_a_beside_parked_z(runner: _Runner, positions) -> None:
+    """z parks one row and then sits idle, so two requests stay parked while
+    a fills its block: one full block is below the batch threshold."""
+    first, *rest = positions
+    runner.step({"a": (A_BLOCKS, first, 1), "z": (Z_BLOCKS, 5, 1)})
+    _decode_a(runner, rest)
+
+
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_hit_on_decode_written_blocks_reads_the_produced_rows(monkeypatch, coalesce):
     _patch_pp(monkeypatch)
-    r = _Runner(coalesce, max_full_blocks)
+    r = _Runner(coalesce)
     r.step({"a": (A_BLOCKS, 0, 6)}, new=["a"])  # prefill 0..5
     ids = _decode_a(r, range(6, 12))  # decode fills block 1 (at 7) and block 2 (at 11)
     assert all(i is None for i in ids) == coalesce
-    # b shares a's first 12 tokens: three full blocks, two of them partly or fully decode-written;
-    # with max_full_blocks=8 they are still parked when b arrives.
+    # b shares a's first 12 tokens: three full blocks, two of them partly or fully decode-written.
     _, out = r.step({"a": (A_BLOCKS, 12, 1), "b": ([0, 1, 2, 5], 12, 1)}, new=["b"], hits={"b": 12})
     assert torch.equal(out["b"], _expect("a", range(12), ("b", 12)))
     assert torch.equal(out["a"], _row("a", 12).unsqueeze(0))
 
 
+def test_an_arrival_hit_writes_the_parked_full_block_first(monkeypatch):
+    _patch_pp(monkeypatch)
+    r = _Runner(True)
+    r.step({"a": (A_BLOCKS, 0, 4), "z": (Z_BLOCKS, 0, 5)}, new=["a", "z"])
+    _decode_a_beside_parked_z(r, (4, 5, 6, 7))  # a fills block 1, which stays parked
+    assert r.written([4, 5, 6, 7]) == [False] * 4
+    _, out = r.step({"a": (A_BLOCKS, 8, 1), "b": ([0, 1, 7], 8, 1)}, new=["b"], hits={"b": 8})
+    assert torch.equal(out["b"], _expect("a", range(8), ("b", 8)))
+
+
 def test_parked_full_blocks_are_written_in_batches(monkeypatch):
     _patch_pp(monkeypatch)
-    per_step, parked = _Runner(False), _Runner(True, max_full_blocks=2)
+    per_step, parked = _Runner(False), _Runner(True)
     for r in (per_step, parked):
-        r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
-        _decode_a(r, range(4, 12))
+        r.step({"a": (A_BLOCKS, 0, 4), "z": (Z_BLOCKS, 0, 4)}, new=["a", "z"])
+        for p in range(4, 12):
+            r.step({"a": (A_BLOCKS, p, 1), "z": (Z_BLOCKS, p, 1)})
     assert per_step.saves == 9
-    assert parked.saves == 2  # prefill + one write of blocks 1 and 2
+    assert parked.saves == 3  # prefill + one write per block round, both requests together
     assert parked.written(range(4, 12)) == [True] * 8
 
 
 def test_same_step_hit_on_a_block_completed_by_a_parked_row(monkeypatch):
     _patch_pp(monkeypatch)
-    r = _Runner(True, max_full_blocks=8)
+    r = _Runner(True)
     r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
     _decode_a(r, (4, 5, 6))  # block 1 parked, still open
     # a's decode of position 7 completes block 1 in the step where b hits it.
@@ -189,7 +213,7 @@ def test_same_step_hit_on_a_block_completed_by_a_parked_row(monkeypatch):
 
 def test_an_arrival_without_a_hit_leaves_running_rows_parked(monkeypatch):
     _patch_pp(monkeypatch)
-    r = _Runner(True, max_full_blocks=8)
+    r = _Runner(True)
     r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
     _decode_a(r, (4, 5))
     step_id, out = r.step({"a": (A_BLOCKS, 6, 1), "c": ([6], 0, 2)}, new=["c"])
@@ -201,10 +225,11 @@ def test_an_arrival_without_a_hit_leaves_running_rows_parked(monkeypatch):
 @pytest.mark.parametrize("how", ["finished", "preempted"])
 def test_a_departed_request_writes_full_blocks_and_drops_the_partial_one(monkeypatch, how):
     _patch_pp(monkeypatch)
-    r = _Runner(True, max_full_blocks=8)
-    r.step({"a": (A_BLOCKS, 0, 4), "z": ([8, 9], 0, 4)}, new=["a", "z"])
-    _decode_a(r, range(4, 10))  # block 1 full, block 2 holds 8..9
-    r.step({"z": ([8, 9], 4, 1)}, **{how: ["a"]})
+    r = _Runner(True)
+    r.step({"a": (A_BLOCKS, 0, 4), "z": (Z_BLOCKS, 0, 5)}, new=["a", "z"])
+    _decode_a_beside_parked_z(r, range(4, 10))  # a: block 1 full and parked, block 2 holds 8..9
+    assert r.written([4, 5, 6, 7, 8, 9]) == [False] * 6
+    r.step({"z": (Z_BLOCKS, 6, 1)}, **{how: ["a"]})
     assert r.written([4, 5, 6, 7]) == [True] * 4
     assert r.written([8, 9]) == [False, False]
-    assert not r._prefix_cache_coalescer.has_parked() or "a" not in r._prefix_cache_coalescer.open_bases()
+    assert "a" not in r._prefix_cache_coalescer.open_bases()

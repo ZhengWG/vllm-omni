@@ -5,10 +5,14 @@
 vLLM caches only full KV blocks, so a decode row becomes reachable by a hit
 only once its block is full, and only through a request that starts with that
 block as a prefix hit. The runner therefore parks decode rows instead of
-writing them every step, and writes full blocks in batches: when a request
-has parked ``max_full_blocks`` full blocks, before a step whose new requests
+writing them every step, and writes full blocks in batches: once there are as
+many parked full blocks as parked requests, before a step whose new requests
 hit a parked block, and when a request leaves. A departed request's partial
 block is dropped: vLLM never caches it, and its blocks may be reassigned.
+
+The batch threshold keeps one write per block-size steps at any concurrency
+(every request fills a block that often) while a leaving request has at most
+about one full block still unwritten, so its write stays small.
 
 A parked row is a reference into a once-per-step clone of the step's outputs,
 so parking costs one device copy per key and no host-to-device traffic.
@@ -46,11 +50,11 @@ class _Block:
 class DecodeRowCoalescer:
     """Parked decode rows per request, as consecutive blocks."""
 
-    def __init__(self, block_size: int, max_full_blocks: int = 4) -> None:
+    def __init__(self, block_size: int) -> None:
         self.block_size = block_size
-        self.max_full_blocks = max_full_blocks
         self._blocks: dict[str, list[_Block]] = {}
         self._keys: frozenset[str] = frozenset()
+        self._full = 0  # parked full blocks, all requests
 
     def has_parked(self) -> bool:
         return bool(self._blocks)
@@ -71,8 +75,8 @@ class DecodeRowCoalescer:
     ) -> bool:
         """Park one row per request: ``rows[key][row_index[i]]`` at KV slot ``slots[i]``.
 
-        ``rows`` is cloned once. Returns True when some request now holds
-        ``max_full_blocks`` full blocks.
+        ``rows`` is cloned once. Returns True when the parked full blocks
+        reach the number of parked requests.
         """
         if self._blocks and frozenset(rows) != self._keys:
             raise OmniPrefixCacheUnmatchError(f"parked keys {sorted(self._keys)} differ from {sorted(rows)}")
@@ -80,7 +84,6 @@ class DecodeRowCoalescer:
         bs = self.block_size
         step = {key: val.clone() for key, val in rows.items()}
         index = row_index if row_index is not None else range(len(req_ids))
-        flush = False
         for req_id, slot, row in zip(req_ids, (int(s) for s in slots), index):
             base, offset = slot - slot % bs, slot % bs
             blocks = self._blocks.get(req_id)
@@ -97,9 +100,9 @@ class DecodeRowCoalescer:
                     f"(block base={last.base}, next offset={last.hi})"
                 )
             blocks[-1].refs.append((step, row))
-            if offset == bs - 1 and len(blocks) >= self.max_full_blocks:
-                flush = True
-        return flush
+            if offset == bs - 1:
+                self._full += 1
+        return self._full >= len(self._blocks)
 
     def take(
         self,
@@ -124,6 +127,7 @@ class DecodeRowCoalescer:
                 if (full_only and block.hi < bs) or (bases is not None and block.base not in bases):
                     kept.append(block)
                     continue
+                self._full -= block.hi == bs
                 count += block.hi - block.lo
                 slots.append(np.arange(block.base + block.lo, block.base + block.hi, dtype=np.int64))
                 for key in self._keys:
@@ -146,4 +150,5 @@ class DecodeRowCoalescer:
 
     def drop(self, req_ids: Iterable[str]) -> None:
         for req_id in req_ids:
-            self._blocks.pop(req_id, None)
+            for block in self._blocks.pop(req_id, ()):
+                self._full -= block.hi == self.block_size
