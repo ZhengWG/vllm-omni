@@ -3,18 +3,21 @@
 """Block-granular prefix-cache writes for decode rows.
 
 vLLM caches only full KV blocks, so a decode row becomes reachable by a hit
-only once its block is full. On a pure decode step the runner parks each row
-in a per-request device ring instead of running the per-step save; a block
-that fills is written through ``save_outputs`` in one call, and every other
-step writes all parked rows before its own save. Parked rows of a request that
-finished, aborted, resumed or was preempted are dropped: they belong to a
-partial block vLLM never caches, and its blocks may already be reassigned.
+only once its block is full, and only through a request that starts with that
+block as a prefix hit. The runner therefore parks decode rows instead of
+writing them every step, and writes full blocks in batches: when a request
+has parked ``max_full_blocks`` full blocks, before a step whose new requests
+hit a parked block, and when a request leaves. A departed request's partial
+block is dropped: vLLM never caches it, and its blocks may be reassigned.
+
+A parked row is a reference into a once-per-step clone of the step's outputs,
+so parking costs one device copy per key and no host-to-device traffic.
 """
 
 from __future__ import annotations
 
-from collections.abc import Iterable
-from dataclasses import dataclass
+from collections.abc import Collection, Iterable
+from dataclasses import dataclass, field
 
 import numpy as np
 import torch
@@ -24,7 +27,7 @@ from vllm_omni.core.prefix_cache.interface import OmniPrefixCacheUnmatchError
 
 @dataclass(frozen=True)
 class ParkedRows:
-    """Rows taken out of the rings, packed in ``req_ids`` order."""
+    """Rows taken out of the coalescer, packed in ``req_ids`` order."""
 
     req_ids: tuple[str, ...]
     counts: tuple[int, ...]
@@ -32,108 +35,115 @@ class ParkedRows:
     rows: dict[str, torch.Tensor]  # key -> [sum(counts), width], on the producing device
 
 
-class DecodeRowCoalescer:
-    """Per-request rings of at most one block of not-yet-written decode rows."""
+@dataclass
+class _Block:
+    base: int  # KV slot of the block's first position
+    lo: int  # first parked offset
+    hi: int  # next offset
+    refs: list[tuple[dict[str, torch.Tensor], int]] = field(default_factory=list)  # (step clone, row)
 
-    def __init__(self, block_size: int, capacity: int) -> None:
+
+class DecodeRowCoalescer:
+    """Parked decode rows per request, as consecutive blocks."""
+
+    def __init__(self, block_size: int, max_full_blocks: int = 4) -> None:
         self.block_size = block_size
-        self.capacity = capacity
-        self._rings: dict[str, torch.Tensor] = {}  # key -> [capacity * block_size, width]
-        self._ring_row: dict[str, int] = {}
-        self._free_rows = list(range(capacity - 1, -1, -1))
-        # req -> (slot of the block's first position, first parked offset, next offset)
-        self._parked: dict[str, tuple[int, int, int]] = {}
+        self.max_full_blocks = max_full_blocks
+        self._blocks: dict[str, list[_Block]] = {}
+        self._keys: frozenset[str] = frozenset()
 
     def has_parked(self) -> bool:
-        return bool(self._parked)
+        return bool(self._blocks)
 
-    def keys(self) -> set[str]:
-        return set(self._rings)
+    def keys(self) -> frozenset[str]:
+        return self._keys
 
-    def reset_keys(self) -> None:
-        """Drop the rings; only valid with nothing parked."""
-        assert not self._parked
-        self._rings.clear()
+    def open_bases(self) -> dict[str, int]:
+        """Base slot of each request's last block while it is still filling."""
+        return {r: b[-1].base for r, b in self._blocks.items() if b[-1].hi < self.block_size}
 
-    def has_room(self, req_ids: Iterable[str]) -> bool:
-        new = sum(1 for req_id in req_ids if req_id not in self._ring_row)
-        return new <= len(self._free_rows)
+    def park(
+        self,
+        req_ids: list[str],
+        slots: np.ndarray,
+        rows: dict[str, torch.Tensor],
+        row_index: list[int] | None = None,
+    ) -> bool:
+        """Park one row per request: ``rows[key][row_index[i]]`` at KV slot ``slots[i]``.
+
+        ``rows`` is cloned once. Returns True when some request now holds
+        ``max_full_blocks`` full blocks.
+        """
+        if self._blocks and frozenset(rows) != self._keys:
+            raise OmniPrefixCacheUnmatchError(f"parked keys {sorted(self._keys)} differ from {sorted(rows)}")
+        self._keys = frozenset(rows)
+        bs = self.block_size
+        step = {key: val.clone() for key, val in rows.items()}
+        index = row_index if row_index is not None else range(len(req_ids))
+        flush = False
+        for req_id, slot, row in zip(req_ids, (int(s) for s in slots), index):
+            base, offset = slot - slot % bs, slot % bs
+            blocks = self._blocks.get(req_id)
+            if not blocks:
+                self._blocks[req_id] = blocks = [_Block(base, offset, offset + 1)]
+            elif blocks[-1].base == base and blocks[-1].hi == offset:
+                blocks[-1].hi += 1
+            elif blocks[-1].hi == bs and offset == 0:
+                blocks.append(_Block(base, 0, 1))
+            else:
+                last = blocks[-1]
+                raise OmniPrefixCacheUnmatchError(
+                    f"decode row for req {req_id} at slot {slot} does not continue its parked rows "
+                    f"(block base={last.base}, next offset={last.hi})"
+                )
+            blocks[-1].refs.append((step, row))
+            if offset == bs - 1 and len(blocks) >= self.max_full_blocks:
+                flush = True
+        return flush
+
+    def take(
+        self,
+        req_ids: Iterable[str] | None = None,
+        *,
+        full_only: bool = False,
+        bases: Collection[int] | None = None,
+    ) -> ParkedRows | None:
+        """Remove and return parked rows: all, only full blocks, or only blocks at ``bases``."""
+        bs = self.block_size
+        req_order: list[str] = []
+        counts: list[int] = []
+        slots: list[np.ndarray] = []
+        parts: dict[str, list[torch.Tensor]] = {key: [] for key in self._keys}
+        for req_id in list(self._blocks) if req_ids is None else list(req_ids):
+            blocks = self._blocks.get(req_id)
+            if not blocks:
+                continue
+            kept: list[_Block] = []
+            count = 0
+            for block in blocks:
+                if (full_only and block.hi < bs) or (bases is not None and block.base not in bases):
+                    kept.append(block)
+                    continue
+                count += block.hi - block.lo
+                slots.append(np.arange(block.base + block.lo, block.base + block.hi, dtype=np.int64))
+                for key in self._keys:
+                    parts[key].extend(step[key][row : row + 1] for step, row in block.refs)
+            if count:
+                req_order.append(req_id)
+                counts.append(count)
+            if kept:
+                self._blocks[req_id] = kept
+            else:
+                del self._blocks[req_id]
+        if not req_order:
+            return None
+        return ParkedRows(
+            req_ids=tuple(req_order),
+            counts=tuple(counts),
+            slots_cpu=torch.from_numpy(np.concatenate(slots)),
+            rows={key: torch.cat(rows) for key, rows in parts.items()},
+        )
 
     def drop(self, req_ids: Iterable[str]) -> None:
         for req_id in req_ids:
-            self._parked.pop(req_id, None)
-            row = self._ring_row.pop(req_id, None)
-            if row is not None:
-                self._free_rows.append(row)
-
-    def park(self, req_ids: list[str], slots: np.ndarray, rows: dict[str, torch.Tensor]) -> list[str]:
-        """Park row ``i`` of every tensor for ``req_ids[i]`` at KV slot ``slots[i]``.
-
-        Returns the requests whose block this step filled.
-        """
-        bs = self.block_size
-        n = len(req_ids)
-        ring_index = np.empty(n, dtype=np.int64)
-        filled: list[str] = []
-        for i, req_id in enumerate(req_ids):
-            slot = int(slots[i])
-            base, offset = slot - slot % bs, slot % bs
-            parked = self._parked.get(req_id)
-            if parked is None:
-                parked = (base, offset, offset + 1)
-            elif parked[0] != base or parked[2] != offset:
-                raise OmniPrefixCacheUnmatchError(
-                    f"decode row for req {req_id} at slot {slot} does not continue its parked block "
-                    f"(base={parked[0]}, next offset={parked[2]})"
-                )
-            else:
-                parked = (base, parked[1], offset + 1)
-            self._parked[req_id] = parked
-            row = self._ring_row.get(req_id)
-            if row is None:
-                row = self._free_rows.pop()
-                self._ring_row[req_id] = row
-            ring_index[i] = row * bs + offset
-            if offset == bs - 1:
-                filled.append(req_id)
-        index = torch.from_numpy(ring_index)
-        for key, val in rows.items():
-            ring = self._rings.get(key)
-            if ring is None:
-                ring = torch.empty((self.capacity * bs, int(val.shape[-1])), dtype=val.dtype, device=val.device)
-                self._rings[key] = ring
-            ring.index_copy_(0, _on(index, ring.device), val[:n].reshape(n, -1))
-        return filled
-
-    def take(self, req_ids: Iterable[str]) -> ParkedRows | None:
-        """Remove and return the parked rows of ``req_ids`` (those with none are skipped)."""
-        bs = self.block_size
-        taken = [(req_id, self._parked.pop(req_id)) for req_id in req_ids if req_id in self._parked]
-        if not taken:
-            return None
-        counts: list[int] = []
-        slot_parts: list[np.ndarray] = []
-        ring_parts: list[np.ndarray] = []
-        for req_id, (base, lo, hi) in taken:
-            counts.append(hi - lo)
-            slot_parts.append(np.arange(base + lo, base + hi, dtype=np.int64))
-            start = self._ring_row[req_id] * bs
-            ring_parts.append(np.arange(start + lo, start + hi, dtype=np.int64))
-        index = torch.from_numpy(np.concatenate(ring_parts))
-        rows = {key: ring.index_select(0, _on(index, ring.device)) for key, ring in self._rings.items()}
-        return ParkedRows(
-            req_ids=tuple(req_id for req_id, _ in taken),
-            counts=tuple(counts),
-            slots_cpu=torch.from_numpy(np.concatenate(slot_parts)),
-            rows=rows,
-        )
-
-    def take_all(self) -> ParkedRows | None:
-        return self.take(list(self._parked))
-
-
-def _on(index: torch.Tensor, device: torch.device) -> torch.Tensor:
-    """CPU index tensor on ``device``; a pinned staging copy keeps the H2D async."""
-    if device.type == "cpu":
-        return index
-    return index.pin_memory().to(device, non_blocking=True)
+            self._blocks.pop(req_id, None)

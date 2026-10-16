@@ -1,7 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
-"""Decode-row parking: rows reach the pool when their block fills, and a
-later hit reads the same rows as the per-step save writes. CPU only."""
+"""Decode-row parking: full blocks reach the pool in batches, before a hit
+needs them, or when their request leaves; a later hit reads the same rows as
+the per-step save writes. CPU only."""
 
 import sys
 from types import ModuleType, SimpleNamespace
@@ -26,28 +27,39 @@ def _row(req_id: str, pos: int) -> torch.Tensor:
     return torch.full((WIDTH,), 1000.0 * (ord(req_id[0]) - ord("a") + 1) + pos)
 
 
-def test_coalescer_reports_filled_blocks_and_returns_parked_rows():
-    co = DecodeRowCoalescer(BS, capacity=2)
-    filled = []
-    for pos in range(5, 8):  # block 1 holds positions 4..7; position 4 was saved per step
-        filled = co.park(["a"], np.array([1 * BS + pos % BS]), {HIDDEN_KEY: _row("a", pos).unsqueeze(0)})
-    assert filled == ["a"]
-    parked = co.take(filled)
-    assert parked is not None
-    assert parked.req_ids == ("a",) and parked.counts == (3,)
-    assert parked.slots_cpu.tolist() == [5, 6, 7]
-    assert torch.equal(parked.rows[HIDDEN_KEY], torch.stack([_row("a", p) for p in (5, 6, 7)]))
-    assert co.take(["a"]) is None and not co.has_parked()
+def _park(co: DecodeRowCoalescer, req_id: str, block: int, pos: int) -> bool:
+    return co.park([req_id], np.array([block * BS + pos % BS]), {HIDDEN_KEY: _row(req_id, pos).unsqueeze(0)})
 
 
-def test_coalescer_rejects_a_gap_and_frees_ring_rows_on_drop():
-    co = DecodeRowCoalescer(BS, capacity=1)
-    co.park(["a"], np.array([8]), {HIDDEN_KEY: _row("a", 8).unsqueeze(0)})
+def test_coalescer_keeps_partial_blocks_and_takes_full_ones():
+    co = DecodeRowCoalescer(BS, max_full_blocks=2)
+    flushes = [_park(co, "a", 1 if p < 8 else 2, p) for p in range(5, 10)]  # 5..7 close block 1, 8..9 open block 2
+    assert flushes == [False] * 5
+    full = co.take(full_only=True)
+    assert full is not None and full.req_ids == ("a",) and full.counts == (3,)
+    assert full.slots_cpu.tolist() == [5, 6, 7]
+    assert torch.equal(full.rows[HIDDEN_KEY], torch.stack([_row("a", p) for p in (5, 6, 7)]))
+    assert co.open_bases() == {"a": 8}
+    rest = co.take()
+    assert rest is not None and rest.slots_cpu.tolist() == [8, 9] and not co.has_parked()
+
+
+def test_coalescer_flags_a_flush_and_selects_blocks_by_base():
+    co = DecodeRowCoalescer(BS, max_full_blocks=2)
+    flags = [_park(co, "a", 3 + p // BS, p) for p in range(8)]  # blocks 3 and 4, both full
+    assert flags[-1] and not any(flags[:-1])
+    picked = co.take(bases={4 * BS})
+    assert picked is not None and picked.slots_cpu.tolist() == [16, 17, 18, 19]
+    assert co.take(full_only=True).slots_cpu.tolist() == [12, 13, 14, 15]
+
+
+def test_coalescer_rejects_a_gap_and_drops():
+    co = DecodeRowCoalescer(BS)
+    _park(co, "a", 2, 8)
     with pytest.raises(OmniPrefixCacheUnmatchError, match="does not continue"):
-        co.park(["a"], np.array([10]), {HIDDEN_KEY: _row("a", 10).unsqueeze(0)})
-    assert not co.has_room(["b"])
+        _park(co, "a", 2, 10)
     co.drop(["a"])
-    assert co.has_room(["b"]) and not co.has_parked()
+    assert not co.has_parked()
 
 
 def _patch_pp(monkeypatch) -> None:
@@ -84,11 +96,11 @@ class _View:
 
 
 class _Runner(PrefixCacheRunnerMixin):
-    def __init__(self, coalesce: bool):
+    def __init__(self, coalesce: bool, max_full_blocks: int = 2):
         self.omni_prefix_cache = OmniPrefixCacheManager(PrefixCacheConfig(num_blocks=16, block_size=BS), eager=True)
         self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
         self._prefix_cache_group_view = _View()
-        self._prefix_cache_coalescer = DecodeRowCoalescer(BS, capacity=4) if coalesce else None
+        self._prefix_cache_coalescer = DecodeRowCoalescer(BS, max_full_blocks) if coalesce else None
         self._omni_prefix_cache_cfg = None
         self.is_pooling_model = False
         self.saves = 0
@@ -135,49 +147,64 @@ def _decode_a(runner: _Runner, positions) -> list[int | None]:
     return [runner.step({"a": (A_BLOCKS, p, 1)})[0] for p in positions]
 
 
-@pytest.mark.parametrize("coalesce", [False, True])
-def test_hit_on_decode_written_blocks_reads_the_produced_rows(monkeypatch, coalesce):
+def _expect(req_id: str, positions, tail: tuple[str, int]) -> torch.Tensor:
+    return torch.stack([_row(req_id, p) for p in positions] + [_row(*tail)])
+
+
+@pytest.mark.parametrize(("coalesce", "max_full_blocks"), [(False, 2), (True, 2), (True, 8)])
+def test_hit_on_decode_written_blocks_reads_the_produced_rows(monkeypatch, coalesce, max_full_blocks):
     _patch_pp(monkeypatch)
-    r = _Runner(coalesce)
+    r = _Runner(coalesce, max_full_blocks)
     r.step({"a": (A_BLOCKS, 0, 6)}, new=["a"])  # prefill 0..5
     ids = _decode_a(r, range(6, 12))  # decode fills block 1 (at 7) and block 2 (at 11)
     assert all(i is None for i in ids) == coalesce
-    # b shares a's first 12 tokens: three full blocks, two of them partly or fully decode-written.
+    # b shares a's first 12 tokens: three full blocks, two of them partly or fully decode-written;
+    # with max_full_blocks=8 they are still parked when b arrives.
     _, out = r.step({"a": (A_BLOCKS, 12, 1), "b": ([0, 1, 2, 5], 12, 1)}, new=["b"], hits={"b": 12})
-    assert torch.equal(out["b"], torch.stack([_row("a", p) for p in range(12)] + [_row("b", 12)]))
+    assert torch.equal(out["b"], _expect("a", range(12), ("b", 12)))
     assert torch.equal(out["a"], _row("a", 12).unsqueeze(0))
 
 
-def test_parking_saves_once_per_filled_block(monkeypatch):
+def test_parked_full_blocks_are_written_in_batches(monkeypatch):
     _patch_pp(monkeypatch)
-    per_step, parked = _Runner(False), _Runner(True)
+    per_step, parked = _Runner(False), _Runner(True, max_full_blocks=2)
     for r in (per_step, parked):
         r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
         _decode_a(r, range(4, 12))
     assert per_step.saves == 9
-    assert parked.saves == 3  # prefill + blocks 1 and 2
+    assert parked.saves == 2  # prefill + one write of blocks 1 and 2
+    assert parked.written(range(4, 12)) == [True] * 8
 
 
-def test_arrival_writes_parked_rows_before_its_own_save(monkeypatch):
+def test_same_step_hit_on_a_block_completed_by_a_parked_row(monkeypatch):
     _patch_pp(monkeypatch)
-    r = _Runner(True)
+    r = _Runner(True, max_full_blocks=8)
     r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
-    _decode_a(r, (4, 5))  # parked, block 1 still open
-    assert r.written([4, 5]) == [False, False]
-    r.step({"a": (A_BLOCKS, 6, 1), "c": ([6], 0, 2)}, new=["c"])  # an arrival is not a pure decode step
-    assert r.written([4, 5, 6]) == [True, True, True]
-    _decode_a(r, (7,))  # a's next row is the per-step save's block-filling row
-    _, out = r.step({"a": (A_BLOCKS, 8, 1), "b": ([0, 1, 7], 8, 1)}, new=["b"], hits={"b": 8})
-    assert torch.equal(out["b"], torch.stack([_row("a", p) for p in range(8)] + [_row("b", 8)]))
+    _decode_a(r, (4, 5, 6))  # block 1 parked, still open
+    # a's decode of position 7 completes block 1 in the step where b hits it.
+    _, out = r.step({"a": (A_BLOCKS, 7, 1), "b": ([0, 1, 6], 8, 1)}, new=["b"], hits={"b": 8})
+    assert torch.equal(out["b"], _expect("a", range(8), ("b", 8)))
+    assert torch.equal(out["a"], _row("a", 7).unsqueeze(0))
+
+
+def test_an_arrival_without_a_hit_leaves_running_rows_parked(monkeypatch):
+    _patch_pp(monkeypatch)
+    r = _Runner(True, max_full_blocks=8)
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    _decode_a(r, (4, 5))
+    step_id, out = r.step({"a": (A_BLOCKS, 6, 1), "c": ([6], 0, 2)}, new=["c"])
+    assert step_id is not None and torch.equal(out["a"], _row("a", 6).unsqueeze(0))
+    assert r.written([4, 5, 6]) == [False, False, False]
+    assert r.written([24, 25]) == [True, True]  # c's prefill rows
 
 
 @pytest.mark.parametrize("how", ["finished", "preempted"])
-def test_partial_block_of_a_departed_request_is_dropped(monkeypatch, how):
+def test_a_departed_request_writes_full_blocks_and_drops_the_partial_one(monkeypatch, how):
     _patch_pp(monkeypatch)
-    r = _Runner(True)
+    r = _Runner(True, max_full_blocks=8)
     r.step({"a": (A_BLOCKS, 0, 4), "z": ([8, 9], 0, 4)}, new=["a", "z"])
-    _decode_a(r, (4, 5))
-    gone = {how: ["a"]}
-    r.step({"z": ([8, 9], 4, 1)}, **gone)
-    assert r.written([4, 5]) == [False, False]
-    assert not r._prefix_cache_coalescer.has_parked() or "a" not in r._prefix_cache_coalescer._parked
+    _decode_a(r, range(4, 10))  # block 1 full, block 2 holds 8..9
+    r.step({"z": ([8, 9], 4, 1)}, **{how: ["a"]})
+    assert r.written([4, 5, 6, 7]) == [True] * 4
+    assert r.written([8, 9]) == [False, False]
+    assert not r._prefix_cache_coalescer.has_parked() or "a" not in r._prefix_cache_coalescer.open_bases()
