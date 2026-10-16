@@ -46,27 +46,25 @@ class FullAttentionGroupView:
         The device slot_mapping would need a stream sync to read back, which
         stalls the whole forward; the CPU block table carries the same
         information (positions are num_computed .. +num_scheduled per request).
+        Positions past the table width are dropped. Vectorized: this runs on
+        the engine thread every step.
         """
-        block_table = self._block_table_cpu()
         bs = self.block_size
-        max_blocks = int(block_table.shape[1])
-        computed = self._input_batch.num_computed_tokens_cpu
-        parts: list[torch.Tensor] = []
-        for req_id in req_ids:
-            n = int(num_scheduled.get(req_id, 0))
-            if n <= 0:
-                continue
-            req_idx = self._input_batch.req_id_to_index[req_id]
-            start = int(computed[req_idx])
-            pos = torch.arange(start, start + n, dtype=torch.long)
-            offs = pos // bs
-            if int(offs[-1]) >= max_blocks:
-                keep = offs < max_blocks
-                pos, offs = pos[keep], offs[keep]
-                if pos.numel() == 0:
-                    continue
-            parts.append(block_table[req_idx, offs].to(torch.long) * bs + (pos % bs))
-        return torch.cat(parts) if parts else torch.empty((0,), dtype=torch.long)
+        index_of = self._input_batch.req_id_to_index
+        sched = [(index_of[req_id], n) for req_id in req_ids if (n := int(num_scheduled.get(req_id, 0))) > 0]
+        if not sched:
+            return torch.empty((0,), dtype=torch.long)
+        rows, counts = np.array(sched, dtype=np.int64).T
+        starts = np.asarray(self._input_batch.num_computed_tokens_cpu)[rows].astype(np.int64)
+        first = np.cumsum(counts) - counts
+        pos = np.arange(int(counts.sum()), dtype=np.int64) + np.repeat(starts - first, counts)
+        row = np.repeat(rows, counts)
+        table = self._block_table_cpu().numpy()
+        blocks = pos // bs
+        if int(blocks.max()) >= table.shape[1]:
+            keep = blocks < table.shape[1]
+            pos, row, blocks = pos[keep], row[keep], blocks[keep]
+        return torch.from_numpy(table[row, blocks].astype(np.int64) * bs + pos % bs)
 
     def decode_slots_cpu(self, req_ids: list[str]) -> np.ndarray | None:
         """KV slot of each request's single scheduled position, vectorized.
