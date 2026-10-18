@@ -1579,6 +1579,23 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
     assert all(ref is not src for ref in mgr._pending_reads)
 
 
+def test_pending_read_counts_track_planned_slots():
+    mgr, view = make_manager()
+    sa = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(sa, ["a"])
+    slots = view.slots_for("a", 0, 4)
+    with mgr._state_lock:
+        src = mgr._slot_ref(slots, HIDDEN_KEY, "a")
+    counts = mgr._pending_slot_refs[HIDDEN_KEY]
+    assert counts[slots].tolist() == [1, 1, 1, 1] and int(counts.sum()) == 4
+    sb = run_step(mgr, view, {"b": ([1], 0, 4)})  # other slots: nothing to preserve
+    mgr.materialize(sb, ["b"])
+    assert not src.preserved
+    with torch.inference_mode():
+        mgr._fetch_source(src)
+    assert not counts.any()
+
+
 def test_done_fires_only_after_completion_record_published():
     """A join(done) waiter (the save barrier) must find the completion record
     on its next drain — done-before-append leaves occupancy IN_TRANSIT and the
