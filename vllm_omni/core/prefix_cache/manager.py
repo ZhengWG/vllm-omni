@@ -1023,23 +1023,28 @@ class OmniPrefixCacheManager:
         before claiming, and JOIN_ON_FINISH in-transit rows are read through
         ``staged_list`` task refs directly.
         """
-        new_set = {int(s) for s in new_slots.tolist()}
+        if not self._pending_reads:
+            return
+        new_slots = new_slots.to(torch.long)
         for ref in self._pending_reads:
             if ref.key not in keys or ref.reserved_version is None or not self._pool.has_key(ref.key):
                 continue
-            status = self._slot_status.get_slot_status(ref.key)
-            take: list[tuple[int, int]] = []  # (row index in ref, slot)
-            for i, s in enumerate(ref.slots.tolist()):
-                s = int(s)
-                if s not in new_set or s in ref.preserved:
-                    continue
-                committed = int(status.state[s]) == _Occupancy.COMMITTED
-                if committed and int(status.slot_version[s]) == int(ref.reserved_version[i]):
-                    take.append((i, s))
-            if not take:
+            reclaimed = torch.isin(ref.slots, new_slots)
+            if ref.preserved:
+                reclaimed &= ~torch.isin(ref.slots, torch.tensor(list(ref.preserved), dtype=torch.long))
+            if not bool(reclaimed.any()):
                 continue
-            rows = self._pool.rows(ref.key, torch.tensor([s for _, s in take], dtype=torch.long))
-            for j, (_, s) in enumerate(take):
+            status = self._slot_status.get_slot_status(ref.key)
+            idx = reclaimed.nonzero().flatten()
+            slots = ref.slots[idx]
+            valid = (status.state[slots] == _Occupancy.COMMITTED) & (
+                status.slot_version[slots] == ref.reserved_version[idx]
+            )
+            if not bool(valid.any()):
+                continue
+            slots = slots[valid]
+            rows = self._pool.rows(ref.key, slots)
+            for j, s in enumerate(slots.tolist()):
                 ref.preserved[s] = rows[j].clone()
 
     @torch.inference_mode()
