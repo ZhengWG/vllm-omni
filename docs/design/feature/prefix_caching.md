@@ -331,7 +331,9 @@ preemptions. This applies to policies that cache hidden states, have no deferred
 keys and do not produce mm outputs in `sample()`. The buffer holds at most
 `block_size` steps, bounded by `staging_capacity_tokens` rows and
 `gpu_staging_bytes` of retained tensor data. A batch that cannot fit the byte
-limit uses the ordinary per-step save.
+limit uses the ordinary per-step save. Changes in request order or output keys
+also flush the buffer. The runner retains each step's slot layout and cloned
+tensors, then stacks the stable batch in request/step order when flushing.
 
 Before any mixed step or lifecycle change, the runner writes all buffered rows,
 including partial blocks, before the manager plans hits or new writes can reuse

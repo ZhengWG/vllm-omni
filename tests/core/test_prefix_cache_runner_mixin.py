@@ -32,9 +32,9 @@ except ModuleNotFoundError:
 
 from tests.core.test_prefix_cache import FakeView
 from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter, PrefixCacheStep, PrefixCacheWriteLayout
-from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
+from vllm_omni.core.prefix_cache.interface import HIDDEN_KEY, PrefixCacheConfig, StageCacheOutputs
 from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
-from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin, _DecodeRowCoalescer
+from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -147,10 +147,11 @@ def test_decode_batching_requires_opt_in_and_plain_policy(monkeypatch, enabled, 
     runner._snapshot_prefix_cache_model_policy(SimpleNamespace(**model_attrs))
     try:
         runner._prefix_cache_step_begin(_sched())
-        assert (runner._prefix_cache_coalescer is not None) == expected
+        assert (runner._prefix_cache_block_save_cfg is not None) == expected
     finally:
         runner._shutdown_omni_prefix_cache()
-    assert runner._prefix_cache_coalescer is None
+    assert runner._prefix_cache_block_save_cfg is None
+    assert runner._prefix_cache_decode_steps is None
 
 
 def test_default_policy_isolated_per_instance():
@@ -379,7 +380,10 @@ class _DecodeRunner(PrefixCacheRunnerMixin):
         self.omni_prefix_cache = OmniPrefixCacheManager(cfg, eager=True)
         self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
         self._prefix_cache_group_view = FakeView()
-        self._prefix_cache_coalescer = _DecodeRowCoalescer(cfg) if coalesce else None
+        self._prefix_cache_block_save_cfg = cfg if coalesce else None
+        self._prefix_cache_decode_steps: list[tuple[PrefixCacheWriteLayout, dict[str, torch.Tensor]]] | None = (
+            [] if coalesce else None
+        )
         self.is_pooling_model = False
         self.save_sizes: list[int] = []
         self.begin_calls = 0
@@ -398,7 +402,7 @@ class _DecodeRunner(PrefixCacheRunnerMixin):
         self.omni_prefix_cache.new_step_starts = counting_begin
         self.omni_prefix_cache.save_outputs = counting_save
 
-    def step(self, reqs, *, new=(), hits=None, finished=(), aborted=(), preempted=(), mm=None):
+    def step(self, reqs, *, new=(), hits=None, finished=(), aborted=(), preempted=(), mm=None, hidden=None):
         view = self._prefix_cache_group_view
         view.order = list(reqs)
         for req_id, (blocks, start, _) in reqs.items():
@@ -415,7 +419,8 @@ class _DecodeRunner(PrefixCacheRunnerMixin):
             num_scheduled_tokens={r: n for r, (_, _, n) in reqs.items()},
         )
         self._prefix_cache_step_begin(sched)
-        hidden = torch.stack([_decode_row(r, p) for r, (_, s, n) in reqs.items() for p in range(s, s + n)])
+        if hidden is None:
+            hidden = torch.stack([_decode_row(r, p) for r, (_, s, n) in reqs.items() for p in range(s, s + n)])
         n = int(hidden.shape[0])
         step_id = self._prefix_cache_save_step(hidden, mm, num_tokens_unpadded=n, num_tokens_padded=n)
         out = self._prefix_cache_materialize(step_id, list(reqs)) if step_id is not None else (None, None)
@@ -460,7 +465,7 @@ def test_mixed_step_flushes_before_claiming_its_only_staging_slot(decode_runners
     for p in (4, 5, 6):
         r.step({"a": (A_BLOCKS, p, 1)})
     step_id, (hidden, _) = r.step({"a": (A_BLOCKS, 7, 1), "c": ([6, 7], 0, 8)}, new=["c"])
-    assert step_id is not None and r._prefix_cache_coalescer.take() is None
+    assert step_id is not None and not r._prefix_cache_decode_steps
     assert torch.equal(hidden["a"], _decode_row("a", 7).unsqueeze(0))
     assert r.save_sizes == [4, 3, 9]
     _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
@@ -518,23 +523,25 @@ def test_lifecycle_flush_precedes_reuse_of_partial_block(decode_runners, event):
     assert torch.equal(hidden["b"], _expect_decode_hit("c", range(4), ("b", 4)))
 
 
-def test_buffer_snapshots_live_rows_and_packs_reordered_requests():
-    buffer = _DecodeRowCoalescer(
-        PrefixCacheConfig(num_blocks=8, block_size=BLOCK_SIZE, staging_capacity_tokens=8, gpu_staging_bytes=1024)
-    )
-    live = torch.tensor([[1.0], [2.0]])
-    assert buffer.can_append(2, {"hidden": live})
-    buffer.park(["a", "b"], torch.tensor([4, 12]), {"hidden": live})
-    live.copy_(torch.tensor([[3.0], [4.0]]))
-    buffer.park(["b", "a"], torch.tensor([13, 5]), {"hidden": live})
+@pytest.mark.parametrize("reorder", [False, True])
+def test_buffer_snapshots_live_rows_across_batch_reordering(decode_runners, reorder):
+    r = decode_runners()
+    r.step({"a": (A_BLOCKS, 0, 4), "z": (Z_BLOCKS, 0, 4)}, new=["a", "z"])
+    live = torch.tensor([[1.0] * DECODE_WIDTH, [2.0] * DECODE_WIDTH])
+    r.step({"a": (A_BLOCKS, 4, 1), "z": (Z_BLOCKS, 4, 1)}, hidden=live)
+    live.copy_(torch.tensor([[3.0] * DECODE_WIDTH, [4.0] * DECODE_WIDTH]))
+    reqs = {"a": (A_BLOCKS, 5, 1), "z": (Z_BLOCKS, 5, 1)}
+    if reorder:
+        reqs = dict(reversed(reqs.items()))
+    r.step(reqs, hidden=live)
     live.fill_(-1)
-    parked = buffer.take()
-    assert parked is not None
-    layout, rows = parked
-    assert [(w.req_id, w.row_start, w.row_end) for w in layout.writes] == [("a", 0, 2), ("b", 2, 4)]
-    assert layout.slots_cpu.tolist() == [4, 5, 12, 13]
-    assert rows["hidden"].flatten().tolist() == [1.0, 4.0, 2.0, 3.0]
-    assert buffer.take() is None
+    r._prefix_cache_flush_decode()
+    slots = torch.tensor([4, 5, Z_BLOCKS[1] * BLOCK_SIZE, Z_BLOCKS[1] * BLOCK_SIZE + 1])
+    expected = [1.0, 4.0, 2.0, 3.0] if reorder else [1.0, 3.0, 2.0, 4.0]
+    assert r.omni_prefix_cache._pool.rows(HIDDEN_KEY, slots)[:, 0].tolist() == expected
+    assert r.save_sizes == ([8, 2, 2] if reorder else [8, 4])
+    assert not r._prefix_cache_decode_steps
+    assert r._prefix_cache_decode_bytes == 0
 
 
 def test_key_change_flushes_old_rows_before_parking_new_keys(decode_runners):

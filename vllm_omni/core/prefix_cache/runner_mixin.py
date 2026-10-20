@@ -37,56 +37,6 @@ if TYPE_CHECKING:
     from vllm.v1.core.sched.output import SchedulerOutput
 
 
-class _DecodeRowCoalescer:
-    """Buffer pure-decode rows until a capacity or lifecycle boundary."""
-
-    def __init__(self, config: PrefixCacheConfig) -> None:
-        self._config = config
-        self._refs: dict[str, list[tuple[int, dict[str, torch.Tensor], int]]] = {}
-        self._keys: frozenset[str] = frozenset()
-        self._num_rows = self._num_steps = self._num_bytes = 0
-
-    def can_append(self, n: int, rows: dict[str, torch.Tensor]) -> bool:
-        nbytes = sum(t.numel() * t.element_size() for t in rows.values())
-        return (
-            (not self._refs or frozenset(rows) == self._keys)
-            and self._num_rows + n <= self._config.staging_capacity_tokens
-            and self._num_bytes + nbytes <= self._config.gpu_staging_bytes
-        )
-
-    def park(self, req_ids: list[str], slots: torch.Tensor, rows: dict[str, torch.Tensor]) -> bool:
-        """Snapshot a step after ``can_append``; return whether a flush is due."""
-        # The model may reuse its output storage on the next forward.
-        step = {key: val.clone() for key, val in rows.items()}
-        self._keys = frozenset(step)
-        for i, (req_id, slot) in enumerate(zip(req_ids, slots.tolist())):
-            self._refs.setdefault(req_id, []).append((slot, step, i))
-        self._num_rows += len(req_ids)
-        self._num_steps += 1
-        self._num_bytes += sum(t.numel() * t.element_size() for t in step.values())
-        return (
-            self._num_steps >= self._config.block_size
-            or self._num_rows >= self._config.staging_capacity_tokens
-            or self._num_bytes >= self._config.gpu_staging_bytes
-        )
-
-    def take(self) -> tuple[PrefixCacheWriteLayout, dict[str, torch.Tensor]] | None:
-        """Pack all buffered rows, including partial blocks, for an ordinary save."""
-        if not self._refs:
-            return None
-        writes = []
-        refs: list[tuple[int, dict[str, torch.Tensor], int]] = []
-        for req_id, request_refs in self._refs.items():
-            start = len(refs)
-            refs.extend(request_refs)
-            writes.append(PrefixCacheWrite(req_id, start, len(refs)))
-        slots = torch.tensor([slot for slot, _, _ in refs], dtype=torch.long)
-        rows = {key: torch.cat([step[key][i : i + 1] for _, step, i in refs]) for key in self._keys}
-        self._refs.clear()
-        self._num_rows = self._num_steps = self._num_bytes = 0
-        return PrefixCacheWriteLayout(tuple(writes), len(refs), slots), rows
-
-
 class PrefixCacheRunnerMixin:
     """Prefix-cache integration for a model runner (no state machine here).
 
@@ -116,7 +66,9 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
     _prefix_cache_coalesce_decode = False
-    _prefix_cache_coalescer: _DecodeRowCoalescer | None = None
+    _prefix_cache_block_save_cfg: PrefixCacheConfig | None = None
+    _prefix_cache_decode_steps: list[tuple[PrefixCacheWriteLayout, dict[str, torch.Tensor]]] | None = None
+    _prefix_cache_decode_bytes = 0
     _prefix_cache_pure_decode = False
 
     def _snapshot_prefix_cache_model_policy(self, model) -> None:
@@ -178,7 +130,8 @@ class PrefixCacheRunnerMixin:
             and not policy.deferred_keys
             and not policy.mm_outputs_written_in_sample
         ):
-            self._prefix_cache_coalescer = _DecodeRowCoalescer(cfg)
+            self._prefix_cache_block_save_cfg = cfg
+            self._prefix_cache_decode_steps = []
 
     def _prefix_cache_step_begin(self, scheduler_output: SchedulerOutput) -> None:
         """Per-step lifecycle entry; must run before ``_update_states``
@@ -192,13 +145,14 @@ class PrefixCacheRunnerMixin:
             step = self._prefix_cache_adapter.translate_step(scheduler_output)
             self._prefix_cache_step = step
             self._prefix_cache_pure_decode = (
-                bool(step.scheduled_tokens)
+                self._prefix_cache_block_save_cfg is not None
+                and bool(step.scheduled_tokens)
                 and all(count == 1 for _, count in step.scheduled_tokens)
                 and not step.events
                 and not getattr(scheduler_output, "scheduled_new_reqs", ())
                 and not getattr(scheduler_output, "preempted_req_ids", ())
             )
-            if self._prefix_cache_coalescer is not None and self._prefix_cache_pure_decode:
+            if self._prefix_cache_pure_decode:
                 return
             # Flush before hit planning or slot reuse. A streaming extension
             # retains partial blocks, just like the original per-step writes.
@@ -233,12 +187,10 @@ class PrefixCacheRunnerMixin:
             num_scheduled_tokens=dict(self._prefix_cache_step.scheduled_tokens),
         )
         mm = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
-        coalescer = self._prefix_cache_coalescer
         n = num_tokens_unpadded
         hidden_key = self._omni_cache_policy.hidden_key
         if (
-            coalescer is not None
-            and self._prefix_cache_pure_decode
+            self._prefix_cache_pure_decode
             and hidden_key is not None
             and _is_step_token_tensor(hidden_states, n, num_tokens_padded)
             and len(layout.writes) == n
@@ -253,17 +205,11 @@ class PrefixCacheRunnerMixin:
                 if _is_step_token_tensor(val, n, num_tokens_padded)
                 and not self._omni_cache_policy.skip_immediate_mm(key)
             )
-            if not coalescer.can_append(n, rows):
-                self._prefix_cache_flush_decode()
-            if coalescer.can_append(n, rows):
-                if coalescer.park([write.req_id for write in layout.writes], layout.slots_cpu, rows):
-                    self._prefix_cache_flush_decode()
+            if self._prefix_cache_buffer_decode(layout, rows):
                 return None
-        # Unsupported rows or a single step exceeding the buffer's byte limit
-        # use the ordinary save. Flush first, before it claims a staging slot.
-        self._prefix_cache_flush_decode()
-        if coalescer is not None and self._prefix_cache_pure_decode:
+        if self._prefix_cache_pure_decode:
             # The pure-decode entry skipped the manager, but this step fell back.
+            self._prefix_cache_flush_decode()
             self.omni_prefix_cache.new_step_starts(self._prefix_cache_step)
         return self.omni_prefix_cache.save_outputs(
             hidden_states,
@@ -273,12 +219,49 @@ class PrefixCacheRunnerMixin:
             write_layout=layout,
         )
 
+    def _prefix_cache_buffer_decode(self, layout: PrefixCacheWriteLayout, rows: dict[str, torch.Tensor]) -> bool:
+        """Append one step; return False when it needs an ordinary save."""
+        cfg, steps = self._prefix_cache_block_save_cfg, self._prefix_cache_decode_steps
+        assert cfg is not None and steps is not None
+        n, nbytes = layout.total_rows, sum(t.numel() * t.element_size() for t in rows.values())
+        if n > cfg.staging_capacity_tokens or nbytes > cfg.gpu_staging_bytes:
+            return False
+        if steps and (
+            layout.writes != steps[0][0].writes
+            or rows.keys() != steps[0][1].keys()
+            or (len(steps) + 1) * n > cfg.staging_capacity_tokens
+            or self._prefix_cache_decode_bytes + nbytes > cfg.gpu_staging_bytes
+        ):
+            self._prefix_cache_flush_decode()
+        # The model may reuse its output storage on the next forward.
+        steps.append((layout, {key: val.clone() for key, val in rows.items()}))
+        self._prefix_cache_decode_bytes += nbytes
+        if (
+            len(steps) >= cfg.block_size
+            or len(steps) * n >= cfg.staging_capacity_tokens
+            or self._prefix_cache_decode_bytes >= cfg.gpu_staging_bytes
+        ):
+            self._prefix_cache_flush_decode()
+        return True
+
     def _prefix_cache_flush_decode(self) -> None:
-        """Write buffered decode rows through the manager's ordinary save path."""
-        coalescer = self._prefix_cache_coalescer
-        if coalescer is None or (parked := coalescer.take()) is None:
+        """Stack a stable batch in request/step order and save it once."""
+        steps = self._prefix_cache_decode_steps
+        if not steps:
             return
-        layout, rows = parked
+        count = len(steps)
+        first = steps[0][0]
+        n = first.total_rows * count
+        writes = tuple(PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count) for w in first.writes)
+        slots = []
+        for step_index in range(count):
+            step_slots = steps[step_index][0].slots_cpu
+            assert step_slots is not None
+            slots.append(step_slots)
+        slots_cpu = torch.stack(slots, dim=1).flatten()
+        rows = {key: torch.stack([tensors[key] for _, tensors in steps], dim=1).flatten(0, 1) for key in steps[0][1]}
+        steps.clear()
+        self._prefix_cache_decode_bytes = 0
         hidden_key = self._omni_cache_policy.hidden_key
         assert hidden_key is not None
         hidden = rows.pop(hidden_key)
@@ -287,9 +270,9 @@ class PrefixCacheRunnerMixin:
         step_id = cache.save_outputs(
             hidden,
             rows,
-            num_tokens_unpadded=layout.total_rows,
-            num_tokens_padded=layout.total_rows,
-            write_layout=layout,
+            num_tokens_unpadded=n,
+            num_tokens_padded=n,
+            write_layout=PrefixCacheWriteLayout(writes, n, slots_cpu),
         )
         cache.discard_step(step_id)
 
@@ -305,7 +288,9 @@ class PrefixCacheRunnerMixin:
             self._prefix_cache_group_view = None
             self._prefix_cache_step = None
             self._omni_prefix_cache_cfg = None
-            self._prefix_cache_coalescer = None
+            self._prefix_cache_block_save_cfg = None
+            self._prefix_cache_decode_steps = None
+            self._prefix_cache_decode_bytes = 0
             self._prefix_cache_pure_decode = False
 
     def _prefix_cache_materialize(
