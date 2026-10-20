@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Barrier
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import numpy as np
 import pytest
@@ -751,18 +751,11 @@ def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
 
 
 def test_build_omni_output_serves_live_hidden_for_a_step_the_cache_did_not_save(monkeypatch):
-    """A parked decode step has no cache step id: its payload carries the
+    """A buffered decode step has no cache step id: its payload carries the
     live rows, exactly like a stage without the cache."""
     runner = _make_async_output_runner(engine_output_type="latent")
 
-    class StepCache:
-        def materialize(self, step_id, req_ids):
-            raise AssertionError("a step without a cache step id must not materialize")
-
-        def discard_step(self, step_id):
-            raise AssertionError("a step without a cache step id has nothing to discard")
-
-    runner.omni_prefix_cache = StepCache()
+    runner.omni_prefix_cache = Mock()
     monkeypatch.setattr(GPUARModelRunner, "_resolve_pooler_payload_req_ids", lambda self, req_ids: ("latent", req_ids))
     monkeypatch.setattr(GPUARModelRunner, "_should_accumulate_full_payload_output", lambda self: False)
     monkeypatch.setattr(GPUARModelRunner, "get_omni_connector_output", lambda self: None)
@@ -790,6 +783,8 @@ def test_build_omni_output_serves_live_hidden_for_a_step_the_cache_did_not_save(
         prefix_cache_step_id=None,
     )
 
+    runner.omni_prefix_cache.materialize.assert_not_called()
+    runner.omni_prefix_cache.discard_step.assert_not_called()
     assert output.inter_stage_outputs is not None
     for payload, row in zip(output.inter_stage_outputs, hidden):
         assert torch.equal(payload["hidden"], row.unsqueeze(0))

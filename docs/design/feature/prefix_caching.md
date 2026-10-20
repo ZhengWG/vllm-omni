@@ -325,14 +325,6 @@ When #7681 lands, pin the producer/adapter contract with a real
 Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
 resume delivery watermarks are follow-up contracts, not inferred here.
 
-The GPU AR runner batches pure decode writes (one token per request, no arrivals,
-lifecycle events or preemptions) for full-hidden-state policies without deferred
-keys or mm outputs produced in `sample()`. It retains at most `block_size` steps,
-bounded by `staging_capacity_tokens` rows and `gpu_staging_bytes`; a single step
-that exceeds either capacity uses an ordinary save. Request-order or output-key
-changes, mixed steps and lifecycle events flush all buffered rows, including
-partial blocks, before hits are planned or slots can be reused.
-
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
 - Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into

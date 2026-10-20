@@ -67,7 +67,9 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_step: PrefixCacheStep | None = None
     _prefix_cache_coalesce_decode = False
     _prefix_cache_decode_cfg: PrefixCacheConfig | None = None
-    _prefix_cache_decode_steps: list[tuple[PrefixCacheWriteLayout, torch.Tensor, dict[str, torch.Tensor]]] | None = None
+    _prefix_cache_decode_steps: (
+        list[tuple[tuple[PrefixCacheWrite, ...], torch.Tensor, dict[str, torch.Tensor]]] | None
+    ) = None
     _prefix_cache_decode_bytes = 0
     _prefix_cache_pure_decode = False
 
@@ -124,12 +126,7 @@ class PrefixCacheRunnerMixin:
         self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
         self._prefix_cache_group_view = view
         policy = self._omni_cache_policy
-        if (
-            self._prefix_cache_coalesce_decode
-            and policy.needs_full_hidden_states
-            and not policy.deferred_keys
-            and not policy.mm_outputs_written_in_sample
-        ):
+        if self._prefix_cache_coalesce_decode and policy.needs_full_hidden_states and not policy.deferred_keys:
             self._prefix_cache_decode_cfg = cfg
             self._prefix_cache_decode_steps = []
 
@@ -204,12 +201,10 @@ class PrefixCacheRunnerMixin:
                 if _is_step_token_tensor(val, n, num_tokens_padded)
                 and not self._omni_cache_policy.skip_immediate_mm(key)
             )
-            if self._prefix_cache_buffer_decode(layout, layout.slots_cpu, rows):
+            if self._prefix_cache_buffer_decode(layout.writes, layout.slots_cpu, rows):
                 return None
         if self._prefix_cache_pure_decode:
-            # The pure-decode entry skipped the manager, but this step fell back.
             self._prefix_cache_flush_decode()
-            self.omni_prefix_cache.new_step_starts(self._prefix_cache_step)
         return self.omni_prefix_cache.save_outputs(
             hidden_states,
             mm,
@@ -219,23 +214,23 @@ class PrefixCacheRunnerMixin:
         )
 
     def _prefix_cache_buffer_decode(
-        self, layout: PrefixCacheWriteLayout, slots_cpu: torch.Tensor, rows: dict[str, torch.Tensor]
+        self, writes: tuple[PrefixCacheWrite, ...], slots_cpu: torch.Tensor, rows: dict[str, torch.Tensor]
     ) -> bool:
         """Append one step; return False when it needs an ordinary save."""
         cfg, steps = self._prefix_cache_decode_cfg, self._prefix_cache_decode_steps
         assert cfg is not None and steps is not None
-        n, nbytes = layout.total_rows, sum(t.numel() * t.element_size() for t in rows.values())
+        n, nbytes = len(writes), sum(t.numel() * t.element_size() for t in rows.values())
         if n > cfg.staging_capacity_tokens or nbytes > cfg.gpu_staging_bytes:
             return False
         if steps and (
-            layout.writes != steps[0][0].writes
+            writes != steps[0][0]
             or rows.keys() != steps[0][2].keys()
             or (len(steps) + 1) * n > cfg.staging_capacity_tokens
             or self._prefix_cache_decode_bytes + nbytes > cfg.gpu_staging_bytes
         ):
             self._prefix_cache_flush_decode()
         # The model may reuse its output storage on the next forward.
-        steps.append((layout, slots_cpu, {key: val.clone() for key, val in rows.items()}))
+        steps.append((writes, slots_cpu, {key: val.clone() for key, val in rows.items()}))
         self._prefix_cache_decode_bytes += nbytes
         if (
             len(steps) >= cfg.block_size
@@ -252,8 +247,8 @@ class PrefixCacheRunnerMixin:
             return
         count = len(steps)
         first = steps[0][0]
-        n = first.total_rows * count
-        writes = tuple(PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count) for w in first.writes)
+        n = len(first) * count
+        writes = tuple(PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count) for w in first)
         slots_cpu = torch.stack([slots for _, slots, _ in steps], dim=1).flatten()
         rows = {key: torch.stack([tensors[key] for _, _, tensors in steps], dim=1).flatten(0, 1) for key in steps[0][2]}
         steps.clear()

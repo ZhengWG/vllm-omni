@@ -468,9 +468,8 @@ class OmniPrefixCacheManager:
         """Handle one immutable adapter-produced step.
 
         Engine thread only; before _update_states removes finished
-        requests; once per step that uses the manager (buffered pure-decode
-        steps skip this entry). Registers new-request prefix
-        hits (copying their block tables) and forces finished/aborted
+        requests. Runners may skip this entry for pure decode steps. Registers
+        new-request prefix hits (copying their block tables) and forces finished/aborted
         requests' still-open writes onto the high-priority copy queue —
         a block hash that entered the batch must land in the cache,
         abort included. ``escalate`` (eager: the copy + pool write) runs
