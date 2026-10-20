@@ -30,9 +30,11 @@ except ModuleNotFoundError:
     sys.modules["vllm"] = _vllm
     sys.modules["vllm.logger"] = _vllm_logger
 
-from vllm_omni.core.prefix_cache.adapter import PrefixCacheStep, PrefixCacheWriteLayout
+from tests.core.test_prefix_cache import FakeView
+from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter, PrefixCacheStep, PrefixCacheWriteLayout
 from vllm_omni.core.prefix_cache.interface import PrefixCacheConfig, StageCacheOutputs
-from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin
+from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager
+from vllm_omni.core.prefix_cache.runner_mixin import PrefixCacheRunnerMixin, _DecodeRowCoalescer
 
 pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
 
@@ -128,6 +130,29 @@ def test_step_begin_builds_once_and_registers_snapshot_policy(monkeypatch):
     assert r.omni_prefix_cache is mgr  # one-shot
 
 
+@pytest.mark.parametrize(
+    "enabled,model_attrs,expected",
+    [
+        (True, {}, True),
+        (False, {}, False),
+        (True, {"deferred_prefix_cache_mm_keys": ("audio",)}, False),
+        (True, {"requires_full_prefix_cached_hidden_states": False}, False),
+        (True, {"requires_full_prefix_cached_hidden_states": False, "mm_outputs_written_in_sample": True}, False),
+    ],
+)
+def test_decode_batching_requires_opt_in_and_plain_policy(monkeypatch, enabled, model_attrs, expected):
+    _patch_pp(monkeypatch, is_last=True)
+    runner = _Runner(_cfg())
+    runner._prefix_cache_coalesce_decode = enabled
+    runner._snapshot_prefix_cache_model_policy(SimpleNamespace(**model_attrs))
+    try:
+        runner._prefix_cache_step_begin(_sched())
+        assert (runner._prefix_cache_coalescer is not None) == expected
+    finally:
+        runner._shutdown_omni_prefix_cache()
+    assert runner._prefix_cache_coalescer is None
+
+
 def test_default_policy_isolated_per_instance():
     a, b = _Runner(), _Runner()
     a._snapshot_prefix_cache_model_policy(SimpleNamespace(requires_full_prefix_cached_hidden_states=False))
@@ -192,10 +217,9 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
     _patch_pp(monkeypatch, is_last=True)
     runner = _Runner()
     stub = _CacheStub()
-    steps = []
-    stub.new_step_starts = steps.append
+    steps: list[PrefixCacheStep] = []
+    setattr(stub, "new_step_starts", steps.append)
     runner.omni_prefix_cache = stub
-    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
 
     runner._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
     runner._prefix_cache_group_view = SimpleNamespace(
@@ -228,10 +252,8 @@ def test_step_begin_and_save_keep_the_translated_snapshot(monkeypatch):
 
 @pytest.mark.parametrize("missing", ["adapter", "view"])
 def test_step_begin_rejects_incomplete_cache_initialization(missing):
-    from vllm_omni.core.prefix_cache.adapter import PrefixCacheSchedulerAdapter
-
     runner = _Runner()
-    steps = []
+    steps: list[PrefixCacheStep] = []
     runner.omni_prefix_cache = SimpleNamespace(new_step_starts=steps.append)
     runner._prefix_cache_adapter = None if missing == "adapter" else PrefixCacheSchedulerAdapter()
     runner._prefix_cache_group_view = None if missing == "view" else SimpleNamespace()
@@ -310,6 +332,9 @@ def test_shared_runner_shutdown_releases_cache_before_upstream():
     order = []
 
     class Base:
+        omni_prefix_cache: Any
+        _prefix_cache_group_view: Any
+
         def shutdown(self):
             assert self.omni_prefix_cache is None
             assert self._prefix_cache_group_view is None
@@ -337,3 +362,188 @@ def test_shared_runner_shutdown_releases_cache_before_upstream():
         and node.func.attr == "_shutdown_omni_prefix_cache"
         for node in ast.walk(ar_shutdown)
     )
+
+
+DECODE_WIDTH = 3
+A_BLOCKS = [0, 1, 2, 3]
+Z_BLOCKS = [8, 9, 10, 11]
+
+
+def _decode_row(req_id: str, pos: int) -> torch.Tensor:
+    return torch.full((DECODE_WIDTH,), 1000.0 * (ord(req_id[0]) - ord("a") + 1) + pos)
+
+
+class _DecodeRunner(PrefixCacheRunnerMixin):
+    def __init__(self, coalesce: bool = True, **kwargs):
+        cfg = PrefixCacheConfig(num_blocks=16, block_size=BLOCK_SIZE, **kwargs)
+        self.omni_prefix_cache = OmniPrefixCacheManager(cfg, eager=True)
+        self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
+        self._prefix_cache_group_view = FakeView()
+        self._prefix_cache_coalescer = _DecodeRowCoalescer(cfg) if coalesce else None
+        self.is_pooling_model = False
+        self.save_sizes: list[int] = []
+        self.begin_calls = 0
+        begin = self.omni_prefix_cache.new_step_starts
+        save = self.omni_prefix_cache.save_outputs
+
+        def counting_begin(step):
+            self.begin_calls += 1
+            return begin(step)
+
+        def counting_save(*args, **kwargs):
+            result = save(*args, **kwargs)
+            self.save_sizes.append(kwargs["num_tokens_unpadded"])
+            return result
+
+        self.omni_prefix_cache.new_step_starts = counting_begin
+        self.omni_prefix_cache.save_outputs = counting_save
+
+    def step(self, reqs, *, new=(), hits=None, finished=(), aborted=(), preempted=(), mm=None):
+        view = self._prefix_cache_group_view
+        view.order = list(reqs)
+        for req_id, (blocks, start, _) in reqs.items():
+            view.req_blocks[req_id], view.computed[req_id] = blocks, start
+        sched = SimpleNamespace(
+            scheduled_new_reqs=[
+                SimpleNamespace(req_id=r, num_computed_tokens=(hits or {}).get(r, 0), block_ids=[reqs[r][0]])
+                for r in new
+            ],
+            scheduled_cached_reqs=None,
+            finished_req_ids=set(finished),
+            aborted_req_ids=set(aborted),
+            preempted_req_ids=set(preempted),
+            num_scheduled_tokens={r: n for r, (_, _, n) in reqs.items()},
+        )
+        self._prefix_cache_step_begin(sched)
+        hidden = torch.stack([_decode_row(r, p) for r, (_, s, n) in reqs.items() for p in range(s, s + n)])
+        n = int(hidden.shape[0])
+        step_id = self._prefix_cache_save_step(hidden, mm, num_tokens_unpadded=n, num_tokens_padded=n)
+        out = self._prefix_cache_materialize(step_id, list(reqs)) if step_id is not None else (None, None)
+        return step_id, out
+
+
+@pytest.fixture
+def decode_runners(monkeypatch):
+    _patch_pp(monkeypatch, is_last=True)
+    created = []
+
+    def create(**kwargs):
+        runner = _DecodeRunner(**kwargs)
+        created.append(runner)
+        return runner
+
+    yield create
+    for runner in created:
+        runner._shutdown_omni_prefix_cache()
+
+
+def _expect_decode_hit(req_id, positions, tail):
+    return torch.stack([_decode_row(req_id, p) for p in positions] + [_decode_row(*tail)])
+
+
+@pytest.mark.parametrize("coalesce", [False, True])
+def test_decode_batches_preserve_later_prefix_hits(decode_runners, coalesce):
+    r = decode_runners(coalesce=coalesce)
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    for p in range(4, 12):
+        step_id, _ = r.step({"a": (A_BLOCKS, p, 1)})
+        assert (step_id is None) == coalesce
+    assert len(r.save_sizes) == (3 if coalesce else 9)
+    assert r.begin_calls == (1 if coalesce else 9)
+    _, (hidden, _) = r.step({"b": ([0, 1, 2, 5], 12, 1)}, new=["b"], hits={"b": 12})
+    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(12), ("b", 12)))
+
+
+def test_mixed_step_flushes_before_claiming_its_only_staging_slot(decode_runners):
+    r = decode_runners(staging_depth=1, staging_claim_timeout_s=0.1)
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    for p in (4, 5, 6):
+        r.step({"a": (A_BLOCKS, p, 1)})
+    step_id, (hidden, _) = r.step({"a": (A_BLOCKS, 7, 1), "c": ([6, 7], 0, 8)}, new=["c"])
+    assert step_id is not None and r._prefix_cache_coalescer.take() is None
+    assert torch.equal(hidden["a"], _decode_row("a", 7).unsqueeze(0))
+    assert r.save_sizes == [4, 3, 9]
+    _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
+    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
+
+
+def test_streaming_extension_preserves_partial_decode_block(decode_runners):
+    r = decode_runners()
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    for p in (4, 5):
+        r.step({"a": (A_BLOCKS, p, 1)})
+    r.step({"a": (A_BLOCKS, 6, 2)}, new=["a"], hits={"a": 6})
+    _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
+    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
+
+
+def test_hit_on_block_completed_in_transition_step(decode_runners):
+    r = decode_runners()
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    for p in (4, 5, 6):
+        r.step({"a": (A_BLOCKS, p, 1)})
+    _, (hidden, _) = r.step({"a": (A_BLOCKS, 7, 1), "b": ([0, 1, 6], 8, 1)}, new=["b"], hits={"b": 8})
+    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
+
+
+@pytest.mark.parametrize("capacity", [3, 4])
+def test_decode_buffer_never_exceeds_staging_capacity(decode_runners, capacity):
+    r = decode_runners(staging_capacity_tokens=capacity)
+    r.step({"a": (A_BLOCKS, 0, 1), "z": (Z_BLOCKS, 0, 1)}, new=["a", "z"])
+    for p in range(1, 8):
+        r.step({"a": (A_BLOCKS, p, 1), "z": (Z_BLOCKS, p, 1)})
+    _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
+    assert max(r.save_sizes) <= capacity
+    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
+
+
+@pytest.mark.parametrize("budget", [8, 24])
+def test_decode_buffer_obeys_byte_budget_and_falls_back(decode_runners, budget):
+    r = decode_runners(gpu_staging_bytes=budget)
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    ids = [r.step({"a": (A_BLOCKS, p, 1)})[0] for p in range(4, 8)]
+    assert all(step_id is None for step_id in ids) == (budget >= DECODE_WIDTH * 4)
+    assert r.save_sizes == ([4, 1, 1, 1, 1] if budget == 8 else [4, 2, 2])
+    assert r.begin_calls == (5 if budget == 8 else 1)
+
+
+@pytest.mark.parametrize("event", ["finished", "aborted", "preempted"])
+def test_lifecycle_flush_precedes_reuse_of_partial_block(decode_runners, event):
+    r = decode_runners()
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    for p in (4, 5):
+        r.step({"a": (A_BLOCKS, p, 1)})
+    r.step({"c": ([1, 6], 0, 4)}, new=["c"], **{event: ["a"]})
+    _, (hidden, _) = r.step({"b": ([1, 7], 4, 1)}, new=["b"], hits={"b": 4})
+    assert torch.equal(hidden["b"], _expect_decode_hit("c", range(4), ("b", 4)))
+
+
+def test_buffer_snapshots_live_rows_and_packs_reordered_requests():
+    buffer = _DecodeRowCoalescer(
+        PrefixCacheConfig(num_blocks=8, block_size=BLOCK_SIZE, staging_capacity_tokens=8, gpu_staging_bytes=1024)
+    )
+    live = torch.tensor([[1.0], [2.0]])
+    assert buffer.can_append(2, {"hidden": live})
+    buffer.park(["a", "b"], torch.tensor([4, 12]), {"hidden": live})
+    live.copy_(torch.tensor([[3.0], [4.0]]))
+    buffer.park(["b", "a"], torch.tensor([13, 5]), {"hidden": live})
+    live.fill_(-1)
+    parked = buffer.take()
+    assert parked is not None
+    layout, rows = parked
+    assert [(w.req_id, w.row_start, w.row_end) for w in layout.writes] == [("a", 0, 2), ("b", 2, 4)]
+    assert layout.slots_cpu.tolist() == [4, 5, 12, 13]
+    assert rows["hidden"].flatten().tolist() == [1.0, 4.0, 2.0, 3.0]
+    assert buffer.take() is None
+
+
+def test_key_change_flushes_old_rows_before_parking_new_keys(decode_runners):
+    r = decode_runners()
+    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
+    r.step({"a": (A_BLOCKS, 4, 1)})
+    for p in (5, 6, 7):
+        r.step({"a": (A_BLOCKS, p, 1)}, mm={"mm": torch.full((1, 2), float(p))})
+    _, (hidden, mm) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8}, mm={"mm": torch.full((1, 2), 8.0)})
+    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
+    assert torch.equal(mm["mm"]["b"][:5], torch.zeros(5, 2))
+    assert mm["mm"]["b"][5:, 0].tolist() == [5.0, 6.0, 7.0, 8.0]

@@ -53,7 +53,7 @@ from __future__ import annotations
 import logging
 import threading
 from collections import deque
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from enum import IntEnum
@@ -468,7 +468,8 @@ class OmniPrefixCacheManager:
         """Handle one immutable adapter-produced step.
 
         Engine thread only; before _update_states removes finished
-        requests; exactly once per real step. Registers new-request prefix
+        requests; once per step that uses the manager (buffered pure-decode
+        steps skip this entry). Registers new-request prefix
         hits (copying their block tables) and forces finished/aborted
         requests' still-open writes onto the high-priority copy queue —
         a block hash that entered the batch must land in the cache,
@@ -553,15 +554,8 @@ class OmniPrefixCacheManager:
         num_tokens_unpadded: int,
         num_tokens_padded: int,
         write_layout: PrefixCacheWriteLayout,
-        skip_write_req_ids: Collection[str] = (),
-        write_only: bool = False,
     ) -> int:
         """Write this step's outputs into the cache; returns the step id.
-
-        ``skip_write_req_ids`` rows stay in the step snapshot for materialize
-        but are not written (the runner writes them later). ``write_only``
-        writes rows that are not this step's (parked decode rows): it leaves
-        the step's hit bookkeeping alone, and the caller discards the id.
 
         Engine thread only, after the forward and before materialize.
         Immediately-cached rows: one on-device clone, one whole-step
@@ -593,7 +587,7 @@ class OmniPrefixCacheManager:
         # Hit buffers were sized from the captured step, not this layout.
         # Reject disagreement before cloning, staging or publishing rows.
         with self._state_lock:
-            for req_id in () if write_only else self._hit_spans:
+            for req_id in self._hit_spans:
                 expected = self._cur_num_scheduled.get(req_id, 0)
                 actual = num_sched.get(req_id, 0)
                 if actual != expected:
@@ -646,8 +640,6 @@ class OmniPrefixCacheManager:
                     slots_cpu=slots_cpu,
                     mm_keys=set(mm_outputs.keys()),
                     write_ctx=write_ctx,
-                    skip_write_req_ids=skip_write_req_ids,
-                    write_only=write_only,
                 )
                 # Eager execution and queue dispatch must remain outside the lock.
                 write_ctx.start_writes()
@@ -888,8 +880,6 @@ class OmniPrefixCacheManager:
         slots_cpu: torch.Tensor | None,
         mm_keys: set[str],
         write_ctx: StepWriteContext,
-        skip_write_req_ids: Collection[str] = (),
-        write_only: bool = False,
     ) -> None:
         """Takes ``_state_lock``. Register this step's writes and store the
         consume-once snapshot. Copies live hits into the snapshot, then
@@ -902,27 +892,24 @@ class OmniPrefixCacheManager:
             self._slot_status.init_table(key)
         if step_outputs.immediate or step_outputs.deferred:
             assert slots_cpu is not None
-            write_order = [r for r in req_order if r not in skip_write_req_ids] if skip_write_req_ids else req_order
-            self._register_step_writes(write_ctx, step_outputs, slots_cpu, write_order, query_start, num_sched)
+            self._register_step_writes(write_ctx, step_outputs, slots_cpu, req_order, query_start, num_sched)
         if self._hit_spans:
             # Same-step hits: their rows are registered now (IN_TRANSIT on
             # this step's tasks); start the gather before the next step.
             self._invalidate_overwritten_prefetches()
-            if not write_only:
-                self._prefetch_hit_spans()
+            self._prefetch_hit_spans()
         self._next_step_id = step_id + 1
         self._step_ctxs[step_id] = _StepContext(
             spans={r: (query_start[r], query_start[r] + num_sched[r]) for r in req_order},
             num_tokens_unpadded=num_tokens_unpadded,
-            hits={} if write_only else dict(self._hit_spans),
-            hit_prefetch={} if write_only else dict(self._hit_prefetch),
+            hits=dict(self._hit_spans),
+            hit_prefetch=dict(self._hit_prefetch),
             cached_keys=without_hidden(self._pool.keys()) & mm_keys,
             mm_cpu_snapshot=step_outputs.leftover,
             mm_cpu_snapshot_event=step_outputs.leftover_event,
             d2h_snapshot=write_ctx.snapshot,
         )
-        if not write_only:
-            self._clear_hit_infos()
+        self._clear_hit_infos()
 
     def _split_step_outputs(
         self,

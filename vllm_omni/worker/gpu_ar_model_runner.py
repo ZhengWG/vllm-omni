@@ -1929,8 +1929,7 @@ class GPUARModelRunner(OmniGPUModelRunner, OmniConnectorModelRunnerMixin, Duplex
         hidden_states_cpu = None
         req_hidden_states_cpu: dict[str, torch.Tensor] | None = None
         include_hidden_payload = self._model_omni_pooler_payload_include_hidden()
-        # A step the cache did not save (a parked decode step) serves its live
-        # rows, like a stage without the cache.
+        # Buffered decode steps have no cache snapshot and serve their live rows.
         cache_step = self.omni_prefix_cache is not None and prefix_cache_step_id is not None
         needs_scheduled_hidden_payload = (
             include_hidden_payload

@@ -132,7 +132,6 @@ def run_step(
     finished=(),
     mm=None,
     num_tokens_padded=None,
-    skip_write=(),
 ) -> int:
     """One step: reqs = req_id -> (blocks, sched_start_pos, sched_tokens)."""
     view.order = list(reqs.keys())
@@ -160,14 +159,7 @@ def run_step(
     layout = adapter.build_write_layout(view, num_scheduled_tokens=dict(step.scheduled_tokens))
     n = int(view.step_slot_mapping.numel())
     padded = n if num_tokens_padded is None else int(num_tokens_padded)
-    return mgr.save_outputs(
-        hidden,
-        mm or {},
-        num_tokens_unpadded=n,
-        num_tokens_padded=padded,
-        write_layout=layout,
-        skip_write_req_ids=skip_write,
-    )
+    return mgr.save_outputs(hidden, mm or {}, num_tokens_unpadded=n, num_tokens_padded=padded, write_layout=layout)
 
 
 def expected_rows(slots: torch.Tensor) -> torch.Tensor:
@@ -1658,18 +1650,6 @@ def test_save_waits_pool_write_of_previous_step():
     run_step(mgr, view, {"a": ([0], 0, 4)})
     with pytest.raises(OmniPrefixCacheUnmatchError, match="did not reach done"):
         run_step(mgr, view, {"b": ([1], 0, 4)})
-
-
-def test_save_with_pending_reads_and_every_row_skipped():
-    mgr, view = make_manager()
-    try:
-        mgr.materialize(run_step(mgr, view, {"a": ([0, 1], 0, 8)}), ["a"])
-        with mgr._state_lock:
-            mgr._slot_ref(view.slots_for("a", 0, 8), HIDDEN_KEY, "b")
-        sid = run_step(mgr, view, {"a": ([0, 1, 2], 8, 1)}, skip_write=("a",))
-        mgr.materialize(sid, ["a"])
-    finally:
-        mgr.shutdown()
 
 
 def test_join_next_step_hit_survives_task_already_drained():

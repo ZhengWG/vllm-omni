@@ -16,14 +16,14 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
+import torch
+
 from vllm_omni.core.prefix_cache.adapter import (
-    PrefixCacheEventKind,
     PrefixCacheSchedulerAdapter,
     PrefixCacheStep,
     PrefixCacheWrite,
     PrefixCacheWriteLayout,
 )
-from vllm_omni.core.prefix_cache.coalesce import DecodeRowCoalescer, ParkedRows
 from vllm_omni.core.prefix_cache.group_view import get_prefix_cache_group_view
 from vllm_omni.core.prefix_cache.interface import (
     ModelCachePolicy,
@@ -34,8 +34,57 @@ from vllm_omni.core.prefix_cache.manager import OmniPrefixCacheManager, _is_step
 from vllm_omni.data_entry_keys import flatten_payload
 
 if TYPE_CHECKING:
-    import torch
     from vllm.v1.core.sched.output import SchedulerOutput
+
+
+class _DecodeRowCoalescer:
+    """Buffer pure-decode rows until a capacity or lifecycle boundary."""
+
+    def __init__(self, config: PrefixCacheConfig) -> None:
+        self._config = config
+        self._refs: dict[str, list[tuple[int, dict[str, torch.Tensor], int]]] = {}
+        self._keys: frozenset[str] = frozenset()
+        self._num_rows = self._num_steps = self._num_bytes = 0
+
+    def can_append(self, n: int, rows: dict[str, torch.Tensor]) -> bool:
+        nbytes = sum(t.numel() * t.element_size() for t in rows.values())
+        return (
+            (not self._refs or frozenset(rows) == self._keys)
+            and self._num_rows + n <= self._config.staging_capacity_tokens
+            and self._num_bytes + nbytes <= self._config.gpu_staging_bytes
+        )
+
+    def park(self, req_ids: list[str], slots: torch.Tensor, rows: dict[str, torch.Tensor]) -> bool:
+        """Snapshot a step after ``can_append``; return whether a flush is due."""
+        # The model may reuse its output storage on the next forward.
+        step = {key: val.clone() for key, val in rows.items()}
+        self._keys = frozenset(step)
+        for i, (req_id, slot) in enumerate(zip(req_ids, slots.tolist())):
+            self._refs.setdefault(req_id, []).append((slot, step, i))
+        self._num_rows += len(req_ids)
+        self._num_steps += 1
+        self._num_bytes += sum(t.numel() * t.element_size() for t in step.values())
+        return (
+            self._num_steps >= self._config.block_size
+            or self._num_rows >= self._config.staging_capacity_tokens
+            or self._num_bytes >= self._config.gpu_staging_bytes
+        )
+
+    def take(self) -> tuple[PrefixCacheWriteLayout, dict[str, torch.Tensor]] | None:
+        """Pack all buffered rows, including partial blocks, for an ordinary save."""
+        if not self._refs:
+            return None
+        writes = []
+        refs: list[tuple[int, dict[str, torch.Tensor], int]] = []
+        for req_id, request_refs in self._refs.items():
+            start = len(refs)
+            refs.extend(request_refs)
+            writes.append(PrefixCacheWrite(req_id, start, len(refs)))
+        slots = torch.tensor([slot for slot, _, _ in refs], dtype=torch.long)
+        rows = {key: torch.cat([step[key][i : i + 1] for _, step, i in refs]) for key in self._keys}
+        self._refs.clear()
+        self._num_rows = self._num_steps = self._num_bytes = 0
+        return PrefixCacheWriteLayout(tuple(writes), len(refs), slots), rows
 
 
 class PrefixCacheRunnerMixin:
@@ -66,13 +115,8 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_adapter: PrefixCacheSchedulerAdapter | None = None
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
-    # Runners whose group view has ``decode_slots_cpu`` opt in to parking
-    # decode rows until their block fills (see coalesce.py).
     _prefix_cache_coalesce_decode = False
-    _prefix_cache_coalescer: DecodeRowCoalescer | None = None
-    # Planned at step begin, consumed by the save.
-    _prefix_cache_park_req_ids: tuple[str, ...] = ()
-    _prefix_cache_hit_bases: frozenset[int] = frozenset()
+    _prefix_cache_coalescer: _DecodeRowCoalescer | None = None
     _prefix_cache_pure_decode = False
 
     def _snapshot_prefix_cache_model_policy(self, model) -> None:
@@ -127,21 +171,14 @@ class PrefixCacheRunnerMixin:
         self.omni_prefix_cache = manager
         self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
         self._prefix_cache_group_view = view
-        self._prefix_cache_coalescer = self._build_decode_coalescer(cfg, view)
-
-    def _build_decode_coalescer(self, cfg: PrefixCacheConfig, view: Any) -> DecodeRowCoalescer | None:
-        """Decode rows are parked only for the plain policy: full hidden,
-        no deferred keys and the step snapshot holds every mm output."""
         policy = self._omni_cache_policy
         if (
-            not self._prefix_cache_coalesce_decode
-            or not policy.needs_full_hidden_states
-            or policy.deferred_keys
-            or policy.mm_outputs_written_in_sample
-            or not hasattr(view, "decode_slots_cpu")
+            self._prefix_cache_coalesce_decode
+            and policy.needs_full_hidden_states
+            and not policy.deferred_keys
+            and not policy.mm_outputs_written_in_sample
         ):
-            return None
-        return DecodeRowCoalescer(cfg.block_size)
+            self._prefix_cache_coalescer = _DecodeRowCoalescer(cfg)
 
     def _prefix_cache_step_begin(self, scheduler_output: SchedulerOutput) -> None:
         """Per-step lifecycle entry; must run before ``_update_states``
@@ -154,50 +191,19 @@ class PrefixCacheRunnerMixin:
                 raise RuntimeError("prefix-cache adapter and view were not initialized together")
             step = self._prefix_cache_adapter.translate_step(scheduler_output)
             self._prefix_cache_step = step
-            if self._prefix_cache_coalescer is not None and self._prefix_cache_plan_parking(scheduler_output, step):
+            self._prefix_cache_pure_decode = (
+                bool(step.scheduled_tokens)
+                and all(count == 1 for _, count in step.scheduled_tokens)
+                and not step.events
+                and not getattr(scheduler_output, "scheduled_new_reqs", ())
+                and not getattr(scheduler_output, "preempted_req_ids", ())
+            )
+            if self._prefix_cache_coalescer is not None and self._prefix_cache_pure_decode:
                 return
+            # Flush before hit planning or slot reuse. A streaming extension
+            # retains partial blocks, just like the original per-step writes.
+            self._prefix_cache_flush_decode()
             self.omni_prefix_cache.new_step_starts(step)
-
-    def _prefix_cache_plan_parking(self, scheduler_output: SchedulerOutput, step: PrefixCacheStep) -> bool:
-        """Pick the requests whose row this step parks.
-
-        Every one-token request that is not arriving parks. Returns True for
-        a pure decode step (all requests park, no event), which skips
-        ``new_step_starts`` as it has nothing to do. A departed request
-        writes its full parked blocks (vLLM still caches them) and drops
-        the partial one; parked blocks an arrival hits are written here, so
-        the hit's prefetch can plan them.
-        """
-        coalescer = self._prefix_cache_coalescer
-        assert coalescer is not None
-        new_req_ids = {
-            PrefixCacheSchedulerAdapter._req_id(data)
-            for data in getattr(scheduler_output, "scheduled_new_reqs", ()) or ()
-        }
-        gone = [event.req_id for event in step.events if event.kind is not PrefixCacheEventKind.STARTED]
-        gone += [str(req_id) for req_id in getattr(scheduler_output, "preempted_req_ids", ()) or ()]
-        gone += list(new_req_ids)
-        if gone:
-            self._prefix_cache_write_parked(coalescer.take(gone, full_only=True))
-            coalescer.drop(gone)
-        bs = coalescer.block_size
-        self._prefix_cache_hit_bases = frozenset(
-            block * bs
-            for event in step.events
-            if event.kind is PrefixCacheEventKind.STARTED and event.hit_end > 0 and event.block_ids
-            for block in event.block_ids[0][: event.hit_end // bs]
-        )
-        if self._prefix_cache_hit_bases:
-            self._prefix_cache_write_parked(coalescer.take(bases=self._prefix_cache_hit_bases))
-        self._prefix_cache_park_req_ids = tuple(
-            req_id for req_id, count in step.scheduled_tokens if count == 1 and req_id not in new_req_ids
-        )
-        self._prefix_cache_pure_decode = (
-            not step.events
-            and not new_req_ids
-            and len(self._prefix_cache_park_req_ids) == len(step.scheduled_tokens) > 0
-        )
-        return self._prefix_cache_pure_decode
 
     def _prefix_cache_save_step(
         self,
@@ -210,9 +216,9 @@ class PrefixCacheRunnerMixin:
         """Write this step's outputs into the cache.
 
         None when this stage/rank does not write (pooling, cache off, or not
-        the last PP rank), or when every row of the step was parked. The
-        returned step id must be consumed exactly once — materialize or
-        discard_step — by the output path.
+        the last PP rank), or when a pure decode step was buffered.
+        The returned step id must be consumed exactly once
+        — materialize or discard_step — by the output path.
         """
         from vllm.distributed.parallel_state import get_pp_group
 
@@ -222,112 +228,68 @@ class PrefixCacheRunnerMixin:
             raise RuntimeError("prefix-cache adapter was not initialized")
         if self._prefix_cache_step is None:
             raise RuntimeError("prefix-cache step snapshot was not initialized")
-        mm = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
-        coalescer = self._prefix_cache_coalescer
-        parked: list[str] = []
-        flush = False
-        if coalescer is not None:
-            pure = self._prefix_cache_pure_decode
-            parked, flush = self._prefix_cache_park_step(hidden_states, mm, num_tokens_unpadded, num_tokens_padded)
-            if pure and len(parked) == num_tokens_unpadded > 0:
-                if flush:
-                    self._prefix_cache_write_parked(coalescer.take(full_only=True))
-                return None
-            if pure:
-                # Scheduled as a pure decode step but not parked whole:
-                # new_step_starts was skipped, run it before the save.
-                self.omni_prefix_cache.new_step_starts(self._prefix_cache_step)
-            # A request saved this step continues from its parked rows, and a
-            # block an arrival hits must be complete before this save plans
-            # the hit.
-            parked_set = set(parked)
-            unparked = [r for r, _ in self._prefix_cache_step.scheduled_tokens if r not in parked_set]
-            self._prefix_cache_write_parked(coalescer.take(unparked))
-            if self._prefix_cache_hit_bases:
-                self._prefix_cache_write_parked(coalescer.take(bases=self._prefix_cache_hit_bases))
         layout = self._prefix_cache_adapter.build_write_layout(
             self._prefix_cache_group_view,
             num_scheduled_tokens=dict(self._prefix_cache_step.scheduled_tokens),
         )
-        skip = {"skip_write_req_ids": frozenset(parked)} if parked else {}
-        step_id = self.omni_prefix_cache.save_outputs(
+        mm = flatten_payload(multimodal_outputs) if multimodal_outputs else {}
+        coalescer = self._prefix_cache_coalescer
+        n = num_tokens_unpadded
+        hidden_key = self._omni_cache_policy.hidden_key
+        if (
+            coalescer is not None
+            and self._prefix_cache_pure_decode
+            and hidden_key is not None
+            and _is_step_token_tensor(hidden_states, n, num_tokens_padded)
+            and len(layout.writes) == n
+            and all(write.row_end - write.row_start == 1 for write in layout.writes)
+            and layout.slots_cpu is not None
+            and layout.slots_cpu.numel() == n
+        ):
+            rows = {hidden_key: hidden_states[:n]}
+            rows.update(
+                (key, val[:n])
+                for key, val in mm.items()
+                if _is_step_token_tensor(val, n, num_tokens_padded)
+                and not self._omni_cache_policy.skip_immediate_mm(key)
+            )
+            if not coalescer.can_append(n, rows):
+                self._prefix_cache_flush_decode()
+            if coalescer.can_append(n, rows):
+                if coalescer.park([write.req_id for write in layout.writes], layout.slots_cpu, rows):
+                    self._prefix_cache_flush_decode()
+                return None
+        # Unsupported rows or a single step exceeding the buffer's byte limit
+        # use the ordinary save. Flush first, before it claims a staging slot.
+        self._prefix_cache_flush_decode()
+        if coalescer is not None and self._prefix_cache_pure_decode:
+            # The pure-decode entry skipped the manager, but this step fell back.
+            self.omni_prefix_cache.new_step_starts(self._prefix_cache_step)
+        return self.omni_prefix_cache.save_outputs(
             hidden_states,
             mm,
             num_tokens_unpadded=num_tokens_unpadded,
             num_tokens_padded=num_tokens_padded,
             write_layout=layout,
-            **skip,
         )
-        if flush and coalescer is not None:
-            self._prefix_cache_write_parked(coalescer.take(full_only=True))
-        return step_id
 
-    def _prefix_cache_park_step(
-        self,
-        hidden_states: torch.Tensor | None,
-        mm: dict[str, Any],
-        num_tokens_unpadded: int,
-        num_tokens_padded: int,
-    ) -> tuple[list[str], bool]:
-        """Park the planned one-token requests' rows. Returns the parked
-        requests (empty when the step cannot be parked) and whether full
-        blocks are due for a write."""
+    def _prefix_cache_flush_decode(self) -> None:
+        """Write buffered decode rows through the manager's ordinary save path."""
         coalescer = self._prefix_cache_coalescer
-        hidden_key = self._omni_cache_policy.hidden_key
-        view = self._prefix_cache_group_view
-        step = self._prefix_cache_step
-        want = list(self._prefix_cache_park_req_ids)
-        n = num_tokens_unpadded
-        if (
-            coalescer is None
-            or step is None
-            or not want
-            or hidden_key is None
-            or hidden_states is None
-            or not _is_step_token_tensor(hidden_states, n, num_tokens_padded)
-        ):
-            return [], False
-        rows = {hidden_key: hidden_states[:n]}
-        for key, val in mm.items():
-            if _is_step_token_tensor(val, n, num_tokens_padded) and not self._omni_cache_policy.skip_immediate_mm(key):
-                rows[key] = val[:n]
-        if coalescer.has_parked() and frozenset(rows) != coalescer.keys():
-            # Parked rows follow one key set; write them before it changes.
-            self._prefix_cache_write_parked(coalescer.take())
-        scheduled = dict(step.scheduled_tokens)
-        offset: dict[str, int] = {}
-        cursor = 0
-        for req_id in view.batch_req_ids():
-            offset[req_id] = cursor
-            cursor += scheduled.get(req_id, 0)
-        if cursor != n or any(req_id not in offset for req_id in want):
-            return [], False
-        slots = view.decode_slots_cpu(want)
-        if slots is None:
-            return [], False
-        flush = coalescer.park(want, slots, rows, [offset[req_id] for req_id in want])
-        return want, flush
-
-    def _prefix_cache_write_parked(self, parked: ParkedRows | None) -> None:
-        """Write rows taken from the coalescer; nothing materializes them."""
-        if parked is None:
+        if coalescer is None or (parked := coalescer.take()) is None:
             return
-        writes: list[PrefixCacheWrite] = []
-        cursor = 0
-        for req_id, count in zip(parked.req_ids, parked.counts):
-            writes.append(PrefixCacheWrite(req_id, cursor, cursor + count))
-            cursor += count
-        rows = dict(parked.rows)
-        hidden = rows.pop(self._omni_cache_policy.hidden_key, None)  # type: ignore[arg-type]
+        layout, rows = parked
+        hidden_key = self._omni_cache_policy.hidden_key
+        assert hidden_key is not None
+        hidden = rows.pop(hidden_key)
         cache = self.omni_prefix_cache
         assert cache is not None
         step_id = cache.save_outputs(
             hidden,
             rows,
-            num_tokens_unpadded=cursor,
-            num_tokens_padded=cursor,
-            write_layout=PrefixCacheWriteLayout(tuple(writes), cursor, parked.slots_cpu),
-            write_only=True,
+            num_tokens_unpadded=layout.total_rows,
+            num_tokens_padded=layout.total_rows,
+            write_layout=layout,
         )
         cache.discard_step(step_id)
 

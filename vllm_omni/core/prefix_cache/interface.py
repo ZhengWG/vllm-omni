@@ -54,7 +54,8 @@ class PrefixCacheConfig:
 
     num_blocks: int
     block_size: int
-    # GPU-clone byte budget for JOIN_ON_FINISH; exceeding it forces a copy.
+    # GPU-clone byte budget for JOIN_ON_FINISH and pure-decode buffering.
+    # Exceeding it forces a copy or a buffer flush.
     gpu_staging_bytes: int = 512 * 1024 * 1024
     # Device→host staging: circular slots, one whole step each (not per request).
     # Host memory per key ≈ staging_depth * staging_capacity_tokens * width * dtype.
