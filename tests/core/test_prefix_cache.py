@@ -1247,7 +1247,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         original = WriteTask.mark_host_ready
 
         def fail_copy(task):
-            if task.req_id == "b":
+            if task.req_id == "a":
                 raise RuntimeError("injected copy failure")
             return original(task)
 
@@ -1256,7 +1256,7 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
         original = ctrl._scatter
 
         def fail_scatter(task):
-            if task.req_id == "b":
+            if task.req_id == "a":
                 raise RuntimeError("injected scatter failure")
             return original(task)
 
@@ -1267,12 +1267,9 @@ def test_eager_dispatch_failure_releases_step_and_all_task_owners(monkeypatch, f
             run_step(mgr, view, {"a": ([0], 0, 4), "b": ([1], 0, 4), "c": ([2], 0, 4)})
         assert set(mgr._step_ctxs) == {preserved_sid}
         assert ctrl._staged_bytes == 0
-        tasks = [task for task in ctrl._tasks.values() if task.req_id in {"a", "b", "c"}]
-        assert len(tasks) == 3
-        for task in tasks:
-            expected = TaskState.WRITTEN if task.req_id == "a" else TaskState.FAILED
-            assert task.state is expected
-            assert task.done.is_set() and task.host_ready.is_set()
+        (task,) = [task for task in ctrl._tasks.values() if task.req_id in {"a", "b", "c"}]
+        assert task.state is TaskState.FAILED
+        assert task.done.is_set() and task.host_ready.is_set()
         assert all(
             holder == StagingBufferHolder.for_step(preserved_sid)
             for holders in ctrl._staging_pool._busy
@@ -1313,14 +1310,12 @@ def test_eager_escalation_failure_releases_deferred_tasks(monkeypatch):
         mgr.shutdown()
 
 
-def test_per_request_staging_writes():
+def test_step_shares_one_staging_write():
     mgr, view = make_manager()
     sid = run_step(mgr, view, {"p": ([0, 1], 0, 8), "d": ([2], 0, 1)})
-    tp = mgr._controller._tasks.get(next(iter(mgr._request_tasks.tasks["p"])))
-    td = mgr._controller._tasks.get(next(iter(mgr._request_tasks.tasks["d"])))
-    assert tp is not None and td is not None
-    assert (tp.req_id, td.req_id) == ("p", "d")
-    assert mgr._join_next_step_tids == [tp.tid, td.tid]
+    (tid,) = mgr._request_tasks.tasks["p"]
+    assert mgr._request_tasks.tasks["d"] == {tid}
+    assert mgr._join_next_step_tids == [tid]
     outs = mgr.materialize(sid, ["p", "d"])
     assert torch.equal(outs.hidden_states["p"], expected_rows(view.slots_for("p", 0, 8)))
     assert torch.equal(outs.hidden_states["d"], expected_rows(view.slots_for("d", 0, 1)))

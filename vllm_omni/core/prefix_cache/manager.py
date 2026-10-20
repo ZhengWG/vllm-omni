@@ -559,7 +559,7 @@ class OmniPrefixCacheManager:
         Engine thread only, after the forward and before materialize.
         Immediately-cached rows: one on-device clone, one whole-step
         device→host into the staging pool, then one JOIN_NEXT_STEP
-        write per request sharing that page, managed by the controller.
+        write for the step's requests, managed by the controller.
         Deferred rows stay on the device clone (JOIN_ON_FINISH); the
         committer copies them later. Leftover mm (this-step deferred rows
         + mm not written to the pool) is copied to CPU here so materialize
@@ -981,13 +981,17 @@ class OmniPrefixCacheManager:
         ):
             if not tensors:
                 continue
+            if schedule is WriteSchedule.JOIN_NEXT_STEP:
+                self._register_immediate_write(
+                    write_ctx, tuple(tensors.keys()), slots, req_order, query_start, num_sched
+                )
+                continue
             for req_id in req_order:
                 start = query_start[req_id]
                 end = start + num_sched[req_id]
                 if start == end:
                     continue
-                deferred = schedule is WriteSchedule.JOIN_ON_FINISH
-                handle = self._request_tasks.deferred.get(req_id) if deferred else None
+                handle = self._request_tasks.deferred.get(req_id)
                 if handle is None or not write_ctx.append(handle, start=start, end=end):
                     handle = write_ctx.register(
                         tid=self._request_tasks.alloc_tid(),
@@ -998,11 +1002,42 @@ class OmniPrefixCacheManager:
                         end=end,
                     )
                     self._request_tasks.track(req_id, handle.tid)
-                    if deferred:
-                        self._request_tasks.deferred[req_id] = handle
-                    else:
-                        self._join_next_step_tids.append(handle.tid)
+                    self._request_tasks.deferred[req_id] = handle
                 self._map_slots(slots[start:end], handle.tid, tensors.keys())
+
+    def _register_immediate_write(
+        self,
+        write_ctx: StepWriteContext,
+        keys: tuple[str, ...],
+        slots: torch.Tensor,
+        req_order: list[str],
+        query_start: dict[str, int],
+        num_sched: dict[str, int],
+    ) -> None:
+        """One immediate write for every request of the step.
+
+        A write per request costs a slot-table update and a pool scatter per
+        request on every step, which dominates decode batches.
+        """
+        written = [req_id for req_id in req_order if num_sched[req_id]]
+        if not written:
+            return
+        start = query_start[written[0]]
+        end = query_start[written[-1]] + num_sched[written[-1]]
+        if end - start != sum(num_sched[req_id] for req_id in written):
+            raise OmniPrefixCacheUnmatchError(f"step rows [{start}, {end}) are not one packed span")
+        handle = write_ctx.register(
+            tid=self._request_tasks.alloc_tid(),
+            req_id=written[0],
+            write_n=self._request_tasks.increment_write_n(written[0]),
+            schedule=WriteSchedule.JOIN_NEXT_STEP,
+            start=start,
+            end=end,
+        )
+        for req_id in written:
+            self._request_tasks.track(req_id, handle.tid)
+        self._join_next_step_tids.append(handle.tid)
+        self._map_slots(slots[start:end], handle.tid, keys)
 
     # ----------------------------------------------------- occupancy
 

@@ -328,7 +328,8 @@ resume delivery watermarks are follow-up contracts, not inferred here.
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
 - Immediate (`JOIN_NEXT_STEP`): save launches a whole-step device→host into
-  a staging slot; the committer waits that event and writes the CPU pool.
+  a staging slot; one WriteTask covers every request of the step, and the
+  committer waits that event and writes the CPU pool.
   The next save waits `done` (the pool write): a reused slot must never
   leave a pending pool write behind, or a delayed hit read of the old rows
   would find nothing recoverable.
