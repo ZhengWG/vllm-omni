@@ -1539,9 +1539,8 @@ class TestDeployConfigLoading:
         sampler, which asserts on its codec ids (device-side assert out of
         ``get_token_bin_counts_and_mask``).
 
-        Stage 0's prefix caching is NPU-scoped for the same reason: a CUDA
-        stage-0 prefix hit hands the Thinker an empty tts handoff, and the
-        Talker then indexes past the codec vocab.
+        This base profile also leaves stage-0 prefix caching off on CUDA; the
+        CUDA turn profile enables it (see test_thinker_prefix_cache_defaults).
         """
         deploy = _apply_platform_overrides(
             load_deploy_config(Path(get_deploy_config_path("minicpmo_4_5.yaml"))),
@@ -2028,6 +2027,11 @@ stages:
             ("qwen3_omni_moe.yaml", "cuda", True),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
+            ("minicpmo_4_5_turn.yaml", "cuda", True),
+            ("minicpmo_4_5_turn.yaml", "npu", False),
+            ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5.yaml", "cuda", False),
+            ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
         ],
     )
     def test_thinker_prefix_cache_defaults(self, yaml_name: str, platform: str, enabled: bool):

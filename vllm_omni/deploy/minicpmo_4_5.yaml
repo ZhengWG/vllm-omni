@@ -58,9 +58,9 @@ stages:
     # The NPU block below overrides this with measured single-card budgets.
     gpu_memory_utilization: 0.55
     enforce_eager: false
-    # Stage-level prefix caching is NPU-only (see platforms.npu below): in the
-    # platform-shared block it killed the stage-1 replica on CUDA (empty tts
-    # handoff, then an indexSelectSmallIndex device assert). Stage-0 n-gram
+    # This shared block leaves stage-level prefix caching unset (platforms.npu
+    # sets it off for the duplex KV window; minicpmo_4_5_turn.yaml turns it on
+    # for CUDA turn serving). Stage-0 n-gram
     # speculation stays off either way -- the omni prefix cache refuses it next
     # to enable_prefix_caching.
     tensor_parallel_size: 1
