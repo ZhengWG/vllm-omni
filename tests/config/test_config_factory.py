@@ -2022,6 +2022,23 @@ stages:
         assert deploy.stages[0].tensor_parallel_size == 2
         assert deploy.stages[1].devices == "1"
 
+    @pytest.mark.parametrize(
+        ("yaml_name", "platform", "enabled"),
+        [
+            ("qwen3_omni_moe.yaml", "cuda", True),
+            ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
+            ("qwen3_omni_duplex.yaml", "cuda", False),
+        ],
+    )
+    def test_thinker_prefix_cache_defaults(self, yaml_name: str, platform: str, enabled: bool):
+        """Stage-0 prefix caching ships on only for the validated V1 turn profiles."""
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path(yaml_name))),
+            platform=platform,
+        )
+        stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
+        assert stage0.engine_extras.get("enable_prefix_caching", deploy.enable_prefix_caching) is enabled
+
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))
 
