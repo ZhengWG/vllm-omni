@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -147,10 +148,10 @@ def test_decode_batching_requires_opt_in_and_plain_policy(monkeypatch, enabled, 
     runner._snapshot_prefix_cache_model_policy(SimpleNamespace(**model_attrs))
     try:
         runner._prefix_cache_step_begin(_sched())
-        assert (runner._prefix_cache_block_save_cfg is not None) == expected
+        assert (runner._prefix_cache_decode_cfg is not None) == expected
     finally:
         runner._shutdown_omni_prefix_cache()
-    assert runner._prefix_cache_block_save_cfg is None
+    assert runner._prefix_cache_decode_cfg is None
     assert runner._prefix_cache_decode_steps is None
 
 
@@ -375,32 +376,22 @@ def _decode_row(req_id: str, pos: int) -> torch.Tensor:
 
 
 class _DecodeRunner(PrefixCacheRunnerMixin):
-    def __init__(self, coalesce: bool = True, **kwargs):
+    def __init__(self, **kwargs):
         cfg = PrefixCacheConfig(num_blocks=16, block_size=BLOCK_SIZE, **kwargs)
         self.omni_prefix_cache = OmniPrefixCacheManager(cfg, eager=True)
         self._prefix_cache_adapter = PrefixCacheSchedulerAdapter()
         self._prefix_cache_group_view = FakeView()
-        self._prefix_cache_block_save_cfg = cfg if coalesce else None
-        self._prefix_cache_decode_steps: list[tuple[PrefixCacheWriteLayout, dict[str, torch.Tensor]]] | None = (
-            [] if coalesce else None
-        )
+        self._prefix_cache_decode_cfg = cfg
+        self._prefix_cache_decode_steps: list[tuple[PrefixCacheWriteLayout, torch.Tensor, dict[str, torch.Tensor]]] = []
         self.is_pooling_model = False
-        self.save_sizes: list[int] = []
-        self.begin_calls = 0
-        begin = self.omni_prefix_cache.new_step_starts
-        save = self.omni_prefix_cache.save_outputs
+        self.begin = Mock(wraps=self.omni_prefix_cache.new_step_starts)
+        self.save = Mock(wraps=self.omni_prefix_cache.save_outputs)
+        self.omni_prefix_cache.new_step_starts = self.begin
+        self.omni_prefix_cache.save_outputs = self.save
 
-        def counting_begin(step):
-            self.begin_calls += 1
-            return begin(step)
-
-        def counting_save(*args, **kwargs):
-            result = save(*args, **kwargs)
-            self.save_sizes.append(kwargs["num_tokens_unpadded"])
-            return result
-
-        self.omni_prefix_cache.new_step_starts = counting_begin
-        self.omni_prefix_cache.save_outputs = counting_save
+    @property
+    def save_sizes(self):
+        return [call.kwargs["num_tokens_unpadded"] for call in self.save.call_args_list]
 
     def step(self, reqs, *, new=(), hits=None, finished=(), aborted=(), preempted=(), mm=None, hidden=None):
         view = self._prefix_cache_group_view
@@ -446,29 +437,41 @@ def _expect_decode_hit(req_id, positions, tail):
     return torch.stack([_decode_row(req_id, p) for p in positions] + [_decode_row(*tail)])
 
 
-@pytest.mark.parametrize("coalesce", [False, True])
-def test_decode_batches_preserve_later_prefix_hits(decode_runners, coalesce):
-    r = decode_runners(coalesce=coalesce)
-    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
-    for p in range(4, 12):
-        step_id, _ = r.step({"a": (A_BLOCKS, p, 1)})
-        assert (step_id is None) == coalesce
-    assert len(r.save_sizes) == (3 if coalesce else 9)
-    assert r.begin_calls == (1 if coalesce else 9)
-    _, (hidden, _) = r.step({"b": ([0, 1, 2, 5], 12, 1)}, new=["b"], hits={"b": 12})
-    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(12), ("b", 12)))
+@pytest.mark.parametrize(
+    "config,expected_sizes,buffered",
+    [
+        ({}, [2, 8, 6, 1], True),
+        ({"staging_capacity_tokens": 3}, [2] * 8 + [1], True),
+        ({"staging_capacity_tokens": 4}, [2, 4, 4, 4, 2, 1], True),
+        ({"gpu_staging_bytes": 16}, [2] * 8 + [1], False),
+        ({"gpu_staging_bytes": 48}, [2, 4, 4, 4, 2, 1], True),
+    ],
+)
+def test_decode_batching_limits_and_prefix_hits(decode_runners, config, expected_sizes, buffered):
+    r = decode_runners(**config)
+    r.step({"a": (A_BLOCKS, 0, 1), "z": (Z_BLOCKS, 0, 1)}, new=["a", "z"])
+    for p in range(1, 8):
+        step_id, _ = r.step({"a": (A_BLOCKS, p, 1), "z": (Z_BLOCKS, p, 1)})
+        assert (step_id is None) == buffered
+    assert r.begin.call_count == (1 if buffered else 8)
+    _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
+    assert r.save_sizes == expected_sizes
+    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
 
 
-def test_mixed_step_flushes_before_claiming_its_only_staging_slot(decode_runners):
+def test_mixed_step_completes_hit_with_one_staging_slot(decode_runners):
     r = decode_runners(staging_depth=1, staging_claim_timeout_s=0.1)
     r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
     for p in (4, 5, 6):
         r.step({"a": (A_BLOCKS, p, 1)})
-    step_id, (hidden, _) = r.step({"a": (A_BLOCKS, 7, 1), "c": ([6, 7], 0, 8)}, new=["c"])
+    step_id, (hidden, _) = r.step(
+        {"a": (A_BLOCKS, 7, 1), "b": ([0, 1, 5], 8, 1), "c": ([6, 7], 0, 8)},
+        new=["b", "c"],
+        hits={"b": 8},
+    )
     assert step_id is not None and not r._prefix_cache_decode_steps
     assert torch.equal(hidden["a"], _decode_row("a", 7).unsqueeze(0))
-    assert r.save_sizes == [4, 3, 9]
-    _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
+    assert r.save_sizes == [4, 3, 10]
     assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
 
 
@@ -480,36 +483,6 @@ def test_streaming_extension_preserves_partial_decode_block(decode_runners):
     r.step({"a": (A_BLOCKS, 6, 2)}, new=["a"], hits={"a": 6})
     _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
     assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
-
-
-def test_hit_on_block_completed_in_transition_step(decode_runners):
-    r = decode_runners()
-    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
-    for p in (4, 5, 6):
-        r.step({"a": (A_BLOCKS, p, 1)})
-    _, (hidden, _) = r.step({"a": (A_BLOCKS, 7, 1), "b": ([0, 1, 6], 8, 1)}, new=["b"], hits={"b": 8})
-    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
-
-
-@pytest.mark.parametrize("capacity", [3, 4])
-def test_decode_buffer_never_exceeds_staging_capacity(decode_runners, capacity):
-    r = decode_runners(staging_capacity_tokens=capacity)
-    r.step({"a": (A_BLOCKS, 0, 1), "z": (Z_BLOCKS, 0, 1)}, new=["a", "z"])
-    for p in range(1, 8):
-        r.step({"a": (A_BLOCKS, p, 1), "z": (Z_BLOCKS, p, 1)})
-    _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
-    assert max(r.save_sizes) <= capacity
-    assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
-
-
-@pytest.mark.parametrize("budget", [8, 24])
-def test_decode_buffer_obeys_byte_budget_and_falls_back(decode_runners, budget):
-    r = decode_runners(gpu_staging_bytes=budget)
-    r.step({"a": (A_BLOCKS, 0, 4)}, new=["a"])
-    ids = [r.step({"a": (A_BLOCKS, p, 1)})[0] for p in range(4, 8)]
-    assert all(step_id is None for step_id in ids) == (budget >= DECODE_WIDTH * 4)
-    assert r.save_sizes == ([4, 1, 1, 1, 1] if budget == 8 else [4, 2, 2])
-    assert r.begin_calls == (5 if budget == 8 else 1)
 
 
 @pytest.mark.parametrize("event", ["finished", "aborted", "preempted"])

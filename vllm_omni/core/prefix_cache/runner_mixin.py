@@ -66,8 +66,8 @@ class PrefixCacheRunnerMixin:
     _prefix_cache_group_view: Any = None
     _prefix_cache_step: PrefixCacheStep | None = None
     _prefix_cache_coalesce_decode = False
-    _prefix_cache_block_save_cfg: PrefixCacheConfig | None = None
-    _prefix_cache_decode_steps: list[tuple[PrefixCacheWriteLayout, dict[str, torch.Tensor]]] | None = None
+    _prefix_cache_decode_cfg: PrefixCacheConfig | None = None
+    _prefix_cache_decode_steps: list[tuple[PrefixCacheWriteLayout, torch.Tensor, dict[str, torch.Tensor]]] | None = None
     _prefix_cache_decode_bytes = 0
     _prefix_cache_pure_decode = False
 
@@ -130,7 +130,7 @@ class PrefixCacheRunnerMixin:
             and not policy.deferred_keys
             and not policy.mm_outputs_written_in_sample
         ):
-            self._prefix_cache_block_save_cfg = cfg
+            self._prefix_cache_decode_cfg = cfg
             self._prefix_cache_decode_steps = []
 
     def _prefix_cache_step_begin(self, scheduler_output: SchedulerOutput) -> None:
@@ -145,7 +145,7 @@ class PrefixCacheRunnerMixin:
             step = self._prefix_cache_adapter.translate_step(scheduler_output)
             self._prefix_cache_step = step
             self._prefix_cache_pure_decode = (
-                self._prefix_cache_block_save_cfg is not None
+                self._prefix_cache_decode_cfg is not None
                 and bool(step.scheduled_tokens)
                 and all(count == 1 for _, count in step.scheduled_tokens)
                 and not step.events
@@ -194,7 +194,6 @@ class PrefixCacheRunnerMixin:
             and hidden_key is not None
             and _is_step_token_tensor(hidden_states, n, num_tokens_padded)
             and len(layout.writes) == n
-            and all(write.row_end - write.row_start == 1 for write in layout.writes)
             and layout.slots_cpu is not None
             and layout.slots_cpu.numel() == n
         ):
@@ -205,7 +204,7 @@ class PrefixCacheRunnerMixin:
                 if _is_step_token_tensor(val, n, num_tokens_padded)
                 and not self._omni_cache_policy.skip_immediate_mm(key)
             )
-            if self._prefix_cache_buffer_decode(layout, rows):
+            if self._prefix_cache_buffer_decode(layout, layout.slots_cpu, rows):
                 return None
         if self._prefix_cache_pure_decode:
             # The pure-decode entry skipped the manager, but this step fell back.
@@ -219,22 +218,24 @@ class PrefixCacheRunnerMixin:
             write_layout=layout,
         )
 
-    def _prefix_cache_buffer_decode(self, layout: PrefixCacheWriteLayout, rows: dict[str, torch.Tensor]) -> bool:
+    def _prefix_cache_buffer_decode(
+        self, layout: PrefixCacheWriteLayout, slots_cpu: torch.Tensor, rows: dict[str, torch.Tensor]
+    ) -> bool:
         """Append one step; return False when it needs an ordinary save."""
-        cfg, steps = self._prefix_cache_block_save_cfg, self._prefix_cache_decode_steps
+        cfg, steps = self._prefix_cache_decode_cfg, self._prefix_cache_decode_steps
         assert cfg is not None and steps is not None
         n, nbytes = layout.total_rows, sum(t.numel() * t.element_size() for t in rows.values())
         if n > cfg.staging_capacity_tokens or nbytes > cfg.gpu_staging_bytes:
             return False
         if steps and (
             layout.writes != steps[0][0].writes
-            or rows.keys() != steps[0][1].keys()
+            or rows.keys() != steps[0][2].keys()
             or (len(steps) + 1) * n > cfg.staging_capacity_tokens
             or self._prefix_cache_decode_bytes + nbytes > cfg.gpu_staging_bytes
         ):
             self._prefix_cache_flush_decode()
         # The model may reuse its output storage on the next forward.
-        steps.append((layout, {key: val.clone() for key, val in rows.items()}))
+        steps.append((layout, slots_cpu, {key: val.clone() for key, val in rows.items()}))
         self._prefix_cache_decode_bytes += nbytes
         if (
             len(steps) >= cfg.block_size
@@ -253,13 +254,8 @@ class PrefixCacheRunnerMixin:
         first = steps[0][0]
         n = first.total_rows * count
         writes = tuple(PrefixCacheWrite(w.req_id, w.row_start * count, w.row_end * count) for w in first.writes)
-        slots = []
-        for step_index in range(count):
-            step_slots = steps[step_index][0].slots_cpu
-            assert step_slots is not None
-            slots.append(step_slots)
-        slots_cpu = torch.stack(slots, dim=1).flatten()
-        rows = {key: torch.stack([tensors[key] for _, tensors in steps], dim=1).flatten(0, 1) for key in steps[0][1]}
+        slots_cpu = torch.stack([slots for _, slots, _ in steps], dim=1).flatten()
+        rows = {key: torch.stack([tensors[key] for _, _, tensors in steps], dim=1).flatten(0, 1) for key in steps[0][2]}
         steps.clear()
         self._prefix_cache_decode_bytes = 0
         hidden_key = self._omni_cache_policy.hidden_key
@@ -288,7 +284,7 @@ class PrefixCacheRunnerMixin:
             self._prefix_cache_group_view = None
             self._prefix_cache_step = None
             self._omni_prefix_cache_cfg = None
-            self._prefix_cache_block_save_cfg = None
+            self._prefix_cache_decode_cfg = None
             self._prefix_cache_decode_steps = None
             self._prefix_cache_decode_bytes = 0
             self._prefix_cache_pure_decode = False
