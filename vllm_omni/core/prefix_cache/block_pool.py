@@ -27,12 +27,9 @@ class PrefixBlockPool:
     pool. Rows *are* those kv slots: when vLLM recycles a block, the
     next pool write overwrites that row. Slot reuse is the eviction.
 
-    Storage is plain pageable memory, neither pinned nor zero-filled:
-    pinning or zeroing a mirror of every KV slot takes seconds on the first
-    save, and the pool is only touched by CPU copies (writes from the
-    pinned staging buffers, reads through ``index_select``). Rows never
-    written hold arbitrary bytes; readers zero the slots that were absent
-    when the read was planned.
+    Only staging buffers need pinning; the mirror receives CPU copies.
+    Leave storage uninitialized to avoid clearing the whole pool on first save;
+    the manager zeroes rows that were absent when a read was planned.
     """
 
     def __init__(self, config: PrefixCacheConfig):

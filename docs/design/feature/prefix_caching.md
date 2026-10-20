@@ -41,7 +41,7 @@ The main focus of vLLM-Omni's approach to prefix caching stage outputs is to bui
 
 With this in mind, consider the set of blocks in a 2D layout, where the row represents the index of blocks being considered, and the columns represent the slots corresponding to tokens within each block. Since we know the `num_blocks` and `block_size` from our kv cache config, if we want to cache a tensor with feature size `D`, we can preallocate a CPU tensor of size `(num_blocks, block_size, D)`, and use the same block index and slot mapping to retrieve the corresponding feature vector.
 
-Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of pageable CPU memory, allocated without zero-filling on the first `save_outputs` that sees the key. The manager returns zeros for multimodal slots that were absent when a read was planned; hidden-state reads reject absent slots. Device→host copies use separate pinned staging buffers before CPU copies write the mirror. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
+Host footprint: each cached key costs `num_blocks × block_size × D × dtype_bytes` of pageable CPU memory, allocated without zero-filling on the first `save_outputs` that sees the key. Device→host copies use separate pinned staging buffers. Measured on a Qwen3-Omni deployment: thinker `__hidden_states__` `[15092, 16, 2048]` bf16 ≈ 0.92 GiB (plus the same again for each `hidden_states.layer_*` key a model exposes), Qwen3-TTS talker `codes.audio` `[16180, 16, 16]` ≈ 33 MiB. Budget host RAM for the stage accordingly.
 
 ### Example
 
@@ -325,23 +325,13 @@ When #7681 lands, pin the producer/adapter contract with a real
 Hit payloads describe prefixes `[0, hit_end)`; arbitrary read ranges and
 resume delivery watermarks are follow-up contracts, not inferred here.
 
-The GPU AR runner batches cache writes only for pure decode steps: every
-scheduled request produces one token, with no arrivals, lifecycle events or
-preemptions. This applies to policies that cache hidden states, have no deferred
-keys and do not produce mm outputs in `sample()`. The buffer holds at most
-`block_size` steps, bounded by `staging_capacity_tokens` rows and
-`gpu_staging_bytes` of retained tensor data. A batch that cannot fit the byte
-limit uses the ordinary per-step save. Changes in request order or output keys
-also flush the buffer. The runner retains each step's slot layout and cloned
-tensors, then stacks the stable batch in request/step order when flushing.
-
-Before any mixed step or lifecycle change, the runner writes all buffered rows,
-including partial blocks, before the manager plans hits or new writes can reuse
-the slots. Streaming extensions keep those rows. Buffer flushes use the ordinary
-save/discard path and finish before the next step claims a staging slot.
-Buffered decode steps skip `new_step_starts` and per-step `save_outputs`, serving
-their current outputs through the normal live-output path. A capacity-triggered
-flush saves the accumulated rows; a fallback step enters the manager normally.
+The GPU AR runner batches pure decode writes (one token per request, no arrivals,
+lifecycle events or preemptions) for full-hidden-state policies without deferred
+keys or mm outputs produced in `sample()`. It retains at most `block_size` steps,
+bounded by `staging_capacity_tokens` rows and `gpu_staging_bytes`; a single step
+that exceeds either capacity uses an ordinary save. Request-order or output-key
+changes, mixed steps and lifecycle events flush all buffered rows, including
+partial blocks, before hits are planned or slots can be reused.
 
 Two write paths, split by `ModelCachePolicy.deferred_keys`:
 
