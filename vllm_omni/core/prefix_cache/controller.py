@@ -154,12 +154,11 @@ def _is_legal_move(frm: TaskState, to: TaskState) -> bool:
 
 @dataclass
 class WriteTask:
-    """One write of (slot, key) rows: one request's deferred rows, or the
-    immediate rows of every request in a step.
+    """One write of (slot, key) rows for one request or a whole step.
 
     Identity: `tid` is the handle in the manager's (slot, key) tables.
-    `req_id` + `write_n` label the write (a step write carries its first
-    request). One write may cover several keys.
+    `req_id` + `write_n` label the write (first request for a shared task).
+    One write may cover several keys.
 
     `state` is the single source of truth for where the write is (see
     `TaskState`). `host_ready` / `done` are wait primitives set by the
