@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
+    QwenEmbedLayer3DRope,
     QwenEmbedRope,
 )
 from vllm_omni.diffusion.models.qwen_image.rope_utils import txt_seq_lens_from_embeds
@@ -47,11 +48,12 @@ def test_txt_seq_lens_from_embeds_rejects_invalid_rank():
         txt_seq_lens_from_embeds(torch.zeros(2, 3, 4, 5))
 
 
-def test_rope_freqs_cache_does_not_outlive_module():
+@pytest.mark.parametrize("rope_cls", [QwenEmbedRope, QwenEmbedLayer3DRope])
+def test_rope_freqs_cache_does_not_outlive_module(rope_cls):
     import gc
     import weakref
 
-    rope = QwenEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
+    rope = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
     rope([[(1, 16, 16)]], [8], device="cpu")
     ref = weakref.ref(rope)
 
@@ -61,12 +63,14 @@ def test_rope_freqs_cache_does_not_outlive_module():
     assert ref() is None
 
 
-def test_rope_freqs_cache_is_bounded_lru():
+@pytest.mark.parametrize("rope_cls", [QwenEmbedRope, QwenEmbedLayer3DRope])
+def test_rope_freqs_cache_is_bounded_lru(rope_cls):
     from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import _ROPE_FREQS_CACHE_SIZE
 
-    rope = QwenEmbedRope(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
+    rope = rope_cls(theta=10000, axes_dim=[16, 56, 56], scale_rope=True)
     first = rope._compute_video_freqs(1, 2, 2)
-    for size in range(3, 2 + _ROPE_FREQS_CACHE_SIZE):
+    second = rope._compute_video_freqs(1, 3, 3)
+    for size in range(4, 2 + _ROPE_FREQS_CACHE_SIZE):
         rope._compute_video_freqs(1, size, size)
 
     assert len(rope._freqs_cache) == _ROPE_FREQS_CACHE_SIZE
@@ -75,5 +79,5 @@ def test_rope_freqs_cache_is_bounded_lru():
     rope._compute_video_freqs(1, 2 + _ROPE_FREQS_CACHE_SIZE, 2 + _ROPE_FREQS_CACHE_SIZE)
 
     assert len(rope._freqs_cache) == _ROPE_FREQS_CACHE_SIZE
-    assert (1, 2, 2, 0) in rope._freqs_cache
-    assert (1, 3, 3, 0) not in rope._freqs_cache
+    assert rope._compute_video_freqs(1, 2, 2) is first
+    assert rope._compute_video_freqs(1, 3, 3) is not second
