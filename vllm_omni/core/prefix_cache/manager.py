@@ -981,10 +981,7 @@ class OmniPrefixCacheManager:
         ):
             if not tensors:
                 continue
-            if self._pending_reads:
-                # Copy committed rows aside before this step's claims overwrite them.
-                spans = [slots[query_start[r] : query_start[r] + num_sched[r]] for r in req_order]
-                self._preserve_for_pending_reads(torch.cat(spans), tuple(tensors.keys()))
+            spans: list[tuple[int, int, int]] = []
             for req_id in req_order:
                 start = query_start[req_id]
                 end = start + num_sched[req_id]
@@ -1006,18 +1003,24 @@ class OmniPrefixCacheManager:
                         self._request_tasks.deferred[req_id] = handle
                     else:
                         self._join_next_step_tids.append(handle.tid)
-                self._map_slots(slots[start:end], handle.tid, tensors.keys())
+                spans.append((handle.tid, start, end))
+            self._claim_slots(slots, tuple(tensors.keys()), spans)
 
     # ----------------------------------------------------- occupancy
 
-    def _map_slots(self, slots: torch.Tensor, tid: int, keys: Iterable[str]) -> None:
-        """Caller holds ``_state_lock``. Record `tid` on these (slot, key);
-        if another write still owns them, mark those rows skipped on it.
-        The only caller, ``_register_step_writes``, copies pending reads of
-        these slots aside first (``_preserve_for_pending_reads``)."""
-        keys = tuple(keys)
-        for old, key, stolen in self._slot_status.map_slots(slots, tid, keys):
-            self._controller.mark_reassigned(old, key, stolen)
+    def _claim_slots(self, slots: torch.Tensor, keys: tuple[str, ...], spans: list[tuple[int, int, int]]) -> None:
+        """Caller holds ``_state_lock``. Hand each ``(tid, start, end)`` span of
+        ``slots`` to that write for ``keys``; a write that still owns some of
+        them has those rows marked skipped. Slots are claimed only here, so
+        pending reads of the reused rows are always copied aside first (COW).
+        """
+        if not spans:
+            return
+        if self._pending_reads:
+            self._preserve_for_pending_reads(torch.cat([slots[start:end] for _, start, end in spans]), keys)
+        for tid, start, end in spans:
+            for old, key, stolen in self._slot_status.map_slots(slots[start:end], tid, keys):
+                self._controller.mark_reassigned(old, key, stolen)
 
     def _preserve_for_pending_reads(self, new_slots: torch.Tensor, keys: tuple[str, ...]) -> None:
         """Caller holds ``_state_lock``. Copy still-valid committed rows into

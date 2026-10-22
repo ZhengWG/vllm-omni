@@ -1843,10 +1843,10 @@ def _bare_controller(eager=True):
 def test_manager_partial_publish_failure_releases_resources(monkeypatch):
     policy = ModelCachePolicy(deferred_keys=frozenset({"k"}))
     mgr, view = make_manager(policy=policy)
-    map_slots = mgr._map_slots
+    claim_slots = mgr._claim_slots
 
-    def fail_publish(slots, tid, keys):
-        map_slots(slots, tid, keys)
+    def fail_publish(slots, keys, spans):
+        claim_slots(slots, keys, spans)
         if "k" in keys:
             raise RuntimeError("partial publish")
 
@@ -1854,7 +1854,7 @@ def test_manager_partial_publish_failure_releases_resources(monkeypatch):
         # Rollback must release both the old and newly appended deferred rows.
         sid = run_step(mgr, view, {"a": ([0], 0, 1)}, mm={"k": torch.ones(1, 2)})
         mgr.materialize(sid, ["a"])
-        monkeypatch.setattr(mgr, "_map_slots", fail_publish)
+        monkeypatch.setattr(mgr, "_claim_slots", fail_publish)
         with pytest.raises(RuntimeError, match="partial publish"):
             run_step(mgr, view, {"a": ([0], 1, 1), "b": ([1], 0, 2)}, mm={"k": torch.ones(3, 2)})
         assert mgr._step_ctxs == {}
