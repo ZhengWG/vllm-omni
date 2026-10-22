@@ -5,5 +5,20 @@ session_mode: turn
 stages:
   - stage_id: 0
     # Thinker prefix cache for turn serving on CUDA. The NPU platform block in
-    # the base keeps it off; the MRv2 turn profile turns it back off.
+    # the base and the blocks below keep it off on other platforms; the MRv2
+    # turn profile turns it back off.
     enable_prefix_caching: true
+
+platforms:
+  rocm:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  xpu:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false
+  musa:
+    stages:
+      - stage_id: 0
+        enable_prefix_caching: false

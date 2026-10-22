@@ -2025,10 +2025,11 @@ stages:
         ("yaml_name", "platform", "enabled"),
         [
             ("qwen3_omni_moe.yaml", "cuda", True),
+            *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
-            ("minicpmo_4_5_turn.yaml", "npu", False),
+            *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5.yaml", "cuda", False),
             ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),

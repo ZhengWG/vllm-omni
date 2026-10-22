@@ -30,7 +30,8 @@ stages:
     moe_backend: triton
     trust_remote_code: true
     # Thinker prefix cache: hits reuse KV and the cached hidden rows the Talker
-    # consumes. The MRv2 and duplex profiles keep it off until validated there.
+    # consumes. Validated on CUDA V1 turn serving only: the non-CUDA platform
+    # blocks below and the MRv2 and duplex profiles keep it off.
     enable_prefix_caching: true
     devices: "0"
     default_sampling_params:
@@ -97,6 +98,8 @@ platforms:
   # profile before vLLM performs its normal quantization auto-detection.
   musa:
     stages:
+      - stage_id: 0
+        enable_prefix_caching: false
       - stage_id: 1
         hf_overrides:
           quantization_config: null
@@ -107,6 +110,7 @@ platforms:
   npu:
     stages:
       - stage_id: 0
+        enable_prefix_caching: false
         gpu_memory_utilization: 0.6
         tensor_parallel_size: 2
         max_num_batched_tokens: 8192
@@ -131,12 +135,15 @@ platforms:
   # graph-capture failures.
   rocm:
     stages:
+      - stage_id: 0
+        enable_prefix_caching: false
       - stage_id: 2
         enforce_eager: true
 
   xpu:
     stages:
       - stage_id: 0
+        enable_prefix_caching: false
         tensor_parallel_size: 4
         enforce_eager: true
         max_cudagraph_capture_size: 0
