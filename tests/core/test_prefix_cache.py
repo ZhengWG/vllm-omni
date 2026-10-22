@@ -1971,12 +1971,21 @@ def test_scatter_host_ready_writes_only_staged_tasks():
     assert torch.equal(pool.rows(HIDDEN_KEY, slots), torch.ones(2, HIDDEN))
 
 
+def test_release_bytes_rejects_more_than_charged():
+    ctrl, _ = _bare_controller()
+    ctrl.reserve_bytes(64)
+    ctrl.release_bytes(64)
+    with pytest.raises(OmniPrefixCacheUnmatchError, match="releasing 1 GPU-budget bytes with only 0 charged"):
+        ctrl.release_bytes(1)
+    assert ctrl._staged_bytes == 0
+
+
 def test_budget_ticket_uncharges_once_per_clone():
     from vllm_omni.core.prefix_cache.controller import _BudgetTicket
 
     ctrl, _ = _bare_controller()
     ticket = _BudgetTicket(nbytes=100)
-    ctrl._reserve_bytes(100)
+    ctrl.reserve_bytes(100)
     a, _ = _bare_task(tid=1, budget=ticket)
     b, _ = _bare_task(tid=2, budget=ticket)
     ctrl._pin_budget(ticket, 1)
@@ -1996,7 +2005,7 @@ def test_fail_task_after_copy_does_not_uncharge_twice():
 
     ctrl, _ = _bare_controller()
     ticket = _BudgetTicket(nbytes=64)
-    ctrl._reserve_bytes(64)
+    ctrl.reserve_bytes(64)
     task, _ = _bare_task(tid=3, budget=ticket, queued=True)
     ctrl._tasks[task.tid] = task
     ctrl._pin_budget(ticket, 3)

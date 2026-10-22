@@ -695,7 +695,7 @@ class OmniPrefixCacheController:
             if rows
         }
         if tickets:
-            self._reserve_bytes(sum(ticket.nbytes for ticket in tickets.values()))
+            self.reserve_bytes(sum(ticket.nbytes for ticket in tickets.values()))
         holder = StagingBufferHolder.for_step(step_id)
         try:
             claim = self._stage_step_host(immediate, num_tokens, freeze_event, holder)
@@ -832,7 +832,7 @@ class OmniPrefixCacheController:
             for ticket in tickets:
                 self._staged_bytes -= ticket.release(task.tid)
 
-    def _reserve_bytes(self, nbytes: int) -> None:
+    def reserve_bytes(self, nbytes: int) -> None:
         # GPU-byte budget: force-copy oldest pending tasks until under
         # budget. Bounded wait: their device→host has usually long completed.
         while True:
@@ -846,6 +846,15 @@ class OmniPrefixCacheController:
             logger.warning("omni prefix cache: staging cap hit, force-flushing task %d", oldest)
             self.escalate([oldest])
             self.join([oldest])
+
+    def release_bytes(self, nbytes: int) -> None:
+        """Uncharge a `reserve_bytes` hold that no task owns."""
+        with self._lock:
+            if nbytes > self._staged_bytes:
+                raise OmniPrefixCacheUnmatchError(
+                    f"releasing {nbytes} GPU-budget bytes with only {self._staged_bytes} charged"
+                )
+            self._staged_bytes -= nbytes
 
     # ------------------------------------------------------------- lifecycle
 

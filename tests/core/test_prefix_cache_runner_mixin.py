@@ -430,28 +430,51 @@ def _expect_decode_hit(req_id, positions, tail):
 
 
 @pytest.mark.parametrize(
-    "config,expected_sizes,buffered",
+    "config,expected_sizes",
     [
-        ({}, [2, 8, 6, 1], True),
-        ({"staging_capacity_tokens": 3}, [2] * 8 + [1], True),
-        ({"staging_capacity_tokens": 4}, [2, 4, 4, 4, 2, 1], True),
-        ({"gpu_staging_bytes": 16}, [2] * 8 + [1], False),
-        ({"gpu_staging_bytes": 48}, [2, 4, 4, 4, 2, 1], True),
+        ({}, [2, 8, 6, 1]),
+        ({"staging_capacity_tokens": 3}, [2] * 8 + [1]),
+        ({"staging_capacity_tokens": 4}, [2, 4, 4, 4, 2, 1]),
     ],
 )
-def test_decode_batching_limits_and_prefix_hits(decode_runners, config, expected_sizes, buffered):
+def test_decode_batching_limits_and_prefix_hits(decode_runners, config, expected_sizes):
     r = decode_runners(**config)
     r.step({"a": (A_BLOCKS, 0, 1), "z": (Z_BLOCKS, 0, 1)}, new=["a", "z"])
     for p in range(1, 8):
         step_id, _ = r.step({"a": (A_BLOCKS, p, 1), "z": (Z_BLOCKS, p, 1)})
-        assert (step_id is None) == buffered
+        assert step_id is None
     _, (hidden, _) = r.step({"b": ([0, 1, 5], 8, 1)}, new=["b"], hits={"b": 8})
     assert r.save_sizes == expected_sizes
     assert torch.equal(hidden["b"], _expect_decode_hit("a", range(8), ("b", 8)))
-    step_id, (hidden, _) = r.step({"b": ([0, 1, 5], 9, 1), "z": (Z_BLOCKS, 8, 1)})
-    assert (step_id is None) == buffered
-    if not buffered:
-        assert torch.equal(hidden["b"], _decode_row("b", 9).unsqueeze(0))
+    step_id, _ = r.step({"b": ([0, 1, 5], 9, 1), "z": (Z_BLOCKS, 8, 1)})
+    assert step_id is None
+
+
+def test_decode_buffer_charges_its_batch_to_the_gpu_budget(decode_runners):
+    r = decode_runners()
+    ctrl = r.omni_prefix_cache._controller
+    reserve = ctrl.reserve_bytes
+    under_state_lock = []
+
+    def checked_reserve(nbytes):
+        # The reserve may wait on copies, which must not hold the state lock.
+        under_state_lock.append(r.omni_prefix_cache._state_lock.locked())
+        reserve(nbytes)
+
+    ctrl.reserve_bytes = checked_reserve
+    step_bytes = 2 * DECODE_WIDTH * 4
+    r.step({"a": (A_BLOCKS, 0, 1), "z": (Z_BLOCKS, 0, 1)}, new=["a", "z"])
+    for p in range(1, BLOCK_SIZE):
+        r.step({"a": (A_BLOCKS, p, 1), "z": (Z_BLOCKS, p, 1)})
+        assert ctrl._staged_bytes == p * step_bytes
+    r.step({"a": (A_BLOCKS, BLOCK_SIZE, 1), "z": (Z_BLOCKS, BLOCK_SIZE, 1)})
+    assert ctrl._staged_bytes == 0
+    r.step({"a": (A_BLOCKS, 5, 1), "z": (Z_BLOCKS, 5, 1)})
+    assert ctrl._staged_bytes == step_bytes
+    r.step({"a": (A_BLOCKS, 6, 1), "c": ([6, 7], 0, 2)}, new=["c"])
+    assert r.save_sizes == [2, 2 * BLOCK_SIZE, 2, 3]
+    assert ctrl._staged_bytes == 0
+    assert under_state_lock and not any(under_state_lock)
 
 
 def test_mixed_step_completes_hit_with_one_staging_slot(decode_runners):

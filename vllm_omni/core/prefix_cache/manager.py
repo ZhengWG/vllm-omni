@@ -741,6 +741,15 @@ class OmniPrefixCacheManager:
             if ctx is not None and not step_released:
                 self._release_step_staging(ctx)
 
+    def reserve_device_bytes(self, nbytes: int) -> None:
+        """Charge device rows the runner holds for a later save (its decode
+        buffer) to the GPU-byte budget; may force pending copies first, so
+        it runs outside the state lock."""
+        self._controller.reserve_bytes(nbytes)
+
+    def release_device_bytes(self, nbytes: int) -> None:
+        self._controller.release_bytes(nbytes)
+
     @_locked
     def discard_step(self, step_id: int) -> None:
         """Consume the step context when nothing will materialize it.
