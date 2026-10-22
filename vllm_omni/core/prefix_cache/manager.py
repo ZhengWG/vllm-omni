@@ -1012,7 +1012,9 @@ class OmniPrefixCacheManager:
 
     def _map_slots(self, slots: torch.Tensor, tid: int, keys: Iterable[str]) -> None:
         """Caller holds ``_state_lock``. Record `tid` on these (slot, key);
-        if another write still owns them, mark those rows skipped on it."""
+        if another write still owns them, mark those rows skipped on it.
+        The only caller, ``_register_step_writes``, copies pending reads of
+        these slots aside first (``_preserve_for_pending_reads``)."""
         keys = tuple(keys)
         for old, key, stolen in self._slot_status.map_slots(slots, tid, keys):
             self._controller.mark_reassigned(old, key, stolen)
@@ -1028,7 +1030,7 @@ class OmniPrefixCacheManager:
         """
         if not self._pending_reads:
             return
-        new_slots = new_slots.to(torch.long)
+        new_slots = new_slots.to(device="cpu", dtype=torch.long)  # counts and status tables live on CPU
         keys = tuple(
             k for k in keys if (counts := self._pending_slot_refs.get(k)) is not None and bool(counts[new_slots].any())
         )

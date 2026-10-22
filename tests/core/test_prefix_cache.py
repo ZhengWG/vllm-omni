@@ -1577,6 +1577,27 @@ def test_delayed_read_after_committed_reuse_serves_preserved():
         got = mgr._fetch_source(src)
     assert torch.equal(got, expected_rows(slots))
     assert all(ref is not src for ref in mgr._pending_reads)
+    assert not any(bool(counts.any()) for counts in mgr._pending_slot_refs.values())
+
+
+def test_pending_slot_counts_drain_with_duplicate_slots():
+    """The per-slot pending-ref counter is the fast-path gate for COW
+    preservation: a ref counts each of its slots, duplicates included, and
+    the fetch's unregister takes the same amount back."""
+    mgr, view = make_manager()
+    s1 = run_step(mgr, view, {"a": ([0], 0, 4)})
+    mgr.materialize(s1, ["a"])
+    slots = view.slots_for("a", 0, 4)
+    dup = torch.cat([slots, slots[:1]])
+    with mgr._state_lock:
+        src = mgr._slot_ref(dup, HIDDEN_KEY, "a")
+    counts = mgr._pending_slot_refs[HIDDEN_KEY]
+    assert counts[slots].tolist() == [2, 1, 1, 1] and int(counts.sum()) == 5
+    with torch.inference_mode():
+        got = mgr._fetch_source(src)
+    assert torch.equal(got, expected_rows(dup))
+    assert not any(bool(c.any()) for c in mgr._pending_slot_refs.values())
+    mgr.shutdown()
 
 
 def test_done_fires_only_after_completion_record_published():
