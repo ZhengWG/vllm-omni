@@ -553,6 +553,7 @@ class OmniPrefixCacheManager:
         num_tokens_unpadded: int,
         num_tokens_padded: int,
         write_layout: PrefixCacheWriteLayout,
+        owned: bool = False,
     ) -> int:
         """Write this step's outputs into the cache; returns the step id.
 
@@ -568,7 +569,8 @@ class OmniPrefixCacheManager:
         be consumed exactly once — by materialize() or discard_step().
         Every step id claims one staging slot (saves with only leftover mm
         included); a later save waits for a free slot and times out if
-        none return.
+        none return. ``owned`` inputs are fresh, unaliased storage the
+        caller hands over, so they are kept instead of cloned.
 
         The state lock never covers a blocking wait: the previous step's
         JOIN_NEXT_STEP wait, the clone build, the GPU-byte-budget reserve
@@ -617,6 +619,7 @@ class OmniPrefixCacheManager:
             mm_outputs,
             num_tokens_unpadded,
             num_tokens_padded,
+            owned=owned,
         )
 
         # Freeze on the compute stream before the controller launches copies.
@@ -925,6 +928,8 @@ class OmniPrefixCacheManager:
         mm_outputs: dict[str, Any],
         num_tokens_unpadded: int,
         num_tokens_padded: int,
+        *,
+        owned: bool = False,
     ) -> _StepOutputs:
         """Split this step's outputs into immediate / deferred / leftover.
 
@@ -937,6 +942,9 @@ class OmniPrefixCacheManager:
         Lists and other shapes stay leftover.
         """
         n = num_tokens_unpadded
+        if owned and num_tokens_padded != n:
+            # Owned rows are the caller's whole batch; a padded tail means a live buffer.
+            raise OmniPrefixCacheUnmatchError(f"owned step outputs must be unpadded: {num_tokens_padded} rows for {n}")
         immediate: dict[str, torch.Tensor] = {}
         deferred_tensors: dict[str, torch.Tensor] = {}
         new_key_storage: dict[str, torch.Tensor] = {}
@@ -953,18 +961,18 @@ class OmniPrefixCacheManager:
                     rows = 0 if hidden_states.ndim < 2 else int(hidden_states.shape[0])
                     raise OmniPrefixCacheUnmatchError(f"hidden_states has {rows} rows, need {n}")
                 alloc_key(hk, hidden_states)
-                immediate[hk] = hidden_states[:n].clone()
+                immediate[hk] = hidden_states[:n] if owned else hidden_states[:n].clone()
             for key, val in mm_outputs.items():
                 is_step_rows = _is_step_token_tensor(val, n, num_tokens_padded)
                 if key in self._policy.deferred_keys:
                     if is_step_rows:
                         alloc_key(key, val)
-                        deferred_tensors[key] = val[:n].clone()
+                        deferred_tensors[key] = val[:n] if owned else val[:n].clone()
                     continue
                 if self._policy.skip_immediate_mm(key) or not is_step_rows:
                     continue
                 alloc_key(key, val)
-                immediate[key] = val[:n].clone()
+                immediate[key] = val[:n] if owned else val[:n].clone()
         leftover, leftover_event = _snapshot_leftover_mm_cpu(mm_outputs, set(immediate), n, num_tokens_padded)
         return _StepOutputs(
             immediate=immediate,

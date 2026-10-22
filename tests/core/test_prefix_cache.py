@@ -375,6 +375,15 @@ def test_same_step_terminal_id_reuse_merges_only_the_new_start(terminal):
         mgr.shutdown()
 
 
+def test_owned_step_outputs_must_be_unpadded():
+    mgr, _ = make_manager()
+    try:
+        with pytest.raises(OmniPrefixCacheUnmatchError, match="owned step outputs must be unpadded: 4 rows for 2"):
+            mgr._split_step_outputs(torch.zeros(4, HIDDEN), {}, 2, 4, owned=True)
+    finally:
+        mgr.shutdown()
+
+
 def test_save_requires_write_layout_before_waiting(monkeypatch):
     mgr, _ = make_manager()
     waited = []

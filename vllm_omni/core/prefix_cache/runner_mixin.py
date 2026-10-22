@@ -268,6 +268,7 @@ class PrefixCacheRunnerMixin:
             num_tokens_unpadded=n,
             num_tokens_padded=n,
             write_layout=PrefixCacheWriteLayout(writes, n, slots_cpu),
+            owned=True,
         )
         cache.discard_step(step_id)
 
