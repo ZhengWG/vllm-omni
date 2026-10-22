@@ -310,6 +310,7 @@ def test_speech_extra_params_reach_model_sampler_as_sampling_metadata(monkeypatc
     runner._omni_cache_policy = ModelCachePolicy(needs_full_hidden_states=True)
     runner._pooler_payload_include_hidden_flag = True
     runner.input_batch = input_batch
+
     runner.model = SimpleNamespace(
         prefer_model_sampler=True,
         skips_model_sampler_output_token_history=True,
@@ -706,10 +707,17 @@ def test_async_omni_output_guard_requires_safe_conditions():
     assert GPUARModelRunner._should_use_async_omni_output(runner)
 
 
-def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch):
+@pytest.mark.parametrize("ming3", [False, True])
+def test_build_omni_output_skips_hidden_when_model_opts_out(monkeypatch, ming3):
     runner = _make_async_output_runner(engine_output_type="latent")
-    runner.model.omni_pooler_payload_include_hidden = False
-    runner._pooler_payload_include_hidden_flag = False
+    if ming3:
+        from vllm_omni.model_executor.models.ming3_audio.ming3_audio import BailingMoeV3AudioForConditionalGeneration
+
+        runner.model = BailingMoeV3AudioForConditionalGeneration
+        runner._pooler_payload_include_hidden_flag = getattr(runner.model, "omni_pooler_payload_include_hidden", True)
+    else:
+        runner.model.omni_pooler_payload_include_hidden = False
+        runner._pooler_payload_include_hidden_flag = False
 
     monkeypatch.setattr(
         GPUARModelRunner,
@@ -1810,7 +1818,7 @@ class TestMergeModelKvTransferMetadata:
                 return {"talker_codes": [7], "seen_tokens": num_computed_tokens}
 
         original_meta = {"a": 1}
-        original = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
+        original: dict[str, dict[str, Any]] = {"r1": {"seq_len": 3, "block_ids": [4], "custom_metadata": original_meta}}
         runner = self._runner_with_model(_Model())
 
         merged = runner._merge_model_kv_transfer_metadata(original)
