@@ -2028,21 +2028,30 @@ stages:
             *(("qwen3_omni_moe.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("qwen3_omni_moe_mrv2.yaml", "cuda", False),
             ("qwen3_omni_duplex.yaml", "cuda", False),
+            ("qwen3_omni_duplex_mrv2.yaml", "cuda", False),
             ("minicpmo_4_5_turn.yaml", "cuda", True),
             *(("minicpmo_4_5_turn.yaml", platform, False) for platform in ("npu", "rocm", "xpu", "musa")),
             ("minicpmo_4_5_turn_mrv2.yaml", "cuda", False),
+            ("minicpmo_4_5_turn_mrv2_h200.yaml", "cuda", False),
             ("minicpmo_4_5.yaml", "cuda", False),
             ("minicpmo_4_5_duplex_h200.yaml", "cuda", False),
         ],
     )
-    def test_thinker_prefix_cache_defaults(self, yaml_name: str, platform: str, enabled: bool):
-        """Stage-0 prefix caching ships on only for the validated V1 turn profiles."""
-        deploy = _apply_platform_overrides(
-            load_deploy_config(Path(get_deploy_config_path(yaml_name))),
-            platform=platform,
-        )
-        stage0 = next(stage for stage in deploy.stages if stage.stage_id == 0)
-        assert stage0.engine_extras.get("enable_prefix_caching", deploy.enable_prefix_caching) is enabled
+    def test_thinker_prefix_cache_defaults(self, monkeypatch, yaml_name: str, platform: str, enabled: bool):
+        """Stage-0 prefix caching ships on only for the validated V1 turn profiles.
+
+        Checked on the final engine args: the stage value rides in
+        ``engine_extras`` and must keep winning over the pipeline-wide flag.
+        """
+        from vllm_omni import platforms
+
+        monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
+        deploy = load_deploy_config(Path(get_deploy_config_path(yaml_name)))
+        # The Qwen3-Omni profiles carry no ``pipeline:`` key; serving resolves it from the model config.
+        pipeline = resolve_pipeline_config(deploy.pipeline or "qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        assert pipeline is not None
+        stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
+        assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
 
     def test_step_audio2_online_ci_deploy_is_single_thinker(self):
         deploy = load_deploy_config(Path(get_deploy_config_path("step_audio2_ci.yaml")))

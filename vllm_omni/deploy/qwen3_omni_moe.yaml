@@ -31,7 +31,14 @@ stages:
     trust_remote_code: true
     # Thinker prefix cache: hits reuse KV and the cached hidden rows the Talker
     # consumes. Validated on CUDA V1 turn serving only: the non-CUDA platform
-    # blocks below and the MRv2 and duplex profiles keep it off.
+    # blocks below and the MRv2 and duplex profiles keep it off. The cache
+    # keeps a host mirror of the cached rows, sized by the KV block count, so
+    # stage-0 host RSS grows by several GiB per replica. To turn it off, serve
+    # an overlay:
+    #   base_config: qwen3_omni_moe.yaml
+    #   stages:
+    #     - stage_id: 0
+    #       enable_prefix_caching: false
     enable_prefix_caching: true
     devices: "0"
     default_sampling_params:
