@@ -2045,10 +2045,18 @@ stages:
         """
         from vllm_omni import platforms
 
+        # merge_pipeline_deploy runs its own override pass for the host platform;
+        # pin it so the row does not depend on the machine running the test.
         monkeypatch.setattr(platforms.current_omni_platform, "device_name", platform)
-        deploy = load_deploy_config(Path(get_deploy_config_path(yaml_name)))
+        deploy = _apply_platform_overrides(
+            load_deploy_config(Path(get_deploy_config_path(yaml_name))), platform=platform
+        )
         # The Qwen3-Omni profiles carry no ``pipeline:`` key; serving resolves it from the model config.
-        pipeline = resolve_pipeline_config(deploy.pipeline or "qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        pipeline = (
+            resolve_pipeline_config(deploy.pipeline)
+            if deploy.pipeline
+            else resolve_pipeline_config("qwen3_omni_moe", Q3_OMNI_ALL_STAGES_HF_CONFIG)
+        )
         assert pipeline is not None
         stage0 = next(stage for stage in merge_pipeline_deploy(pipeline, deploy) if stage.stage_id == 0)
         assert stage0.yaml_engine_args["enable_prefix_caching"] is enabled
