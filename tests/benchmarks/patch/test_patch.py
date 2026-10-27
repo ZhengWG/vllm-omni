@@ -2381,6 +2381,59 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
     assert result["request_stage_metrics"] == expected
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("endpoint_type", ["openai-chat-omni", "openai-audio-speech"])
+async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_type):
+    """The ready check and each warmup carry a private cache_salt; measured requests are unchanged."""
+    sent = []
+
+    async def request_func(request_func_input, session, pbar=None):
+        sent.append((request_func_input.request_id, request_func_input.extra_body or {}))
+        return MixRequestFuncOutput(
+            success=True, prompt_len=1, output_tokens=1, ttft=0.01, text_latency=0.1, latency=0.1
+        )
+
+    monkeypatch.setitem(patch.ASYNC_REQUEST_FUNCS, endpoint_type, request_func)
+    extra_body = {"return_stage_metrics": True}
+    await patch.benchmark(
+        task_type=patch.TaskType.GENERATION,
+        endpoint_type=endpoint_type,
+        api_url="http://unused/v1/unused",
+        base_url="http://unused",
+        model_id="test-model",
+        model_name="test-model",
+        tokenizer=None,
+        input_requests=[
+            patch.SampleRequest(prompt="hello", prompt_len=1, expected_output_len=1, request_id=str(i))
+            for i in range(2)
+        ],
+        logprobs=None,
+        request_rate=float("inf"),
+        burstiness=1.0,
+        disable_tqdm=True,
+        num_warmups=3,
+        profile=False,
+        selected_percentile_metrics=[],
+        selected_percentiles=[],
+        ignore_eos=True,
+        goodput_config_dict={},
+        max_concurrency=2,
+        lora_modules=None,
+        extra_headers=None,
+        extra_body=extra_body,
+        ready_check_timeout_sec=5,
+    )
+    assert extra_body == {"return_stage_metrics": True}
+    warmup_salts = [body.get("cache_salt") for request_id, body in sent if not request_id]
+    measured = [body for request_id, body in sent if request_id]
+    assert len(warmup_salts) == 4 and len(measured) == 2
+    assert all("cache_salt" not in body for body in measured)
+    if endpoint_type in patch.CACHE_SALT_BACKENDS:
+        assert all(warmup_salts) and len(set(warmup_salts)) == 4
+    else:
+        assert warmup_salts == [None] * 4
+
+
 @pytest.mark.parametrize("snapshot", [None, {}, "not-a-dict"])
 def test_compact_request_stage_metrics_drops_empty_snapshots(snapshot):
     """Empty chat-omni snapshots must not make every result persist request_stage_metrics."""

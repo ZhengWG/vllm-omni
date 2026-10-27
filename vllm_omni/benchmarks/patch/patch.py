@@ -4,6 +4,7 @@
 import argparse
 import asyncio
 import contextlib
+import copy
 import io
 import json
 import mimetypes
@@ -3479,6 +3480,10 @@ ASYNC_REQUEST_FUNCS["daily-omni"] = async_request_openai_chat_omni_completions
 if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("daily-omni")
 
+# Backends whose request body is a completions / chat completions request, the
+# protocols that define ``cache_salt``. Other protocols reject unknown fields.
+CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "daily-omni"})
+
 # ruff: noqa: E402
 # Prevent import order from causing patch failures
 from vllm.benchmarks import serve
@@ -3518,6 +3523,11 @@ def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
     merged = dict(base or {})
     merged.update(overrides or {})
     return merged
+
+
+def _with_cache_salt(body: dict | None, salt: str | None) -> dict | None:
+    """Default ``cache_salt`` for a request body; an explicit one wins."""
+    return body if salt is None else {"cache_salt": salt, **(body or {})}
 
 
 def _cancelled_after_timeout_output(request: RequestFuncInput) -> MixRequestFuncOutput:
@@ -3636,6 +3646,10 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
+    # The ready check and each warmup get a private prefix-cache salt, so they
+    # neither hit each other (warmup then runs the measured run's prefill
+    # shapes) nor seed the cache for the measured requests.
+    warmup_scope = uuid.uuid4().hex if endpoint_type in CACHE_SALT_BACKENDS else None
     test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
     test_chat_messages = input_requests[0].chat_messages
 
@@ -3655,7 +3669,7 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=test_extra_body,
+        extra_body=_with_cache_salt(test_extra_body, warmup_scope and f"{warmup_scope}-ready"),
         chat_messages=test_chat_messages,
     )
     _attach_omni_chat_to_request_func_input(input_requests[0], test_input)
@@ -3687,12 +3701,16 @@ async def benchmark(
         warmup_semaphore = _async_limiter(max_concurrency)
         warmup_tasks = []
 
-        async def warmup_limited_request_func():
+        async def warmup_limited_request_func(warmup_input: RequestFuncInput):
             async with warmup_semaphore:
-                return await request_func(request_func_input=test_input, session=session, pbar=warmup_pbar)
+                return await request_func(request_func_input=warmup_input, session=session, pbar=warmup_pbar)
 
-        for _ in range(num_warmups):
-            request_task = asyncio.create_task(warmup_limited_request_func())
+        for i in range(num_warmups):
+            # copy, not dataclasses.replace: the _attach_* helpers add attributes
+            # outside the dataclass fields, which replace() would drop.
+            warmup_input = copy.copy(test_input)
+            warmup_input.extra_body = _with_cache_salt(test_extra_body, warmup_scope and f"{warmup_scope}-{i}")
+            request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
         _ = await asyncio.gather(*warmup_tasks)
 
