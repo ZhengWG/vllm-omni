@@ -3525,9 +3525,16 @@ def _merge_overrides(base: dict | None, overrides: dict | None) -> dict | None:
     return merged
 
 
-def _with_cache_salt(body: dict | None, salt: str | None) -> dict | None:
-    """Default ``cache_salt`` for a request body; an explicit one wins."""
-    return body if salt is None else {"cache_salt": salt, **(body or {})}
+def _salted_copy(rfi: RequestFuncInput, salt: str | None) -> RequestFuncInput:
+    """Copy with a default ``cache_salt``; an explicit one wins.
+
+    ``copy``, not ``dataclasses.replace``: the ``_attach_*`` helpers add
+    attributes outside the dataclass fields, which ``replace`` would drop.
+    """
+    out = copy.copy(rfi)
+    if salt is not None:
+        out.extra_body = {"cache_salt": salt, **(rfi.extra_body or {})}
+    return out
 
 
 def _cancelled_after_timeout_output(request: RequestFuncInput) -> MixRequestFuncOutput:
@@ -3669,7 +3676,7 @@ async def benchmark(
         multi_modal_content=test_mm_content,
         ignore_eos=ignore_eos,
         extra_headers=extra_headers,
-        extra_body=_with_cache_salt(test_extra_body, warmup_scope and f"{warmup_scope}-ready"),
+        extra_body=test_extra_body,
         chat_messages=test_chat_messages,
     )
     _attach_omni_chat_to_request_func_input(input_requests[0], test_input)
@@ -3680,7 +3687,7 @@ async def benchmark(
     if ready_check_timeout_sec > 0:
         test_output = await wait_for_endpoint(
             request_func,
-            test_input,
+            _salted_copy(test_input, warmup_scope and f"{warmup_scope}-ready"),
             session,
             timeout_seconds=ready_check_timeout_sec,
         )
@@ -3706,10 +3713,7 @@ async def benchmark(
                 return await request_func(request_func_input=warmup_input, session=session, pbar=warmup_pbar)
 
         for i in range(num_warmups):
-            # copy, not dataclasses.replace: the _attach_* helpers add attributes
-            # outside the dataclass fields, which replace() would drop.
-            warmup_input = copy.copy(test_input)
-            warmup_input.extra_body = _with_cache_salt(test_extra_body, warmup_scope and f"{warmup_scope}-{i}")
+            warmup_input = _salted_copy(test_input, warmup_scope and f"{warmup_scope}-{i}")
             request_task = asyncio.create_task(warmup_limited_request_func(warmup_input))
             warmup_tasks.append(request_task)
         _ = await asyncio.gather(*warmup_tasks)

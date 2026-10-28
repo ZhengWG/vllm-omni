@@ -2382,9 +2382,12 @@ async def test_benchmark_preserves_stage_metrics_request_order_and_missing_snaps
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("endpoint_type", ["openai-chat-omni", "openai-audio-speech"])
-async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_type):
-    """The ready check and each warmup carry a private cache_salt; measured requests are unchanged."""
+@pytest.mark.parametrize(
+    ("endpoint_type", "speech_extra"),
+    [("openai-chat-omni", None), ("openai-chat-omni", {"ref_audio": "x"}), ("openai-audio-speech", {"ref_audio": "x"})],
+)
+async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_type, speech_extra):
+    """The ready check and each warmup carry a private cache_salt; measured requests and dataset fields are unchanged."""
     sent = []
 
     async def request_func(request_func_input, session, pbar=None):
@@ -2404,7 +2407,13 @@ async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_
         model_name="test-model",
         tokenizer=None,
         input_requests=[
-            patch.SampleRequest(prompt="hello", prompt_len=1, expected_output_len=1, request_id=str(i))
+            SeedTTSSampleRequest(
+                prompt="hello",
+                prompt_len=1,
+                expected_output_len=1,
+                request_id=str(i),
+                seed_tts_speech_extra=speech_extra,
+            )
             for i in range(2)
         ],
         logprobs=None,
@@ -2428,6 +2437,8 @@ async def test_benchmark_warmups_do_not_seed_prefix_cache(monkeypatch, endpoint_
     measured = [body for request_id, body in sent if request_id]
     assert len(warmup_salts) == 4 and len(measured) == 2
     assert all("cache_salt" not in body for body in measured)
+    if speech_extra:
+        assert all(body["ref_audio"] == "x" for _, body in sent)
     if endpoint_type in patch.CACHE_SALT_BACKENDS:
         assert all(warmup_salts) and len(set(warmup_salts)) == 4
     else:
