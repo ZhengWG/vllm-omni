@@ -3481,7 +3481,8 @@ if "daily-omni" not in OPENAI_COMPATIBLE_BACKENDS:
     OPENAI_COMPATIBLE_BACKENDS.append("daily-omni")
 
 # Backends whose request body is a completions / chat completions request, the
-# protocols that define ``cache_salt``. Other protocols reject unknown fields.
+# protocols that accept ``cache_salt``. Speech derives its own server-side salt
+# and drops unknown fields; multimodal processor caches are not keyed by it.
 CACHE_SALT_BACKENDS = frozenset({"openai", "openai-chat", "openai-chat-omni", "daily-omni"})
 
 # ruff: noqa: E402
@@ -3653,9 +3654,9 @@ async def benchmark(
         input_requests[0].expected_output_len,
         input_requests[0].multi_modal_data,
     )
-    # The ready check and each warmup get a private prefix-cache salt, so they
-    # neither hit each other (warmup then runs the measured run's prefill
-    # shapes) nor seed the cache for the measured requests.
+    # The ready check and each warmup get a private salt, so their AR prefix-KV
+    # blocks neither hit each other (warmup then runs the measured run's prefill
+    # shapes) nor serve the measured requests. Only those blocks are isolated.
     warmup_scope = uuid.uuid4().hex if endpoint_type in CACHE_SALT_BACKENDS else None
     test_extra_body = _merge_overrides(extra_body, input_requests[0].request_overrides)
     test_chat_messages = input_requests[0].chat_messages
